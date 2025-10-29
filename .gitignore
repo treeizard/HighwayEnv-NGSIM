@@ -147,3 +147,13 @@ jupyter_execute
 .idea
 
 racetrack_oval_ppo/
+
+highway_dqn/
+
+figs_frames_10min_every10s/
+
+videos/
+
+highway_env/data/processed
+
+raw_data
