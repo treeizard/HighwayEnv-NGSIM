@@ -23,178 +23,305 @@ class DebugState:
     crashed: bool
     overtaken: bool
 
-class ReplayVehicle(IDMVehicle):
-    """
-    Robust NGSIM trajectory replayer with overlap diagnostics.
 
-    Expected traj rows already in METERS: [s_m, r_m, v_mps, lane_id]
-    where s is longitudinal along the freeway centerline and r is lateral.
+class NGSIMVehicle(IDMVehicle):
+    """
+    NGSIM-driven vehicle that replays a human trajectory while it is safe,
+    and hands over to IDM/MOBIL when the gap to the front vehicle becomes too small,
+    or when the trajectory is exhausted.
+
+    Expected ngsim_traj rows (already converted to METERS):
+        [x_m, y_m, v_mps, lane_id]
     """
 
-    # IDM tuning (kept modest to avoid aggressive catch-ups on handover)
-    ACC_MAX = 4.0
-    COMFORT_ACC_MAX = 2.5
-    COMFORT_ACC_MIN = -3.0
-    DISTANCE_WANTED = 2.0
-    TIME_WANTED = 0.7
+    # Longitudinal policy parameters (you can retune if you like)
+    COLLISIONS_ENABLED  = True
+    ACC_MAX = 5.0          # [m/s²]
+    COMFORT_ACC_MAX = 3.0  # [m/s²]
+    COMFORT_ACC_MIN = -3.0 # [m/s²]
+    DISTANCE_WANTED = 1.0  # [m]
+    TIME_WANTED = 0.5      # [s]
     DELTA = 4.0
 
+    # Lateral policy parameters [MOBIL]
+    POLITENESS = 0.1
+    LANE_CHANGE_MIN_ACC_GAIN = 0.2
+    LANE_CHANGE_MAX_BRAKING_IMPOSED = 2.0
+    LANE_CHANGE_DELAY = 1.0
+
+    # Scenario
+    SCENE = "us-101"
+
+    # NGSIM sampling period (seconds)
+    DATA_DT = 0.1
+
     def __init__(
-        self, road, position, heading: float = 0.0, speed: float = 0.0,
-        target_lane_index=None, target_speed: Optional[float] = None,
-        route=None, enable_lane_change: bool = False, timer: Optional[float] = None,
-        *, vehicle_ID: Optional[int] = None, v_length: Optional[float] = None,
-        v_width: Optional[float] = None, ngsim_traj=None, debug: bool = True
+        self,
+        road,
+        position,
+        heading: float = 0.0,
+        speed: float = 0.0,
+        target_lane_index=None,
+        target_speed: float = None,
+        route=None,
+        enable_lane_change: bool = False,
+        timer: float = None,
+        vehicle_ID=None,
+        v_length=None,
+        v_width=None,
+        ngsim_traj=None,
     ):
         super().__init__(
-            road, position, heading=heading, speed=speed,
-            target_lane_index=target_lane_index, target_speed=target_speed,
-            route=route, enable_lane_change=enable_lane_change, timer=timer
+            road,
+            position,
+            heading=heading,
+            speed=speed,
+            target_lane_index=target_lane_index,
+            target_speed=target_speed,
+            route=route,
+            enable_lane_change=enable_lane_change,
+            timer=timer,
         )
-        self.vehicle_ID = int(vehicle_ID) if vehicle_ID is not None else -1
-        self.ngsim_traj = np.asarray(ngsim_traj) if ngsim_traj is not None else None
+
+        # Trajectory: [x, y, v, lane_id]
+        self.ngsim_traj = (
+            np.asarray(ngsim_traj, dtype=float) if ngsim_traj is not None else None
+        )
+        self.vehicle_ID = vehicle_ID
+
+        # Replay state
         self.sim_steps = 0
-        self.overtaken = False   # False => follow replay; True => use IDM/MOBIL
-        self.debug = debug
+        self.overtaken = False       # False => follow NGSIM; True => IDM/MOBIL
+        self.appear = bool(self.position[0] != 0)
 
-        # Dimensions
-        if v_length is not None: self.LENGTH = float(v_length)
-        if v_width is not None:  self.WIDTH  = float(v_width)
+        # Diagnostics
+        self.traj = np.array(self.position, dtype=float)
+        self.speed_history = []
+        self.heading_history = []
+        self.crash_history = []
+        self.overtaken_history = []
 
-        # Histories
-        self.debug_history: list[DebugState] = []
-
-    # ---- helpers ----
-    def _edge_for_s(self, s: float) -> Tuple[Tuple[str, str], float]:
-        # MUST match env's _create_road cutpoints
-        cut1 = 560/3.281
-        cut2 = (698+578+150)/3.281
-        if s <= cut1:
-            return ("s1","s2"), 0.0
-        elif s <= cut2:
-            return ("s2","s3"), cut1
-        else:
-            return ("s3","s4"), cut2
-
-    def _rect_aabb(self, x: float, y: float, heading: float) -> Tuple[float,float,float,float]:
-        """Axis-aligned bbox of oriented rectangle (conservative)."""
-        # Over-approximate with a circle radius then AABB (fast + safe)
-        r = 0.5 * math.hypot(self.LENGTH, self.WIDTH)
-        return (x - r, y - r, x + r, y + r)
-
-    def _log_debug(self, lane_idx_tuple, edge, local_s, r_val):
-        if not self.debug: return
-        self.debug_history.append(
-            DebugState(
-                step=self.sim_steps, veh_id=self.vehicle_ID,
-                edge=edge, lane_idx=lane_idx_tuple[2] if lane_idx_tuple else -1,
-                local_s=float(local_s), r=float(r_val),
-                x=float(self.position[0]), y=float(self.position[1]),
-                speed=float(self.speed), length=float(self.LENGTH), width=float(self.WIDTH),
-                crashed=bool(self.crashed), overtaken=bool(self.overtaken)
-            )
-        )
-
-    # ---- main logic ----
+        # Dimensions with safe fallbacks
+        self.LENGTH = float(v_length) if v_length is not None else getattr(self, "LENGTH", 4.5)
+        self.WIDTH  = float(v_width)  if v_width  is not None else getattr(self, "WIDTH", 2.0)
+        self.diagonal = np.sqrt(self.LENGTH**2 + self.WIDTH**2)
+    # ---------------- Factory ----------------
     @classmethod
     def create(
-        cls, road, vehicle_ID: int, position, v_length: float, v_width: float, ngsim_traj,
-        heading: float = 0.0, speed: float = 15.0, target_lane_index=None, target_speed=None,
-        route=None, enable_lane_change: bool = False, debug: bool = True
+        cls,
+        road,
+        vehicle_ID,
+        position,
+        v_length,
+        v_width,
+        ngsim_traj,
+        heading: float = 0.0,
+        speed: float = 15.0,
     ):
         return cls(
-            road, position, heading=heading, speed=float(speed),
-            target_lane_index=target_lane_index, target_speed=target_speed, route=route,
-            enable_lane_change=enable_lane_change,
-            vehicle_ID=vehicle_ID, v_length=v_length, v_width=v_width,
-            ngsim_traj=ngsim_traj, debug=debug
+            road,
+            position,
+            heading=heading,
+            speed=speed,
+            vehicle_ID=vehicle_ID,
+            v_length=v_length,
+            v_width=v_width,
+            ngsim_traj=ngsim_traj,
         )
 
-    def act(self, action=None) -> None:
-        # On replay we do nothing; once overtaken we let IDM handle it
-        if not self.overtaken or self.crashed:
+    # ---------------- Behaviour ----------------
+    def act(self, action: dict | str = None):
+        """
+        Only act (IDM/MOBIL) once we are overtaken.
+        While in replay mode (not overtaken), we don't call Vehicle.act().
+        """
+        if self.crashed:
             return
+        if not self.overtaken:
+            return
+        # Reuse IDMVehicle.act for actual control once taken over
         super().act(action)
 
-    def _ngsim_step_update(self, dt: float) -> None:
-        # Hand off to IDM if replay is exhausted
-        if self.ngsim_traj is None or self.sim_steps + 1 >= len(self.ngsim_traj):
+    def _update_from_trajectory(self):
+        """
+        Apply one replay step from ngsim_traj[sim_steps] -> [sim_steps+1].
+        Sets position, speed, heading, lane_index/lane.
+        """
+        if self.ngsim_traj is None:
+            self.overtaken = True
+            return
+        if self.sim_steps + 1 >= len(self.ngsim_traj):
             self.overtaken = True
             return
 
-        cur_s, cur_r_abs, cur_v, cur_lane = self.ngsim_traj[self.sim_steps]
-        nxt_s, nxt_r_abs, nxt_v, _ = self.ngsim_traj[self.sim_steps + 1]
+        # Current and next samples: [x, y, v, lane_id]
+        cur_x, cur_y, cur_v, cur_lane = self.ngsim_traj[self.sim_steps][:4]
+        nxt_x, nxt_y, nxt_v, _        = self.ngsim_traj[self.sim_steps + 1][:4]
 
-        # Pick road edge by global s and compute local s
-        edge, edge_start = self._edge_for_s(float(cur_s))
-        try:
-            n_lanes_on_edge = len(self.road.network.graph[edge[0]][edge[1]])
-        except Exception:
-            n_lanes_on_edge = 1
+        # Position from data
+        self.position = np.array([cur_x, cur_y], dtype=float)
+        self.appear = bool(cur_x != 0.0)
 
-        # Lane index (NGSIM is 1-based); clamp to edge lane count
-        lane_zero_based = int(np.clip((int(cur_lane) if cur_lane else 1) - 1, 0, max(0, n_lanes_on_edge - 1)))
-        lane_idx_tuple = (edge[0], edge[1], lane_zero_based)
-        lane = self.road.network.get_lane(lane_idx_tuple)
+        # Speed from spatial difference (fallback to recorded v)
+        dx = nxt_x - cur_x
+        dy = nxt_y - cur_y
+        dist = math.hypot(dx, dy)
+        data_dt = self.DATA_DT
 
-        # Local curvilinear s relative to the chosen edge
-        local_s = float(cur_s - edge_start)
+        speed_est = dist / utils.not_zero(data_dt)
+        self.speed = speed_est if speed_est > 1e-3 else float(cur_v)
+        self.target_speed = self.speed
 
-        # ---- KEY FIX: convert absolute lateral (r_abs) -> relative to lane center ----
-        # lane.position(local_s, 0.0) returns the lane center at that s
-        center_x, center_y = lane.position(local_s, 0.0)
-        # cur_r_abs is absolute lateral (already meters). Make it relative to lane center:
-        cur_r_rel = float(cur_r_abs) - float(center_y)
+        # Heading from motion vector
+        if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+            self.heading = math.atan2(dy, dx)
 
-        # Update pose from replay
-        self.position = np.asarray(lane.position(local_s, cur_r_rel), dtype=float)
-        self.heading  = float(lane.heading_at(local_s))
+        # Attach to nearest lane
+        self.lane_index = self.road.network.get_closest_lane_index(self.position)
+        self.lane = self.road.network.get_lane(self.lane_index)
 
-        # Prefer finite-difference speed from s; fallback to dataset v
-        ds = float(nxt_s - cur_s)
-        self.speed = ds / utils.not_zero(dt) if abs(ds) > 1e-6 else float(cur_v)
+    def _front_gap_logic(self):
+        """
+        Decide which front vehicle counts for gap checking.
 
-        # Book-keeping
-        self.lane_index = lane_idx_tuple
-        self.lane = lane
+        - Ignore NGSIM vs NGSIM if the front is still in replay (not overtaken).
+        - Otherwise use IDM desired_gap.
+        """
+        front_vehicle, rear_vehicle = self.road.neighbour_vehicles(self)
 
-        # Debug log (store absolute r so you can inspect conversion later)
-        self._log_debug(lane_idx_tuple, edge, local_s, cur_r_abs)
+        if front_vehicle is not None:
+            if isinstance(front_vehicle, NGSIMVehicle) and front_vehicle.overtaken:
+                gap = self.lane_distance_to(front_vehicle)
+                desired_gap = self.desired_gap(self, front_vehicle)
+            elif not isinstance(front_vehicle, NGSIMVehicle):
+                gap = self.lane_distance_to(front_vehicle)
+                desired_gap = self.desired_gap(self, front_vehicle)
+            else:
+                # front is NGSIMVehicle and still replaying -> ignore
+                gap = 100.0
+                desired_gap = 50.0
+        else:
+            gap = 100.0
+            desired_gap = 50.0
 
-    def step(self, dt: float) -> None:
-        # Maintain histories
-        if getattr(self, "timer", None) is not None:
-            self.timer += dt
+        return gap, desired_gap
 
-        if self.crashed:
+    def step(self, dt: float):
+        """
+        Update the state:
+
+        - If safe and we have more NGSIM steps: follow the recorded trajectory.
+        - Otherwise: mark as overtaken and use IDM/MOBIL dynamics.
+        """
+        if self.ngsim_traj is None or len(self.ngsim_traj) == 0:
+            # No trajectory: behave as a pure IDMVehicle
+            self.overtaken = True
             super().step(dt)
             return
 
-        # Neighbour check to avoid piling on top of a stopped car
-        if self.road is not None:
-            lane_idx = getattr(self, "lane_index", None)
-            front_vehicle, rear_vehicle = self.road.neighbour_vehicles(self, lane_idx)
-        else:
-            front_vehicle, rear_vehicle = (None, None)
+        # Timer / histories
+        self.timer += dt
+        self.heading_history.append(self.heading)
+        self.speed_history.append(self.speed)
+        self.crash_history.append(self.crashed)
+        self.overtaken_history.append(self.overtaken)
 
-        gap = self.lane_distance_to(front_vehicle) if front_vehicle is not None else float("inf")
-        desired_gap = self.desired_gap(self, front_vehicle) if front_vehicle is not None else 0.0
+        gap, desired_gap = self._front_gap_logic()
+        can_replay = (not self.overtaken) and (self.sim_steps + 1 < len(self.ngsim_traj))
 
-        can_replay = (not self.overtaken and self.ngsim_traj is not None and self.sim_steps + 1 < len(self.ngsim_traj))
-        if can_replay and (gap >= max(desired_gap, 0.5 * self.LENGTH)):
-            self._ngsim_step_update(dt)
+        if can_replay and gap >= desired_gap:
+            # Keep replaying
+            self._update_from_trajectory()
             self.sim_steps += 1
+        else:
+            # Handover to IDM/MOBIL
+            self.overtaken = True
+
+            # Use lane_id + x to pick a target lane index (optional but keeps old behavior)
+            lane_id = int(
+                self.ngsim_traj[min(self.sim_steps, len(self.ngsim_traj) - 1)][3]
+            )
+            x = self.position[0]
+            target_lane_index = None
+
+            if self.SCENE == "us-101":
+                if lane_id <= 5:
+                    if 0 < x <= 560 / 3.281:
+                        target_lane_index = ("s1", "s2", lane_id - 1)
+                    elif 560 / 3.281 < x <= (698 + 578 + 150) / 3.281:
+                        target_lane_index = ("s2", "s3", lane_id - 1)
+                    else:
+                        target_lane_index = ("s3", "s4", lane_id - 1)
+                elif lane_id == 6:
+                    target_lane_index = ("s2", "s3", -1)
+                elif lane_id == 7:
+                    target_lane_index = ("merge_in", "s2", -1)
+                elif lane_id == 8:
+                    target_lane_index = ("s3", "merge_out", -1)
+            elif self.SCENE == "i-80":
+                if lane_id <= 6:
+                    if 0 < x <= 600 / 3.281:
+                        target_lane_index = ("s1", "s2", lane_id - 1)
+                    elif 600 / 3.281 < x <= 700 / 3.281:
+                        target_lane_index = ("s2", "s3", lane_id - 1)
+                    elif 700 / 3.281 < x <= 900 / 3.281:
+                        target_lane_index = ("s3", "s4", lane_id - 1)
+                    else:
+                        target_lane_index = ("s4", "s5", lane_id - 1)
+                elif lane_id == 7:
+                    target_lane_index = ("s1", "s2", -1)
+
+            if target_lane_index is not None:
+                self.target_lane_index = target_lane_index
+
+            super().step(dt)
+
+        # Record replayed / simulated position
+        self.traj = np.append(self.traj, self.position, axis=0)
+
+    # ---------------- Collision handling ----------------
+        # ---------------- Collision handling ----------------
+    def handle_collisions(self, other: IDMVehicle, dt: float = 0.0) -> None:
+        """
+        Collision handling that plugs into RoadObject.handle_collisions, but keeps
+        the NGSIM-specific behaviour:
+
+        - Respect COLLISIONS_ENABLED on both sides.
+        - Ignore NGSIM-vs-NGSIM collisions while both are still in replay
+          (both overtaken == False).
+        - Delegate geometry and crash/hit/impact flags to the base implementation.
+        - When a *new* crash happens, clamp both speeds to the smaller magnitude
+          (your original "safe-ish min speed" rule).
+        """
+
+        # 1. Global toggle: if either side disabled, do nothing.
+        if not getattr(self, "COLLISIONS_ENABLED", True) or \
+           not getattr(other, "COLLISIONS_ENABLED", True):
             return
 
-        # Handover to IDM/MOBIL if replay blocked or exhausted
-        self.overtaken = True
-        super().step(dt)
+        # 2. Skip NGSIM-vs-NGSIM collisions while both still in replay mode.
+        #    This preserves your original "ignore replay vs replay" logic.
+        if isinstance(self, NGSIMVehicle) and isinstance(other, NGSIMVehicle):
+            if not self.overtaken and not getattr(other, "overtaken", False):
+                return
 
-    # ---- overlap test (optional, used by env) ----
-    def aabb(self) -> Tuple[float, float, float, float]:
-        return self._rect_aabb(self.position[0], self.position[1], self.heading)
+        # 3. Remember prior crash states so we can detect a *new* crash.
+        pre_crash_self = self.crashed
+        pre_crash_other = getattr(other, "crashed", False)
 
-    def overlaps_aabb(self, other: "ReplayVehicle") -> bool:
-        ax1, ay1, ax2, ay2 = self.aabb()
-        bx1, by1, bx2, by2 = other.aabb()
-        return (ax1 <= bx2) and (ax2 >= bx1) and (ay1 <= by2) and (ay2 >= by1)
+        # 4. Delegate the actual geometric test and crash/hit/impact logic
+        #    to the parent implementation (Vehicle/RoadObject).
+        super().handle_collisions(other, dt)
+
+        # 5. If a new crash has just occurred, and both are now crashed,
+        #    apply the "safe-ish" min-speed rule from your legacy code.
+        post_crash_self = self.crashed
+        post_crash_other = getattr(other, "crashed", False)
+
+        new_crash_happened = (not pre_crash_self or not pre_crash_other) and \
+                             (post_crash_self and post_crash_other)
+
+        if new_crash_happened and hasattr(other, "speed"):
+            # Use the smaller absolute speed of the two
+            min_speed = min(self.speed, other.speed, key=abs)
+            self.speed = other.speed = min_speed

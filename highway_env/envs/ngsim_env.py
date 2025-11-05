@@ -7,7 +7,7 @@ from highway_env.envs.common.abstract import AbstractEnv
 from highway_env.envs.common.action import Action
 from highway_env.road.lane import LineType, StraightLane
 from highway_env.road.road import Road, RoadNetwork
-from highway_env.ngsim_utils.obs_vehicle import ReplayVehicle
+from highway_env.ngsim_utils.obs_vehicle import NGSIMVehicle
 
 
 from highway_env.ngsim_utils.trajectory_gen import build_trajectory, process_raw_trajectory
@@ -98,11 +98,13 @@ class NGSimEnv(AbstractEnv):
         self.road = Road(network=net, np_random=self.np_random, record_history=self.config["show_trajectories"])
 
     # ---- vehicles ----
+
     def _create_vehicles(self) -> None:
         # ---------------- Ego ----------------
         main_edge = ("s1", "s2")
         num_main = len(self.net.graph[main_edge[0]][main_edge[1]])
-        ego_lane_id = int(np.clip(self.config.get("ego_lane_index", 1), 0, max(0, num_main - 1)))
+        ego_lane_id = int(np.clip(self.config.get("ego_lane_index", 1),
+                                0, max(0, num_main - 1)))
         ego_s = float(self.config.get("ego_longitudinal_m", 30.0))
         ego_speed = float(self.config.get("ego_speed", 30.0))
         ego_lane = self.net.get_lane((*main_edge, ego_lane_id))
@@ -116,95 +118,17 @@ class NGSimEnv(AbstractEnv):
         self.vehicle = ego
 
         # ---------------- Surrounding (replay) ----------------
-        ego_s_window = (ego_s - self.config["spawn_radius_m"], ego_s + self.config["spawn_radius_m"])
-        min_gap = float(self.config.get("min_initial_gap_m", 2.0))
 
-        count_added = 0
+
         for veh_id, meta in self.trajectory_set.items():
-            if count_added >= int(self.config.get("max_surrounding", 80)):
-                break
-
-            traj_m = process_raw_trajectory(meta["trajectory"])  # rows: [s_abs_m, r_abs_m, v_mps, lane_id]
-            if traj_m.shape[0] < 2:
-                continue
-
-            # first point inside window (prefer an explicit find over argmax)
-            in_win = np.where((traj_m[:, 0] >= ego_s_window[0]) & (traj_m[:, 0] <= ego_s_window[1]))[0]
-            if in_win.size == 0:
-                continue
-            idx0 = int(in_win[0])
-
-            # Unpack first usable sample
-            cur_s, cur_r_abs, v_cur, lane_id = traj_m[idx0]
-
-            # Choose edge + local s from s_abs
-            cut1 = 560/3.281
-            cut2 = (698+578+150)/3.281
-            if cur_s <= cut1:
-                edge, edge_start = ("s1", "s2"), 0.0
-            elif cur_s <= cut2:
-                edge, edge_start = ("s2", "s3"), cut1
-            else:
-                edge, edge_start = ("s3", "s4"), cut2
-
-            try:
-                n_lanes_on_edge = len(self.net.graph[edge[0]][edge[1]])
-            except Exception:
-                n_lanes_on_edge = 1
-
-            lane0 = int(np.clip(int(lane_id) - 1, 0, max(0, n_lanes_on_edge - 1)))
-            lane = self.net.get_lane((edge[0], edge[1], lane0))
-
-            local_s = float(cur_s - edge_start)
-
-            # ---- KEY FIX: absolute -> relative lateral for spawn pose ----
-            center_x, center_y = lane.position(local_s, 0.0)
-            cur_r_rel = float(cur_r_abs) - float(center_y)
-
-            # World pose at spawn (NO magic '-6' offset)
-            xy0 = np.asarray(lane.position(local_s, cur_r_rel), dtype=float)
-
-            # Initial speed (finite-diff on s if possible; fallback to v)
-            if idx0 + 1 < traj_m.shape[0]:
-                v0 = float(traj_m[idx0 + 1, 0] - cur_s) / utils.not_zero(self.dt)
-            else:
-                v0 = float(v_cur)
-
-            # Build temp vehicle and check for spawn-time overlap
-            temp = ReplayVehicle.create(
-                self.road, veh_id, xy0,
-                meta["length"]/3.281, meta["width"]/3.281,
-                traj_m[idx0:], speed=v0
-            )
-
-            overlaps = False
-            for other in self.road.vehicles:
-                if hasattr(other, "aabb"):
-                    if temp.overlaps_aabb(other):
-                        overlaps = True
-                        break
-                else:
-                    # Distance fallback if AABB unavailable
-                    if np.linalg.norm(np.asarray(other.position) - xy0) < (0.5 * (temp.LENGTH + getattr(other, "LENGTH", 4.5)) + min_gap):
-                        overlaps = True
-                        break
-
-            if overlaps:
-                continue  # skip this vehicle; optional: jitter and retry instead
-
-            self.road.vehicles.append(temp)
-            count_added += 1
-
-        # Color passive cars grey
-        for v in self.road.vehicles:
-            if getattr(v, "is_ego", False):
-                continue
-            if hasattr(v, "color"):
-                v.color = (150, 150, 150)
+            other_trajectory = process_raw_trajectory(self.trajectory_set[veh_id]['trajectory'])[1:]
+            self.road.vehicles.append(NGSIMVehicle.create(self.road, veh_id, other_trajectory[0][:2], self.trajectory_set[veh_id]['length']/3.281,
+                                                          self.trajectory_set[veh_id]['width']/3.281, other_trajectory, speed=other_trajectory[0][2]))
+        
 
     # ---- trajectories ----
     def _load_trajectory(self) -> None:
-        self.trajectory_set = build_trajectory(self.config["scene"], self.config["replay_period"])
+        self.trajectory_set = build_trajectory(self.config["scene"], self.config["replay_period"], 121)
 
     # ---- rewards/termination (kept minimal) ----
     def _rewards(self, action: int) -> dict[str, float]:

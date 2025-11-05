@@ -28,59 +28,73 @@ def trajectory_smoothing(trajectory):
     speed[np.nonzero(speed)] = signal.savgol_filter(speed[np.nonzero(speed)], window_length=window_length, polyorder=3)
    
     return [[float(x), float(y), float(s), int(l)] for x, y, s, l in zip(x, y, speed, lane)]
+# 
 
-def build_trajectory(scene, period):
-    """
-    Returns:
-        {
-          <veh_id>: {
-            'length': <feet>,
-            'width' : <feet>,
-            'trajectory': [[x, y, speed, lane_ID], ...]
-          },
-          ...
-        }
-    """
+def build_trajectory(scene, period, vehicle_ID):
     ng = ngsim_data(scene)
-    ng.load('highway_env/data/processed/' + scene)
-
+    ng.load('highway_env/data/processed/'+scene)
+    records = ng.vr_dict
     vehicles = ng.veh_dict
-
-    # Precompute each vehicle's trajectories
-    for v in vehicles.values():
+    snapshots = ng.snap_dict
+    surroundings = []
+    record_trajectory = {'ego':{'length':0, 'width':0, 'trajectory':[]}}
+    
+    for veh_ID, v in vehicles.items():
         v.build_trajectory()
 
-    result = {}
+    ego_trajectories = vehicles[vehicle_ID].trajectory
+    selected_trajectory = ego_trajectories[period]
 
-    # Collect trajectories for the requested period across all vehicles
-    for veh_id, v in vehicles.items():
-        # Some vehicles may not have that many periods
-        if period >= len(v.trajectory):
-            continue
+    D = 50 if scene == 'us-101' else 20
 
-        traj = v.trajectory[period]
-        if not traj:
-            continue
+    ego = []
+    nearby_IDs = []
+    for position in selected_trajectory:
+        record_trajectory['ego']['length'] = position.len
+        record_trajectory['ego']['width'] = position.wid
+        ego.append([position.x, position.y, position.spd, position.lane_ID])
+        records = snapshots[position.unixtime].vr_list
+        other = []
+        for record in records:
+            if record.veh_ID != vehicle_ID:
+                other.append([record.veh_ID, record.len, record.wid, record.x, record.y, record.spd, record.lane_ID])
+                d = abs(position.y - record.y)
+                if d <= D:            
+                    nearby_IDs.append(record.veh_ID)
+        surroundings.append(other)
+        
+    record_trajectory['ego']['trajectory'] = ego
 
-        # Raw sequence: [x, y, spd, lane_ID] pulled from each Position-like item
-        seq = []
-        length_ft = 0.0
-        width_ft = 0.0
-        for p in traj:
-            length_ft = getattr(p, 'len', length_ft)
-            width_ft  = getattr(p, 'wid', width_ft)
-            seq.append([p.x, p.y, p.spd, p.lane_ID])
+    for v_ID in set(nearby_IDs):
+        record_trajectory[v_ID] = {'length':0, 'width':0, 'trajectory':[]}
+    
+    # fill in data
+    for timestep_record in surroundings:
+        scene_IDs = []
+        for vehicle_record in timestep_record:
+            v_ID = vehicle_record[0]
+            v_length = vehicle_record[1]
+            v_width = vehicle_record[2]
+            v_x = vehicle_record[3]
+            v_y = vehicle_record[4]
+            v_s = vehicle_record[5]
+            v_laneID = vehicle_record[6]
+            if v_ID in set(nearby_IDs):
+                scene_IDs.append(v_ID)
+                record_trajectory[v_ID]['length'] = v_length
+                record_trajectory[v_ID]['width'] = v_width
+                record_trajectory[v_ID]['trajectory'].append([v_x, v_y, v_s, v_laneID])
+        for v_ID in set(nearby_IDs):
+            if v_ID not in scene_IDs:
+                record_trajectory[v_ID]['trajectory'].append([0, 0, 0, 0])
+    
+    # trajectory smoothing
+    for key in record_trajectory.keys():
+        orginal_trajectory = record_trajectory[key]['trajectory']
+        smoothed_trajectory = trajectory_smoothing(orginal_trajectory)
+        record_trajectory[key]['trajectory'] = smoothed_trajectory
 
-        # Smooth this vehicle's trajectory
-        smoothed = trajectory_smoothing(seq)
-
-        result[veh_id] = {
-            'length': length_ft,
-            'width':  width_ft,
-            'trajectory': smoothed
-        }
-
-    return result
+    return record_trajectory
 
 def process_raw_trajectory(trajectory):
     trajectory = np.array(trajectory)

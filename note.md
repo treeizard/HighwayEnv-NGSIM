@@ -152,6 +152,24 @@ net.add_lane(
 - `[window_start, window_end]` defines the time interval for the set of data which is to be played. 
 -  `_spawn_replay_for_time(t_ms)` Filters vehicles whose trajectory covers t_ms. 
 - `step()` Increments the simulation time, when the window ends, it cycles and respawns a fresh set of new `window_start`. 
+```mermaid
+graph LR
+    A[_read_trajectory_] --> B[_build_road_]
+    A --> C[_build_vehicles_]
+
+    B --> F{simulation step}
+
+    C --> D[_build_ego_vehicle_]
+    C --> E[_build_NGSIM_vehicles_]
+
+    D --> H[Ego Vehicle]
+    E --> G[NGSIM Vehicle]
+
+    H -- act() --> G
+    G -- replay() / IDM --> F
+    F --> H
+```
+
 ### 3. Reference Materials
 - https://github.com/MCZhi/Driving-IRL-NGSIM/tree/main
 - https://github.com/Farama-Foundation/HighwayEnv
