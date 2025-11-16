@@ -6,16 +6,16 @@
 - [x] Document existing Code and how it works. 
 #### 1.2. Training Environment Implementation
 - [x] Set up templates for trajectory replay. (Due: 27th Oct 2025)
-- [ ] Trajectory Replay Optimization
+- [x] Trajectory Replay Optimization
     - [x] Issue with the interpolation?
     - [x] Issue with topology?  
 - [x] Fix the crashing and jumble issue, create a dataset (Due: 27th Oct 2025)
 - [ ] Document the trajectory replay. (Due: 27th Oct 2025)
 - [x] Incoorporate IDM into the trajectory replay. (Due: 28th Oct 2025)
-- [ ] Optimize the training environment and ensure the discovered errors are fixed. 
-    - [ ] Some car too close to the edge.
+- [x] Optimize the training environment and ensure the discovered errors are fixed. 
+    - [x] Some car too close to the edge.
     - [ ] IDM when activated change color.
-    - [ ] Spawn the car in the middle of the traffic.  
+    - [x] Spawn the car in the middle of the traffic.  
 
 ##### 1.2.1. NGSIM Data
 - [ ] IRL using the NGSIM data on a set of target vehicles. 
@@ -45,12 +45,12 @@ graph TD;
     Road --> Vehicles;
     RoadNetwork --> Note2["Uses graph to represent lanes as edges and nodes as intersections"]
 ```
-##### 2.2.2. NGSIM Implementation
+##### 2.2.2. Road Networks
 
-**0. Data Pre-processing**
+**2.2.2.1. Data Pre-processing**
 
 
-**1. Topology Developement**
+**2.2.2.2. Topology Developement**
 ```python
 net = RoadNetwork()
 
@@ -146,29 +146,118 @@ net.add_lane(
 )
 ```
 - Finalise the lanes. 
+#### 2.3. NGSIM Environment
 
-**2. Trajectory Replay**
--  `_load_ngsim_replay()` reads the `vehicle_record_file.csv`, which is a dictionary of `id2rec[ID] = {t, x, y, spd, len, wid, ...}`.
-- `[window_start, window_end]` defines the time interval for the set of data which is to be played. 
--  `_spawn_replay_for_time(t_ms)` Filters vehicles whose trajectory covers t_ms. 
-- `step()` Increments the simulation time, when the window ends, it cycles and respawns a fresh set of new `window_start`. 
+#### 2.4. NGSIM Vehicles
+**2.4.1. NGSIM Vehicle Functions**
 ```mermaid
-graph LR
-    A[_read_trajectory_] --> B[_build_road_]
-    A --> C[_build_vehicles_]
+graph TD
+    NGSIMVehicle -->|handover condition| HandoverLogic["gap < desired_gap OR trajectory exhausted"]
+    HandoverLogic--> ReplayMode["Replay Mode, _update_from_trajectory()"]
+    HandoverLogic --> IDMMOBILMode["IDM/MOBIL Mode"]
 
-    B --> F{simulation step}
+    ReplayMode -->|follows| NGSIMTrajectory["NGSIM Human Trajectory"]
+    IDMMOBILMode -->|controlled by| IDMPolicy["IDM Car-Following Policy"]
+    IDMMOBILMode -->|lane change| MOBILPolicy["MOBIL Lane-Change Policy"]
 
-    C --> D[_build_ego_vehicle_]
-    C --> E[_build_NGSIM_vehicles_]
+    NGSIMTrajectory -->|sampled every 0.1s| TrajData["[x_m, y_m, v_mps, lane_id]"]
+    
 
-    D --> H[Ego Vehicle]
-    E --> G[NGSIM Vehicle]
-
-    H -- act() --> G
-    G -- replay() / IDM --> F
-    F --> H
 ```
+- The contructed NGSIM Vehicle class has two modes, the Replay Mode and the IDM/MOBIL Mode. 
+- The key input we need to provide to the Vehicle class is the `ngsim_traj` variable which composes of `[x_m, y_m, v_mps, lane_id]`. 
+    - `x_m`: the vehicle’s x-coordinate in the road/world frame at that time.
+    - `y_m`: the vehicle’s y-coordinate in the same frame.
+    - `v_mps`: the vehicle’s instantaneous speed recorded in the dataset at that time.
+    - `lane_id`: which NGSIM lane the vehicle is in at that time step, e.g. lane 1–5 for mainline, 6–8 for on-ramp / off-ramp / aux lane.
+- The simulator will replay human trajectory if the distance between the NGSIM Vehicle and front vehicle is greater than a certain value. Else, IDM will take over. 
+
+**2.4.2. Vehicle Class Inheritance** 
+```mermaid
+classDiagram
+    %% ----------------
+    %% Inheritance tree
+    %% ----------------
+    RoadObject <|-- Vehicle
+    Vehicle <|-- ControlledVehicle
+    ControlledVehicle <|-- IDMVehicle
+    IDMVehicle <|-- NGSIMVehicle
+
+    %% ----------------
+    %% Graphics linkage
+    %% ----------------
+    Vehicle ..> VehicleGraphics : rendered by
+    NGSIMVehicle ..> VehicleGraphics : rendered by
+
+    %% ----------------
+    %% Classes & members
+    %% ----------------
+    class RoadObject {
+        +position : Vector
+        +heading : float
+        +length : float
+        +width : float
+        +crashed : bool
+        +handle_collisions(other, dt)
+    }
+
+    class Vehicle {
+        +road : Road
+        +position : Vector
+        +heading : float
+        +speed : float
+        +LENGTH : float
+        +WIDTH : float
+        +step(dt)
+    }
+
+    class ControlledVehicle {
+        +target_speed : float
+        +target_lane_index : LaneIndex
+        +route : Route
+        +act(action)
+    }
+
+    class IDMVehicle {
+        +ACC_MAX : float
+        +COMFORT_ACC_MAX : float
+        +COMFORT_ACC_MIN : float
+        +DISTANCE_WANTED : float
+        +TIME_WANTED : float
+        +DELTA : float
+        +POLITENESS : float
+        +LANE_CHANGE_MIN_ACC_GAIN : float
+        +LANE_CHANGE_MAX_BRAKING_IMPOSED : float
+        +LANE_CHANGE_DELAY : float
+        +acceleration(ego, front)
+        +mobil(road)
+    }
+
+    class NGSIMVehicle {
+        +road : Road
+        +vehicle_ID : int
+        +ngsim_traj : float[][4]
+        +LENGTH : float
+        +WIDTH : float
+        +speed : float
+        +color : tuple
+        +sim_steps : int
+        +overtaken : bool
+        +appear : bool
+        +traj : float[]  %% recorded positions
+        +step(dt)
+        +act(action)
+        +handle_collisions(other, dt)
+        +_update_from_trajectory()
+    }
+
+    class VehicleGraphics {
+        +display(vehicle, surface)
+        +display_history(vehicle, surface, frequency, offscreen)
+        +get_color(vehicle, transparent)
+    }
+```
+
 
 ### 3. Reference Materials
 - https://github.com/MCZhi/Driving-IRL-NGSIM/tree/main

@@ -1,3 +1,21 @@
+# Modified by: Yide Tao (yide.tao@monash.edu)
+# Reference: @article{huang2021driving,
+#   title={Driving Behavior Modeling Using Naturalistic Human Driving Data With Inverse Reinforcement Learning},
+#   author={Huang, Zhiyu and Wu, Jingda and Lv, Chen},
+#   journal={IEEE Transactions on Intelligent Transportation Systems},
+#   year={2021},
+#   publisher={IEEE}
+# }
+# @misc{highway-env,
+#   author = {Leurent, Edouard},
+#   title = {An Environment for Autonomous Driving Decision-Making},
+#   year = {2018},
+#   publisher = {GitHub},
+#   journal = {GitHub repository},
+#   howpublished = {\url{https://github.com/eleurent/highway-env}},
+# }
+
+
 from __future__ import annotations
 from dataclasses import dataclass
 import math
@@ -54,7 +72,7 @@ class NGSIMVehicle(IDMVehicle):
 
     # NGSIM sampling period (seconds)
     DATA_DT = 0.1
-
+    DEFAULT_COLOR = (160, 160, 160)
     def __init__(
         self,
         road,
@@ -70,6 +88,7 @@ class NGSIMVehicle(IDMVehicle):
         v_length=None,
         v_width=None,
         ngsim_traj=None,
+        color=None
     ):
         super().__init__(
             road,
@@ -105,6 +124,7 @@ class NGSIMVehicle(IDMVehicle):
         self.LENGTH = float(v_length) if v_length is not None else getattr(self, "LENGTH", 4.5)
         self.WIDTH  = float(v_width)  if v_width  is not None else getattr(self, "WIDTH", 2.0)
         self.diagonal = np.sqrt(self.LENGTH**2 + self.WIDTH**2)
+        self.color = color if color is not None else self.DEFAULT_COLOR
     # ---------------- Factory ----------------
     @classmethod
     def create(
@@ -117,6 +137,7 @@ class NGSIMVehicle(IDMVehicle):
         ngsim_traj,
         heading: float = 0.0,
         speed: float = 15.0,
+        color=None,  
     ):
         return cls(
             road,
@@ -127,6 +148,7 @@ class NGSIMVehicle(IDMVehicle):
             v_length=v_length,
             v_width=v_width,
             ngsim_traj=ngsim_traj,
+            color=color,
         )
 
     # ---------------- Behaviour ----------------
@@ -236,7 +258,7 @@ class NGSIMVehicle(IDMVehicle):
         else:
             # Handover to IDM/MOBIL
             self.overtaken = True
-
+            self.color = (100, 200, 255)
             # Use lane_id + x to pick a target lane index (optional but keeps old behavior)
             lane_id = int(
                 self.ngsim_traj[min(self.sim_steps, len(self.ngsim_traj) - 1)][3]

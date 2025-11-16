@@ -1,14 +1,20 @@
-'''
-Modified by: Yide Tao (yide.tao@monash.edu)
-Source: https://github.com/MCZhi/Driving-IRL-NGSIM/tree/main/NGSIM_env
-Reference: @article{huang2021driving,
-  title={Driving Behavior Modeling Using Naturalistic Human Driving Data With Inverse Reinforcement Learning},
-  author={Huang, Zhiyu and Wu, Jingda and Lv, Chen},
-  journal={IEEE Transactions on Intelligent Transportation Systems},
-  year={2021},
-  publisher={IEEE}
-}
-'''
+# Modified by: Yide Tao (yide.tao@monash.edu)
+# Reference: @article{huang2021driving,
+#   title={Driving Behavior Modeling Using Naturalistic Human Driving Data With Inverse Reinforcement Learning},
+#   author={Huang, Zhiyu and Wu, Jingda and Lv, Chen},
+#   journal={IEEE Transactions on Intelligent Transportation Systems},
+#   year={2021},
+#   publisher={IEEE}
+# }
+# @misc{highway-env,
+#   author = {Leurent, Edouard},
+#   title = {An Environment for Autonomous Driving Decision-Making},
+#   year = {2018},
+#   publisher = {GitHub},
+#   journal = {GitHub repository},
+#   howpublished = {\url{https://github.com/eleurent/highway-env}},
+# }
+
 
 import numpy as np
 from scipy import signal
@@ -45,7 +51,7 @@ def build_trajectory(scene, period, vehicle_ID):
     ego_trajectories = vehicles[vehicle_ID].trajectory
     selected_trajectory = ego_trajectories[period]
 
-    D = 50 if scene == 'us-101' else 20
+    D = 200 if scene == 'us-101' else 20
 
     ego = []
     nearby_IDs = []
@@ -107,6 +113,13 @@ def process_raw_trajectory(trajectory):
         trajectory[i][2] = speed / 3.281
 
     return trajectory
+
+def first_valid_index(traj):
+    """Return index of first non-zero trajectory entry, or None if all zero."""
+    for i, (x, y, spd, lane) in enumerate(traj):
+        if not (x == 0 and y == 0 and spd == 0 and lane == 0):
+            return i
+    return None
 
 if __name__ == "__main__":
     scene  = "us-101"
