@@ -155,5 +155,6 @@ figs_frames_10min_every10s/
 videos/
 
 highway_env/data/processed
+highway_env/data/processed_10s
 
 raw_data

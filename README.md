@@ -22,12 +22,15 @@ Sometimes the packages: `typeguard` and `pyyaml` will be missing.
 ```
 pip install highway-env
 ```
-5. Install gymnasium and tensorboard:
+5. Install gymnasium, imitation and tensorboard:
 ```
 pip install gymnasium
 ```
 ```
 pip install gymnasium[other]
+```
+```
+pip install imitation
 ```
 ```
 pip install tensorboard
@@ -44,4 +47,8 @@ You should see rendering of the highway env environment and video playing.
 2. Place the csv trajectory file inside the `raw_data` folder. If you do not change the name of the raw Data, you can just run:
 ```
 python dump_data.py raw_data/Next_Generation_Simulation__NGSIM__Vehicle_Trajectories_and_Supporting_Data.csv 
+```
+in development:
+```
+python dump_data_time.py raw_data/Next_Generation_Simulation__NGSIM__Vehicle_Trajectories_and_Supporting_Data.csv
 ```
