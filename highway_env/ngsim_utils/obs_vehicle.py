@@ -24,6 +24,7 @@ from typing import Tuple, Optional
 
 from highway_env import utils
 from highway_env.vehicle.behavior import IDMVehicle
+from highway_env.ngsim_utils.ego_vehicle import ControlledVehicle
 
 @dataclass
 class DebugState:
@@ -206,37 +207,42 @@ class NGSIMVehicle(IDMVehicle):
         """
         Decide which front vehicle counts for gap checking.
 
-        - Ignore NGSIM vs NGSIM if the front is still in replay (not overtaken).
-        - Otherwise use IDM desired_gap.
+        We only care when the front vehicle is the ego (ControlledVehicle).
+        All other fronts (NGSIM or background vehicles) are ignored
+        for takeover (treated as "safe" for the replay logic).
+
+        Returns:
+            gap: float
+            desired_gap: float
+            ego_ahead: bool
         """
         front_vehicle, rear_vehicle = self.road.neighbour_vehicles(self)
 
-        if front_vehicle is not None:
-            if isinstance(front_vehicle, NGSIMVehicle) and front_vehicle.overtaken:
-                gap = self.lane_distance_to(front_vehicle)
-                desired_gap = self.desired_gap(self, front_vehicle)
-            elif not isinstance(front_vehicle, NGSIMVehicle):
-                gap = self.lane_distance_to(front_vehicle)
-                desired_gap = self.desired_gap(self, front_vehicle)
-            else:
-                # front is NGSIMVehicle and still replaying -> ignore
-                gap = 100.0
-                desired_gap = 50.0
-        else:
-            gap = 100.0
-            desired_gap = 50.0
+        # No front vehicle -> treat as safe, no ego ahead
+        if front_vehicle is None:
+            return 100.0, 50.0, False
 
-        return gap, desired_gap
+        # If the front vehicle is the ego, we care about the real gap
+        if isinstance(front_vehicle, ControlledVehicle):
+            gap = self.lane_distance_to(front_vehicle)
+            desired_gap = self.desired_gap(self, front_vehicle)
+            return gap, desired_gap, True
+
+        # Any other front vehicle (NGSIM or other) is ignored for takeover
+        return 100.0, 50.0, False
+
 
     def step(self, dt: float):
         """
         Update the state:
 
-        - If safe and we have more NGSIM steps: follow the recorded trajectory.
-        - Otherwise: mark as overtaken and use IDM/MOBIL dynamics.
+        - If we still have NGSIM data and (either no ego ahead, or ego is at a safe gap):
+              → follow the recorded NGSIM trajectory.
+        - Otherwise (trajectory exhausted OR ego too close ahead):
+              → mark as overtaken and use IDM/MOBIL dynamics.
         """
+        # No trajectory: behave as a pure IDM vehicle
         if self.ngsim_traj is None or len(self.ngsim_traj) == 0:
-            # No trajectory: behave as a pure IDMVehicle
             self.overtaken = True
             super().step(dt)
             return
@@ -248,18 +254,24 @@ class NGSIMVehicle(IDMVehicle):
         self.crash_history.append(self.crashed)
         self.overtaken_history.append(self.overtaken)
 
-        gap, desired_gap = self._front_gap_logic()
+        gap, desired_gap, ego_ahead = self._front_gap_logic()
+
+        # Still have replay data?
         can_replay = (not self.overtaken) and (self.sim_steps + 1 < len(self.ngsim_traj))
 
-        if can_replay and gap >= desired_gap:
-            # Keep replaying
+        # --- Replay vs takeover logic ---
+        #  - If no ego ahead: ignore gaps, just replay while we have data.
+        #  - If ego ahead: only replay when gap >= desired_gap.
+        if can_replay and (not ego_ahead or gap >= desired_gap):
+            # Keep replaying the NGSIM trajectory
             self._update_from_trajectory()
             self.sim_steps += 1
         else:
             # Handover to IDM/MOBIL
             self.overtaken = True
             self.color = (100, 200, 255)
-            # Use lane_id + x to pick a target lane index (optional but keeps old behavior)
+
+            # Use lane_id + x to pick a target lane index (your existing mapping)
             lane_id = int(
                 self.ngsim_traj[min(self.sim_steps, len(self.ngsim_traj) - 1)][3]
             )
@@ -296,10 +308,12 @@ class NGSIMVehicle(IDMVehicle):
             if target_lane_index is not None:
                 self.target_lane_index = target_lane_index
 
+            # Now evolve with IDM/MOBIL dynamics
             super().step(dt)
 
         # Record replayed / simulated position
         self.traj = np.append(self.traj, self.position, axis=0)
+
 
     # ---------------- Collision handling ----------------
         # ---------------- Collision handling ----------------

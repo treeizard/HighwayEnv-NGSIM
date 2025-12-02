@@ -1,28 +1,43 @@
-"""
-dump_data_time.py
-
-Read an NGSIM CSV (e.g. us-101) using ngsim_data, then dump the data
-into 10-second (or configurable) time windows. This file is constructed to improve the data processing efficiency later on
-
-For example, with default settings:
-
-    highway_env/data/processed_10s/us-101/
-        t1118846663000/
-            vehicle_record_file.csv
-            vehicle_file.csv
-            snapshot_file.csv
-        t1118846673000/
-            ...
-
-Each subfolder contains the same three files and formats as ngsim_data.dump(),
-but restricted to the snapshots and vehicles that appear in that time window.
-"""
+# Modified by: Yide Tao (yide.tao@monash.edu), Huy Nguyen, Ted Sing Lo
+# Reference: @article{huang2021driving,
+#   title={Driving Behavior Modeling Using Naturalistic Human Driving Data With Inverse Reinforcement Learning},
+#   author={Huang, Zhiyu and Wu, Jingda and Lv, Chen},
+#   journal={IEEE Transactions on Intelligent Transportation Systems},
+#   year={2021},
+#   publisher={IEEE}
+# }
+# @misc{highway-env,
+#   author = {Leurent, Edouard},
+#   title = {An Environment for Autonomous Driving Decision-Making},
+#   year = {2018},
+#   publisher = {GitHub},
+#   journal = {GitHub repository},
+#   howpublished = {\url{https://github.com/eleurent/highway-env}},
+# }
+#dump_data_time.py
+#
+#Read an NGSIM CSV (e.g. us-101) using ngsim_data, then dump the data
+#into 10-second (or configurable) time windows. This file is constructed to improve the data processing efficiency later on
+#
+#For example, with default settings:
+#    highway_env/data/processed_10s/us-101/
+#        t1118846663000/
+#            vehicle_record_file.csv
+#            vehicle_file.csv
+#            snapshot_file.csv
+#        t1118846673000/
+#            ...
+#
+#Each subfolder contains the same three files and formats as ngsim_data.dump(),
+#but restricted to the snapshots and vehicles that appear in that time window.
 
 import os
 import argparse
 from collections import defaultdict
 
 from highway_env.data.ngsim import ngsim_data
+from highway_env.data.traj_to_action import traj_cont_action
+
 
 
 def build_episodes(
@@ -197,6 +212,7 @@ def main():
         print(f"[{idx+1}/{len(episodes)}] Dumping episode starting at {t_start} "
               f"with {len(snap_times)} snapshots -> {ep_dir}")
         dump_episode(reader, snap_times, ep_dir)
+        traj_cont_action(ep_dir)
 
     print("Done.")
 

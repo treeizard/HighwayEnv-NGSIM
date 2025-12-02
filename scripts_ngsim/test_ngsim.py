@@ -20,7 +20,7 @@ def main():
     base_cfg = {
         "scene": "us-101",
         "observation": {"type": "Kinematics"},
-        "action": {"type": "DiscreteMetaAction"},
+        "action": {"type": "ContinuousAction"},
         "show_trajectories": False,
 
         # Rendering

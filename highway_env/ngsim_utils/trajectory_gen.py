@@ -20,7 +20,7 @@ import numpy as np
 from scipy import signal
 import matplotlib.pyplot as plt
 from highway_env.data.ngsim import *
-
+"""
 def trajectory_smoothing(trajectory):
     trajectory = np.array(trajectory)
     x = trajectory[:,0]
@@ -34,7 +34,47 @@ def trajectory_smoothing(trajectory):
     speed[np.nonzero(speed)] = signal.savgol_filter(speed[np.nonzero(speed)], window_length=window_length, polyorder=3)
    
     return [[float(x), float(y), float(s), int(l)] for x, y, s, l in zip(x, y, speed, lane)]
-# 
+"""
+def trajectory_smoothing(trajectory):
+    """
+    trajectory: array-like of shape (T, 4) with columns [x, y, speed, lane]
+    Returns: list of [x, y, speed, lane] with smoothed x, y, speed
+    """
+    trajectory = np.array(trajectory)
+    x = trajectory[:, 0]
+    y = trajectory[:, 1]
+    speed = trajectory[:, 2]
+    lane = trajectory[:, 3]  # lane kept as-is
+
+    def _smooth_1d(arr):
+        idx = np.nonzero(arr)[0]
+        if len(idx) == 0:
+            return arr
+        n = len(idx)
+        # Start with window capped at 21 but not larger than n
+        window_length = 21 if n >= 21 else n
+        # Make it odd
+        if window_length % 2 == 0:
+            window_length -= 1
+        # Need window_length > polyorder
+        polyorder = 3
+        if window_length <= polyorder:
+            # Not enough points to fit a cubic; skip smoothing
+            return arr
+        arr[idx] = signal.savgol_filter(
+            arr[idx], window_length=window_length, polyorder=polyorder
+        )
+        return arr
+
+    x = _smooth_1d(x)
+    y = _smooth_1d(y)
+    speed = _smooth_1d(speed)
+
+    return [
+        [float(xx), float(yy), float(s), int(l)]
+        for xx, yy, s, l in zip(x, y, speed, lane)
+    ]
+
 
 def build_trajectory(scene, period, vehicle_ID):
     ng = ngsim_data(scene)

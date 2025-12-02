@@ -3,13 +3,14 @@
 from __future__ import annotations
 import os
 import numpy as np
-from typing import List, Tuple
+from typing import Any
 
 from highway_env import utils
 from highway_env.envs.common.abstract import AbstractEnv
 from highway_env.envs.common.action import Action
 from highway_env.road.road import Road
 from highway_env.ngsim_utils.obs_vehicle import NGSIMVehicle
+from highway_env.ngsim_utils.ego_vehicle import ControlledVehicle
 from highway_env.ngsim_utils.gen_road import create_ngsim_101_road
 
 from highway_env.ngsim_utils.trajectory_gen import (
@@ -146,30 +147,63 @@ class NGSimEnv(AbstractEnv):
 
         # --- ego first state ---
         x0, y0, ego_speed, lane0 = ego_traj[ego_start_i]
-        ego_xy = np.array([x0, y0])
+        ego_xy = np.array([x0, y0], dtype=float)
 
-        main_edge = ("s1", "s2")
+        # ----------------- choose the correct edge based on x -----------------
+        # Must match the geometry in create_ngsim_101_road()
+        length = 2150 / 3.281
+        ends = [0.0,
+                560 / 3.281,
+                (698 + 578 + 150) / 3.281,
+                length]
+
+        x_m = float(x0)  # assume ego_traj already in meters
+        if x_m < ends[1]:
+            main_edge = ("s1", "s2")   # first 5-lane section
+        elif x_m < ends[2]:
+            main_edge = ("s2", "s3")   # 6-lane section (lane 5 lives here)
+        else:
+            main_edge = ("s3", "s4")   # last 5-lane section
+
         lane_index = int(lane0)
+
+        # Optional: clamp lane_index so it doesn't blow up if out of range
+        lanes_on_edge = self.net.graph[main_edge[0]][main_edge[1]]
+        n_lanes = len(lanes_on_edge)
+        if lane_index < 0 or lane_index >= n_lanes:
+            print(
+                f"[NGSimEnv] WARNING: lane_index {lane_index} out of range for "
+                f"edge {main_edge} (n_lanes={n_lanes}); clamping."
+            )
+            lane_index = int(np.clip(lane_index, 0, n_lanes - 1))
+
+        print("lane ids:", lane_index, ", position:", x0, ",", y0,
+              ", edge:", main_edge)
+
         ego_lane = self.net.get_lane((*main_edge, lane_index))
         ego_s, ego_r = ego_lane.local_coordinates(ego_xy)
 
-        # snap to lane
+        # snap to lane centerline
         ego_xy = np.asarray(ego_lane.position(ego_s, ego_r), float)
 
-        ego = self.action_type.vehicle_class(
+        ego = ControlledVehicle(
             road=self.road,
             position=ego_xy,
             speed=ego_speed,
             heading=ego_lane.heading_at(ego_s),
+            control_mode="continuous"
         )
+
         self.road.vehicles.append(ego)
         self.vehicle = ego
 
-        # --- surrounding vehicles ---
+        # --- surrounding vehicles (unchanged) ---
         for vid, meta in self.trajectory_set.items():
-            if vid == "ego": continue
+            if vid == "ego":
+                continue
             traj = process_raw_trajectory(meta["trajectory"])
-            if len(traj) < 2: continue
+            if len(traj) < 2:
+                continue
 
             v = NGSIMVehicle.create(
                 road=self.road,
@@ -183,8 +217,10 @@ class NGSimEnv(AbstractEnv):
             )
             self.road.vehicles.append(v)
 
+
     # ---------------------------------------------------------------------
-    def _rewards(self, action: int) -> dict[str, float]:
+    def _rewards(self, action: Any) -> dict[str, float]:
+        # ----- Speed term -----
         speed = float(getattr(self.vehicle, "speed", 0.0))
         scaled_speed = utils.lmap(
             speed,
@@ -192,20 +228,43 @@ class NGSimEnv(AbstractEnv):
             [0.0, 1.0],
         )
 
+        # ----- Right-lane term -----
         lane_tuple = getattr(self.vehicle, "lane_index", None)
         right_lane_reward = 0.0
         if lane_tuple is not None:
             try:
-                n_on_edge = len(
-                    self.road.network.graph[lane_tuple[0]][lane_tuple[1]]
-                )
+                n_on_edge = len(self.road.network.graph[lane_tuple[0]][lane_tuple[1]])
+                # Normalize lane id so rightmost lane gets 1.0
                 right_lane_reward = (
                     lane_tuple[2] / max(1, n_on_edge - 1)
                 ) if n_on_edge > 1 else 1.0
             except Exception:
                 pass
 
-        lane_change_pen = int(action in [0, 2])
+        # ----- Lane-change / steering penalty -----
+        lane_change_pen = 0.0
+
+        # Case 1: DISCRETE action (int index)
+        if isinstance(action, (int, np.integer)):
+            # Indices that correspond to lane changes in your DiscreteMetaAction
+            lane_change_indices = self.config.get("lane_change_action_indices", [0, 2])
+            lane_change_pen = float(action in lane_change_indices)
+
+        # Case 2: CONTINUOUS vector (e.g. Box action → [steering, accel])
+        elif isinstance(action, (np.ndarray, list, tuple)):
+            # Assume first element encodes steering (normalized or physical)
+            steering_val = float(action[0]) if len(action) > 0 else 0.0
+            steer_thresh = self.config.get("lane_change_steer_thresh", 0.3)
+            lane_change_pen = float(abs(steering_val) > steer_thresh)
+
+        # Case 3: CONTINUOUS dict (e.g. replay / ContinuousAction → {"steering": ..., "acceleration": ...})
+        elif isinstance(action, dict):
+            steering_val = float(action.get("steering", 0.0))
+            steer_thresh = self.config.get("lane_change_steer_thresh", 0.3)
+            lane_change_pen = float(abs(steering_val) > steer_thresh)
+
+        # Fallback: anything else → no lane-change penalty
+
         return {
             "collision_reward": float(self.vehicle.crashed),
             "right_lane_reward": float(right_lane_reward),
@@ -213,12 +272,15 @@ class NGSimEnv(AbstractEnv):
             "lane_change_reward": float(lane_change_pen),
         }
 
-    # ---------------------------------------------------------------------
-    def _reward(self, action: int) -> float:
+
+    def _reward(self, action: Any) -> float:
         terms = self._rewards(action)
         raw = sum(self.config.get(name, 0.0) * val for name, val in terms.items())
+
         worst = self.config.get("collision_reward", -1.0)
         best = self.config.get("high_speed_reward", 1.0)
+
+        # Map raw reward linearly into [0, 1] for scaling
         return utils.lmap(raw, [worst, best], [0.0, 1.0])
 
     # ---------------------------------------------------------------------
