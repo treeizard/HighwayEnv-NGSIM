@@ -169,6 +169,7 @@ class NGSIMVehicle(IDMVehicle):
         """
         Apply one replay step from ngsim_traj[sim_steps] -> [sim_steps+1].
         Sets position, speed, heading, lane_index/lane.
+        Patch: Gap being too small, causing vehicles to suddenly turn 90 degrees.
         """
         if self.ngsim_traj is None:
             self.overtaken = True
@@ -195,11 +196,13 @@ class NGSIMVehicle(IDMVehicle):
         self.speed = speed_est if speed_est > 1e-3 else float(cur_v)
         self.target_speed = self.speed
 
-        # Heading from motion vector
-        if abs(dx) > 1e-6 or abs(dy) > 1e-6:
-            self.heading = math.atan2(dy, dx)
+        # ---- Attach to nearest lane and take heading from lane geometry ----
+        self.lane_index = self.road.network.get_closest_lane_index(self.position)
+        self.lane = self.road.network.get_lane(self.lane_index)
 
-        # Attach to nearest lane
+        local_s, local_r = self.lane.local_coordinates(self.position)
+        self.heading = self.lane.heading_at(local_s)
+        # ------ Attach to nearest lane --------------    
         self.lane_index = self.road.network.get_closest_lane_index(self.position)
         self.lane = self.road.network.get_lane(self.lane_index)
 

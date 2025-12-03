@@ -3,6 +3,7 @@
 from __future__ import annotations
 import os
 import numpy as np
+import pandas as pd
 from typing import Any
 
 from highway_env import utils
@@ -46,7 +47,7 @@ class NGSimEnv(AbstractEnv):
             # Frequencies
             "simulation_frequency": 15,
             "policy_frequency": 5,
-            "max_episode_steps": 600,
+            "max_episode_steps": 300,
 
             # Ego override (if None → sample random)
             "ego_vehicle_ID": None,
@@ -124,6 +125,73 @@ class NGSimEnv(AbstractEnv):
             episode_dir=self._episode_dir,
         )
 
+        # --- load expert actions ---
+        self._load_expert_actions()
+    
+    def _load_expert_actions(self):
+        """
+        Load continuous expert actions for the chosen ego vehicle
+        from processed_cont_actions.csv in the selected episode dir.
+
+        Exposes:
+            self._expert_actions_sim : np.ndarray [T, 2] as [steering, accel]
+        """
+        csv_path = os.path.join(self._episode_dir, "processed_cont_actions.csv")
+        if not os.path.exists(csv_path):
+            print(f"[NGSimEnv] WARNING: No processed_cont_actions.csv in {self._episode_dir}")
+            self._expert_actions_sim = None
+            return
+
+        df = pd.read_csv(csv_path)
+
+        # Keep only ego rows
+        ego_id = self._ego_id
+        df = df[df["veh_ID"] == ego_id].sort_values("time")
+        if df.empty:
+            print(f"[NGSimEnv] WARNING: No expert actions for ego {ego_id} in {csv_path}")
+            self._expert_actions_sim = None
+            return
+
+        # Shape [T, 2]: [steering, accel] per raw / simulation step
+        # column names from traj_cont_action: 'accel', 'steering'
+        steering = df["steering"].to_numpy(dtype=float)
+        accel = df["accel"].to_numpy(dtype=float)
+        self._expert_actions_sim = np.stack([steering, accel], axis=-1)
+
+        # Also store the times in case you want exact time alignment later
+        self._expert_times = df["time"].to_numpy(dtype=float)
+
+        print(
+            f"[NGSimEnv] Loaded expert actions for ego {ego_id}: "
+            f"T={len(self._expert_actions_sim)}"
+        )
+
+        # ---------------------------------------------------------------------
+    def expert_action_at(self, policy_step: int | None = None):
+        """
+        Return expert continuous action [steering, accel] for a given policy step.
+
+        Steps are counted from reset; assumes self._expert_actions_sim is at
+        simulation frequency (simulation_frequency Hz).
+        """
+        if getattr(self, "_expert_actions_sim", None) is None:
+            raise RuntimeError("Expert actions not loaded for this episode.")
+
+        if policy_step is None:
+            policy_step = self.steps  # current policy step (after last env.step)
+
+        sim_freq = float(self.config["simulation_frequency"])
+        pol_freq = float(self.config["policy_frequency"])
+        sim_per_policy = int(sim_freq // pol_freq)
+
+        sim_idx = policy_step * sim_per_policy
+
+        # Clamp to last expert step, so we don't crash index at episode tail
+        sim_idx = int(np.clip(sim_idx, 0, len(self._expert_actions_sim) - 1))
+
+        steering, accel = self._expert_actions_sim[sim_idx]
+        return np.array([steering, accel], dtype=float)
+
     # ---------------------------------------------------------------------
     def _create_road(self):
         net = create_ngsim_101_road()
@@ -144,6 +212,26 @@ class NGSimEnv(AbstractEnv):
         ego_start_i = first_valid_index(ego_traj)
         if ego_start_i is None:
             raise RuntimeError("Ego trajectory contains no valid motion data.")
+
+        # ------------- NEW: trajectory-based horizon -----------------
+        # number of simulation steps from start of episode to end of traj
+        n_sim_steps = len(ego_traj) - int(ego_start_i)
+
+        sim_freq = float(self.config["simulation_frequency"])
+        pol_freq = float(self.config["policy_frequency"])
+        sim_per_policy = int(sim_freq // pol_freq)  # here: 15 // 5 = 3
+
+        # ceil so we don't cut one frame early
+        self._max_traj_policy_steps = int(
+            np.ceil(n_sim_steps / float(sim_per_policy))
+        )
+
+        print(
+            f"[NGSimEnv] Traj sim steps: {n_sim_steps}, "
+            f"sim_per_policy: {sim_per_policy}, "
+            f"max_traj_policy_steps: {self._max_traj_policy_steps}"
+        )
+        # -------------------------------------------------------------
 
         # --- ego first state ---
         x0, y0, ego_speed, lane0 = ego_traj[ego_start_i]
@@ -288,8 +376,18 @@ class NGSimEnv(AbstractEnv):
         return bool(self.vehicle.crashed)
 
     def _is_truncated(self) -> bool:
-        max_steps = self.config.get("max_episode_steps", None)
-        return max_steps is not None and self.steps >= max_steps
+        # Config-based cap
+        max_steps_cfg = self.config.get("max_episode_steps", None)
+        # Trajectory-based cap (might not exist if something went wrong)
+        max_steps_traj = getattr(self, "_max_traj_policy_steps", None)
+
+        # Take the minimum of the defined caps
+        candidates = [v for v in (max_steps_cfg, max_steps_traj) if v is not None]
+        if not candidates:
+            return False  # no truncation limit at all
+
+        hard_cap = min(candidates)
+        return self.steps >= hard_cap
 
     # ---------------------------------------------------------------------
     def step(self, action: Action):
@@ -314,3 +412,5 @@ class NGSimEnv(AbstractEnv):
                 info["overlaps"] = overlaps
 
         return obs, reward, terminated, truncated, info
+    
+    
