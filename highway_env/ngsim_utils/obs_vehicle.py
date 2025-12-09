@@ -319,7 +319,6 @@ class NGSIMVehicle(IDMVehicle):
 
 
     # ---------------- Collision handling ----------------
-        # ---------------- Collision handling ----------------
     def handle_collisions(self, other: IDMVehicle, dt: float = 0.0) -> None:
         """
         Collision handling that plugs into RoadObject.handle_collisions, but keeps

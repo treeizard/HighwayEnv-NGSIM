@@ -1,3 +1,20 @@
+# Modified by: Yide Tao (yide.tao@monash.edu)
+# Reference: @article{huang2021driving,
+#   title={Driving Behavior Modeling Using Naturalistic Human Driving Data With Inverse Reinforcement Learning},
+#   author={Huang, Zhiyu and Wu, Jingda and Lv, Chen},
+#   journal={IEEE Transactions on Intelligent Transportation Systems},
+#   year={2021},
+#   publisher={IEEE}
+# }
+# @misc{highway-env,
+#   author = {Leurent, Edouard},
+#   title = {An Environment for Autonomous Driving Decision-Making},
+#   year = {2018},
+#   publisher = {GitHub},
+#   journal = {GitHub repository},
+#   howpublished = {\url{https://github.com/eleurent/highway-env}},
+# }
+
 from typing import List, Tuple, Union
 
 import numpy as np
@@ -86,6 +103,19 @@ class ControlledVehicle(Vehicle):
         """
         assert mode in ("discrete", "continuous")
         self.control_mode = mode
+    
+    def set_ego_dimension(self, width:float, length:float) -> None:
+        """
+        Docstring for set_ego_dimension
+        
+        :param self: Description
+        :param width: Description
+        :type width: float
+        :param length: Description
+        :type length: float
+        """
+        self.LENGTH = length
+        self.WIDTH = width
 
     def act(self, action: Union[dict, str, None] = None) -> None:
         """

@@ -1,20 +1,5 @@
 # Modified by: Yide Tao (yide.tao@monash.edu)
-# Reference: @article{huang2021driving,
-#   title={Driving Behavior Modeling Using Naturalistic Human Driving Data With Inverse Reinforcement Learning},
-#   author={Huang, Zhiyu and Wu, Jingda and Lv, Chen},
-#   journal={IEEE Transactions on Intelligent Transportation Systems},
-#   year={2021},
-#   publisher={IEEE}
-# }
-# @misc{highway-env,
-#   author = {Leurent, Edouard},
-#   title = {An Environment for Autonomous Driving Decision-Making},
-#   year = {2018},
-#   publisher = {GitHub},
-#   journal = {GitHub repository},
-#   howpublished = {\url{https://github.com/eleurent/highway-env}},
-# }
-
+# Reference: Huang et al. (2021), Leurent (2018)
 from __future__ import annotations
 
 import os
@@ -29,10 +14,10 @@ from highway_env.envs.common.action import Action
 from highway_env.road.road import Road
 from highway_env.ngsim_utils.obs_vehicle import NGSIMVehicle
 from highway_env.ngsim_utils.ego_vehicle import ControlledVehicle
-from highway_env.ngsim_utils.gen_road import create_ngsim_101_road, clamp_location_ngsim
+from highway_env.ngsim_utils.gen_road import create_ngsim_101_road
 from highway_env.ngsim_utils.trajectory_gen import (
+    build_trajectory_from_chunk,
     process_raw_trajectory,
-    build_all_trajectories_for_scene,
     first_valid_index,
 )
 
@@ -82,6 +67,7 @@ class NGSimEnv(AbstractEnv):
 
             # Debug
             "show_trajectories": False,
+            "log_overlaps": True,
             "seed": None,
 
             # Reward config (weights)
@@ -99,12 +85,18 @@ class NGSimEnv(AbstractEnv):
     # INIT / DT
     # -------------------------------------------------------------------------
     def __init__(self, config: dict | None = None, render_mode: str | None = None) -> None:
+        # ---- our custom state / caches (must exist before first reset) ----
         # Cache of available episodes for the current scene
         self._episodes: list[str] = []
         self._episode_root: str | None = None
-        self._valid_ids_by_episode = {} 
+
+        # Cache per episode:
+        # ep_name -> {
+        #   "valid_ids": list[int],
+        #   "traj_by_ego": { ego_id: trajectory_set },
+        #   "expert_by_ego": { ego_id: (expert_actions_sim, expert_times) }
+        # }
         self._episode_cache: Dict[str, Dict[str, Any]] = {}
-        self.ego_id = None
 
         # These are set each reset
         self._episode_dir: str | None = None
@@ -114,26 +106,8 @@ class NGSimEnv(AbstractEnv):
         self._expert_times: np.ndarray | None = None
         self._max_traj_policy_steps: int | None = None
 
-        # Load all Trajectories
-        self._episode_root = config["episode_root"]
-        self._traj_all_by_episode = build_all_trajectories_for_scene(
-            scene= config["scene"],
-            episodes_root=self._episode_root,
-        )
-        self._episodes = sorted(self._traj_all_by_episode.keys())
-
-        # Valid Ego IDs
-        for ep_name, veh_dict in self._traj_all_by_episode.items():
-            valid_ids = []
-            for vid, meta in veh_dict.items():
-                traj = meta["trajectory"]
-                if traj.shape[0] < 2:
-                    continue
-                nonzero = np.any(traj[:, :3] != 0.0, axis=1)
-                if nonzero.sum() >= 2:
-                    valid_ids.append(vid)
-            self._valid_ids_by_episode[ep_name] = valid_ids
-
+        # Load and Cache Trajectories
+        self._load_trajectory() 
         # Let AbstractEnv do its normal setup (config, spaces, reset, etc.)
         super().__init__(config=config, render_mode=render_mode)
 
@@ -150,49 +124,32 @@ class NGSimEnv(AbstractEnv):
         seed = self.config.get("seed", None)
         if seed is not None and hasattr(self, "seed"):
             self.seed(seed)
-
-        self._load_trajectory()
+        
         self._create_road()
         self._create_vehicles()
-  
 
     # -------------------------------------------------------------------------
-    # LOAD TRAJECTORY
+    # EPISODE DISCOVERY / CACHE
     # -------------------------------------------------------------------------
-    def _load_trajectory(self):
-        """
-        Choose an episode, select a valid ego_id, and attach:
-          - self.trajectory_set
-          - self._expert_actions_sim
-          - self._expert_times
-          - self._episode_dir, self._ego_id
+    def _ensure_episode_list(self):
+        """Scan the scene directory once and cache episode names."""
+        if self._episodes:
+            return
 
-        Uses per-episode cache so disk I/O is minimized.
-        """
+        scene = self.config["scene"]
+        root = os.path.join(self.config["episode_root"], scene)
 
-        # 1. Randomly select episode
-        if self.config["replay_period"] is None:
-            self.episode_name = self.np_random.choice(self._episodes)
-        else:
-            self.episode_name = self._episodes[int(self.config["replay_period"]) % len(self._episodes)]
-        
-        # 2. Randomly select ego id
-        self.ego_id = int(self.np_random.choice(self._valid_ids_by_episode[self.episode_name]))
-        self._episode_dir = os.path.join(self._episode_root, self.episode_name)
-        #print(f"[NGSimEnv] Using episode: {self._episode_dir}")
-        
-        # 3. Define Trajectory set
-        traj_all = self._traj_all_by_episode[self.episode_name]
-        traj_set = {"ego": traj_all[self.ego_id]}
-        for vid, meta in traj_all.items():
-            if vid == self.ego_id:
-                continue
-            traj_set[vid] = meta
-        self.trajectory_set = traj_set
-            
-    # -------------------------------------------------------------------------
-    # EXPERT ACTION QUERY
-    # -------------------------------------------------------------------------
+        episodes = sorted(
+            d for d in os.listdir(root)
+            if d.startswith("t") and os.path.isdir(os.path.join(root, d))
+        )
+        if not episodes:
+            raise RuntimeError(f"No 10-second episodes found in {root}")
+
+        self._episodes = episodes
+        self._episode_root = root
+        print(f"[NGSimEnv] Found {len(self._episodes)} episodes in {root}")
+
     @staticmethod
     def _load_expert_actions_for(
         episode_dir: str,
@@ -223,14 +180,148 @@ class NGSimEnv(AbstractEnv):
         accel = df["accel"].to_numpy(dtype=float)
         expert_actions_sim = np.stack([steering, accel], axis=-1)
         expert_times = df["time"].to_numpy(dtype=float)
-        """
+
         print(
             f"[NGSimEnv] Loaded expert actions for ego {ego_id}: "
             f"T={len(expert_actions_sim)}"
         )
-        """
         return expert_actions_sim, expert_times
 
+    # -------------------------------------------------------------------------
+    # LOAD TRAJECTORY + EXPERT ACTIONS (CACHED)
+    # -------------------------------------------------------------------------
+    def _load_trajectory(self):
+        """
+        Choose an episode, select a valid ego_id, and attach:
+          - self.trajectory_set
+          - self._expert_actions_sim
+          - self._expert_times
+          - self._episode_dir, self._ego_id
+
+        Uses per-episode cache so disk I/O is minimized.
+        """
+        self._ensure_episode_list()
+        scene = self.config["scene"]
+
+        # --- choose episode name ---
+        if self.config["replay_period"] is None:
+            ep_name = self.np_random.choice(self._episodes)
+        else:
+            ep_name = self._episodes[int(self.config["replay_period"]) % len(self._episodes)]
+
+        self._episode_dir = os.path.join(self._episode_root, ep_name)
+        print(f"[NGSimEnv] Using episode: {self._episode_dir}")
+
+        # Get / create cache entry for this episode
+        ep_cache = self._episode_cache.get(ep_name)
+        if ep_cache is None:
+            ep_cache = {
+                "valid_ids": None,     # list[int]
+                "traj_by_ego": {},     # ego_id -> trajectory_set
+                "expert_by_ego": {},   # ego_id -> (expert_actions_sim, expert_times)
+            }
+            self._episode_cache[ep_name] = ep_cache
+
+        # ------------------------------------------------------------------
+        # 1) Compute valid ego IDs for this episode ONCE
+        # ------------------------------------------------------------------
+        if ep_cache["valid_ids"] is None:
+            from highway_env.data.ngsim import ngsim_data, GLB_TIME_THRES
+
+            ng = ngsim_data(scene)
+            ng.load(self._episode_dir)
+
+            def has_nonempty_trajectory(veh) -> bool:
+                vr_list = veh.vr_list
+                if len(vr_list) < 2:
+                    return False
+                # vr_list already time-sorted by ng.load()
+                for prev, cur in zip(vr_list, vr_list[1:]):
+                    if cur.unixtime - prev.unixtime <= GLB_TIME_THRES:
+                        return True
+                return False
+
+            valid_vehicle_ids: list[int] = [
+                vid for vid, veh in ng.veh_dict.items() if has_nonempty_trajectory(veh)
+            ]
+
+            if not valid_vehicle_ids:
+                raise RuntimeError(
+                    f"[NGSimEnv] No vehicles with non-empty trajectory in episode {self._episode_dir}"
+                )
+
+            ep_cache["valid_ids"] = valid_vehicle_ids
+            print(
+                f"[NGSimEnv] Cached {len(valid_vehicle_ids)} valid vehicles for episode {ep_name}"
+            )
+        else:
+            valid_vehicle_ids = ep_cache["valid_ids"]
+
+        # ------------------------------------------------------------------
+        # 2) Choose ego_id (fixed or random among valid IDs)
+        # ------------------------------------------------------------------
+        ego_id_cfg = self.config.get("ego_vehicle_ID", None)
+        if ego_id_cfg is not None:
+            if ego_id_cfg not in valid_vehicle_ids:
+                print(
+                    f"[NGSimEnv] WARNING: requested ego_vehicle_ID={ego_id_cfg} "
+                    f"has no valid trajectory in this episode; choosing random instead."
+                )
+                ego_id = int(self.np_random.choice(valid_vehicle_ids))
+            else:
+                ego_id = int(ego_id_cfg)
+        else:
+            ego_id = int(self.np_random.choice(valid_vehicle_ids))
+
+        self._ego_id = ego_id
+        print(
+            f"[NGSimEnv] Selected ego vehicle: {self._ego_id} "
+            f"(from {len(valid_vehicle_ids)} with non-empty trajectories)"
+        )
+
+        # ------------------------------------------------------------------
+        # 3) Build / reuse trajectory_set for (episode, ego_id)
+        # ------------------------------------------------------------------
+        traj_by_ego: Dict[int, Dict[str, Any]] = ep_cache["traj_by_ego"]
+        if ego_id not in traj_by_ego:
+            print(
+                f"[NGSimEnv] Building trajectory_set for episode {ep_name}, ego {ego_id}"
+            )
+            traj_set = build_trajectory_from_chunk(
+                scene,
+                vehicle_ID=ego_id,
+                episode_dir=self._episode_dir,
+            )
+            traj_by_ego[ego_id] = traj_set
+        else:
+            traj_set = traj_by_ego[ego_id]
+            print(
+                f"[NGSimEnv] Reusing cached trajectory_set for episode {ep_name}, ego {ego_id}"
+            )
+
+        self.trajectory_set = traj_set
+
+        # ------------------------------------------------------------------
+        # 4) Build / reuse expert actions for (episode, ego_id)
+        # ------------------------------------------------------------------
+        expert_by_ego: Dict[int, Tuple[np.ndarray | None, np.ndarray | None]] = ep_cache["expert_by_ego"]
+        if ego_id not in expert_by_ego:
+            expert_actions_sim, expert_times = self._load_expert_actions_for(
+                self._episode_dir, ego_id
+            )
+            expert_by_ego[ego_id] = (expert_actions_sim, expert_times)
+        else:
+            expert_actions_sim, expert_times = expert_by_ego[ego_id]
+            print(
+                f"[NGSimEnv] Reusing cached expert actions for episode {ep_name}, ego {ego_id}"
+            )
+
+        self._expert_actions_sim = expert_actions_sim
+        self._expert_times = expert_times
+
+    # -------------------------------------------------------------------------
+    # EXPERT ACTION QUERY
+    # -------------------------------------------------------------------------
     def expert_action_at(self, policy_step: int | None = None) -> np.ndarray:
         """
         Return expert continuous action [steering, accel] for a given policy step.
@@ -271,7 +362,7 @@ class NGSimEnv(AbstractEnv):
     def _create_vehicles(self):
         # --- Ego trajectory ---
         ego_rec = self.trajectory_set["ego"]
-        ego_traj = process_raw_trajectory(ego_rec["trajectory"]) # Convert to meters
+        ego_traj = process_raw_trajectory(ego_rec["trajectory"])
         ego_len = ego_rec["length"]
         ego_wid = ego_rec["width"]
 
@@ -296,13 +387,12 @@ class NGSimEnv(AbstractEnv):
             f"max_traj_policy_steps: {self._max_traj_policy_steps}"
         )
         """
-        # --- Ego initial state (meters) ---
+        # --- Ego initial state ---
         x0, y0, ego_speed, lane0 = ego_traj[ego_start_i]
         ego_xy = np.array([x0, y0], dtype=float)
 
         # ----------------- choose the correct edge based on x -----------------
         # Must match the geometry in create_ngsim_101_road()
-        """
         length = 2150 / 3.281
         ends = [
             0.0,
@@ -324,34 +414,24 @@ class NGSimEnv(AbstractEnv):
         lanes_on_edge = self.net.graph[main_edge[0]][main_edge[1]]
         n_lanes = len(lanes_on_edge)
         if lane_index < 0 or lane_index >= n_lanes:
-            
             print(
                 f"[NGSimEnv] WARNING: lane_index {lane_index} out of range for "
                 f"edge {main_edge} (n_lanes={n_lanes}); clamping."
             )
-            
             lane_index = int(np.clip(lane_index, 0, n_lanes - 1))
-        
+
         print(
             "lane ids:", lane_index,
             ", position:", x0, ",", y0,
             ", edge:", main_edge
         )
-        
 
         ego_lane = self.net.get_lane((*main_edge, lane_index))
-        """
-        # Clamp to ensure noise does not disturb ego generation
-        ego_lane = clamp_location_ngsim(x_pos = x0, 
-                                        lane0=lane0, 
-                                        net = self.net, 
-                                        warning = False)
         ego_s, ego_r = ego_lane.local_coordinates(ego_xy)
 
         # snap to lane centerline
         ego_xy = np.asarray(ego_lane.position(ego_s, ego_r), float)
-        
-        # Create the ego Vehicle 
+
         ego = ControlledVehicle(
             road=self.road,
             position=ego_xy,
@@ -359,7 +439,6 @@ class NGSimEnv(AbstractEnv):
             heading=ego_lane.heading_at(ego_s),
             control_mode="continuous"
         )
-        ego.set_ego_dimension(width=ego_wid, length=ego_len)
 
         self.road.vehicles.append(ego)
         self.vehicle = ego
@@ -474,7 +553,7 @@ class NGSimEnv(AbstractEnv):
 
         if not truncated and self._is_truncated():
             truncated = True
-        """
+
         if self.config["log_overlaps"]:
             overlaps = []
             vehs = [v for v in self.road.vehicles if hasattr(v, "aabb")]
@@ -490,5 +569,5 @@ class NGSimEnv(AbstractEnv):
             if overlaps:
                 info = dict(info) if info else {}
                 info["overlaps"] = overlaps
-        """
+
         return obs, reward, terminated, truncated, info

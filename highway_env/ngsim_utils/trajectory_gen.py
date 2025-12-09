@@ -20,6 +20,7 @@ import numpy as np
 from scipy import signal
 import matplotlib.pyplot as plt
 from highway_env.data.ngsim import *
+from typing import Any, Dict
 """
 def trajectory_smoothing(trajectory):
     trajectory = np.array(trajectory)
@@ -162,6 +163,7 @@ def build_trajectory_from_chunk(scene, vehicle_ID, episode_dir):
     ego_vehicle = vehicles[vehicle_ID]
     ego_vehicle.build_trajectory()
     ego_trajectories = ego_vehicle.trajectory
+    #print('trajectory:',ego_trajectories)
     # With a 10s chunk you'll almost always have a single period = 0
     selected_trajectory = ego_trajectories[0]
 
@@ -216,6 +218,131 @@ def build_trajectory_from_chunk(scene, vehicle_ID, episode_dir):
         record_trajectory[key]['trajectory'] = smoothed_trajectory
 
     return record_trajectory
+
+
+
+def build_all_trajectories_for_scene(
+    scene: str,
+    episodes_root: str,
+) -> Dict[str, Dict[int, Dict[str, Any]]]:
+    """
+    Preload and preprocess trajectories for *all* 10-second intervals (episodes)
+    of a given scene.
+
+    Args:
+        scene:
+            Name of the NGSIM scene, e.g. "us-101".
+        episodes_root:
+            Path to the directory that contains the 10s episode folders
+            for this scene. Typical layout:
+
+                episodes_root/
+                  us-101/
+                    t1118846663000/
+                    t1118846673000/
+                    ...
+
+            In that case you would pass episodes_root=".../processed_10s"
+            and scene="us-101", and this function will look under
+            episodes_root/scene for folders starting with "t".
+
+    Returns:
+        A nested dict:
+
+        {
+            "t1118846663000": {
+                veh_ID_1: {
+                    "length": float,
+                    "width": float,
+                    "trajectory": np.ndarray [T, 4]  # [x, y, speed, lane_ID]
+                },
+                veh_ID_2: { ... },
+                ...
+            },
+            "t1118846673000": {
+                ...
+            },
+            ...
+        }
+
+        All trajectories within a given episode are aligned on the same
+        time grid (same length T). Missing times are padded with [0,0,0,0].
+    """
+    scene_root = os.path.join(episodes_root, scene)
+
+    # Find all 10-second episode folders (same rule as _ensure_episode_list)
+    episode_names = sorted(
+        d for d in os.listdir(scene_root)
+        if d.startswith("t") and os.path.isdir(os.path.join(scene_root, d))
+    )
+    if not episode_names:
+        raise RuntimeError(f"No 10-second episodes found in {scene_root}")
+
+    all_episodes: Dict[str, Dict[int, Dict[str, Any]]] = {}
+
+    for ep_name in episode_names:
+        ep_dir = os.path.join(scene_root, ep_name)
+        print(f"[build_all_trajectories_for_scene] Loading episode: {ep_dir}")
+
+        ng = ngsim_data(scene)
+        ng.load(ep_dir)
+
+        snapshots = ng.snap_dict  # unixtime -> snapshot with vr_list
+        time_keys = sorted(snapshots.keys())
+        if not time_keys:
+            print(f"[build_all_trajectories_for_scene] WARNING: empty episode {ep_dir}")
+            all_episodes[ep_name] = {}
+            continue
+
+        # veh_ID -> {"length": float, "width": float, "trajectory": list[list[4]]}
+        record_trajectory: Dict[int, Dict[str, Any]] = {}
+
+        for step_idx, unixtime in enumerate(time_keys):
+            snap = snapshots[unixtime]
+            present_ids = set()
+
+            # 1) Update/add vehicles present in this snapshot
+            for vr in snap.vr_list:
+                v_ID = vr.veh_ID
+                present_ids.add(v_ID)
+
+                if v_ID not in record_trajectory:
+                    # New vehicle: pre-fill zeros for previous steps
+                    record_trajectory[v_ID] = {
+                        "length": vr.len,
+                        "width": vr.wid,
+                        "trajectory": [],
+                    }
+                    if step_idx > 0:
+                        record_trajectory[v_ID]["trajectory"].extend(
+                            [[0.0, 0.0, 0.0, 0] for _ in range(step_idx)]
+                        )
+
+                rec = record_trajectory[v_ID]
+                rec["length"] = vr.len
+                rec["width"] = vr.wid
+                rec["trajectory"].append(
+                    [vr.x, vr.y, vr.spd, vr.lane_ID]
+                )
+
+            # 2) For vehicles we've already seen but that are not
+            #    present in this snapshot: append a zero row to keep
+            #    trajectories aligned in time.
+            for v_ID, rec in record_trajectory.items():
+                if v_ID not in present_ids:
+                    rec["trajectory"].append([0.0, 0.0, 0.0, 0])
+
+        # 3) Smoothing per vehicle and convert to np.ndarray
+        for v_ID, rec in record_trajectory.items():
+            original_traj = rec["trajectory"]
+            smoothed = trajectory_smoothing(original_traj)
+            rec["trajectory"] = np.asarray(smoothed, dtype=float)
+
+        all_episodes[ep_name] = record_trajectory
+
+    return all_episodes
+
+
 
 def process_raw_trajectory(trajectory):
     trajectory = np.array(trajectory)
