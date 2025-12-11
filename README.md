@@ -50,5 +50,5 @@ python dump_data.py raw_data/Next_Generation_Simulation__NGSIM__Vehicle_Trajecto
 ```
 in development:
 ```
-python dump_data_time.py raw_data/Next_Generation_Simulation__NGSIM__Vehicle_Trajectories_and_Supporting_Data.csv
+python dump_data_time_v2.py raw_data/Next_Generation_Simulation__NGSIM__Vehicle_Trajectories_and_Supporting_Data.csv
 ```

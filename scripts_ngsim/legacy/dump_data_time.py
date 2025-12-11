@@ -14,33 +14,30 @@
 #   journal = {GitHub repository},
 #   howpublished = {\url{https://github.com/eleurent/highway-env}},
 # }
-# dump_data_time.py
+#dump_data_time.py
 #
-# Read an NGSIM CSV (e.g. us-101) using ngsim_data, then dump the data
-# into 10-second (or configurable) time windows. This file is constructed to improve the data processing efficiency later on
+#Read an NGSIM CSV (e.g. us-101) using ngsim_data, then dump the data
+#into 10-second (or configurable) time windows. This file is constructed to improve the data processing efficiency later on
 #
-# For example, with default settings:
+#For example, with default settings:
 #    highway_env/data/processed_10s/us-101/
-#        train/
-#            t1118846663000/
-#                vehicle_record_file.csv
-#                vehicle_file.csv
-#                snapshot_file.csv
+#        t1118846663000/
+#            vehicle_record_file.csv
+#            vehicle_file.csv
+#            snapshot_file.csv
+#        t1118846673000/
 #            ...
-#        val/
-#            t1118846673000/
-#                ...
 #
-# Each subfolder contains the same three files and formats as ngsim_data.dump(),
-# but restricted to the snapshots and vehicles that appear in that time window.
+#Each subfolder contains the same three files and formats as ngsim_data.dump(),
+#but restricted to the snapshots and vehicles that appear in that time window.
 
 import os
 import argparse
-import random
 from collections import defaultdict
 
 from highway_env.data.ngsim import ngsim_data
 from highway_env.data.traj_to_action import traj_cont_action
+
 
 
 def build_episodes(
@@ -200,38 +197,22 @@ def main():
     reader.read_from_csv(path)
     reader.clean()
 
-    # 2) Build episodes
+    # 2) Build 10-second episodes
     episodes = build_episodes(reader, episode_len_ms, stride_ms)
-    print(
-        f"Found {len(episodes)} episodes "
-        f"of length {args.episode_len_sec} s (stride {args.stride_sec} s)."
-    )
+    print(f"Found {len(episodes)} episodes "
+          f"of length {args.episode_len_sec} s (stride {args.stride_sec} s).")
 
-    # 2.5) Randomly split episodes into train (0.8) and val (0.2)
-    random.shuffle(episodes)
-    n_total = len(episodes)
-    n_train = int(0.8 * n_total)
-    train_episodes = episodes[:n_train]
-    val_episodes = episodes[n_train:]
-
+    # 3) Dump each episode
     base_dir = os.path.join(out_root, scene)
     os.makedirs(base_dir, exist_ok=True)
 
-    # 3) Dump each episode into train/ and val/ subfolders
-    for split_name, split_episodes in [("train", train_episodes), ("val", val_episodes)]:
-        split_dir = os.path.join(base_dir, split_name)
-        os.makedirs(split_dir, exist_ok=True)
-
-        for idx, (t_start, snap_times) in enumerate(split_episodes):
-            # Folder name: t<start_unixtime>, e.g. t1118846663000
-            ep_dir = os.path.join(split_dir, f"t{t_start}")
-            print(
-                f"[{split_name}] [{idx+1}/{len(split_episodes)}] "
-                f"Dumping episode starting at {t_start} "
-                f"with {len(snap_times)} snapshots -> {ep_dir}"
-            )
-            dump_episode(reader, snap_times, ep_dir)
-            #traj_cont_action(ep_dir)
+    for idx, (t_start, snap_times) in enumerate(episodes):
+        # Folder name: t<start_unixtime>, e.g. t1118846663000
+        ep_dir = os.path.join(base_dir, f"t{t_start}")
+        print(f"[{idx+1}/{len(episodes)}] Dumping episode starting at {t_start} "
+              f"with {len(snap_times)} snapshots -> {ep_dir}")
+        dump_episode(reader, snap_times, ep_dir)
+        traj_cont_action(ep_dir)
 
     print("Done.")
 

@@ -32,7 +32,6 @@ from highway_env.ngsim_utils.ego_vehicle import ControlledVehicle
 from highway_env.ngsim_utils.gen_road import create_ngsim_101_road, clamp_location_ngsim
 from highway_env.ngsim_utils.trajectory_gen import (
     process_raw_trajectory,
-    build_all_trajectories_for_scene,
     first_valid_index,
 )
 
@@ -107,15 +106,23 @@ class NGSimEnv(AbstractEnv):
         self.ego_id = None
 
         # These are set each reset
-        self._episode_dir: str | None = None
         self._ego_id: int | None = None
 
+        # Expert Actions for debugging
         self._expert_actions_sim: np.ndarray | None = None
         self._expert_times: np.ndarray | None = None
         self._max_traj_policy_steps: int | None = None
 
         # Load all Trajectories
-        self._episode_root = config["episode_root"]
+        print(config)
+        self._prebuilt_dir = os.path.join(config["episode_root"], config["scene"], "prebuilt")
+        print(self._prebuilt_dir)
+        veh_ids_path= os.path.join(self._prebuilt_dir, f"veh_ids_train.npy")
+        traj_path = os.path.join(self._prebuilt_dir, f"trajectory_train.npy")
+        self._valid_ids_by_episode = np.load(veh_ids_path, allow_pickle=True).item()
+        self._traj_all_by_episode  = np.load(traj_path, allow_pickle=True).item()
+        self._episodes = sorted(self._traj_all_by_episode.keys())
+        '''
         self._traj_all_by_episode = build_all_trajectories_for_scene(
             scene= config["scene"],
             episodes_root=self._episode_root,
@@ -135,6 +142,7 @@ class NGSimEnv(AbstractEnv):
             self._valid_ids_by_episode[ep_name] = valid_ids
 
         # Let AbstractEnv do its normal setup (config, spaces, reset, etc.)
+        '''
         super().__init__(config=config, render_mode=render_mode)
 
     @property
@@ -165,21 +173,17 @@ class NGSimEnv(AbstractEnv):
           - self.trajectory_set
           - self._expert_actions_sim
           - self._expert_times
-          - self._episode_dir, self._ego_id
+          -  self._ego_id
 
         Uses per-episode cache so disk I/O is minimized.
         """
 
         # 1. Randomly select episode
-        if self.config["replay_period"] is None:
-            self.episode_name = self.np_random.choice(self._episodes)
-        else:
-            self.episode_name = self._episodes[int(self.config["replay_period"]) % len(self._episodes)]
+        self.episode_name = self.np_random.choice(self._episodes)
         
         # 2. Randomly select ego id
         self.ego_id = int(self.np_random.choice(self._valid_ids_by_episode[self.episode_name]))
-        self._episode_dir = os.path.join(self._episode_root, self.episode_name)
-        #print(f"[NGSimEnv] Using episode: {self._episode_dir}")
+        print("episode name:", self.episode_name, ", ego id:", self.ego_id )
         
         # 3. Define Trajectory set
         traj_all = self._traj_all_by_episode[self.episode_name]
@@ -269,18 +273,32 @@ class NGSimEnv(AbstractEnv):
         )
 
     def _create_vehicles(self):
-        # --- Ego trajectory ---
+        # --- Ego trajectory record & convert to meters ---
         ego_rec = self.trajectory_set["ego"]
-        ego_traj = process_raw_trajectory(ego_rec["trajectory"]) # Convert to meters
-        ego_len = ego_rec["length"]
-        ego_wid = ego_rec["width"]
+        ego_traj_full = process_raw_trajectory(ego_rec["trajectory"])  # [T, 4]: x, y, speed, lane
+        ego_len = ego_rec["length"] / 3.281
+        ego_wid = ego_rec["width"] / 3.281
 
-        ego_start_i = first_valid_index(ego_traj)
+        # Find the first valid index for the ego vehicle
+        ego_start_i = first_valid_index(ego_rec["trajectory"])
+        print("first valide index:",ego_start_i)
+        
         if ego_start_i is None:
             raise RuntimeError("Ego trajectory contains no valid motion data.")
 
-        # --- Horizon in policy steps based on trajectory length ---
-        n_sim_steps = len(ego_traj) - int(ego_start_i)
+        # --------- TRUNCATE ALL TRAJECTORIES AT EGO SPAWN ---------
+        # From now on, 'time step 0' in the simulation corresponds to ego_start_i
+        ego_traj = ego_traj_full[ego_start_i:]
+        if len(ego_traj) < 2:
+            raise RuntimeError(
+                f"Ego trajectory too short after truncation (len={len(ego_traj)})."
+            )
+        # Optionally store this for debugging or future use
+        self._ego_start_index = int(ego_start_i)
+        # -----------------------------------------------------------
+
+        # --- Horizon in policy steps based on truncated trajectory length ---
+        n_sim_steps = len(ego_traj)  # already truncated, so full length is usable
 
         sim_freq = float(self.config["simulation_frequency"])
         pol_freq = float(self.config["policy_frequency"])
@@ -289,100 +307,72 @@ class NGSimEnv(AbstractEnv):
         self._max_traj_policy_steps = int(
             np.ceil(n_sim_steps / float(sim_per_policy))
         )
-        """
-        print(
-            f"[NGSimEnv] Traj sim steps: {n_sim_steps}, "
-            f"sim_per_policy: {sim_per_policy}, "
-            f"max_traj_policy_steps: {self._max_traj_policy_steps}"
-        )
-        """
-        # --- Ego initial state (meters) ---
-        x0, y0, ego_speed, lane0 = ego_traj[ego_start_i]
+
+        # --- Ego initial state (meters) from truncated traj[0] ---
+        x0, y0, ego_speed, lane0 = ego_traj[0]
         ego_xy = np.array([x0, y0], dtype=float)
 
         # ----------------- choose the correct edge based on x -----------------
-        # Must match the geometry in create_ngsim_101_road()
-        """
-        length = 2150 / 3.281
-        ends = [
-            0.0,
-            560 / 3.281,
-            (698 + 578 + 150) / 3.281,
-            length,
-        ]
-
-        x_m = float(x0)  # assume ego_traj already in meters
-        if x_m < ends[1]:
-            main_edge = ("s1", "s2")   # first 5-lane section
-        elif x_m < ends[2]:
-            main_edge = ("s2", "s3")   # 6-lane section (lane 5 lives here)
-        else:
-            main_edge = ("s3", "s4")   # last 5-lane section
-
-        lane_index = int(lane0)
-
-        lanes_on_edge = self.net.graph[main_edge[0]][main_edge[1]]
-        n_lanes = len(lanes_on_edge)
-        if lane_index < 0 or lane_index >= n_lanes:
-            
-            print(
-                f"[NGSimEnv] WARNING: lane_index {lane_index} out of range for "
-                f"edge {main_edge} (n_lanes={n_lanes}); clamping."
-            )
-            
-            lane_index = int(np.clip(lane_index, 0, n_lanes - 1))
-        
-        print(
-            "lane ids:", lane_index,
-            ", position:", x0, ",", y0,
-            ", edge:", main_edge
+        ego_lane = clamp_location_ngsim(
+            x_pos=x0,
+            lane0=lane0,
+            net=self.net,
+            warning=False,
         )
-        
-
-        ego_lane = self.net.get_lane((*main_edge, lane_index))
-        """
-        # Clamp to ensure noise does not disturb ego generation
-        ego_lane = clamp_location_ngsim(x_pos = x0, 
-                                        lane0=lane0, 
-                                        net = self.net, 
-                                        warning = False)
         ego_s, ego_r = ego_lane.local_coordinates(ego_xy)
 
-        # snap to lane centerline
+        # Snap to lane centerline
         ego_xy = np.asarray(ego_lane.position(ego_s, ego_r), float)
-        
-        # Create the ego Vehicle 
+
+        # Create the ego Vehicle
         ego = ControlledVehicle(
             road=self.road,
             position=ego_xy,
             speed=ego_speed,
             heading=ego_lane.heading_at(ego_s),
-            control_mode="continuous"
+            control_mode="continuous",
         )
         ego.set_ego_dimension(width=ego_wid, length=ego_len)
 
         self.road.vehicles.append(ego)
         self.vehicle = ego
 
-        # --- Surrounding vehicles ---
+        # --- Surrounding vehicles (also truncated to ego spawn time) ---
         for vid, meta in self.trajectory_set.items():
             if vid == "ego":
                 continue
-            traj = process_raw_trajectory(meta["trajectory"])
+
+            traj_full = process_raw_trajectory(meta["trajectory"])
+            if len(traj_full) <= self._ego_start_index:
+                # This vehicle never appears after ego spawn
+                continue
+
+            # Truncate this vehicle's trajectory so time 0 aligns with ego spawn
+            traj = traj_full[self._ego_start_index:]
+
+            # Optional: drop leading all-zero rows (ghost segment)
+            nonzero = np.any(traj[:, :3] != 0.0, axis=1)
+            if not np.any(nonzero):
+                # Vehicle is effectively absent after ego spawn
+                continue
+            first_idx = int(np.argmax(nonzero))
+            traj = traj[first_idx:]
+
             if len(traj) < 2:
                 continue
 
             v = NGSIMVehicle.create(
                 road=self.road,
                 vehicle_ID=vid,
-                position=traj[1][:2],
+                position=traj[0][:2],
                 v_length=meta["length"] / 3.281,
                 v_width=meta["width"] / 3.281,
                 ngsim_traj=traj,
-                speed=traj[1][2],
+                speed=traj[0][2],
                 color=(200, 0, 150),
             )
             self.road.vehicles.append(v)
+
 
     # -------------------------------------------------------------------------
     # REWARDS
@@ -474,21 +464,5 @@ class NGSimEnv(AbstractEnv):
 
         if not truncated and self._is_truncated():
             truncated = True
-        """
-        if self.config["log_overlaps"]:
-            overlaps = []
-            vehs = [v for v in self.road.vehicles if hasattr(v, "aabb")]
-            for i in range(len(vehs)):
-                for j in range(i + 1, len(vehs)):
-                    if vehs[i].overlaps_aabb(vehs[j]):
-                        overlaps.append(
-                            (
-                                getattr(vehs[i], "vehicle_ID", -1),
-                                getattr(vehs[j], "vehicle_ID", -1),
-                            )
-                        )
-            if overlaps:
-                info = dict(info) if info else {}
-                info["overlaps"] = overlaps
-        """
+      
         return obs, reward, terminated, truncated, info

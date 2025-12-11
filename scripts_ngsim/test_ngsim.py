@@ -6,7 +6,8 @@ from gymnasium.envs.registration import register
 
 # Make sure project root is importable
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(0, parent_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 
 # Register NGSimEnv
 register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
@@ -31,7 +32,7 @@ def main():
         "scaling": 2.0,
         "offscreen_rendering": True,
 
-        # Ego vehicle override (None → auto-random by new NGSimEnv)
+        # Ego vehicle override (None → auto-random by NGSimEnv)
         "ego_vehicle_ID": None,
 
         # Replay chunk root directory
@@ -48,16 +49,20 @@ def main():
     }
 
     # --------------------- Generate 5 Random Replays ---------------------
-    NUM_REPLAYS = 5
+    NUM_REPLAYS = 100
 
     for i in range(NUM_REPLAYS):
         print(f"\n=== Generating video #{i+1}/{NUM_REPLAYS} ===")
 
-        # Build the environment
-        env = gym.make("NGSim-US101-v0", render_mode="rgb_array")
+        # Build the environment, passing config DIRECTLY into __init__
+        env = gym.make(
+            "NGSim-US101-v0",
+            render_mode="rgb_array",
+            config=base_cfg,   # <-- this is the key change
+        )
 
-        # Apply base config (random chunk + random ego handled inside env)
-        env.unwrapped.configure(dict(base_cfg))
+        # (Optional) you can still tweak things AFTER init if needed:
+        # env.unwrapped.configure({...})
 
         # Activate video recording
         env = RecordVideo(

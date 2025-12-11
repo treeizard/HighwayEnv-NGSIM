@@ -112,8 +112,14 @@ class NGSIMVehicle(IDMVehicle):
         # Replay state
         self.sim_steps = 0
         self.overtaken = False       # False => follow NGSIM; True => IDM/MOBIL
-        self.appear = bool(self.position[0] != 0)
-
+        
+        #self.appear = bool(self.position[0] != 0)
+        if self.ngsim_traj is not None and len(self.ngsim_traj) > 0:
+            first_x = float(self.ngsim_traj[0, 0])
+            self.appear = bool(first_x != 0.0)
+        else:
+            self.appear = bool(self.position[0] != 0.0)
+        
         # Diagnostics
         self.traj = np.array(self.position, dtype=float)
         self.speed_history = []
@@ -122,8 +128,11 @@ class NGSIMVehicle(IDMVehicle):
         self.overtaken_history = []
 
         # Dimensions with safe fallbacks
-        self.LENGTH = float(v_length) if v_length is not None else getattr(self, "LENGTH", 4.5)
-        self.WIDTH  = float(v_width)  if v_width  is not None else getattr(self, "WIDTH", 2.0)
+        self.real_length = float(v_length) if v_length is not None else getattr(self, "LENGTH", 4.5)
+        self.real_width = float(v_width)  if v_width  is not None else getattr(self, "WIDTH", 2.0)
+
+        self.LENGTH = self.real_length if self.appear is not False else 0
+        self.WIDTH  = self.real_width if self.appear is not False else 0
         self.diagonal = np.sqrt(self.LENGTH**2 + self.WIDTH**2)
         self.color = color if color is not None else self.DEFAULT_COLOR
     # ---------------- Factory ----------------
@@ -165,15 +174,25 @@ class NGSIMVehicle(IDMVehicle):
         # Reuse IDMVehicle.act for actual control once taken over
         super().act(action)
 
+    # ---------------- collision prevention ----------------
+
     def _update_from_trajectory(self):
         """
         Apply one replay step from ngsim_traj[sim_steps] -> [sim_steps+1].
         Sets position, speed, heading, lane_index/lane.
         Patch: Gap being too small, causing vehicles to suddenly turn 90 degrees.
         """
+        if not self.appear:
+            self.LENGTH = 0.0
+            self.WIDTH = 0.0
+        else:
+            self.LENGTH = self.real_length
+            self.WIDTH = self.real_width
+
         if self.ngsim_traj is None:
             self.overtaken = True
             return
+        # Switch to idm is trajectory is expired
         if self.sim_steps + 1 >= len(self.ngsim_traj):
             self.overtaken = True
             return
@@ -326,40 +345,46 @@ class NGSIMVehicle(IDMVehicle):
 
         - Respect COLLISIONS_ENABLED on both sides.
         - Ignore NGSIM-vs-NGSIM collisions while both are still in replay
-          (both overtaken == False).
-        - Delegate geometry and crash/hit/impact flags to the base implementation.
-        - When a *new* crash happens, clamp both speeds to the smaller magnitude
-          (your original "safe-ish min speed" rule).
+        (both overtaken == False).
+        - Ignore collisions involving vehicles that have not yet appeared
+        (ngsim_traj row is [0,0,0,0] → appear == False).
+        - Delegate geometry and crash flags to the base implementation.
+        - When a new crash happens, clamp both speeds to the smaller magnitude.
         """
 
         # 1. Global toggle: if either side disabled, do nothing.
         if not getattr(self, "COLLISIONS_ENABLED", True) or \
-           not getattr(other, "COLLISIONS_ENABLED", True):
+        not getattr(other, "COLLISIONS_ENABLED", True):
             return
 
-        # 2. Skip NGSIM-vs-NGSIM collisions while both still in replay mode.
-        #    This preserves your original "ignore replay vs replay" logic.
+        # 2. NEW: ghost/“not yet appeared” guard.
+        #    If either vehicle is marked as not appearing, skip collisions entirely.
+        if hasattr(self, "appear") and not self.appear:
+            return
+        if hasattr(other, "appear") and not getattr(other, "appear", True):
+            return
+
+        # 3. Skip NGSIM-vs-NGSIM collisions while both still in replay mode.
         if isinstance(self, NGSIMVehicle) and isinstance(other, NGSIMVehicle):
             if not self.overtaken and not getattr(other, "overtaken", False):
                 return
 
-        # 3. Remember prior crash states so we can detect a *new* crash.
+        # 4. Remember prior crash states to detect a new crash.
         pre_crash_self = self.crashed
         pre_crash_other = getattr(other, "crashed", False)
 
-        # 4. Delegate the actual geometric test and crash/hit/impact logic
-        #    to the parent implementation (Vehicle/RoadObject).
+        # 5. Delegate actual geometry + crash logic.
         super().handle_collisions(other, dt)
 
-        # 5. If a new crash has just occurred, and both are now crashed,
-        #    apply the "safe-ish" min-speed rule from your legacy code.
+        # 6. If a new crash has occurred, clamp speeds.
         post_crash_self = self.crashed
         post_crash_other = getattr(other, "crashed", False)
 
         new_crash_happened = (not pre_crash_self or not pre_crash_other) and \
-                             (post_crash_self and post_crash_other)
+                            (post_crash_self and post_crash_other)
 
         if new_crash_happened and hasattr(other, "speed"):
-            # Use the smaller absolute speed of the two
             min_speed = min(self.speed, other.speed, key=abs)
             self.speed = other.speed = min_speed
+
+    

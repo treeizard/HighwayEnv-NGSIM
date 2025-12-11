@@ -15,12 +15,15 @@
 #   howpublished = {\url{https://github.com/eleurent/highway-env}},
 # }
 
-
+import os, sys
 import numpy as np
 from scipy import signal
 import matplotlib.pyplot as plt
-from highway_env.data.ngsim import *
 from typing import Any, Dict
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, parent_dir)
+from highway_env.data.ngsim import *
+
 """
 def trajectory_smoothing(trajectory):
     trajectory = np.array(trajectory)
@@ -224,7 +227,6 @@ def build_trajectory_from_chunk(scene, vehicle_ID, episode_dir):
 def build_all_trajectories_for_scene(
     scene: str,
     episodes_root: str,
-    train_val_div: str,
 ) -> Dict[str, Dict[int, Dict[str, Any]]]:
     """
     Preload and preprocess trajectories for *all* 10-second intervals (episodes)
@@ -269,7 +271,7 @@ def build_all_trajectories_for_scene(
         All trajectories within a given episode are aligned on the same
         time grid (same length T). Missing times are padded with [0,0,0,0].
     """
-    scene_root = os.path.join(episodes_root, scene, train_val_div)
+    scene_root = os.path.join(episodes_root, scene)
 
     # Find all 10-second episode folders (same rule as _ensure_episode_list)
     episode_names = sorted(
@@ -365,38 +367,24 @@ def first_valid_index(traj):
     return None
 
 if __name__ == "__main__":
-    scene  = "us-101"
-    period = 0
+    scene = 'us-101'
 
-    # Build once
-    trajectory_set = build_trajectory(scene, period)
+    for id in np.random.choice(3200, size=300, replace=False):
+        try:
+            trajectory_set = build_trajectory(scene, 0, id+1)
+        except:
+            continue
 
-    # Choose a subset to keep the figure readable
-    veh_ids = list(trajectory_set.keys())
-    if len(veh_ids) == 0:
-        raise RuntimeError("No trajectories found. Check your data path and period index.")
-    sample_size = min(150, len(veh_ids))
-    sel = np.random.choice(veh_ids, size=sample_size, replace=False)
-
-    plt.figure(figsize=(10, 4))
-    for vid in sel:
-        traj_ft = trajectory_set[vid]["trajectory"]        # [x_ft, y_ft, spd, lane]
-        traj_m  = process_raw_trajectory(traj_ft)          # [s_m, r_m, spd_mps, lane]
-        arr = np.asarray(traj_m)
-        s = arr[:, 0]   # longitudinal (meters)
-        r = arr[:, 1]   # lateral (meters)
-        plt.plot(s, r, linewidth=1, alpha=0.45)
-
-    # Axes/labels
+        ego = trajectory_set['ego']['trajectory']
+        trajectory = np.array(ego)
+        plt.plot(trajectory[:,1]/3.281, trajectory[:,0]/3.281)
+    
     plt.gca().set_aspect('auto', 'datalim')
-    plt.xlabel("Longitudinal position [m]", fontsize=14)
-    plt.ylabel("Lateral position [m]", fontsize=14)
-
-    # Optional: crop to a typical US-101 clip span
-    plt.xlim(0, 660)
-    plt.ylim(0, 25)
-
-    # NOTE: If your lane index increases downward in your rendering,
-    # you can flip lateral with: plt.gca().invert_yaxis()
+    plt.gca().set(xlim=(0, 660), ylim=(0, 25))
+    plt.gca().invert_yaxis()
+    plt.xlabel('Longitudinal position [m]', fontsize=20)
+    plt.ylabel('Lateral position [m]', fontsize=20)
+    plt.xticks(fontsize=20)
+    plt.yticks(fontsize=20)
     plt.tight_layout()
     plt.show()
