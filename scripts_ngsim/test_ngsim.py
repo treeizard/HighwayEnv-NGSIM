@@ -22,11 +22,11 @@ def main():
         "scene": "us-101",
         "observation": {"type": "Kinematics"},
         "action": {"type": "ContinuousAction"},
-        "show_trajectories": False,
+        "show_trajectories": True,
 
         # Rendering
-        "simulation_frequency": 15,
-        "policy_frequency": 5,
+        "simulation_frequency": 10,
+        "policy_frequency": 10,
         "screen_width": 400,
         "screen_height": 150,
         "scaling": 2.0,
@@ -42,14 +42,16 @@ def main():
         "replay_period": None,
 
         # How many vehicles to spawn
-        "max_surrounding": 60,
+        "max_surrounding": 20000,
 
         # Optional: start the replay slightly after beginning
         "reset_step_offset": 1,
+
+        "expert_test_mode": True,
     }
 
     # --------------------- Generate 5 Random Replays ---------------------
-    NUM_REPLAYS = 100
+    NUM_REPLAYS = 20
 
     for i in range(NUM_REPLAYS):
         print(f"\n=== Generating video #{i+1}/{NUM_REPLAYS} ===")

@@ -30,6 +30,7 @@ from highway_env.road.road import Road
 from highway_env.ngsim_utils.obs_vehicle import NGSIMVehicle
 from highway_env.ngsim_utils.ego_vehicle import ControlledVehicle
 from highway_env.ngsim_utils.gen_road import create_ngsim_101_road, clamp_location_ngsim
+from highway_env.ngsim_utils.trajectory_to_action import traj_to_expert_actions, PurePursuitTracker
 from highway_env.ngsim_utils.trajectory_gen import (
     process_raw_trajectory,
     first_valid_index,
@@ -65,8 +66,8 @@ class NGSimEnv(AbstractEnv):
             "action": {"type": "ContinuousAction"},
 
             # Frequencies
-            "simulation_frequency": 15,
-            "policy_frequency": 5,
+            "simulation_frequency": 10, # Must align !!!
+            "policy_frequency": 10, # Must align !!!
             "max_episode_steps": 300,
 
             # Ego override (if None → sample random)
@@ -80,7 +81,7 @@ class NGSimEnv(AbstractEnv):
             "max_surrounding": 80,
 
             # Debug
-            "show_trajectories": False,
+            "show_trajectories": True,
             "seed": None,
 
             # Reward config (weights)
@@ -91,6 +92,9 @@ class NGSimEnv(AbstractEnv):
             # Lane change heuristics
             "lane_change_action_indices": [0, 2],
             "lane_change_steer_thresh": 0.3,
+
+            # Expert Mode 
+            "expert_test_mode": False,
         })
         return config
 
@@ -112,37 +116,20 @@ class NGSimEnv(AbstractEnv):
         self._expert_actions_sim: np.ndarray | None = None
         self._expert_times: np.ndarray | None = None
         self._max_traj_policy_steps: int | None = None
+        self._replay_xy_pol = []
 
         # Load all Trajectories
-        print(config)
         self._prebuilt_dir = os.path.join(config["episode_root"], config["scene"], "prebuilt")
         print(self._prebuilt_dir)
+
+        # Read in precomputed Trajectory data
         veh_ids_path= os.path.join(self._prebuilt_dir, f"veh_ids_train.npy")
         traj_path = os.path.join(self._prebuilt_dir, f"trajectory_train.npy")
         self._valid_ids_by_episode = np.load(veh_ids_path, allow_pickle=True).item()
         self._traj_all_by_episode  = np.load(traj_path, allow_pickle=True).item()
         self._episodes = sorted(self._traj_all_by_episode.keys())
-        '''
-        self._traj_all_by_episode = build_all_trajectories_for_scene(
-            scene= config["scene"],
-            episodes_root=self._episode_root,
-        )
-        self._episodes = sorted(self._traj_all_by_episode.keys())
-
-        # Valid Ego IDs
-        for ep_name, veh_dict in self._traj_all_by_episode.items():
-            valid_ids = []
-            for vid, meta in veh_dict.items():
-                traj = meta["trajectory"]
-                if traj.shape[0] < 2:
-                    continue
-                nonzero = np.any(traj[:, :3] != 0.0, axis=1)
-                if nonzero.sum() >= 2:
-                    valid_ids.append(vid)
-            self._valid_ids_by_episode[ep_name] = valid_ids
-
-        # Let AbstractEnv do its normal setup (config, spaces, reset, etc.)
-        '''
+        
+        
         super().__init__(config=config, render_mode=render_mode)
 
     @property
@@ -162,6 +149,8 @@ class NGSimEnv(AbstractEnv):
         self._load_trajectory()
         self._create_road()
         self._create_vehicles()
+        if self.config.get("expert_test_mode", False):
+            self._replay_xy_pol = [self.vehicle.position.copy()]
   
 
     # -------------------------------------------------------------------------
@@ -193,73 +182,9 @@ class NGSimEnv(AbstractEnv):
                 continue
             traj_set[vid] = meta
         self.trajectory_set = traj_set
+        
             
-    # -------------------------------------------------------------------------
-    # EXPERT ACTION QUERY
-    # -------------------------------------------------------------------------
-    @staticmethod
-    def _load_expert_actions_for(
-        episode_dir: str,
-        ego_id: int,
-    ) -> Tuple[np.ndarray | None, np.ndarray | None]:
-        """
-        Load continuous expert actions for a specific (episode_dir, ego_id).
-
-        Returns:
-            expert_actions_sim : np.ndarray [T, 2] or None
-            expert_times       : np.ndarray [T]     or None
-        """
-        csv_path = os.path.join(episode_dir, "processed_cont_actions.csv")
-        if not os.path.exists(csv_path):
-            print(f"[NGSimEnv] WARNING: No processed_cont_actions.csv in {episode_dir}")
-            return None, None
-
-        df = pd.read_csv(csv_path)
-
-        # Keep only ego rows
-        df = df[df["veh_ID"] == ego_id].sort_values("time")
-        if df.empty:
-            print(f"[NGSimEnv] WARNING: No expert actions for ego {ego_id} in {csv_path}")
-            return None, None
-
-        # Shape [T, 2]: [steering, accel]
-        steering = df["steering"].to_numpy(dtype=float)
-        accel = df["accel"].to_numpy(dtype=float)
-        expert_actions_sim = np.stack([steering, accel], axis=-1)
-        expert_times = df["time"].to_numpy(dtype=float)
-        """
-        print(
-            f"[NGSimEnv] Loaded expert actions for ego {ego_id}: "
-            f"T={len(expert_actions_sim)}"
-        )
-        """
-        return expert_actions_sim, expert_times
-
-    def expert_action_at(self, policy_step: int | None = None) -> np.ndarray:
-        """
-        Return expert continuous action [steering, accel] for a given policy step.
-
-        Steps are counted from reset; assumes self._expert_actions_sim is at
-        simulation frequency (simulation_frequency Hz).
-        """
-        if getattr(self, "_expert_actions_sim", None) is None:
-            raise RuntimeError("Expert actions not loaded for this episode.")
-
-        if policy_step is None:
-            policy_step = self.steps  # current policy step (after last env.step)
-
-        sim_freq = float(self.config["simulation_frequency"])
-        pol_freq = float(self.config["policy_frequency"])
-        sim_per_policy = int(sim_freq // pol_freq)
-
-        sim_idx = policy_step * sim_per_policy
-
-        # Clamp to last expert step, so we don't crash index at episode tail
-        sim_idx = int(np.clip(sim_idx, 0, len(self._expert_actions_sim) - 1))
-
-        steering, accel = self._expert_actions_sim[sim_idx]
-        return np.array([steering, accel], dtype=float)
-
+    
     # -------------------------------------------------------------------------
     # ROAD + VEHICLES
     # -------------------------------------------------------------------------
@@ -276,88 +201,153 @@ class NGSimEnv(AbstractEnv):
         # --- Ego trajectory record & convert to meters ---
         ego_rec = self.trajectory_set["ego"]
         ego_traj_full = process_raw_trajectory(ego_rec["trajectory"])  # [T, 4]: x, y, speed, lane
+
         ego_len = ego_rec["length"] / 3.281
         ego_wid = ego_rec["width"] / 3.281
 
-        # Find the first valid index for the ego vehicle
-        ego_start_i = first_valid_index(ego_rec["trajectory"])
-        print("first valide index:",ego_start_i)
-        
-        if ego_start_i is None:
-            raise RuntimeError("Ego trajectory contains no valid motion data.")
+        # Reset replay logger each episode (needed for compare script)
+        if not hasattr(self, "_replay_xy_pol"):
+            self._replay_xy_pol = []
+        else:
+            self._replay_xy_pol.clear()
 
-        # --------- TRUNCATE ALL TRAJECTORIES AT EGO SPAWN ---------
-        # From now on, 'time step 0' in the simulation corresponds to ego_start_i
-        ego_traj = ego_traj_full[ego_start_i:]
-        if len(ego_traj) < 2:
-            raise RuntimeError(
-                f"Ego trajectory too short after truncation (len={len(ego_traj)})."
+        # expert mode:
+        # expert mode:
+        if self.config.get("expert_test_mode", False):
+            # Define reference window: keep your original logic for start_idx if you want
+            # If ego_traj_full is already truncated/valid, you can just use the full slice.
+            # Here I keep your existing 'traj_to_expert_actions' start_idx selection ONLY to find a window.
+            expert = traj_to_expert_actions(ego_traj_full, dt=self.dt, L_forward=ego_len)
+            start_idx = int(expert["start_idx"])
+            end_idx   = int(expert["end_idx"])
+            if end_idx <= start_idx:
+                raise RuntimeError(f"Invalid expert start/end idx: {start_idx}, {end_idx}")
+
+            self._ego_start_index = start_idx
+
+            sim_freq = float(self.config["simulation_frequency"])
+            pol_freq = float(self.config["policy_frequency"])
+            sim_per_policy = max(1, int(sim_freq // pol_freq))
+
+            ref_slice = ego_traj_full[start_idx:end_idx + 1]
+            self._expert_ref_xy_pol = ref_slice[:, :2][::sim_per_policy].copy()
+            self._expert_ref_v_pol  = ref_slice[:, 2][::sim_per_policy].copy()
+
+            # Initialize closed-loop tracker (IMPORTANT: use ego_len as L_forward)
+            self._tracker = PurePursuitTracker(
+                ref_xy=self._expert_ref_xy_pol,
+                ref_v=self._expert_ref_v_pol,
+                dt=1.0 / pol_freq,          # tracker runs at policy rate
+                L_forward=ego_len,
+                max_steer=np.pi / 4,
+                # human-like defaults (tune later)
+                Ld0=5.0,
+                Ld_k=0.6,
+                kp_v=0.8,
+                steer_rate_limit=6.0,
+                steer_lpf_tau=0.15,
+                jerk_limit=10.0,
             )
-        # Optionally store this for debugging or future use
-        self._ego_start_index = int(ego_start_i)
-        # -----------------------------------------------------------
+
+            # Optional: store actions you generate (these are your "expert actions")
+            self._expert_actions_policy = []
+            self._tracker_dbg = []  # (nearest_idx, target_idx) per step
+
+
+        # non-expert mode:
+        else:
+            ego_start_i = first_valid_index(ego_rec["trajectory"])
+            if ego_start_i is None:
+                raise RuntimeError("Ego trajectory contains no valid motion data.")
+            self._ego_start_index = int(ego_start_i)
+
+        # --------- TRUNCATE ALL TRAJECTORIES AT EGO START INDEX ---------
+        ego_traj = ego_traj_full[self._ego_start_index :]
+        if len(ego_traj) < 2:
+            raise RuntimeError(f"Ego trajectory too short after truncation (len={len(ego_traj)}).")
 
         # --- Horizon in policy steps based on truncated trajectory length ---
-        n_sim_steps = len(ego_traj)  # already truncated, so full length is usable
-
+        n_sim_steps = len(ego_traj)
         sim_freq = float(self.config["simulation_frequency"])
         pol_freq = float(self.config["policy_frequency"])
-        sim_per_policy = int(sim_freq // pol_freq)  # e.g., 15 // 5 = 3
-
-        self._max_traj_policy_steps = int(
-            np.ceil(n_sim_steps / float(sim_per_policy))
-        )
+        sim_per_policy = max(1, int(sim_freq // pol_freq))
+        self._max_traj_policy_steps = int(np.ceil(n_sim_steps / float(sim_per_policy)))
 
         # --- Ego initial state (meters) from truncated traj[0] ---
         x0, y0, ego_speed, lane0 = ego_traj[0]
         ego_xy = np.array([x0, y0], dtype=float)
-
-        # ----------------- choose the correct edge based on x -----------------
+        '''
         ego_lane = clamp_location_ngsim(
             x_pos=x0,
             lane0=lane0,
             net=self.net,
             warning=False,
         )
-        ego_s, ego_r = ego_lane.local_coordinates(ego_xy)
+        '''
+        #ego_s, ego_r = ego_lane.local_coordinates(ego_xy)
 
-        # Snap to lane centerline
-        ego_xy = np.asarray(ego_lane.position(ego_s, ego_r), float)
+        # Keep your original behaviour: snap to lane centerline
+        #ego_xy = np.asarray(ego_lane.position(ego_s, ego_r), float)
+        ego_xy = np.array([x0, y0], dtype=float)
+        # Compute heading from ego_trajectory
+        #print(ego_traj)
+        dx0 = ego_traj[1, 0] - ego_traj[0, 0]
+        dy0 = ego_traj[1, 1] - ego_traj[0, 1]
 
-        # Create the ego Vehicle
+        disp = np.hypot(dx0, dy0)
+
+        MIN_DISP = 0.1  # meters (reasonable for NGSIM @ 10Hz)
+
+        if disp >= MIN_DISP:
+            heading_raw = np.arctan2(dy0, dx0)
+        else:
+            heading_raw = 0.0  # safe only for first frame
+
         ego = ControlledVehicle(
             road=self.road,
             position=ego_xy,
             speed=ego_speed,
-            heading=ego_lane.heading_at(ego_s),
+            heading=heading_raw,
             control_mode="continuous",
         )
+        print(heading_raw)
         ego.set_ego_dimension(width=ego_wid, length=ego_len)
-
+        # DEBUGGING:
         self.road.vehicles.append(ego)
         self.vehicle = ego
 
+        # MINIMAL step-mismatch fix:
+        # log t=0 position here, so replay and reference align without rep[:-1]
+        if self.config.get("expert_test_mode", False):
+            self._replay_xy_pol.append(self.vehicle.position.copy())
+
+        # ---------------- MINIMAL CRASH FIX ----------------
+        # honour max_surrounding. If 0, do not spawn any other vehicles.
+        max_surr = int(self.config.get("max_surrounding", 0))
+        if max_surr <= 0:
+            return
+        # ---------------------------------------------------
+
         # --- Surrounding vehicles (also truncated to ego spawn time) ---
+        spawned = 0
         for vid, meta in self.trajectory_set.items():
             if vid == "ego":
                 continue
+            if spawned >= max_surr:
+                break
 
             traj_full = process_raw_trajectory(meta["trajectory"])
             if len(traj_full) <= self._ego_start_index:
-                # This vehicle never appears after ego spawn
                 continue
 
-            # Truncate this vehicle's trajectory so time 0 aligns with ego spawn
-            traj = traj_full[self._ego_start_index:]
+            traj = traj_full[self._ego_start_index :]
 
-            # Optional: drop leading all-zero rows (ghost segment)
+            # drop leading ghost segment
             nonzero = np.any(traj[:, :3] != 0.0, axis=1)
             if not np.any(nonzero):
-                # Vehicle is effectively absent after ego spawn
                 continue
             first_idx = int(np.argmax(nonzero))
             traj = traj[first_idx:]
-
             if len(traj) < 2:
                 continue
 
@@ -371,7 +361,15 @@ class NGSimEnv(AbstractEnv):
                 speed=traj[0][2],
                 color=(200, 0, 150),
             )
+
+            # keep collision off in expert debug to avoid the polygon NoneType crash
+            if self.config.get("expert_test_mode", False):
+                v.COLLISIONS_ENABLED = False
+
             self.road.vehicles.append(v)
+            spawned += 1
+
+
 
 
     # -------------------------------------------------------------------------
@@ -455,12 +453,74 @@ class NGSimEnv(AbstractEnv):
         hard_cap = min(candidates)
         return self.steps >= hard_cap
 
+
+
+    # -------------------------------------------------------------------------
+    # EXPERT ACTION QUERY
+    # -------------------------------------------------------------------------
+    def _get_expert_action_for_step(self) -> np.ndarray:
+        if not hasattr(self, "_expert_actions_policy") or self._expert_actions_policy is None:
+            raise RuntimeError(
+                "Expert test mode enabled but expert actions are not available."
+            )
+
+        # self.steps = number of policy steps taken so far
+        idx = min(self.steps, self._expert_actions_policy.shape[0] - 1)
+
+        return self._expert_actions_policy[idx]
+    
+    def expert_replay_metrics(self):
+        if not hasattr(self, "_expert_ref_xy_pol"):
+            raise RuntimeError("No expert reference saved. Run reset with expert_test_mode=True.")
+        if not hasattr(self, "_replay_xy_pol"):
+            raise RuntimeError("No replay recorded yet. Step the env first.")
+
+        ref = np.asarray(self._expert_ref_xy_pol, dtype=float)
+        rep = np.asarray(self._replay_xy_pol, dtype=float)
+
+        T = min(len(ref), len(rep))
+        ref = ref[:T]
+        rep = rep[:T]
+
+        err = np.linalg.norm(ref - rep, axis=1)
+        ade = float(np.mean(err))
+        fde = float(err[-1]) if T > 0 else np.nan
+
+        return {"T": T, "ADE_m": ade, "FDE_m": fde, "err_per_step_m": err}
+
+    
     # -------------------------------------------------------------------------
     # STEP
     # -------------------------------------------------------------------------
     def step(self, action: Action):
+        # Expert mode debug
+        if self.config.get("expert_test_mode", False):
+            # closed-loop action from tracker based on current simulated state
+            pos = self.vehicle.position
+            hdg = float(self.vehicle.heading)
+            spd = float(self.vehicle.speed)
+
+            steer_cmd, accel_cmd, i_near, i_tgt = self._tracker.step(pos, hdg, spd)
+
+            # IMPORTANT: match YOUR action convention.
+            # You currently stack [accel, steering] normalized.
+            MAX_ACCEL = 5.0
+            MAX_STEER = np.pi / 4
+            accel_norm = float(np.clip(accel_cmd / MAX_ACCEL, -1.0, 1.0))
+            steer_norm = float(np.clip(steer_cmd / MAX_STEER, -1.0, 1.0))
+
+            action = np.array([accel_norm, steer_norm], dtype=np.float32)
+
+            # log the expert action actually applied
+            self._expert_actions_policy.append(action.copy())
+            self._tracker_dbg.append((i_near, i_tgt))
+
+
         obs, reward, terminated, truncated, info = super().step(action)
-        self.steps += 1
+        #self.steps += 1
+        #print("step:", self.steps)
+        if self.config.get("expert_test_mode", False):            
+            self._replay_xy_pol.append(self.vehicle.position.copy())
 
         if not truncated and self._is_truncated():
             truncated = True

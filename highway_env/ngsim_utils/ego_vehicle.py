@@ -52,7 +52,7 @@ class ControlledVehicle(Vehicle):
     KP_A = 1 / TAU_ACC
     KP_HEADING = 1 / TAU_HEADING
     KP_LATERAL = 1 / TAU_LATERAL  # [1/s]
-    MAX_STEERING_ANGLE = np.pi / 3  # [rad]
+    MAX_STEERING_ANGLE = np.pi / 4  # [rad]
     DELTA_SPEED = 5  # [m/s]
 
     def __init__(
@@ -137,20 +137,30 @@ class ControlledVehicle(Vehicle):
 
         # ------------------------ CONTINUOUS MODE ------------------------
         if self.control_mode == "continuous":
-            # We assume ActionType has already converted env action into a dict
-            # of physical steering/acceleration, e.g. from replay or a continuous policy.
+            # If called with None (e.g., by road.act()), keep last applied control
+            if action is None:
+                super().act(self._last_low_level_action)
+                return
+
             if not isinstance(action, dict):
-                # Fail-safe: treat missing/invalid action as zero control
+                # If you want to be strict, raise instead of zeroing:
+                # raise TypeError(...)
                 steering = 0.0
                 acceleration = 0.0
+                print("wrong action")
             else:
                 steering = float(action.get("steering", 0.0))
                 acceleration = float(action.get("acceleration", 0.0))
 
-            # Clip steering to allowed range
             steering = np.clip(steering, -self.MAX_STEERING_ANGLE, self.MAX_STEERING_ANGLE)
-
             low_level_action = {"steering": steering, "acceleration": acceleration}
+
+            self._last_low_level_action = low_level_action  # store
+            #print("received:", low_level_action)
+            #print(
+            #    f"ego pos = ({self.position[0]:.3f}, {self.position[1]:.3f}), "
+            #    f"speed = {self.speed:.3f}, heading = {self.heading:.3f}"
+            #)
             super().act(low_level_action)
             return
 
