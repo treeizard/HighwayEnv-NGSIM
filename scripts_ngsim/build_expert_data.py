@@ -1,39 +1,116 @@
 #!/usr/bin/env python3
 """
-Generate an expert dataset from NGSimEnv using continuous expert actions.
+Collect an expert dataset from NGSimEnv when `expert_test_mode=True` makes the environment
+apply expert actions internally (i.e., the action passed into env.step() is ignored/overridden).
 
-- Uses NGSimEnv.expert_action_at(policy_step) as the expert policy.
-- Steps the environment with those continuous actions.
-- Records (obs, act, next_obs, done) tuples.
-- Saves to a compressed NPZ file, ready for GAIL (imitation library) consumption.
+This script:
+- Uses your NGSim-US101-v0 registration and config
+- Steps the environment with a dummy action
+- Reads the actually applied "expert" action from `info`
+- Saves (obs, acts, next_obs, dones, ep_id) into a compressed NPZ
+
+IMPORTANT:
+- NGSimEnv.step() MUST put the applied/expert action into info["expert_action"]
+  (or info["applied_action"] as a fallback).
 """
 
 from __future__ import annotations
 
-import sys
 import os
+import sys
 import argparse
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
+import gymnasium as gym
+from gymnasium.envs.registration import register
 from gymnasium.wrappers import FlattenObservation
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(0, parent_dir)
-from highway_env.envs.ngsim_env import NGSimEnv  # adjust path if needed
+
+# ----------------------------------------------------------------------
+# Import project root so `highway_env` is importable
+# ----------------------------------------------------------------------
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+# ----------------------------------------------------------------------
+# Register NGSimEnv
+# ----------------------------------------------------------------------
+register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
 
 
-def collect_expert_rollouts(
-    env: NGSimEnv,
-    n_episodes: int = 200,
-    max_steps_per_episode: int | None = None,
+# ----------------------------------------------------------------------
+# Environment construction
+# ----------------------------------------------------------------------
+def make_env(config: Dict[str, Any]) -> gym.Env:
+    """
+    Construct NGSim env using gym.make so config is passed into NGSimEnv.__init__.
+
+    We do NOT set render_mode (defaults to None). No video recording is used.
+    """
+    env = gym.make(
+        "NGSim-US101-v0",
+        config=config,
+    )
+    # Flatten obs to 1D float32 vector
+    env = FlattenObservation(env)
+    return env
+
+
+# ----------------------------------------------------------------------
+# Utilities for extracting expert/applied action
+# ----------------------------------------------------------------------
+def _extract_applied_action(info: Optional[Dict[str, Any]]) -> np.ndarray:
+    """
+    Extract the action actually applied by the environment.
+
+    Prefer info["expert_action"], fall back to info["applied_action"].
+    Raise a clear error if neither exists.
+    """
+    if info is None:
+        info = {}
+
+    if "expert_action" in info:
+        return np.asarray(info["expert_action"], dtype=np.float32).ravel()
+    if "applied_action" in info:
+        return np.asarray(info["applied_action"], dtype=np.float32).ravel()
+
+    raise RuntimeError(
+        "expert_test_mode=True but env.step() did not expose the applied/expert action.\n"
+        "Please modify NGSimEnv.step() to set either:\n"
+        "  info['expert_action'] = expert_action\n"
+        "or\n"
+        "  info['applied_action'] = action_actually_applied\n"
+    )
+
+
+def _dummy_action(env: gym.Env) -> np.ndarray:
+    """
+    Create a valid dummy action; will be ignored if expert_test_mode=True.
+
+    For ContinuousAction, the action space is a Box; we just construct zeros of the
+    appropriate shape.
+    """
+    shape = getattr(env.action_space, "shape", None)
+    if shape is None:
+        # Fallback: sample once and zero-like it
+        a = env.action_space.sample()
+        return np.zeros_like(np.asarray(a, dtype=np.float32)).ravel()
+    return np.zeros(shape, dtype=np.float32)
+
+
+# ----------------------------------------------------------------------
+# Rollout collection
+# ----------------------------------------------------------------------
+def collect_expert_rollouts_expert_mode(
+    base_cfg: Dict[str, Any],
+    n_episodes: int,
+    max_steps_per_episode: Optional[int],
+    seed: int,
 ) -> Dict[str, np.ndarray]:
     """
-    Run NGSimEnv with expert actions and collect transitions.
-
-    We assume:
-      - env.reset() -> (obs, info)
-      - env.step(action) -> (obs, reward, terminated, truncated, info)
-      - env.expert_action_at(policy_step) -> np.array([steering, accel])
+    Collect transitions by stepping the env with a dummy action, then recording the
+    expert/applied action returned in info.
 
     Returns:
       {
@@ -41,127 +118,137 @@ def collect_expert_rollouts(
         "acts":     [N, act_dim],
         "next_obs": [N, obs_dim],
         "dones":    [N,],
+        "ep_id":    [N,]  (episode index)
       }
     """
-
     obs_buf: List[np.ndarray] = []
     act_buf: List[np.ndarray] = []
     next_obs_buf: List[np.ndarray] = []
     done_buf: List[bool] = []
+    ep_id_buf: List[int] = []
 
     for ep in range(n_episodes):
-        obs, info = env.reset()
+        env = make_env(base_cfg)
+        obs, info = env.reset(seed=seed + ep)
         obs = np.asarray(obs, dtype=np.float32).ravel()
-
-        done = False
-        t = 0
-        steps_in_ep = 0
 
         print(f"[ExpertCollect] Episode {ep + 1}/{n_episodes}")
 
-        # Quick check: ensure this episode actually has expert actions
-        try:
-            _ = env.expert_action_at(policy_step=0)
-        except RuntimeError as e:
-            print(f"[ExpertCollect]   Skipping episode: no expert actions ({e})")
-            continue
+        done = False
+        steps_in_ep = 0
 
         while not done:
-            # ----- 1) Expert action for this policy step -----
-            try:
-                a = env.expert_action_at(policy_step=t)
-            except RuntimeError as e:
-                print(f"[ExpertCollect]   Expert missing at step {t}: {e}")
-                break
-
-            a = np.asarray(a, dtype=np.float32)
-
-            # ----- 2) Step environment with expert action -----
-            next_obs, reward, terminated, truncated, info = env.step(a)
-            next_obs = np.asarray(next_obs, dtype=np.float32).ravel()
-
-            done = bool(terminated or truncated)
-            steps_in_ep += 1
-
-            # ----- 3) Store transition -----
-            obs_buf.append(obs.copy())
-            act_buf.append(a.copy())
-            next_obs_buf.append(next_obs.copy())
-            done_buf.append(done)
-
-            obs = next_obs
-            t += 1
-
             if max_steps_per_episode is not None and steps_in_ep >= max_steps_per_episode:
                 break
 
-        print(f"[ExpertCollect]   Collected {steps_in_ep} steps in this episode.")
+            dummy = _dummy_action(env)
+            next_obs, reward, terminated, truncated, info = env.step(dummy)
+            next_obs = np.asarray(next_obs, dtype=np.float32).ravel()
+            done = bool(terminated or truncated)
+
+            # Key: pull the expert-applied action out of info
+            a_used = _extract_applied_action(info)
+
+            obs_buf.append(obs.copy())
+            act_buf.append(a_used.copy())
+            next_obs_buf.append(next_obs.copy())
+            done_buf.append(done)
+            ep_id_buf.append(ep)
+
+            obs = next_obs
+            steps_in_ep += 1
+
+        print(f"[ExpertCollect]   Collected {steps_in_ep} steps.")
+        env.close()
 
     if len(obs_buf) == 0:
-        raise RuntimeError("No expert transitions were collected. Check your episodes / actions.")
+        raise RuntimeError(
+            "No transitions collected. Possible causes:\n"
+            "- Episodes terminate immediately\n"
+            "- expert_test_mode not enabled in config\n"
+            "- NGSimEnv.step() does not fill info['expert_action'] / info['applied_action']"
+        )
 
     data = {
         "obs": np.stack(obs_buf, axis=0).astype(np.float32),
         "acts": np.stack(act_buf, axis=0).astype(np.float32),
         "next_obs": np.stack(next_obs_buf, axis=0).astype(np.float32),
-        "dones": np.array(done_buf, dtype=bool),
+        "dones": np.asarray(done_buf, dtype=bool),
+        "ep_id": np.asarray(ep_id_buf, dtype=np.int32),
     }
 
-    print(
-        f"[ExpertCollect] Finished: {data['obs'].shape[0]} transitions "
-        f"from up to {n_episodes} episodes."
-    )
+    print(f"[ExpertCollect] Finished: {data['obs'].shape[0]} transitions.")
+    print(f"[ExpertCollect] obs_dim={data['obs'].shape[1]} act_dim={data['acts'].shape[1]}")
     return data
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Generate NGSim expert dataset (continuous actions).")
-    parser.add_argument(
-        "--episodes",
-        type=int,
-        default=200,
-        help="Number of expert episodes to roll out.",
+# ----------------------------------------------------------------------
+# CLI and entrypoint
+# ----------------------------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Collect NGSim expert dataset (continuous actions) using expert_test_mode=True."
     )
-    parser.add_argument(
-        "--max_steps",
-        type=int,
-        default=None,
-        help="Optional cap on steps per episode (policy steps).",
-    )
+    parser.add_argument("--episodes", type=int, default=200, help="Number of episodes to attempt.")
+    parser.add_argument("--max_steps", type=int, default=None, help="Optional cap on steps per episode.")
     parser.add_argument(
         "--out",
         type=str,
         default="expert_data/ngsim_expert_continuous.npz",
         help="Output NPZ path.",
     )
+    parser.add_argument("--seed", type=int, default=0, help="Base RNG seed.")
     args = parser.parse_args()
 
-    # ----- Configure NGSimEnv -----
-    config = {
+    # ---------------------- YOUR CONFIG (unchanged) ----------------------
+    base_cfg: Dict[str, Any] = {
         "scene": "us-101",
-        "episode_root": "highway_env/data/processed_10s",
-        "observation": {"type": "Kinematics"},
+        "observation": {
+            "type": "LidarObservation",
+            "cells": 128,
+            "maximum_range": 64,
+            "normalise": True,
+        },
         "action": {"type": "ContinuousAction"},
-        "simulation_frequency": 15,
-        "policy_frequency": 5,
-        "max_episode_steps": 300,
-        "log_overlaps": False,
-        # "ego_vehicle_ID": None,  # keep random or fix if you want
+        "show_trajectories": True,
+
+        # Keep them equal for a clean 1-to-1 step mapping (recommended in expert replay mode)
+        "simulation_frequency": 10,
+        "policy_frequency": 10,
+
+        # Rendering flags (kept from your config; not used for video here)
+        "screen_width": 400,
+        "screen_height": 150,
+        "scaling": 2.0,
+        "offscreen_rendering": True,
+
+        # Random episode selection each reset
+        "episode_root": "highway_env/data/processed_10s",
+        "replay_period": None,
+        "reset_step_offset": 1,
+
+        # Ego override (None -> random ego by NGSimEnv)
+        "ego_vehicle_ID": None,
+
+        # Spawn volume (your existing setting)
+        "max_surrounding": 20000,
+
+        # Critical: environment applies expert actions internally
+        "expert_test_mode": True,
     }
 
-    env = NGSimEnv(config=config)
-    env = FlattenObservation(env)
-
-    # ----- Collect expert transitions -----
-    dataset = collect_expert_rollouts(
-        env,
+    dataset = collect_expert_rollouts_expert_mode(
+        base_cfg=base_cfg,
         n_episodes=args.episodes,
         max_steps_per_episode=args.max_steps,
+        seed=args.seed,
     )
 
-    # ----- Save dataset -----
     out_path = args.out
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     np.savez_compressed(out_path, **dataset)
     print(f"[ExpertCollect] Saved dataset to: {out_path}")
 

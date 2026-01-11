@@ -89,7 +89,7 @@ class NGSIMVehicle(IDMVehicle):
         v_length=None,
         v_width=None,
         ngsim_traj=None,
-        color=None
+        color=None,
     ):
         super().__init__(
             road,
@@ -111,15 +111,27 @@ class NGSIMVehicle(IDMVehicle):
 
         # Replay state
         self.sim_steps = 0
-        self.overtaken = False       # False => follow NGSIM; True => IDM/MOBIL
-        
-        #self.appear = bool(self.position[0] != 0)
+        self.overtaken = False
+
+        # ---- Initialise from trajectory instead of dummy (0,0) ----
         if self.ngsim_traj is not None and len(self.ngsim_traj) > 0:
-            first_x = float(self.ngsim_traj[0, 0])
-            self.appear = bool(first_x != 0.0)
+            # Current sample (sim_steps == 0 initially)
+            cur_x, cur_y, cur_v, _ = self.ngsim_traj[self.sim_steps][:4]
+
+            # Use data pose as initial pose
+            self.position = np.array([cur_x, cur_y], dtype=float)
+            self.speed = float(cur_v)
+            self.target_speed = self.speed
+
+            # "Appear" is keyed off x == 0.0 (your convention)
+            self.appear = bool(cur_x != 0.0)
         else:
+            # Fallback if no traj at all
             self.appear = bool(self.position[0] != 0.0)
-        
+
+        # Hook into highway-env's rendering: ghost vehicles are invisible
+        self.visible = self.appear
+
         # Diagnostics
         self.traj = np.array(self.position, dtype=float)
         self.speed_history = []
@@ -129,11 +141,17 @@ class NGSIMVehicle(IDMVehicle):
 
         # Dimensions with safe fallbacks
         self.real_length = float(v_length) if v_length is not None else getattr(self, "LENGTH", 4.5)
-        self.real_width = float(v_width)  if v_width  is not None else getattr(self, "WIDTH", 2.0)
+        self.real_width  = float(v_width)  if v_width  is not None else getattr(self, "WIDTH", 2.0)
 
-        self.LENGTH = self.real_length if self.appear is not False else 0
-        self.WIDTH  = self.real_width if self.appear is not False else 0
+        if self.appear:
+            self.LENGTH = self.real_length
+            self.WIDTH  = self.real_width
+        else:
+            # Ghost: zero footprint
+            self.LENGTH = 0.0
+            self.WIDTH  = 0.0
         self.diagonal = np.sqrt(self.LENGTH**2 + self.WIDTH**2)
+
         self.color = color if color is not None else self.DEFAULT_COLOR
     # ---------------- Factory ----------------
     @classmethod
@@ -180,19 +198,12 @@ class NGSIMVehicle(IDMVehicle):
         """
         Apply one replay step from ngsim_traj[sim_steps] -> [sim_steps+1].
         Sets position, speed, heading, lane_index/lane.
-        Patch: Gap being too small, causing vehicles to suddenly turn 90 degrees.
         """
-        if not self.appear:
-            self.LENGTH = 0.0
-            self.WIDTH = 0.0
-        else:
-            self.LENGTH = self.real_length
-            self.WIDTH = self.real_width
-
         if self.ngsim_traj is None:
             self.overtaken = True
             return
-        # Switch to idm is trajectory is expired
+
+        # Switch to IDM if trajectory is expired
         if self.sim_steps + 1 >= len(self.ngsim_traj):
             self.overtaken = True
             return
@@ -203,7 +214,18 @@ class NGSIMVehicle(IDMVehicle):
 
         # Position from data
         self.position = np.array([cur_x, cur_y], dtype=float)
+
+        # Update appear/visible + footprint for this frame
         self.appear = bool(cur_x != 0.0)
+        self.visible = self.appear  # <- critical for rendering
+
+        if not self.appear:
+            # Ghost: no collisions / display footprint
+            self.LENGTH = 0.0
+            self.WIDTH = 0.0
+        else:
+            self.LENGTH = self.real_length
+            self.WIDTH = self.real_width
 
         # Speed from spatial difference (fallback to recorded v)
         dx = nxt_x - cur_x
@@ -221,9 +243,6 @@ class NGSIMVehicle(IDMVehicle):
 
         local_s, local_r = self.lane.local_coordinates(self.position)
         self.heading = self.lane.heading_at(local_s)
-        # ------ Attach to nearest lane --------------    
-        self.lane_index = self.road.network.get_closest_lane_index(self.position)
-        self.lane = self.road.network.get_lane(self.lane_index)
 
     def _front_gap_logic(self):
         """

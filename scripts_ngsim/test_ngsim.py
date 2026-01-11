@@ -20,7 +20,12 @@ def main():
     # ---------------------- Base Config ----------------------
     base_cfg = {
         "scene": "us-101",
-        "observation": {"type": "Kinematics"},
+        "observation": {
+            "type": "LidarObservation",
+            "cells": 128,
+            "maximum_range": 64,
+            "normalise": True,
+        },
         "action": {"type": "ContinuousAction"},
         "show_trajectories": True,
 
@@ -51,7 +56,7 @@ def main():
     }
 
     # --------------------- Generate 5 Random Replays ---------------------
-    NUM_REPLAYS = 20
+    NUM_REPLAYS = 1
 
     for i in range(NUM_REPLAYS):
         print(f"\n=== Generating video #{i+1}/{NUM_REPLAYS} ===")
