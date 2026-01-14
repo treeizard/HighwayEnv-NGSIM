@@ -37,7 +37,11 @@ from highway_env.ngsim_utils.trajectory_gen import (
 )
 
 Observation = np.ndarray
+
+# Constants
 f2m_conv = 3.281
+MAX_ACCEL = 5.0
+MAX_STEER = np.pi / 4
 
 class NGSimEnv(AbstractEnv):
     """
@@ -62,12 +66,17 @@ class NGSimEnv(AbstractEnv):
             "scene": "us-101",
 
             # Observation / action
-            "observation": {"type": "Kinematics"},
+            "observation": {"type": "LidarObservation",
+                "cells": 128,
+                "maximum_range": 64,
+                "normalize": True,
+            },
+
             "action": {"type": "ContinuousAction"},
 
             # Frequencies
-            "simulation_frequency": 10, # Must align !!!
-            "policy_frequency": 10, # Must align !!!
+            "simulation_frequency": 10, # Must align with policy frequency
+            "policy_frequency": 10, # Must align with policy frequency
             "max_episode_steps": 300,
 
             # Simulation override (if None -> sample random)
@@ -278,7 +287,7 @@ class NGSimEnv(AbstractEnv):
                 ref_v=self._expert_ref_v_pol,
                 dt=1.0 / pol_freq,          # tracker runs at policy rate
                 L_forward=ego_len,
-                max_steer=np.pi / 4,
+                max_steer=MAX_STEER,
                 # Hard-coded Control Parameter
                 Ld0= 5.0,
                 Ld_k= 0.6,
@@ -483,9 +492,6 @@ class NGSimEnv(AbstractEnv):
 
             steer_cmd, accel_cmd, i_near, i_tgt = self._tracker.step(pos, hdg, spd)
             
-            MAX_ACCEL = 5.0
-            MAX_STEER = np.pi / 4
-
             accel_norm = float(np.clip(accel_cmd / MAX_ACCEL, -1.0, 1.0))
             steer_norm = float(np.clip(steer_cmd / MAX_STEER, -1.0, 1.0))
 

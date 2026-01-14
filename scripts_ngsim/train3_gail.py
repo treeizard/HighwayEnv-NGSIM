@@ -41,7 +41,7 @@ def make_ngsim_env():
             "type": "LidarObservation",
             "cells": 128,
             "maximum_range": 64,
-            "normalize": True,   # IMPORTANT spelling
+            "normalize": True,
         },
         "action": {"type": "ContinuousAction"},
 
@@ -50,7 +50,7 @@ def make_ngsim_env():
         "max_episode_steps": 300,
 
         "expert_test_mode": False,
-        "max_surrounding": 80,
+        "max_surrounding": 200000,
     }
     env = NGSimEnv(config=config)
     env = FlattenObservation(env)

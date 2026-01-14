@@ -70,8 +70,8 @@ def _extract_applied_action(info: Optional[Dict[str, Any]]) -> np.ndarray:
     if info is None:
         info = {}
 
-    if "expert_action" in info:
-        return np.asarray(info["expert_action"], dtype=np.float32).ravel()
+    #if "expert_action" in info:
+        #return np.asarray(info["expert_action"], dtype=np.float32).ravel()
     if "applied_action" in info:
         return np.asarray(info["applied_action"], dtype=np.float32).ravel()
 
@@ -189,7 +189,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Collect NGSim expert dataset (continuous actions) using expert_test_mode=True."
     )
-    parser.add_argument("--episodes", type=int, default=200, help="Number of episodes to attempt.")
+    parser.add_argument("--episodes", type=int, default=2000, help="Number of episodes to attempt.")
     parser.add_argument("--max_steps", type=int, default=None, help="Optional cap on steps per episode.")
     parser.add_argument(
         "--out",
