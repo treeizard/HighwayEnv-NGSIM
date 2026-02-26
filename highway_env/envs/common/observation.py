@@ -674,14 +674,21 @@ class ExitObservation(KinematicObservation):
         return obs.astype(self.space().dtype)
 
 
-import numpy as np
-from gymnasium import spaces
-
-from highway_env import utils
-from highway_env.envs.common.observation import ObservationType
-
-
 class LidarObservation(ObservationType):
+    """
+    LiDAR observation with road-edge clamping.
+
+    Key behavior:
+      - Each LiDAR beam is truncated at the first point where the ray leaves the road.
+      - The returned distance is the minimum of:
+            (distance to nearest obstacle intersection) and (distance to road edge).
+      - If no obstacle is hit, the beam returns the road edge distance (dense boundary cue).
+
+    Output:
+      grid[:, 0] = distance (meters)
+      grid[:, 1] = relative speed along beam direction (m/s)
+    """
+
     DISTANCE = 0
     SPEED = 1
 
@@ -691,16 +698,29 @@ class LidarObservation(ObservationType):
         cells: int = 16,
         maximum_range: float = 60.0,
         normalize: bool = True,
+        edge_as_return: bool = True,
+        coarse_step: float | None = None,
+        refine_iters: int = 8,
         **kwargs,
     ):
         super().__init__(env, **kwargs)
         self.cells = int(cells)
         self.maximum_range = float(maximum_range)
-        self.normalize = normalize
+        self.normalize = bool(normalize)
+
+        # If True: empty beams return road-edge distance; else they return maximum_range.
+        self.edge_as_return = bool(edge_as_return)
+
+        # Ray-march parameters
+        self.coarse_step = float(coarse_step) if coarse_step is not None else max(0.5, self.maximum_range / 60.0)
+        self.refine_iters = int(refine_iters)
+
         self.angle = 2 * np.pi / self.cells
-        # grid[:, 0] = distance, grid[:, 1] = relative speed
         self.grid = np.ones((self.cells, 2), dtype=np.float32) * self.maximum_range
         self.origin = None
+
+        # Cache lanes for faster on-road checks (safe for typical static road networks)
+        self._lanes_cache = self._collect_lanes()
 
     # ----------------- Gym space -----------------
 
@@ -726,15 +746,41 @@ class LidarObservation(ObservationType):
     # ----------------- Core LiDAR logic -----------------
 
     def trace(self, origin: np.ndarray, origin_velocity: np.ndarray) -> np.ndarray:
-        self.origin = origin.copy()
-        self.grid = np.ones((self.cells, 2), dtype=np.float32) * self.maximum_range
+        self.origin = np.array(origin, dtype=float).copy()
 
         # Ensure velocity is finite
         if origin_velocity is None or not np.all(np.isfinite(origin_velocity)):
             origin_velocity = np.zeros(2, dtype=float)
+        else:
+            origin_velocity = np.array(origin_velocity, dtype=float)
+
+        # Refresh lane cache if road object changed (rare, but safe)
+        if self._lanes_cache is None or getattr(self.env, "road", None) is None:
+            self._lanes_cache = self._collect_lanes()
+
+        # Precompute per-ray road edge distance
+        edge_dists = np.empty((self.cells,), dtype=np.float32)
+        for i in range(self.cells):
+            d = self.index_to_direction(i)
+            edge = self._distance_to_road_edge(
+                origin=self.origin,
+                direction=d,
+                max_range=self.maximum_range,
+                coarse_step=self.coarse_step,
+                refine_iters=self.refine_iters,
+            )
+            edge_dists[i] = np.float32(np.clip(edge, 0.0, self.maximum_range))
+
+        # Initialize grid distances
+        self.grid = np.zeros((self.cells, 2), dtype=np.float32)
+        if self.edge_as_return:
+            self.grid[:, self.DISTANCE] = edge_dists
+        else:
+            self.grid[:, self.DISTANCE] = self.maximum_range
+        self.grid[:, self.SPEED] = 0.0
 
         # Iterate over road vehicles + static objects
-        for obstacle in self.env.road.vehicles + self.env.road.objects:
+        for obstacle in (self.env.road.vehicles + self.env.road.objects):
             # Skip self
             if obstacle is self.observer_vehicle:
                 continue
@@ -744,62 +790,54 @@ class LidarObservation(ObservationType):
                 continue
 
             # -------- Ghost / not-yet-appeared guards --------
-            # If a vehicle has `appear=False`, treat as ghost (no LiDAR return)
             if hasattr(obstacle, "appear") and not getattr(obstacle, "appear", True):
                 continue
-            # Respect `visible=False` if present
             if hasattr(obstacle, "visible") and not getattr(obstacle, "visible", True):
                 continue
-            # Also skip degenerate footprint (ghosts with zero size)
             if getattr(obstacle, "LENGTH", 0.0) == 0.0 and getattr(obstacle, "WIDTH", 0.0) == 0.0:
                 continue
 
-            # -------- Basic distance / visibility checks --------
+            # -------- Basic validity --------
             if obstacle.position is None or not np.all(np.isfinite(obstacle.position)):
                 continue
 
-            center_vec = obstacle.position - origin
-            center_distance = np.linalg.norm(center_vec)
-            if not np.isfinite(center_distance) or center_distance > self.maximum_range:
+            obstacle_pos = np.array(obstacle.position, dtype=float)
+            center_vec = obstacle_pos - self.origin
+            center_distance = float(np.linalg.norm(center_vec))
+            if (not np.isfinite(center_distance)) or (center_distance > self.maximum_range):
                 continue
 
-            center_angle = self.position_to_angle(obstacle.position, origin)
+            # Approximate center ray bin
+            center_angle = self.position_to_angle(obstacle_pos, self.origin)
             center_index = self.angle_to_index(center_angle)
 
-            # Use half-width to approximate closest point on obstacle
+            # Quick cull: if obstacle center beyond the road edge for its bin plus its half width, likely irrelevant
             width = float(getattr(obstacle, "WIDTH", 0.0))
-            distance = center_distance - width / 2.0
-            distance = max(distance, 0.0)
+            if center_distance > float(edge_dists[center_index]) + 0.5 * width:
+                # Still might intersect another bin, but this removes many far obstacles cheaply
+                pass  # keep conservative; do not continue
 
-            # Relative velocity along the ray direction for the center cell
-            direction_center = self.index_to_direction(center_index)
+            # Obstacle kinematics
             obs_vel = getattr(obstacle, "velocity", np.zeros(2, dtype=float))
             if obs_vel is None or not np.all(np.isfinite(obs_vel)):
                 obs_vel = np.zeros(2, dtype=float)
-            rel_vel = (obs_vel - origin_velocity).dot(direction_center)
+            else:
+                obs_vel = np.array(obs_vel, dtype=float)
 
-            if distance <= self.grid[center_index, self.DISTANCE]:
-                self.grid[center_index, :] = [distance, rel_vel]
-
-            # -------- Angular sector covered by the obstacle --------
             length = float(getattr(obstacle, "LENGTH", 0.0))
-            corners = utils.rect_corners(
-                obstacle.position,
-                length,
-                width,
-                getattr(obstacle, "heading", 0.0),
-            )
+            heading = float(getattr(obstacle, "heading", 0.0))
 
-            angles = [self.position_to_angle(corner, origin) for corner in corners]
+            # Geometry
+            corners = utils.rect_corners(obstacle_pos, length, width, heading)
+            angles = [self.position_to_angle(corner, self.origin) for corner in corners]
             angles = [a for a in angles if np.isfinite(a)]
             if len(angles) == 0:
-                continue  # skip object entirely if geometry invalid
+                continue
 
             min_angle, max_angle = min(angles), max(angles)
 
             # Handle wrap-around across -pi / +pi
             if min_angle < -np.pi / 2 < np.pi / 2 < max_angle:
-                # Object crosses the +/- pi boundary
                 min_angle, max_angle = max_angle, min_angle + 2 * np.pi
 
             start = self.angle_to_index(min_angle)
@@ -808,50 +846,132 @@ class LidarObservation(ObservationType):
             if start <= end:
                 indexes = np.arange(start, end + 1)
             else:
-                # Object's corners are wrapping around 0
-                indexes = np.hstack(
-                    [np.arange(start, self.cells), np.arange(0, end + 1)]
-                )
+                indexes = np.hstack([np.arange(start, self.cells), np.arange(0, end + 1)])
 
-            # -------- Exact ray-rectangle distance per LiDAR cell --------
+            # Exact ray-rectangle distance per LiDAR cell, with road-edge clamping
             for index in indexes:
-                direction = self.index_to_direction(index)
-                ray = [origin, origin + self.maximum_range * direction]
-                distance = utils.distance_to_rect(ray, corners)
-
-                if not np.isfinite(distance):
+                max_t = float(edge_dists[index])
+                if max_t <= 0.0:
                     continue
 
-                distance = max(distance, 0.0)
-                if distance <= self.grid[index, self.DISTANCE]:
-                    rel_vel = (obs_vel - origin_velocity).dot(direction)
-                    self.grid[index, :] = [distance, rel_vel]
+                direction = self.index_to_direction(int(index))
+
+                # IMPORTANT: clamp ray segment to road edge
+                ray = [self.origin, self.origin + max_t * direction]
+                dist = utils.distance_to_rect(ray, corners)
+
+                if not np.isfinite(dist):
+                    continue
+
+                dist = float(np.clip(dist, 0.0, max_t))
+
+                if dist <= float(self.grid[int(index), self.DISTANCE]):
+                    rel_vel = float((obs_vel - origin_velocity).dot(direction))
+                    self.grid[int(index), :] = [dist, rel_vel]
+
+        # If we are NOT returning edge as return, still ensure beams do not exceed edge
+        if not self.edge_as_return:
+            self.grid[:, self.DISTANCE] = np.minimum(self.grid[:, self.DISTANCE], edge_dists)
 
         return self.grid
+
+    # ----------------- Road boundary helpers -----------------
+
+    def _collect_lanes(self):
+        """
+        Cache lane objects for on-road tests.
+        """
+        road = getattr(self.env, "road", None)
+        if road is None or getattr(road, "network", None) is None:
+            return None
+
+        lanes = []
+        try:
+            for _from, tos in road.network.graph.items():
+                for _to, lane_list in tos.items():
+                    for lane in lane_list:
+                        lanes.append(lane)
+        except Exception:
+            return None
+
+        return lanes if lanes else None
+
+    def _on_road_at(self, p: np.ndarray) -> bool:
+        """
+        Conservative point-on-road test: on-road if it lies on any lane surface.
+        """
+        if self._lanes_cache is None:
+            self._lanes_cache = self._collect_lanes()
+            if self._lanes_cache is None:
+                # Fallback: assume on-road to avoid over-clamping in pathological cases
+                return True
+
+        for lane in self._lanes_cache:
+            try:
+                if lane.on_lane(p):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _distance_to_road_edge(
+        self,
+        origin: np.ndarray,
+        direction: np.ndarray,
+        max_range: float,
+        coarse_step: float,
+        refine_iters: int,
+    ) -> float:
+        """
+        Distance along ray until it first leaves the road surface.
+        Returns in [0, max_range]. If road never ends within max_range, returns max_range.
+        """
+        d = direction / (np.linalg.norm(direction) + 1e-12)
+
+        # If already off-road, edge is at 0
+        if not self._on_road_at(origin):
+            return 0.0
+
+        t = 0.0
+        last_on = 0.0
+
+        # Coarse march
+        while t < max_range:
+            t = min(t + coarse_step, max_range)
+            p = origin + t * d
+            if not self._on_road_at(p):
+                # Refine boundary between last_on (on) and t (off)
+                lo, hi = last_on, t
+                for _ in range(refine_iters):
+                    mid = 0.5 * (lo + hi)
+                    pm = origin + mid * d
+                    if self._on_road_at(pm):
+                        lo = mid
+                    else:
+                        hi = mid
+                return lo
+            last_on = t
+
+        return max_range
 
     # ----------------- Helper functions -----------------
 
     def position_to_angle(self, position: np.ndarray, origin: np.ndarray) -> float:
-        dx = position[0] - origin[0]
-        dy = position[1] - origin[1]
+        dx = float(position[0] - origin[0])
+        dy = float(position[1] - origin[1])
 
-        # Safety cases: treat broken geometry as "forward"
         if not np.isfinite(dx) or not np.isfinite(dy):
             return 0.0
 
-        # arctan2 is robust; add half a cell so index boundaries align nicely
-        ang = np.arctan2(dy, dx) + self.angle / 2.0
-
+        ang = float(np.arctan2(dy, dx) + self.angle / 2.0)
         if not np.isfinite(ang):
             return 0.0
-
         return ang
 
     def position_to_index(self, position: np.ndarray, origin: np.ndarray) -> int:
         return self.angle_to_index(self.position_to_angle(position, origin))
 
     def angle_to_index(self, angle: float) -> int:
-        # Safety guard: map invalid angle to the front-center cell
         if not np.isfinite(angle):
             return 0
         return int(np.floor(angle / self.angle)) % self.cells
@@ -861,7 +981,7 @@ class LidarObservation(ObservationType):
         Convert a LiDAR cell index into a unit direction vector in world coordinates.
         The beam is centered in the cell: angle = (index + 0.5) * cell_angle.
         """
-        theta = (index + 0.5) * self.angle
+        theta = (int(index) + 0.5) * self.angle
         return np.array([np.cos(theta), np.sin(theta)], dtype=float)
 
 

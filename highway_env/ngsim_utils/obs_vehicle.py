@@ -24,7 +24,8 @@ from typing import Tuple, Optional
 
 from highway_env import utils
 from highway_env.vehicle.behavior import IDMVehicle
-from highway_env.ngsim_utils.ego_vehicle import ControlledVehicle
+from highway_env.ngsim_utils.ego_vehicle import EgoVehicle
+from highway_env.ngsim_utils.trajectory_gen import process_raw_trajectory
 
 @dataclass
 class DebugState:
@@ -264,7 +265,7 @@ class NGSIMVehicle(IDMVehicle):
             return 100.0, 50.0, False
 
         # If the front vehicle is the ego, we care about the real gap
-        if isinstance(front_vehicle, ControlledVehicle):
+        if isinstance(front_vehicle, EgoVehicle):
             gap = self.lane_distance_to(front_vehicle)
             desired_gap = self.desired_gap(self, front_vehicle)
             return gap, desired_gap, True
@@ -407,3 +408,39 @@ class NGSIMVehicle(IDMVehicle):
             self.speed = other.speed = min_speed
 
     
+def spawn_surrounding_vehicles(trajectory_set, ego_start_index, 
+                               max_surrounding, road,
+                               f2m_conv = 3.281):
+    """Spawn surrounding vehicles based on the given trajectory set."""
+    spawned = 0
+    for vid, meta in trajectory_set.items():
+        if vid == "ego":
+            continue
+        if spawned >= max_surrounding:
+            break
+
+        traj_full = process_raw_trajectory(meta["trajectory"])
+        if len(traj_full) <= ego_start_index:
+            continue
+
+        traj = traj_full[ego_start_index:]
+        nonzero = np.any(traj[:, :3] != 0.0, axis=1)
+        if not np.any(nonzero):
+            continue
+        first_idx = np.argmax(nonzero)
+        traj = traj[first_idx:]
+        if len(traj) < 2:
+            continue
+
+        v = NGSIMVehicle.create(
+            road=road,
+            vehicle_ID=vid,
+            position=traj[0][:2],
+            v_length=meta["length"] / f2m_conv,
+            v_width=meta["width"] / f2m_conv,
+            ngsim_traj=traj,
+            speed=traj[0][2],
+            color=(200, 0, 150),
+        )
+        road.vehicles.append(v)
+        spawned += 1

@@ -153,12 +153,17 @@ highway_dqn/
 figs_frames_10min_every10s/
 
 videos/
+videos_discrete_test/
 
 highway_env/data/processed
 highway_env/data/processed_10s
+
+logs
+tb_logs
 
 raw_data
 
 expert_data
 
 plots
+

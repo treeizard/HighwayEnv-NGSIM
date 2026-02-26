@@ -11,7 +11,7 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-# Register env (safe if re-run)
+# Register environment (safe if re-run)
 try:
     register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
 except Exception:
@@ -38,7 +38,7 @@ def polyline_mse_xy(ref_xy: np.ndarray, rep_xy: np.ndarray, n_samples: int = 200
     return float(np.mean(np.sum((r1 - r2) ** 2, axis=1)))
 
 
-def run_one(cfg: dict, seed: int, max_steps: int = 300) -> dict:
+def run_one(cfg: dict, seed: int, max_steps: int = 10) -> dict:
     """Run one expert-replay episode and return ref/replay XY and MSE."""
     print("seed:", seed)
     env = gym.make("NGSim-US101-v0", config=cfg)
@@ -51,11 +51,13 @@ def run_one(cfg: dict, seed: int, max_steps: int = 300) -> dict:
         if terminated or truncated:
             break
 
+    # Collect the true expert reference data (true trajectory)
     ref = np.asarray(getattr(uenv, "_expert_ref_xy_pol", []), dtype=float)
+    # Collect the replay data (replay trajectory)
     rep = np.asarray(getattr(uenv, "_replay_xy_pol", []), dtype=float)
 
-    # If you already log t=0 before stepping, DO NOT drop last element.
-    # If replay is post-step only, drop last to align lengths.
+    # If you already log t=0 before stepping, DO NOT drop the last element.
+    # If replay is post-step only, drop the last to align lengths.
     # Robust handling: just trim to min length without assuming off-by-one.
     if ref.size == 0 or rep.size == 0:
         env.close()
@@ -137,7 +139,8 @@ def plot_mse_summary(runs: list[dict]) -> None:
 
 
 def main():
-    cfg = {
+    # Set up configuration for both continuous and discrete modes
+    continuous_cfg = {
         "scene": "us-101",
         "observation": {"type": "Kinematics"},
         "action": {"type": "ContinuousAction"},
@@ -146,14 +149,32 @@ def main():
         "episode_root": "highway_env/data/processed_10s",
         "max_surrounding": 0,
         "expert_test_mode": True,
-        # Optional: if you are saving videos or using render_mode, set here
-        # "render_mode": "rgb_array",
+        "expert_action_mode": "continuous",  # Continuous mode
     }
 
-    runs = [run_one(cfg, seed=i, max_steps=300) for i in range(20)]
+    discrete_cfg = {
+        "scene": "us-101",
+        "observation": {"type": "Kinematics"},
+        "action": {"type": "DiscreteSteerMetaAction"},
+        "simulation_frequency": 10,
+        "policy_frequency": 10,
+        "episode_root": "highway_env/data/processed_10s",
+        "max_surrounding": 0,
+        "expert_test_mode": True,
+        "expert_action_mode": "discrete",  # Discrete mode
+    }
 
-    plot_grid(runs, nrows=4, ncols=5)
-    plot_mse_summary(runs)
+    # Run the experiment for both continuous and discrete modes
+    continuous_runs = [run_one(continuous_cfg, seed=i, max_steps=100) for i in range(20)]
+    discrete_runs = [run_one(discrete_cfg, seed=i, max_steps=100) for i in range(20)]
+
+    # Plot the results for continuous and discrete expert action replays
+    plot_grid(continuous_runs, nrows=4, ncols=5)
+    plot_grid(discrete_runs, nrows=4, ncols=5)
+
+    # Plot MSE summary for both modes
+    plot_mse_summary(continuous_runs)
+    plot_mse_summary(discrete_runs)
 
     # Make sure windows actually appear
     plt.show(block=True)

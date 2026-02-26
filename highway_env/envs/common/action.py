@@ -12,6 +12,7 @@ from highway_env.utils import Vector
 from highway_env.vehicle.controller import MDPVehicle
 from highway_env.vehicle.dynamics import BicycleVehicle
 from highway_env.vehicle.kinematics import Vehicle
+from highway_env.ngsim_utils.ego_vehicle import EgoVehicle
 
 
 if TYPE_CHECKING:
@@ -297,6 +298,144 @@ class DiscreteMetaAction(ActionType):
             actions.append(self.actions_indexes["SLOWER"])
         return actions
 
+class DiscreteSteerMetaAction(ActionType):
+    """
+    Discrete meta action space for EgoVehicle:
+      - Speed ladder: FASTER / SLOWER / IDLE
+      - Steering bias (within lane): STEER_LEFT / STEER_RIGHT
+      - Lane change primitives: LANE_LEFT / LANE_RIGHT
+
+    IMPORTANT: indices 0..4 remain unchanged for backwards compatibility.
+    """
+
+    # Stable indices (do not reorder once you start training)
+    ACTIONS = {
+        0: "SLOWER",
+        1: "IDLE",
+        2: "FASTER",
+        3: "STEER_LEFT",
+        4: "STEER_RIGHT",
+        # New actions appended (safe for older checkpoints if you don't load with shape mismatch)
+        5: "LANE_LEFT",
+        6: "LANE_RIGHT",
+    }
+
+    def __init__(
+        self,
+        env: AbstractEnv,
+        target_speeds: Vector | None = None,
+        # Optional: allow disabling subsets without changing indices
+        enable_longitudinal: bool = True,
+        enable_steer: bool = True,
+        enable_lane_change: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__(env)
+
+        self.enable_longitudinal = bool(enable_longitudinal)
+        self.enable_steer = bool(enable_steer)
+        self.enable_lane_change = bool(enable_lane_change)
+
+        self.target_speeds = (
+            np.array(target_speeds, dtype=float)
+            if target_speeds is not None
+            else np.array(
+                getattr(EgoVehicle, "DEFAULT_TARGET_SPEEDS", MDPVehicle.DEFAULT_TARGET_SPEEDS),
+                dtype=float,
+            )
+        )
+
+        self.actions = dict(self.ACTIONS)
+        self.actions_indexes = {v: k for k, v in self.actions.items()}
+
+    def space(self) -> spaces.Space:
+        return spaces.Discrete(len(self.actions))
+
+    @property
+    def vehicle_class(self) -> Callable:
+        """
+        Use EgoVehicle so that:
+          - speed_index/target_speeds are meaningful
+          - STEER_LEFT/STEER_RIGHT and LANE_LEFT/LANE_RIGHT are implemented
+        """
+        return functools.partial(
+            EgoVehicle,
+            control_mode="discrete",
+            target_speeds=self.target_speeds,
+        )
+
+    def act(self, action: int | np.ndarray) -> None:
+        self.controlled_vehicle.act(self.actions[int(action)])
+
+    def _lane_change_reachable(self, direction: int) -> bool:
+        """
+        direction: -1 for left lane (decrease lane id), +1 for right lane (increase lane id)
+        Returns True if an adjacent lane exists and is reachable from current position.
+        """
+        v = self.controlled_vehicle
+        if v is None or v.road is None or v.road.network is None:
+            return False
+
+        # Prefer target_lane_index if present, otherwise lane_index
+        lane_index = getattr(v, "target_lane_index", None) or getattr(v, "lane_index", None)
+        if lane_index is None:
+            return False
+
+        try:
+            _from, _to, _id = lane_index
+            lanes_list = v.road.network.graph[_from][_to]
+            n_lanes = len(lanes_list)
+            new_id = int(np.clip(_id + direction, 0, n_lanes - 1))
+            if new_id == _id:
+                return False
+            new_index = (_from, _to, new_id)
+            return v.road.network.get_lane(new_index).is_reachable_from(v.position)
+        except Exception:
+            # If your NGSIM road network doesn't follow this structure perfectly,
+            # fail closed: don't expose lane change actions.
+            return False
+
+    def get_available_actions(self) -> list[int]:
+        """
+        Available actions:
+          - IDLE always.
+          - FASTER/SLOWER bounded by speed ladder.
+          - STEER_LEFT/STEER_RIGHT always available if enabled.
+          - LANE_LEFT/LANE_RIGHT only if enabled and adjacent lane is reachable.
+        """
+        avail = [self.actions_indexes["IDLE"]]
+
+        # Longitudinal bounds
+        if self.enable_longitudinal:
+            speed_index = int(getattr(self.controlled_vehicle, "speed_index", 0))
+            target_speeds = getattr(self.controlled_vehicle, "target_speeds", self.target_speeds)
+
+            if speed_index < int(target_speeds.size - 1):
+                avail.append(self.actions_indexes["FASTER"])
+            if speed_index > 0:
+                avail.append(self.actions_indexes["SLOWER"])
+
+        # Steer within-lane setpoint actions
+        if self.enable_steer:
+            avail.append(self.actions_indexes["STEER_LEFT"])
+            avail.append(self.actions_indexes["STEER_RIGHT"])
+
+        # Lane changes
+        if self.enable_lane_change:
+            # Convention: LANE_LEFT = -1, LANE_RIGHT = +1
+            if self._lane_change_reachable(direction=-1):
+                avail.append(self.actions_indexes["LANE_LEFT"])
+            if self._lane_change_reachable(direction=+1):
+                avail.append(self.actions_indexes["LANE_RIGHT"])
+
+        # Deduplicate while preserving order
+        out = []
+        seen = set()
+        for a in avail:
+            if a not in seen:
+                out.append(a)
+                seen.add(a)
+        return out
 
 class MultiAgentAction(ActionType):
     def __init__(self, env: AbstractEnv, action_config: dict, **kwargs) -> None:
@@ -338,6 +477,8 @@ def action_factory(env: AbstractEnv, config: dict) -> ActionType:
         return DiscreteAction(env, **config)
     elif config["type"] == "DiscreteMetaAction":
         return DiscreteMetaAction(env, **config)
+    elif config["type"] == "DiscreteSteerMetaAction":  
+        return DiscreteSteerMetaAction(env, **config)
     elif config["type"] == "MultiAgentAction":
         return MultiAgentAction(env, **config)
     else:
