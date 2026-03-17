@@ -59,7 +59,7 @@ class HighwayEnv(AbstractEnv):
                 # Patched: disable normalization while redesigning reward
                 "normalize_reward": False,
 
-                "offroad_terminal": False,
+                "offroad_terminal": True,
 
                 # --- Spawn feasibility params ---
                 "spawn_speed_min": 25.0,

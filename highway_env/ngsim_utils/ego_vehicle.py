@@ -72,7 +72,7 @@ class EgoVehicle(Vehicle):
         position: Vector,
         heading: float = 0.0,
         speed: float = 0.0,
-        target_lane_index: LaneIndex | None = None,
+        #target_lane_index: LaneIndex | None = None,
         target_speed: float | None = None,
         route: Route | None = None,
         control_mode: str = "discrete",
@@ -369,128 +369,85 @@ class EgoVehicle(Vehicle):
     # Control loop entrypoint
     # --------------------------
     def act(self, action: Union[dict, str, int, None] = None) -> None:
-        """
-        Supports both:
-          - CONTINUOUS: action is {"steering": float, "acceleration": float}
-          - DISCRETE: action is a string like "LANE_LEFT" or "FASTER"
-        """
-        # 1. Update Cooldowns
         if self._lane_change_cooldown > 0:
             self._lane_change_cooldown -= 1
 
-        # ---------------------------------------------------------
-        # Path A: CONTINUOUS MODE 
-        # ---------------------------------------------------------
         if self.control_mode == "continuous":
-            # Sync target lane to current position to keep road-following logic alive
             self.target_lane_index = self._current_edge_lane_index()
             self.follow_road()
 
-            if action is None:
-                # Repeat last known low-level command if no new action
-                super().act(self._last_low_level_action)
-                return
+            if action is not None:
+                if isinstance(action, dict):
+                    steering = float(action.get("steering", 0.0))
+                    acceleration = float(action.get("acceleration", 0.0))
+                else:
+                    steering, acceleration = 0.0, 0.0
 
-            if isinstance(action, dict):
-                steering = float(action.get("steering", 0.0))
-                acceleration = float(action.get("acceleration", 0.0))
-            else:
-                # Fallback for unexpected action types in continuous mode
-                steering, acceleration = 0.0, 0.0
+                steering = float(np.clip(steering, -self.MAX_STEERING_ANGLE, self.MAX_STEERING_ANGLE))
+                self._last_low_level_action = {"steering": steering, "acceleration": acceleration}
 
-            steering = float(np.clip(steering, -self.MAX_STEERING_ANGLE, self.MAX_STEERING_ANGLE))
-            self._last_low_level_action = {"steering": steering, "acceleration": acceleration}
-            
             super().act(self._last_low_level_action)
             return
 
-        # ---------------------------------------------------------
-        # Path B: DISCRETE MODE
-        # ---------------------------------------------------------
-        # Normalize the discrete action input
-        act = "IDLE"
+        # ---------------- discrete ----------------
+        act = None
         if isinstance(action, str):
             act = action.upper()
 
-        # ---------------------------------------------------------
-        # 1. Handle New Commands
-        # ---------------------------------------------------------
-        if act in ("LANE_LEFT", "LANE_RIGHT"):
-            self._apply_lane_change(act)
-        elif act in ("FASTER", "SLOWER"):
-            self._apply_speed_action(act)
-        # Note: We ignore manual STEER inputs if a lane change is active to prevent fighting
-        elif act in ("STEER_LEFT", "STEER_RIGHT") and self.lane_change_direction == 0:
-            self._apply_steer_bias_action(act)
+        # Only process NEW discrete commands when explicitly provided
+        if act is not None:
+            if act in ("LANE_LEFT", "LANE_RIGHT"):
+                self._apply_lane_change(act)
+            elif act in ("FASTER", "SLOWER"):
+                self._apply_speed_action(act)
+            elif act in ("STEER_LEFT", "STEER_RIGHT") and self.lane_change_direction == 0:
+                self._apply_steer_bias_action(act)
 
-        # ---------------------------------------------------------
-        # 2. Process Ramped Lane Change (The "Macro")
-        # ---------------------------------------------------------
+        # Continue internal lane-change controller
         if self.lane_change_direction != 0:
-            # A. Move the target offset incrementally (Same magnitude as manual steer)
-            # If moving Left (-1), we decrease offset? 
-            # WAIT: Check your coordinate system! 
-            # In highway-env, usually +y is "Left" relative to lane center if heading is 0.
-            # But let's assume standard: direction -1 (Left) implies we want to go to *that* side.
-            # We used direction * lateral_offset_step in steer bias? 
-            # Let's align with your _apply_steer_bias_action logic:
-            # STEER_LEFT (dir -1?) -> lateral_offset += step (Positive is Left)
-            
             step = self.lateral_offset_step
-            if self.lane_change_direction == -1: # LEFT
+            if self.lane_change_direction == -1:
                 self.lateral_offset += step
-            else: # RIGHT
+            else:
                 self.lateral_offset -= step
 
-            # B. Check for Coordinate Swap (Crossing the line)
-            # We swap when we are closer to the new lane than the old one (offset > width/2)
             lane_width = self._lane_width(self.target_lane_index)
             threshold = lane_width / 2.0
-            
-            # Check Left Crossing (Positive Offset > Width/2)
+
             if self.lane_change_direction == -1 and self.lateral_offset > threshold:
                 new_idx = self._adjacent_lane_index(-1)
                 if new_idx:
                     self.target_lane_index = new_idx
-                    self.lateral_offset -= lane_width # Wrap coordinate
+                    self.lateral_offset -= lane_width
                 else:
-                    self.lane_change_direction = 0 # Abort if lane missing
+                    self.lane_change_direction = 0
 
-            # Check Right Crossing (Negative Offset < -Width/2)
             elif self.lane_change_direction == 1 and self.lateral_offset < -threshold:
                 new_idx = self._adjacent_lane_index(1)
                 if new_idx:
                     self.target_lane_index = new_idx
-                    self.lateral_offset += lane_width # Wrap coordinate
+                    self.lateral_offset += lane_width
                 else:
                     self.lane_change_direction = 0
 
-            # C. Check for Completion (Centering)
-            # If we have wrapped, the offset is now "shrinking" towards 0.
-            # If we cross 0 (change sign) or get very close, we are done.
             if abs(self.lateral_offset) < step:
                 self.lateral_offset = 0.0
-                self.lane_change_direction = 0 # FINISHED
+                self.lane_change_direction = 0
 
-        # ---------------------------------------------------------
-        # 3. Standard Constraints (Only clamp if NOT changing lanes)
-        # ---------------------------------------------------------
         if self.lane_change_direction == 0:
-             # Standard "Invisible Wall" logic applies here
-             self.follow_road()
-             if self._lane_change_cooldown == 0:
-                 self.target_lane_index = self._current_edge_lane_index()
-             
-             max_off = self._max_safe_lateral_offset(self.target_lane_index)
-             self.lateral_offset = float(np.clip(self.lateral_offset, -max_off, max_off))
+            self.follow_road()
+            if self._lane_change_cooldown == 0:
+                self.target_lane_index = self._current_edge_lane_index()
 
-        # ---------------------------------------------------------
-        # 4. Low Level Control
-        # ---------------------------------------------------------
+            max_off = self._max_safe_lateral_offset(self.target_lane_index)
+            self.lateral_offset = float(np.clip(self.lateral_offset, -max_off, max_off))
+
         low_level_action = {
             "steering": self.steering_control_with_offset(self.target_lane_index, self.lateral_offset),
             "acceleration": self.speed_control(self.target_speed),
         }
+
+        #print(act if act is not None else "NO_NEW_ACTION")
         super().act(low_level_action)
 
     # --------------------------

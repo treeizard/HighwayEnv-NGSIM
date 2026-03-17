@@ -218,7 +218,7 @@ def main() -> None:
 
         # 2. Enable Expert Discrete Mode
         "expert_test_mode": True,
-        "expert_action_mode": "discrete",
+        "action_mode": "discrete",
         
         # Expert Tuning (Matches your environment settings)
         "expert_prefer_speed": False, 
