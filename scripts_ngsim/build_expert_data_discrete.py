@@ -36,6 +36,28 @@ register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
 
 
 # ----------------------------------------------------------------------
+# Path helpers
+# ----------------------------------------------------------------------
+def resolve_output_path(out_arg: str) -> str:
+    """
+    Resolve output path robustly for local runs and SLURM jobs.
+
+    Rules:
+    - If out_arg is absolute, use it as-is.
+    - If out_arg is relative and SLURM_SUBMIT_DIR exists, resolve against it.
+    - Otherwise resolve against current working directory.
+    """
+    if os.path.isabs(out_arg):
+        return os.path.abspath(out_arg)
+
+    base_dir = os.environ.get("SLURM_SUBMIT_DIR")
+    if not base_dir:
+        base_dir = os.getcwd()
+
+    return os.path.abspath(os.path.join(base_dir, out_arg))
+
+
+# ----------------------------------------------------------------------
 # Environment construction
 # ----------------------------------------------------------------------
 def make_env(config: Dict[str, Any]) -> gym.Env:
@@ -57,25 +79,21 @@ def make_env(config: Dict[str, Any]) -> gym.Env:
 def _extract_applied_action(info: Optional[Dict[str, Any]]) -> np.ndarray:
     """
     Extract the DISCRETE action index actually applied by the environment.
-    
+
     In our modified NGSimEnv, this is stored in info["expert_action_discrete_idx"].
     We return it as a 1D numpy array of shape (1,) so it stacks consistently.
     """
     if info is None:
         info = {}
 
-    # 1. Check for the specific discrete index key (Preferred)
     if "expert_action_discrete_idx" in info:
         idx = info["expert_action_discrete_idx"]
         return np.array([idx], dtype=np.float32)
 
-    # 2. Fallback to generic applied_action
     if "applied_action" in info:
         val = info["applied_action"]
-        # If it's a scalar integer/float (discrete index), wrap it
         if np.isscalar(val):
             return np.array([val], dtype=np.float32)
-        # If it's already an array, ravel it
         return np.asarray(val, dtype=np.float32).ravel()
 
     raise RuntimeError(
@@ -88,7 +106,6 @@ def _dummy_action(env: gym.Env) -> int:
     """
     Create a valid dummy action for Discrete space.
     """
-    # Simply sample a random integer. It will be ignored by the env anyway.
     return env.action_space.sample()
 
 
@@ -130,7 +147,6 @@ def collect_expert_rollouts_expert_mode(
             next_obs = np.asarray(next_obs, dtype=np.float32).ravel()
             done = bool(terminated or truncated)
 
-            # EXTRACT DISCRETE ACTION INDEX
             try:
                 a_used = _extract_applied_action(info)
             except RuntimeError as e:
@@ -154,7 +170,7 @@ def collect_expert_rollouts_expert_mode(
 
     data = {
         "obs": np.stack(obs_buf, axis=0).astype(np.float32),
-        "acts": np.stack(act_buf, axis=0).astype(np.float32), # Shape [N, 1]
+        "acts": np.stack(act_buf, axis=0).astype(np.float32),
         "next_obs": np.stack(next_obs_buf, axis=0).astype(np.float32),
         "dones": np.asarray(done_buf, dtype=bool),
         "ep_id": np.asarray(ep_id_buf, dtype=np.int32),
@@ -162,11 +178,10 @@ def collect_expert_rollouts_expert_mode(
 
     print(f"[ExpertCollect] Finished: {data['obs'].shape[0]} transitions.")
     print(f"[ExpertCollect] obs_dim={data['obs'].shape[1]} act_dim={data['acts'].shape[1]}")
-    
-    # Sanity check for discrete actions
-    unique_acts = np.unique(data['acts'])
+
+    unique_acts = np.unique(data["acts"])
     print(f"[ExpertCollect] Unique Discrete Actions Found: {unique_acts}")
-    
+
     return data
 
 
@@ -183,12 +198,18 @@ def main() -> None:
         "--out",
         type=str,
         default="expert_data/ngsim_expert_discrete.npz",
-        help="Output NPZ path.",
+        help=(
+            "Output NPZ path. Can be absolute, or relative. "
+            "Relative paths are resolved against SLURM_SUBMIT_DIR when running under SLURM, "
+            "otherwise against the current working directory."
+        ),
     )
     parser.add_argument("--seed", type=int, default=42, help="Base RNG seed.")
     args = parser.parse_args()
 
-    # ---------------------- DISCRETE CONFIG ----------------------
+    print(f"[ExpertCollect] Current working directory: {os.getcwd()}")
+    print(f"[ExpertCollect] SLURM_SUBMIT_DIR: {os.environ.get('SLURM_SUBMIT_DIR', '<not set>')}")
+
     base_cfg: Dict[str, Any] = {
         "scene": "us-101",
         "observation": {
@@ -197,31 +218,22 @@ def main() -> None:
             "maximum_range": 64,
             "normalize": True,
         },
-        # 1. Use Discrete Action Space
         "action": {"type": "DiscreteSteerMetaAction"},
-        
-        "show_trajectories": False, # Disable for speed during collection
+        "show_trajectories": False,
         "simulation_frequency": 10,
         "policy_frequency": 10,
-
-        # Rendering options (offscreen)
         "screen_width": 400,
         "screen_height": 150,
         "scaling": 2.0,
         "offscreen_rendering": True,
-
         "episode_root": "highway_env/data/processed_10s",
         "replay_period": None,
         "reset_step_offset": 1,
         "ego_vehicle_ID": None,
-        "max_surrounding": 20000, # Reduce density slightly for speed if desired
-
-        # 2. Enable Expert Discrete Mode
+        "max_surrounding": 20000,
         "expert_test_mode": True,
         "action_mode": "discrete",
-        
-        # Expert Tuning (Matches your environment settings)
-        "expert_prefer_speed": False, 
+        "expert_prefer_speed": False,
         "lane_change_cooldown_steps": 10,
     }
 
@@ -232,11 +244,12 @@ def main() -> None:
         seed=args.seed,
     )
 
-    out_path = args.out
+    out_path = resolve_output_path(args.out)
     out_dir = os.path.dirname(out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
+    print(f"[ExpertCollect] Saving dataset to: {out_path}")
     np.savez_compressed(out_path, **dataset)
     print(f"[ExpertCollect] Saved dataset to: {out_path}")
 
