@@ -232,21 +232,48 @@ class EgoVehicle(Vehicle):
         except Exception:
             pass
         return float(self.DEFAULT_LANE_WIDTH_FALLBACK)
-
-    def _max_safe_lateral_offset(self, lane_index: LaneIndex) -> float:
+    
+    def _safe_lateral_offset_bounds(self, lane_index: LaneIndex) -> tuple[float, float]:
         """
-        Defines the 'invisible wall' for STEER actions.
-        
-        User Goal: "Threshold = Lane's Edge + Half of Car"
-        Interpretation: The vehicle's center can drift up to the lane boundary, 
-                        or slightly past it, but cannot drift fully into the next lane
-                        without a discrete LANE_CHANGE action.
+        Return (min_offset, max_offset) for within-lane STEER actions.
+
+        Convention in this class:
+        - positive lateral_offset  => move left
+        - negative lateral_offset  => move right
+
+        If there is no adjacent lane on one side (i.e. road edge), keep the vehicle body
+        inside the road by subtracting half vehicle width and a small margin from that side.
         """
         lane_w = float(self._lane_width(lane_index))
-        if not np.isfinite(lane_w):
-            lane_w = 3.7 
-        limit = lane_w / 2.0
-        return float(limit)
+        half_lane = lane_w / 2.0
+
+        veh_half_w = float(getattr(self, "WIDTH", 2.0)) / 2.0
+        margin = float(self.DEFAULT_OFFSET_MARGIN)
+
+        # Absolute cap from config
+        abs_cap = float(self.lateral_offset_max)
+
+        # Start from full lane-boundary center limits
+        max_left = half_lane
+        max_right = half_lane
+
+        # Check whether adjacent lanes exist
+        has_left_lane = self._adjacent_lane_index(-1) is not None
+        has_right_lane = self._adjacent_lane_index(1) is not None
+
+        # If this side is the road edge, stop center earlier so body stays on-road
+        if not has_left_lane:
+            max_left = max(0.0, half_lane - veh_half_w - margin)
+
+        if not has_right_lane:
+            max_right = max(0.0, half_lane - veh_half_w - margin)
+
+        # Apply global cap
+        max_left = min(max_left, abs_cap)
+        max_right = min(max_right, abs_cap)
+
+        # Returned as (min, max)
+        return (-max_right, max_left)
 
     def _adjacent_lane_index(self, direction: int) -> LaneIndex | None:
         """
@@ -335,18 +362,14 @@ class EgoVehicle(Vehicle):
             self.target_speed = self.index_to_speed(self.speed_index)
 
     def _apply_steer_bias_action(self, act: str) -> None:
-        # 1. Calculate the Hard Limit for the current lane
-        max_off = self._max_safe_lateral_offset(self.target_lane_index)
-        
-        # 2. Apply Step
+        min_off, max_off = self._safe_lateral_offset_bounds(self.target_lane_index)
+
         if act == "STEER_LEFT":
             self.lateral_offset += self.lateral_offset_step
         elif act == "STEER_RIGHT":
             self.lateral_offset -= self.lateral_offset_step
-        
-        # 3. HARD CLAMP (The "Invisible Wall")
-        # This forces the agent to switch to "LANE_LEFT" if it wants to move further.
-        self.lateral_offset = float(np.clip(self.lateral_offset, -max_off, max_off))
+
+        self.lateral_offset = float(np.clip(self.lateral_offset, min_off, max_off))
 
     def _apply_lane_change(self, act: str) -> None:
         """
@@ -439,8 +462,8 @@ class EgoVehicle(Vehicle):
             if self._lane_change_cooldown == 0:
                 self.target_lane_index = self._current_edge_lane_index()
 
-            max_off = self._max_safe_lateral_offset(self.target_lane_index)
-            self.lateral_offset = float(np.clip(self.lateral_offset, -max_off, max_off))
+            min_off, max_off = self._safe_lateral_offset_bounds(self.target_lane_index)
+            self.lateral_offset = float(np.clip(self.lateral_offset, min_off, max_off))
 
         low_level_action = {
             "steering": self.steering_control_with_offset(self.target_lane_index, self.lateral_offset),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from copy import deepcopy
 from typing import Any, Dict
 
 import numpy as np
@@ -10,20 +11,39 @@ from highway_env.envs.common.abstract import AbstractEnv
 from highway_env.envs.common.action import Action
 from highway_env.road.road import Road
 
-from highway_env.ngsim_utils.helper_ngsim import load_ego_trajectory, get_ego_dimensions, setup_expert_tracker, clamp_lane_id_for_x
+from highway_env.ngsim_utils.helper_ngsim import (
+    clamp_lane_id_for_x,
+    get_ego_dimensions,
+    load_ego_trajectory,
+    setup_expert_tracker,
+)
 from highway_env.ngsim_utils.obs_vehicle import spawn_surrounding_vehicles
-#from highway_env.ngsim_utils.ego_vehicle import create_ego_vehicle
-from highway_env.ngsim_utils.gen_road import create_ngsim_101_road, clamp_location_ngsim
-from highway_env.ngsim_utils.trajectory_to_action import map_discrete_expert_action, PurePursuitTracker #, traj_to_expert_actions
-from highway_env.ngsim_utils.trajectory_gen import first_valid_index #, process_raw_trajectory
-
-#from highway_env.ngsim_utils.obs_vehicle import NGSIMVehicle
+from highway_env.ngsim_utils.gen_road import create_ngsim_101_road
+from highway_env.ngsim_utils.trajectory_to_action import (
+    PurePursuitTracker,
+    map_discrete_expert_action,
+)
+from highway_env.ngsim_utils.trajectory_gen import first_valid_index
 from highway_env.ngsim_utils.ego_vehicle import EgoVehicle
+
 
 # Constants
 f2m_conv = 3.281
 MAX_ACCEL = 5.0
 MAX_STEER = np.pi / 4
+
+
+def _deep_update(base: dict, override: dict) -> dict:
+    """
+    Recursively merge override into base and return the merged dict.
+    """
+    result = deepcopy(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(result.get(k), dict):
+            result[k] = _deep_update(result[k], v)
+        else:
+            result[k] = v
+    return result
 
 
 class NGSimEnv(AbstractEnv):
@@ -47,7 +67,22 @@ class NGSimEnv(AbstractEnv):
                     "maximum_range": 64,
                     "normalize": True,
                 },
+                # Will be normalized from action_mode inside __init__
                 "action": {"type": "ContinuousAction"},
+                "action_mode": "discrete",  # "continuous" or "discrete"
+                "action_config": {
+                    "lateral_offset_step": 0.10,
+                    "lateral_offset_max": 1.50,
+                    "lane_change_cooldown_steps": 10,
+                    "lane_change_commit_hyst_steps": 2,
+                    "target_speeds": list(np.arange(0.0, 35.0 + 1e-6, 2.0)),
+                },
+                "expert_v": {
+                    "expert_speed_deadband_mps": 0.5,
+                    "expert_steer_deadband_rad": 0.05,
+                    "expert_one_action_per_step": True,
+                    "expert_prefer_speed": False,
+                },
                 "simulation_frequency": 10,
                 "policy_frequency": 10,
                 "max_episode_steps": 300,
@@ -57,17 +92,7 @@ class NGSimEnv(AbstractEnv):
                 "max_surrounding": 80,
                 "show_trajectories": True,
                 "seed": None,
-                "lane_change_cooldown_steps": 10,
-                "lateral_offset_step": 0.10,
-                "lateral_offset_max": 1.50,
-                "lane_change_commit_hyst_steps": 2,
                 "expert_test_mode": False,
-                "action_mode": "discrete",
-                "target_speeds": list(np.arange(0.0, 35.0 + 1e-6, 2.0)),
-                "expert_speed_deadband_mps": 0.5,
-                "expert_steer_deadband_rad": 0.05,
-                "expert_one_action_per_step": True,
-                "expert_prefer_speed": False,
             }
         )
         return config
@@ -76,19 +101,22 @@ class NGSimEnv(AbstractEnv):
     # INIT / DT
     # -------------------------------------------------------------------------
     def __init__(self, config: dict | None = None, render_mode: str | None = None) -> None:
-        if config is None:
-            config = self.default_config()
+        cfg = self.default_config() if config is None else _deep_update(self.default_config(), config)
+
+        # Normalize control/action mode before AbstractEnv constructs action_type
+        self.control_mode = str(cfg.get("action_mode", "continuous")).lower()
+        if self.control_mode == "continuous":
+            cfg["action"] = {"type": "ContinuousAction"}
+        elif self.control_mode == "discrete":
+            cfg["action"] = {"type": "DiscreteSteerMetaAction"}
         else:
-            merged = self.default_config()
-            merged.update(config)
-            config = merged
+            raise ValueError(f"Unknown action_mode={self.control_mode!r}")
 
         self._episodes: list[str] = []
         self._episode_root: str | None = None
         self._valid_ids_by_episode: dict[str, np.ndarray] = {}
         self._episode_cache: Dict[str, Dict[str, Any]] = {}
         self.ego_id: int | None = None
-
         self._ego_id: int | None = None
 
         # Expert debug
@@ -98,7 +126,7 @@ class NGSimEnv(AbstractEnv):
         self._replay_xy_pol: list[np.ndarray] = []
 
         # Prebuilt trajectories
-        self._prebuilt_dir = os.path.join(config["episode_root"], config["scene"], "prebuilt")
+        self._prebuilt_dir = os.path.join(cfg["episode_root"], cfg["scene"], "prebuilt")
         veh_ids_path = os.path.join(self._prebuilt_dir, "veh_ids_train.npy")
         traj_path = os.path.join(self._prebuilt_dir, "trajectory_train.npy")
 
@@ -106,15 +134,19 @@ class NGSimEnv(AbstractEnv):
         self._traj_all_by_episode = np.load(traj_path, allow_pickle=True).item()
         self._episodes = sorted(self._traj_all_by_episode.keys())
 
-
-        # Define action_mode
-        self.control_mode = str(config.get("action_mode", "continuous")).lower()
-
-        super().__init__(config=config, render_mode=render_mode)
+        super().__init__(config=cfg, render_mode=render_mode)
 
     @property
     def dt(self) -> float:
         return 1.0 / float(self.config["simulation_frequency"])
+
+    @property
+    def action_cfg(self) -> dict:
+        return self.config.get("action_config", {})
+
+    @property
+    def expert_cfg(self) -> dict:
+        return self.config.get("expert_v", {})
 
     # -------------------------------------------------------------------------
     # RESET
@@ -164,8 +196,6 @@ class NGSimEnv(AbstractEnv):
             traj_set[vid] = meta
         self.trajectory_set = traj_set
 
-        #print("episode name:", self.episode_name, ", ego_id:", self.ego_id)
-
     # -------------------------------------------------------------------------
     # ROAD + VEHICLES
     # -------------------------------------------------------------------------
@@ -177,7 +207,7 @@ class NGSimEnv(AbstractEnv):
             np_random=self.np_random,
             record_history=self.config["show_trajectories"],
         )
-    
+
     def _create_vehicles(self):
         ego_rec = self.trajectory_set["ego"]
         ego_traj_full = load_ego_trajectory(ego_rec)
@@ -187,23 +217,22 @@ class NGSimEnv(AbstractEnv):
             self._replay_xy_pol = []
         else:
             self._replay_xy_pol.clear()
-        
+
         expert_mode = bool(self.config.get("expert_test_mode", False))
-        
+
         if expert_mode:
-            # Note: setup_expert_tracker returns raw lane_pol for runtime clamping
-            ref_xy_pol, ref_v_pol, lane_pol, start_idx = setup_expert_tracker(self.net, ego_traj_full, ego_len, self.config)
-            #print(lane_pol)
+            ref_xy_pol, ref_v_pol, lane_pol, start_idx = setup_expert_tracker(
+                self.net, ego_traj_full, ego_len, self.config
+            )
             self._expert_ref_xy_pol = ref_xy_pol
             self._expert_ref_v_pol = ref_v_pol
-            self._expert_ref_lane_pol = lane_pol - 1 
+            self._expert_ref_lane_pol = lane_pol - 1
             self._ego_start_index = start_idx
 
-            # UPDATE: Pass ref_lanes to tracker so step() can return target_lane_id
             self._tracker = PurePursuitTracker(
                 ref_xy=self._expert_ref_xy_pol,
                 ref_v=self._expert_ref_v_pol,
-                ref_lanes=self._expert_ref_lane_pol,  # <--- CRITICAL UPDATE
+                ref_lanes=self._expert_ref_lane_pol,
                 dt=1.0 / self.config["policy_frequency"],
                 L_forward=ego_len,
                 max_steer=MAX_STEER,
@@ -221,10 +250,10 @@ class NGSimEnv(AbstractEnv):
             if ego_start_i is None:
                 raise RuntimeError("Ego trajectory contains no valid motion data.")
             self._ego_start_index = int(ego_start_i)
-        
+
         ego_traj = ego_traj_full[self._ego_start_index :]
         if len(ego_traj) < 2:
-            raise RuntimeError(f"Ego trajectory too short.")
+            raise RuntimeError("Ego trajectory too short.")
 
         n_sim_steps = len(ego_traj)
         sim_freq = float(self.config["simulation_frequency"])
@@ -234,45 +263,60 @@ class NGSimEnv(AbstractEnv):
 
         x0, y0, ego_speed, lane0 = ego_traj[0]
         ego_xy = np.array([x0, y0], dtype=float)
-        
-        # Init Heading
+
+        # Initial heading from first displacement
         dx0 = ego_traj[1, 0] - ego_traj[0, 0]
         dy0 = ego_traj[1, 1] - ego_traj[0, 1]
         disp = np.hypot(dx0, dy0)
-        if disp >= 0.1:
-            heading_raw = np.arctan2(dy0, dx0)
-        else:
-            heading_raw = 0.0
+        heading_raw = float(np.arctan2(dy0, dx0)) if disp >= 0.1 else 0.0
 
-        #ego_lane = clamp_location_ngsim(x0, lane0, self.net, warning=False)
-        #target_lane_index = ego_lane.index
-    
+        target_speeds_cfg = self.action_cfg.get("target_speeds", None)
+        target_speeds = (
+            np.array(target_speeds_cfg, dtype=float) if target_speeds_cfg is not None else None
+        )
+
         ego = EgoVehicle(
             road=self.road,
             position=ego_xy,
             speed=ego_speed,
             heading=heading_raw,
-            control_mode= self.control_mode,
-            #target_lane_index=target_lane_index,
-            target_speeds= np.array(self.config.get("target_speeds", []), dtype=float) if self.config.get("target_speeds", None) is not None else None,
-            lane_change_cooldown_steps= int(self.config.get("lane_change_cooldown_steps", 10)),
-            lateral_offset_step= float(self.config.get("lateral_offset_step", EgoVehicle.DEFAULT_LATERAL_OFFSET_STEP)),
-            lateral_offset_max= float(self.config.get("lateral_offset_max", EgoVehicle.DEFAULT_LATERAL_OFFSET_MAX)),
+            control_mode=self.control_mode,
+            target_speeds=target_speeds,
+            lane_change_cooldown_steps=int(
+                self.action_cfg.get("lane_change_cooldown_steps", 10)
+            ),
+            lateral_offset_step=float(
+                self.action_cfg.get(
+                    "lateral_offset_step",
+                    EgoVehicle.DEFAULT_LATERAL_OFFSET_STEP,
+                )
+            ),
+            lateral_offset_max=float(
+                self.action_cfg.get(
+                    "lateral_offset_max",
+                    EgoVehicle.DEFAULT_LATERAL_OFFSET_MAX,
+                )
+            ),
         )
         ego.set_ego_dimension(width=ego_wid, length=ego_len)
         self.road.vehicles.append(ego)
         self.vehicle = ego
-        
+
         if self.config.get("expert_test_mode", False):
             self._replay_xy_pol.append(self.vehicle.position.copy())
-        
+
         max_surr = int(self.config.get("max_surrounding", 0))
         if max_surr > 0:
-            spawn_surrounding_vehicles(self.trajectory_set, self._ego_start_index, max_surr, self.road)
-        
+            spawn_surrounding_vehicles(
+                self.trajectory_set,
+                self._ego_start_index,
+                max_surr,
+                self.road,
+            )
+
         if expert_mode:
             self._replay_xy_pol.append(self.vehicle.position.copy())
-    
+
     # -------------------------------------------------------------------------
     # REWARDS & TERMINATION
     # -------------------------------------------------------------------------
@@ -294,30 +338,37 @@ class NGSimEnv(AbstractEnv):
     # -------------------------------------------------------------------------
     # EXPERT METRICS & HELPERS
     # -------------------------------------------------------------------------
-    def _discrete_expert_action_from_tracker(self, steer_cmd: float, accel_cmd: float, lateral_error: float = 0.0) -> str:
+    def _discrete_expert_action_from_tracker(
+        self,
+        steer_cmd: float,
+        accel_cmd: float,
+        lateral_error: float = 0.0,
+    ) -> str:
         """
         Map (steer_cmd, accel_cmd, lateral_error) to one of:
         {"SLOWER", "IDLE", "FASTER", "STEER_LEFT", "STEER_RIGHT"}
         """
-        v_dead = float(self.config.get("expert_speed_deadband_mps", 0.5))
-        s_dead = 4 
-        # Using a deadband for lateral error to decide when to steer bias
-        lat_dead = 0.15 
-        prefer_speed = bool(self.config.get("expert_prefer_speed", False))
+        v_dead = float(self.expert_cfg.get("expert_speed_deadband_mps", 0.5))
+        s_dead = float(self.expert_cfg.get("expert_steer_deadband_rad", 0.05))
+        lat_dead = 0.15
+        prefer_speed = bool(self.expert_cfg.get("expert_prefer_speed", False))
         steps = self.steps
 
         expert_ref_v_pol = self._expert_ref_v_pol
         vehicle_speed = self.vehicle.speed
-        
-        # Updated to pass lateral_error (for steering bias logic)
-        return map_discrete_expert_action(steer_cmd, accel_cmd, 
-                                          expert_ref_v_pol, vehicle_speed, 
-                                          steps,
-                                          lateral_error=lateral_error, 
-                                          v_dead=v_dead, 
-                                          s_dead=s_dead,
-                                          lat_dead=lat_dead, 
-                                          prefer_speed=prefer_speed)
+
+        return map_discrete_expert_action(
+            steer_cmd,
+            accel_cmd,
+            expert_ref_v_pol,
+            vehicle_speed,
+            steps,
+            lateral_error=lateral_error,
+            v_dead=v_dead,
+            s_dead=s_dead,
+            lat_dead=lat_dead,
+            prefer_speed=prefer_speed,
+        )
 
     def expert_replay_metrics(self):
         if not hasattr(self, "_expert_ref_xy_pol"):
@@ -342,35 +393,26 @@ class NGSimEnv(AbstractEnv):
     # STEP
     # -------------------------------------------------------------------------
     def step(self, action: Action):
-        
         expert_action = None
         expert_action_str = None
         expert_action_idx = None
 
         expert_test = bool(self.config.get("expert_test_mode", False))
-        
-        if expert_test:
-            
 
-            # 1. Update Tracker & Get Target Data
+        if expert_test:
             pos = self.vehicle.position
             hdg = float(self.vehicle.heading)
             spd = float(self.vehicle.speed)
-            
-            # UNPACK 5 VALUES: Control Cmds + Indices + TARGET LANE ID
-            # (Requires your PurePursuitTracker to return these 5 values)
-            steer_cmd, accel_cmd, i_near, i_tgt, expert_target_lane_id = self._tracker.step(pos, hdg, spd)
-            #print('computed Expert Lane ID:',expert_target_lane_id)
-            #print('computed Steering Amount:',steer_cmd)
 
-            # 2. Calculate Lateral Error (Cross-Track) for "Hybrid Mimic" Drifting
+            steer_cmd, accel_cmd, i_near, i_tgt, expert_target_lane_id = self._tracker.step(
+                pos, hdg, spd
+            )
+
             lateral_error = 0.0
             if hasattr(self, "_expert_ref_xy_pol") and self.steps < len(self._expert_ref_xy_pol):
                 expert_pos = self._expert_ref_xy_pol[self.steps]
                 dx = expert_pos[0] - pos[0]
                 dy = expert_pos[1] - pos[1]
-                # Rotate global difference into vehicle's local frame
-                # Local Y (Left) = -sin(h)*dx + cos(h)*dy
                 lateral_error = -np.sin(hdg) * dx + np.cos(hdg) * dy
 
             # -----------------------------------------------------------
@@ -386,54 +428,40 @@ class NGSimEnv(AbstractEnv):
             # MODE B: DISCRETE EXPERT
             # -----------------------------------------------------------
             elif self.control_mode == "discrete":
-                
-                # --- PHASE 1: Lane Change Logic (Priority) ---
-                # Logic: "If the tracker's lookahead point is in a different lane, switch."
-                
-                # A. Identify Ego's "Mental" Lane ID
                 ego_current_id = 0
-                if self.vehicle.target_lane_index:
+                if getattr(self.vehicle, "target_lane_index", None):
                     ego_current_id = int(self.vehicle.target_lane_index[2])
 
-                # B. Compare with Expert's Target Lane
-                if expert_target_lane_id != -1:        
+                if expert_target_lane_id != -1:
                     valid_target_id = clamp_lane_id_for_x(self.net, pos[0], expert_target_lane_id)
-                    
                     delta = valid_target_id - ego_current_id
-                    
-                    # C. Issue Command if Valid
+
                     if delta > 0:
-                        # Check if the right lane actually exists physically
                         if self.vehicle._adjacent_lane_index(1) is not None:
                             expert_action_str = "LANE_RIGHT"
-                            
                     elif delta < 0:
-                        # Check if the left lane actually exists physically
                         if self.vehicle._adjacent_lane_index(-1) is not None:
                             expert_action_str = "LANE_LEFT"
 
-                # --- PHASE 2: Steer/Speed Logic (Secondary) ---
-                # If no lane change is commanded, determine lateral/longitudinal adjustments
-                #print('Lateral Error:', lateral_error)
                 if expert_action_str is None:
                     expert_action_str = self._discrete_expert_action_from_tracker(
                         steer_cmd, accel_cmd, lateral_error=lateral_error
                     )
 
-                # --- PHASE 3: Map String to Index ---
-                #print(self.action_type)
                 if not hasattr(self, "action_type") or not hasattr(self.action_type, "actions_indexes"):
-                     raise RuntimeError("Action type mismatch. Config must use DiscreteSteerMetaAction.")
-                
+                    raise RuntimeError(
+                        "Action type mismatch. Config must use DiscreteSteerMetaAction."
+                    )
+
                 if expert_action_str not in self.action_type.actions_indexes:
                     print(f"Warning: Expert action {expert_action_str} invalid. Defaulting to IDLE.")
                     expert_action_str = "IDLE"
 
                 expert_action_idx = int(self.action_type.actions_indexes[expert_action_str])
                 action = expert_action_idx
-                #print("Expert Action:", expert_action_str)
+
             else:
-                raise ValueError(f"Unknown expert_action_mode={self.control_mode!r}")
+                raise ValueError(f"Unknown action_mode={self.control_mode!r}")
 
             # -----------------------------------------------------------
             # LOGGING
@@ -450,12 +478,11 @@ class NGSimEnv(AbstractEnv):
         # -----------------------------------------------------------
         # EXECUTE SIMULATION STEP
         # -----------------------------------------------------------
-        #print("EgoVehicle.act received:", action, type(action), "control_mode=", self.vehicle.control_mode)
-        #print("vehicle speed:", self.vehicle.target_speed,"; control_mode: ", self.vehicle.control_mode, "; vehicle action: ", self.vehicle.act)
         obs, reward, terminated, truncated, info = super().step(action)
+
         if info is None:
             info = {}
-        # Populate Info Dict
+
         info["applied_action"] = action
         if expert_action is not None:
             info["expert_action_continuous"] = expert_action.copy()
@@ -463,7 +490,6 @@ class NGSimEnv(AbstractEnv):
             info["expert_action_discrete"] = expert_action_str
             info["expert_action_discrete_idx"] = expert_action_idx
 
-        # Record Trajectory for ADE/FDE metrics
         if expert_test:
             self._replay_xy_pol.append(self.vehicle.position.copy())
 

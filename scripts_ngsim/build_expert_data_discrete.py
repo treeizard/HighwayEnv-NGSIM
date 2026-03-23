@@ -95,28 +95,58 @@ def _dummy_action(env: gym.Env) -> int:
 # ----------------------------------------------------------------------
 # Rollout collection
 # ----------------------------------------------------------------------
-def collect_expert_rollouts_expert_mode(
+def build_unique_scenarios(env: gym.Env) -> list[tuple[str, int]]:
+    """
+    Extract all unique (episode_name, ego_id) pairs from the unwrapped NGSim env.
+    """
+    base = env.unwrapped
+    scenarios = []
+    for ep_name in base._episodes:
+        for ego_id in base._valid_ids_by_episode[ep_name]:
+            scenarios.append((str(ep_name), int(ego_id)))
+    return scenarios
+
+def collect_expert_rollouts_unique(
     base_cfg: Dict[str, Any],
     n_episodes: int,
     max_steps_per_episode: Optional[int],
     seed: int,
 ) -> Dict[str, np.ndarray]:
-    """
-    Collect transitions by stepping the env with a dummy action, then recording the
-    expert/applied action returned in info.
-    """
-    obs_buf: List[np.ndarray] = []
-    act_buf: List[np.ndarray] = []
-    next_obs_buf: List[np.ndarray] = []
-    done_buf: List[bool] = []
-    ep_id_buf: List[int] = []
+    obs_buf = []
+    act_buf = []
+    next_obs_buf = []
+    done_buf = []
+    ep_id_buf = []
 
-    for ep in range(n_episodes):
-        env = make_env(base_cfg)
-        obs, info = env.reset(seed=seed + ep)
+    # Build scenario pool once
+    probe_env = make_env(base_cfg)
+    scenarios = build_unique_scenarios(probe_env)
+    probe_env.close()
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(scenarios)
+
+    if n_episodes > len(scenarios):
+        raise ValueError(
+            f"Requested {n_episodes} episodes, but only {len(scenarios)} unique "
+            f"(episode_name, ego_id) pairs are available."
+        )
+
+    selected = scenarios[:n_episodes]
+
+    for ep_idx, (episode_name, ego_id) in enumerate(selected):
+        cfg = dict(base_cfg)
+        cfg["simulation_period"] = {"episode_name": episode_name}
+        cfg["ego_vehicle_ID"] = int(ego_id)
+
+        env = make_env(cfg)
+        obs, info = env.reset(seed=seed + ep_idx)
         obs = np.asarray(obs, dtype=np.float32).ravel()
 
-        print(f"[ExpertCollect] Episode {ep + 1}/{n_episodes}")
+        print(
+            f"[ExpertCollect] Episode {ep_idx + 1}/{n_episodes} | "
+            f"episode={episode_name} ego_id={ego_id}"
+        )
 
         done = False
         steps_in_ep = 0
@@ -130,44 +160,29 @@ def collect_expert_rollouts_expert_mode(
             next_obs = np.asarray(next_obs, dtype=np.float32).ravel()
             done = bool(terminated or truncated)
 
-            # EXTRACT DISCRETE ACTION INDEX
-            try:
-                a_used = _extract_applied_action(info)
-            except RuntimeError as e:
-                print(f"Error extracting action at step {steps_in_ep}: {e}")
-                break
+            a_used = _extract_applied_action(info)
 
             obs_buf.append(obs.copy())
             act_buf.append(a_used.copy())
             next_obs_buf.append(next_obs.copy())
             done_buf.append(done)
-            ep_id_buf.append(ep)
+            ep_id_buf.append(ep_idx)
 
             obs = next_obs
             steps_in_ep += 1
 
-        print(f"[ExpertCollect]   Collected {steps_in_ep} steps.")
         env.close()
 
     if len(obs_buf) == 0:
         raise RuntimeError("No transitions collected.")
 
-    data = {
+    return {
         "obs": np.stack(obs_buf, axis=0).astype(np.float32),
-        "acts": np.stack(act_buf, axis=0).astype(np.float32), # Shape [N, 1]
+        "acts": np.stack(act_buf, axis=0).astype(np.float32),
         "next_obs": np.stack(next_obs_buf, axis=0).astype(np.float32),
         "dones": np.asarray(done_buf, dtype=bool),
         "ep_id": np.asarray(ep_id_buf, dtype=np.int32),
     }
-
-    print(f"[ExpertCollect] Finished: {data['obs'].shape[0]} transitions.")
-    print(f"[ExpertCollect] obs_dim={data['obs'].shape[1]} act_dim={data['acts'].shape[1]}")
-    
-    # Sanity check for discrete actions
-    unique_acts = np.unique(data['acts'])
-    print(f"[ExpertCollect] Unique Discrete Actions Found: {unique_acts}")
-    
-    return data
 
 
 # ----------------------------------------------------------------------
@@ -225,7 +240,7 @@ def main() -> None:
         "lane_change_cooldown_steps": 10,
     }
 
-    dataset = collect_expert_rollouts_expert_mode(
+    dataset = collect_expert_rollouts_unique(
         base_cfg=base_cfg,
         n_episodes=args.episodes,
         max_steps_per_episode=args.max_steps,
