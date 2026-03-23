@@ -4,35 +4,47 @@ Collect a DISCRETE expert dataset from NGSimEnv.
 
 This script:
 1. Configures NGSimEnv with 'DiscreteSteerMetaAction'.
-2. Enables 'expert_test_mode' + 'expert_action_mode="discrete"'.
-3. Steps the environment.
-4. Extracts 'info["expert_action_discrete_idx"]' (the integer label calculated by the tracker).
-5. Saves the result to an NPZ file.
+2. Enables expert override mode with discrete expert actions.
+3. Steps the environment using a valid placeholder action.
+4. Reads the actual expert discrete action chosen by the environment from
+   info["expert_action_discrete_idx"].
+5. Saves a non-repeating dataset over unique (episode_name, ego_id) scenarios.
+
+Output arrays:
+    obs           float32 [N, obs_dim]
+    acts          int64   [N, 1]
+    next_obs      float32 [N, obs_dim]
+    dones         bool    [N]
+    ep_id         int32   [N]
+    episode_name  str     [N]
+    ego_id        int32   [N]
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
-import argparse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, Sequence
 
-import numpy as np
 import gymnasium as gym
-from gymnasium.envs.registration import register
+import numpy as np
+from gymnasium.envs.registration import register, registry
 from gymnasium.wrappers import FlattenObservation
 
 # ----------------------------------------------------------------------
 # Import project root so `highway_env` is importable
 # ----------------------------------------------------------------------
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
+PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
 
 # ----------------------------------------------------------------------
-# Register NGSimEnv
+# Register NGSimEnv safely
 # ----------------------------------------------------------------------
-register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
+ENV_ID = "NGSim-US101-v0"
+if ENV_ID not in registry:
+    register(id=ENV_ID, entry_point="highway_env.envs.ngsim_env:NGSimEnv")
 
 
 # ----------------------------------------------------------------------
@@ -50,10 +62,7 @@ def resolve_output_path(out_arg: str) -> str:
     if os.path.isabs(out_arg):
         return os.path.abspath(out_arg)
 
-    base_dir = os.environ.get("SLURM_SUBMIT_DIR")
-    if not base_dir:
-        base_dir = os.getcwd()
-
+    base_dir = os.environ.get("SLURM_SUBMIT_DIR") or os.getcwd()
     return os.path.abspath(os.path.join(base_dir, out_arg))
 
 
@@ -62,83 +71,125 @@ def resolve_output_path(out_arg: str) -> str:
 # ----------------------------------------------------------------------
 def make_env(config: Dict[str, Any]) -> gym.Env:
     """
-    Construct NGSim env using gym.make.
-    We use FlattenObservation to ensure 'obs' is a clean 1D vector.
+    Construct NGSim env using gym.make and flatten the observation to 1D.
     """
-    env = gym.make(
-        "NGSim-US101-v0",
-        config=config,
-    )
+    env = gym.make(ENV_ID, config=config)
     env = FlattenObservation(env)
     return env
 
 
 # ----------------------------------------------------------------------
-# Utilities for extracting expert/applied action
+# Action extraction
 # ----------------------------------------------------------------------
-def _extract_applied_action(info: Optional[Dict[str, Any]]) -> np.ndarray:
+def extract_expert_action(info: Optional[Dict[str, Any]]) -> np.ndarray:
     """
-    Extract the DISCRETE action index actually applied by the environment.
+    Extract the discrete expert action actually applied by the environment.
 
-    In our modified NGSimEnv, this is stored in info["expert_action_discrete_idx"].
-    We return it as a 1D numpy array of shape (1,) so it stacks consistently.
+    Expected primary key:
+        info["expert_action_discrete_idx"]
+
+    Fallback:
+        info["applied_action"]
+
+    Returns:
+        np.ndarray of shape (1,) and dtype int64.
     """
-    if info is None:
-        info = {}
+    info = info or {}
 
     if "expert_action_discrete_idx" in info:
-        idx = info["expert_action_discrete_idx"]
-        return np.array([idx], dtype=np.float32)
+        idx = int(info["expert_action_discrete_idx"])
+        return np.array([idx], dtype=np.int64)
 
     if "applied_action" in info:
         val = info["applied_action"]
         if np.isscalar(val):
-            return np.array([val], dtype=np.float32)
-        return np.asarray(val, dtype=np.float32).ravel()
+            return np.array([int(val)], dtype=np.int64)
+
+        arr = np.asarray(val).ravel()
+        if arr.size != 1:
+            raise RuntimeError(
+                "Expected a scalar discrete action in info['applied_action'], "
+                f"but got shape {arr.shape}."
+            )
+        return np.array([int(arr[0])], dtype=np.int64)
 
     raise RuntimeError(
-        "expert_test_mode=True but env.step() did not expose 'expert_action_discrete_idx'.\n"
-        "Check that your NGSimEnv.step() populates info['expert_action_discrete_idx']."
+        "expert_test_mode=True but env.step() did not expose "
+        "'expert_action_discrete_idx' or 'applied_action'."
     )
 
 
-def _dummy_action(env: gym.Env) -> int:
+def dummy_action(env: gym.Env) -> int:
     """
-    Create a valid dummy action for Discrete space.
+    Return a valid placeholder action.
+
+    In expert override mode, the env should ignore the semantic content of this
+    input and instead apply the internal expert action.
     """
-    return env.action_space.sample()
+    if not hasattr(env.action_space, "sample"):
+        raise RuntimeError("Environment action_space does not support sampling.")
+    return int(env.action_space.sample())
 
 
 # ----------------------------------------------------------------------
-# Rollout collection
+# Scenario enumeration
 # ----------------------------------------------------------------------
 def build_unique_scenarios(env: gym.Env) -> list[tuple[str, int]]:
     """
     Extract all unique (episode_name, ego_id) pairs from the unwrapped NGSim env.
     """
     base = env.unwrapped
-    scenarios = []
+
+    if not hasattr(base, "_episodes"):
+        raise AttributeError("Env is missing attribute '_episodes'.")
+    if not hasattr(base, "_valid_ids_by_episode"):
+        raise AttributeError("Env is missing attribute '_valid_ids_by_episode'.")
+
+    scenarios: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+
     for ep_name in base._episodes:
+        if ep_name not in base._valid_ids_by_episode:
+            continue
+
         for ego_id in base._valid_ids_by_episode[ep_name]:
-            scenarios.append((str(ep_name), int(ego_id)))
+            key = (str(ep_name), int(ego_id))
+            if key in seen:
+                continue
+            seen.add(key)
+            scenarios.append(key)
+
+    if not scenarios:
+        raise RuntimeError("No valid (episode_name, ego_id) scenarios found.")
+
     return scenarios
 
+
+# ----------------------------------------------------------------------
+# Rollout collection
+# ----------------------------------------------------------------------
 def collect_expert_rollouts_unique(
     base_cfg: Dict[str, Any],
     n_episodes: int,
     max_steps_per_episode: Optional[int],
     seed: int,
 ) -> Dict[str, np.ndarray]:
-    obs_buf = []
-    act_buf = []
-    next_obs_buf = []
-    done_buf = []
-    ep_id_buf = []
+    """
+    Collect expert transitions from unique (episode_name, ego_id) scenarios.
+    """
+    obs_buf: list[np.ndarray] = []
+    act_buf: list[np.ndarray] = []
+    next_obs_buf: list[np.ndarray] = []
+    done_buf: list[bool] = []
+    ep_id_buf: list[int] = []
+    episode_name_buf: list[str] = []
+    ego_id_buf: list[int] = []
 
-    # Build scenario pool once
     probe_env = make_env(base_cfg)
-    scenarios = build_unique_scenarios(probe_env)
-    probe_env.close()
+    try:
+        scenarios = build_unique_scenarios(probe_env)
+    finally:
+        probe_env.close()
 
     rng = np.random.default_rng(seed)
     rng.shuffle(scenarios)
@@ -146,101 +197,94 @@ def collect_expert_rollouts_unique(
     if n_episodes > len(scenarios):
         raise ValueError(
             f"Requested {n_episodes} episodes, but only {len(scenarios)} unique "
-            f"(episode_name, ego_id) pairs are available."
+            "(episode_name, ego_id) pairs are available."
         )
 
     selected = scenarios[:n_episodes]
+    used_keys: set[tuple[str, int]] = set()
 
     for ep_idx, (episode_name, ego_id) in enumerate(selected):
+        key = (episode_name, ego_id)
+        if key in used_keys:
+            raise RuntimeError(f"Duplicate scenario selected unexpectedly: {key}")
+        used_keys.add(key)
+
         cfg = dict(base_cfg)
         cfg["simulation_period"] = {"episode_name": episode_name}
         cfg["ego_vehicle_ID"] = int(ego_id)
 
         env = make_env(cfg)
-        obs, info = env.reset(seed=seed + ep_idx)
-        obs = np.asarray(obs, dtype=np.float32).ravel()
+        try:
+            obs, info = env.reset(seed=seed + ep_idx)
+            obs = np.asarray(obs, dtype=np.float32).ravel()
 
-        print(
-            f"[ExpertCollect] Episode {ep_idx + 1}/{n_episodes} | "
-            f"episode={episode_name} ego_id={ego_id}"
-        )
+            print(
+                f"[ExpertCollect] Episode {ep_idx + 1}/{n_episodes} | "
+                f"episode={episode_name} ego_id={ego_id}"
+            )
 
-        done = False
-        steps_in_ep = 0
+            done = False
+            steps_in_ep = 0
 
-        while not done:
-            if max_steps_per_episode is not None and steps_in_ep >= max_steps_per_episode:
-                break
+            while not done:
+                if max_steps_per_episode is not None and steps_in_ep >= max_steps_per_episode:
+                    break
 
-            dummy = _dummy_action(env)
-            next_obs, reward, terminated, truncated, info = env.step(dummy)
-            next_obs = np.asarray(next_obs, dtype=np.float32).ravel()
-            done = bool(terminated or truncated)
+                act_in = dummy_action(env)
+                next_obs, reward, terminated, truncated, info = env.step(act_in)
+                del reward  # reward is not used for dataset export
 
-            try:
-                a_used = _extract_applied_action(info)
-            except RuntimeError as e:
-                print(f"Error extracting action at step {steps_in_ep}: {e}")
-                break
+                next_obs = np.asarray(next_obs, dtype=np.float32).ravel()
+                done = bool(terminated or truncated)
 
-            obs_buf.append(obs.copy())
-            act_buf.append(a_used.copy())
-            next_obs_buf.append(next_obs.copy())
-            done_buf.append(done)
-            ep_id_buf.append(ep_idx)
+                a_used = extract_expert_action(info)
 
-            obs = next_obs
-            steps_in_ep += 1
+                obs_buf.append(obs.copy())
+                act_buf.append(a_used.copy())
+                next_obs_buf.append(next_obs.copy())
+                done_buf.append(done)
+                ep_id_buf.append(ep_idx)
+                episode_name_buf.append(episode_name)
+                ego_id_buf.append(int(ego_id))
 
-        env.close()
+                obs = next_obs
+                steps_in_ep += 1
 
-    if len(obs_buf) == 0:
+        finally:
+            env.close()
+
+    if not obs_buf:
         raise RuntimeError("No transitions collected.")
 
-    return {
+    data: Dict[str, np.ndarray] = {
         "obs": np.stack(obs_buf, axis=0).astype(np.float32),
-        "acts": np.stack(act_buf, axis=0).astype(np.float32), # Shape [N, 1]
+        "acts": np.stack(act_buf, axis=0).astype(np.int64),   # [N, 1]
         "next_obs": np.stack(next_obs_buf, axis=0).astype(np.float32),
         "dones": np.asarray(done_buf, dtype=bool),
         "ep_id": np.asarray(ep_id_buf, dtype=np.int32),
+        "episode_name": np.asarray(episode_name_buf, dtype="<U64"),
+        "ego_id": np.asarray(ego_id_buf, dtype=np.int32),
     }
 
     print(f"[ExpertCollect] Finished: {data['obs'].shape[0]} transitions.")
-    print(f"[ExpertCollect] obs_dim={data['obs'].shape[1]} act_dim={data['acts'].shape[1]}")
-    
-    # Sanity check for discrete actions
-    unique_acts = np.unique(data['acts'])
-    print(f"[ExpertCollect] Unique Discrete Actions Found: {unique_acts}")
-    
+    print(
+        f"[ExpertCollect] obs_dim={data['obs'].shape[1]} "
+        f"act_dim={data['acts'].shape[1]}"
+    )
+    print(f"[ExpertCollect] Unique discrete actions found: {np.unique(data['acts'].ravel())}")
+    print(f"[ExpertCollect] Unique scenarios used: {len(used_keys)}")
+
     return data
 
 
 # ----------------------------------------------------------------------
-# CLI and entrypoint
+# Config
 # ----------------------------------------------------------------------
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Collect NGSim expert dataset (DISCRETE actions)."
-    )
-    parser.add_argument("--episodes", type=int, default=100, help="Number of episodes to collect.")
-    parser.add_argument("--max_steps", type=int, default=None, help="Optional cap on steps per episode.")
-    parser.add_argument(
-        "--out",
-        type=str,
-        default="expert_data/ngsim_expert_discrete.npz",
-        help=(
-            "Output NPZ path. Can be absolute, or relative. "
-            "Relative paths are resolved against SLURM_SUBMIT_DIR when running under SLURM, "
-            "otherwise against the current working directory."
-        ),
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Base RNG seed.")
-    args = parser.parse_args()
-
-    print(f"[ExpertCollect] Current working directory: {os.getcwd()}")
-    print(f"[ExpertCollect] SLURM_SUBMIT_DIR: {os.environ.get('SLURM_SUBMIT_DIR', '<not set>')}")
-
-    base_cfg: Dict[str, Any] = {
+def build_base_config() -> Dict[str, Any]:
+    """
+    Build the default environment config for expert dataset collection.
+    """
+    return {
         "scene": "us-101",
         "observation": {
             "type": "LidarObservation",
@@ -248,7 +292,9 @@ def main() -> None:
             "maximum_range": 64,
             "normalize": True,
         },
-        "action": {"type": "DiscreteSteerMetaAction"},
+        "action": {
+            "type": "DiscreteSteerMetaAction",
+        },
         "show_trajectories": False,
         "simulation_frequency": 10,
         "policy_frequency": 10,
@@ -262,10 +308,59 @@ def main() -> None:
         "ego_vehicle_ID": None,
         "max_surrounding": 20000,
         "expert_test_mode": True,
-        "action_mode": "discrete",
+        "action_mode": "discrete",   # keep this aligned with your env implementation
         "expert_prefer_speed": False,
         "lane_change_cooldown_steps": 10,
     }
+
+
+# ----------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Collect NGSim expert dataset with non-repeating discrete expert actions."
+    )
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=100,
+        help="Number of unique (episode_name, ego_id) scenarios to collect.",
+    )
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=None,
+        help="Optional cap on steps per episode.",
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default="expert_data/ngsim_expert_discrete.npz",
+        help=(
+            "Output NPZ path. If relative, resolve against SLURM_SUBMIT_DIR when set, "
+            "otherwise against current working directory."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Base RNG seed used for scenario shuffle and env reset.",
+    )
+    return parser.parse_args()
+
+
+# ----------------------------------------------------------------------
+# Entrypoint
+# ----------------------------------------------------------------------
+def main() -> None:
+    args = parse_args()
+
+    print(f"[ExpertCollect] Current working directory: {os.getcwd()}")
+    print(f"[ExpertCollect] SLURM_SUBMIT_DIR: {os.environ.get('SLURM_SUBMIT_DIR', '<not set>')}")
+
+    base_cfg = build_base_config()
 
     dataset = collect_expert_rollouts_unique(
         base_cfg=base_cfg,
