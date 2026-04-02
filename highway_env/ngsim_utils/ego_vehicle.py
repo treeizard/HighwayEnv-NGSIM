@@ -9,7 +9,7 @@ from highway_env.road.road import LaneIndex, Road, Route
 from highway_env.utils import Vector
 from highway_env.vehicle.kinematics import Vehicle
 
-from highway_env.ngsim_utils.gen_road import clamp_location_ngsim
+from highway_env.ngsim_utils.helper_ngsim import edge_from_x
 
 
 class EgoVehicle(Vehicle):
@@ -72,7 +72,6 @@ class EgoVehicle(Vehicle):
         position: Vector,
         heading: float = 0.0,
         speed: float = 0.0,
-        #target_lane_index: LaneIndex | None = None,
         target_speed: float | None = None,
         route: Route | None = None,
         control_mode: str = "discrete",
@@ -121,7 +120,7 @@ class EgoVehicle(Vehicle):
         self.lane_change_cooldown_steps = int(max(0, lane_change_cooldown_steps))
         self._lane_change_cooldown = 0
 
-        # Lange-change direction
+        # Lane-change direction: -1 left, +1 right, 0 none.
         self.lane_change_direction = 0
 
     # --------------------------
@@ -163,15 +162,7 @@ class EgoVehicle(Vehicle):
     # NGSIM section helpers (consistent with your create_ngsim_101_road)
     # --------------------------
     def _main_edge_from_x(self, x: float) -> tuple[str, str]:
-        length = 2150 / 3.281
-        ends = [0.0, 560 / 3.281, (698 + 578 + 150) / 3.281, length]
-
-        x_m = float(x)
-        if x_m < ends[1]:
-            return ("s1", "s2")  # 5 lanes
-        if x_m < ends[2]:
-            return ("s2", "s3")  # 6 lanes
-        return ("s3", "s4")      # 5 lanes
+        return edge_from_x(self.road.network, x)
 
     def _current_edge_lane_index(self) -> LaneIndex:
         """
@@ -470,7 +461,6 @@ class EgoVehicle(Vehicle):
             "acceleration": self.speed_control(self.target_speed),
         }
 
-        #print(act if act is not None else "NO_NEW_ACTION")
         super().act(low_level_action)
 
     # --------------------------
@@ -513,52 +503,3 @@ class EgoVehicle(Vehicle):
             for t in times
         ]
         return tuple(zip(*pos_heads))
-
-
-def create_ego_vehicle(net, road, ego_traj, ego_len, ego_wid, ego_start_index, config):
-    """Create the ego vehicle and set its initial position, speed, and heading."""
-    ego_traj = ego_traj[ego_start_index :]
-    if len(ego_traj) < 2:
-        raise RuntimeError(f"Ego trajectory too short after truncation (len={len(ego_traj)}).")
-
-    x0, y0, ego_speed, lane0 = ego_traj[0]
-    ego_xy = np.array([x0, y0], dtype=float)
-    # Compute heading from ego_trajectory
-    dx0 = ego_traj[1, 0] - ego_traj[0, 0]
-    dy0 = ego_traj[1, 1] - ego_traj[0, 1]
-
-    disp = np.hypot(dx0, dy0)
-
-    MIN_DISP = 0.1  # meters (reasonable for NGSIM @ 10Hz)
-
-    if disp >= MIN_DISP:
-        heading_raw = np.arctan2(dy0, dx0)
-    else:
-        heading_raw = 0.0  # safe only for first frame
-
-    ego_lane = clamp_location_ngsim(x0, lane0, net, warning=False)
-    target_lane_index = ego_lane.index  # LaneIndex tuple
-
-    expert_mode = bool(config.get("expert_test_mode", False))
-    expert_action_mode = str(config.get("expert_action_mode", "continuous"))
-    
-    if expert_mode and expert_action_mode == "discrete":
-            ego_control_mode = "discrete"
-    else:
-        ego_control_mode = "continuous" if (expert_mode and expert_action_mode == "continuous") else "continuous"
-
-    ego = EgoVehicle(
-        road=road,
-        position=ego_xy,
-        speed=ego_speed,
-        heading=heading_raw,
-        control_mode=ego_control_mode,
-        target_lane_index=target_lane_index,
-        target_speeds=np.array(config.get("target_speeds", []), dtype=float) if config.get("target_speeds", None) is not None else None,
-        lane_change_cooldown_steps=int(config.get("lane_change_cooldown_steps", 10)),
-        lateral_offset_step=float(config.get("lateral_offset_step", EgoVehicle.DEFAULT_LATERAL_OFFSET_STEP)),
-        lateral_offset_max=float(config.get("lateral_offset_max", EgoVehicle.DEFAULT_LATERAL_OFFSET_MAX)),
-    )
-    ego.set_ego_dimension(width=ego_wid, length=ego_len)
-
-    return ego

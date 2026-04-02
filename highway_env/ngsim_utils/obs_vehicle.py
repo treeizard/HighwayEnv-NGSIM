@@ -25,6 +25,7 @@ from typing import Tuple, Optional
 from highway_env import utils
 from highway_env.vehicle.behavior import IDMVehicle
 from highway_env.ngsim_utils.ego_vehicle import EgoVehicle
+from highway_env.ngsim_utils.helper_ngsim import target_lane_index_from_lane_id
 from highway_env.ngsim_utils.trajectory_gen import process_raw_trajectory
 
 @dataclass
@@ -90,6 +91,7 @@ class NGSIMVehicle(IDMVehicle):
         v_length=None,
         v_width=None,
         ngsim_traj=None,
+        scene: str | None = None,
         color=None,
     ):
         super().__init__(
@@ -109,6 +111,8 @@ class NGSIMVehicle(IDMVehicle):
             np.asarray(ngsim_traj, dtype=float) if ngsim_traj is not None else None
         )
         self.vehicle_ID = vehicle_ID
+        if scene is not None:
+            self.SCENE = str(scene)
 
         # Replay state
         self.sim_steps = 0
@@ -134,7 +138,7 @@ class NGSIMVehicle(IDMVehicle):
         self.visible = self.appear
 
         # Diagnostics
-        self.traj = np.array(self.position, dtype=float)
+        self.traj = np.array([self.position.copy()], dtype=float)
         self.speed_history = []
         self.heading_history = []
         self.crash_history = []
@@ -151,7 +155,7 @@ class NGSIMVehicle(IDMVehicle):
             # Ghost: zero footprint
             self.LENGTH = 0.0
             self.WIDTH  = 0.0
-        self.diagonal = np.sqrt(self.LENGTH**2 + self.WIDTH**2)
+        self._update_diagonal()
 
         self.color = color if color is not None else self.DEFAULT_COLOR
     # ---------------- Factory ----------------
@@ -164,6 +168,7 @@ class NGSIMVehicle(IDMVehicle):
         v_length,
         v_width,
         ngsim_traj,
+        scene: str | None = None,
         heading: float = 0.0,
         speed: float = 15.0,
         color=None,  
@@ -177,10 +182,28 @@ class NGSIMVehicle(IDMVehicle):
             v_length=v_length,
             v_width=v_width,
             ngsim_traj=ngsim_traj,
+            scene=scene,
             color=color,
         )
 
     # ---------------- Behaviour ----------------
+    def _update_diagonal(self) -> None:
+        self.diagonal = float(np.hypot(self.LENGTH, self.WIDTH))
+
+    def _set_visibility_from_appearance(self, appear: bool) -> None:
+        self.appear = bool(appear)
+        self.visible = self.appear
+        if self.appear:
+            self.LENGTH = self.real_length
+            self.WIDTH = self.real_width
+        else:
+            self.LENGTH = 0.0
+            self.WIDTH = 0.0
+        self._update_diagonal()
+
+    def _record_position(self) -> None:
+        self.traj = np.vstack([self.traj, self.position.copy()])
+
     def act(self, action: dict | str = None):
         """
         Only act (IDM/MOBIL) once we are overtaken.
@@ -217,16 +240,7 @@ class NGSIMVehicle(IDMVehicle):
         self.position = np.array([cur_x, cur_y], dtype=float)
 
         # Update appear/visible + footprint for this frame
-        self.appear = bool(cur_x != 0.0)
-        self.visible = self.appear  # <- critical for rendering
-
-        if not self.appear:
-            # Ghost: no collisions / display footprint
-            self.LENGTH = 0.0
-            self.WIDTH = 0.0
-        else:
-            self.LENGTH = self.real_length
-            self.WIDTH = self.real_width
+        self._set_visibility_from_appearance(cur_x != 0.0)
 
         # Speed from spatial difference (fallback to recorded v)
         dx = nxt_x - cur_x
@@ -238,11 +252,18 @@ class NGSIMVehicle(IDMVehicle):
         self.speed = speed_est if speed_est > 1e-3 else float(cur_v)
         self.target_speed = self.speed
 
-        # ---- Attach to nearest lane and take heading from lane geometry ----
-        self.lane_index = self.road.network.get_closest_lane_index(self.position)
+        # Prefer the recorded lane id during replay; fall back to closest geometry.
+        mapped_lane_index = target_lane_index_from_lane_id(
+            self.road.network, self.SCENE, self.position[0], cur_lane
+        )
+        self.lane_index = (
+            mapped_lane_index
+            if mapped_lane_index is not None
+            else self.road.network.get_closest_lane_index(self.position)
+        )
         self.lane = self.road.network.get_lane(self.lane_index)
 
-        local_s, local_r = self.lane.local_coordinates(self.position)
+        local_s, _local_r = self.lane.local_coordinates(self.position)
         self.heading = self.lane.heading_at(local_s)
 
     def _front_gap_logic(self):
@@ -318,43 +339,25 @@ class NGSIMVehicle(IDMVehicle):
                 self.ngsim_traj[min(self.sim_steps, len(self.ngsim_traj) - 1)][3]
             )
             x = self.position[0]
-            target_lane_index = None
-
-            if self.SCENE == "us-101":
-                if lane_id <= 5:
-                    if 0 < x <= 560 / 3.281:
-                        target_lane_index = ("s1", "s2", lane_id - 1)
-                    elif 560 / 3.281 < x <= (698 + 578 + 150) / 3.281:
-                        target_lane_index = ("s2", "s3", lane_id - 1)
-                    else:
-                        target_lane_index = ("s3", "s4", lane_id - 1)
-                elif lane_id == 6:
-                    target_lane_index = ("s2", "s3", -1)
-                elif lane_id == 7:
-                    target_lane_index = ("merge_in", "s2", -1)
-                elif lane_id == 8:
-                    target_lane_index = ("s3", "merge_out", -1)
-            elif self.SCENE == "i-80":
-                if lane_id <= 6:
-                    if 0 < x <= 600 / 3.281:
-                        target_lane_index = ("s1", "s2", lane_id - 1)
-                    elif 600 / 3.281 < x <= 700 / 3.281:
-                        target_lane_index = ("s2", "s3", lane_id - 1)
-                    elif 700 / 3.281 < x <= 900 / 3.281:
-                        target_lane_index = ("s3", "s4", lane_id - 1)
-                    else:
-                        target_lane_index = ("s4", "s5", lane_id - 1)
-                elif lane_id == 7:
-                    target_lane_index = ("s1", "s2", -1)
+            target_lane_index = target_lane_index_from_lane_id(
+                self.road.network, self.SCENE, x, lane_id
+            )
 
             if target_lane_index is not None:
                 self.target_lane_index = target_lane_index
+
+            # Do not hand ghost vehicles with zero footprint to the IDM bicycle model.
+            if not self.appear or self.LENGTH <= 0.0 or self.WIDTH <= 0.0:
+                self.speed = 0.0
+                self.target_speed = 0.0
+                self._record_position()
+                return
 
             # Now evolve with IDM/MOBIL dynamics
             super().step(dt)
 
         # Record replayed / simulated position
-        self.traj = np.append(self.traj, self.position, axis=0)
+        self._record_position()
 
 
     # ---------------- Collision handling ----------------
@@ -425,6 +428,45 @@ def spawn_surrounding_vehicles(
     spawned = 0
     unlimited = max_surrounding is None
 
+    def _heading_from_traj(traj: np.ndarray, idx: int) -> float:
+        """Estimate heading from the current and next non-zero trajectory samples."""
+        if len(traj) < 2:
+            return 0.0
+
+        cur = traj[idx]
+        for next_idx in range(idx + 1, len(traj)):
+            nxt = traj[next_idx]
+            if np.any(nxt[:2] != 0.0):
+                dx = float(nxt[0] - cur[0])
+                dy = float(nxt[1] - cur[1])
+                if math.hypot(dx, dy) > 1e-3:
+                    return float(math.atan2(dy, dx))
+        return 0.0
+
+    def _intersects_existing(
+        position: np.ndarray,
+        heading: float,
+        length: float,
+        width: float,
+    ) -> bool:
+        candidate = (position, length, width, heading)
+        for other in road.vehicles:
+            if not getattr(other, "visible", True):
+                continue
+            other_length = float(getattr(other, "LENGTH", 0.0))
+            other_width = float(getattr(other, "WIDTH", 0.0))
+            if other_length <= 0.0 or other_width <= 0.0:
+                continue
+            other_rect = (
+                np.array(other.position, dtype=float),
+                other_length,
+                other_width,
+                float(getattr(other, "heading", 0.0)),
+            )
+            if utils.rotated_rectangles_intersect(candidate, other_rect):
+                return True
+        return False
+
     for vid, meta in trajectory_set.items():
         if vid == "ego":
             continue
@@ -445,28 +487,44 @@ def spawn_surrounding_vehicles(
         traj = traj[first_idx:]
         if len(traj) < 2:
             continue
-        
-        if scene == 'us-101':
-            v = NGSIMVehicle.create(
-                road=road,
-                vehicle_ID=vid,
-                position=traj[0][:2],
-                v_length=meta["length"] / f2m_conv,
-                v_width=meta["width"] / f2m_conv,
-                ngsim_traj=traj,
-                speed=traj[0][2],
-                color=(200, 0, 150),
-            )
+
+        if scene == "us-101":
+            v_length = meta["length"] / f2m_conv
+            v_width = meta["width"] / f2m_conv
         else:
-            v = NGSIMVehicle.create(
-                road=road,
-                vehicle_ID=vid,
-                position=traj[0][:2],
-                v_length=meta["length"],
-                v_width=meta["width"],
-                ngsim_traj=traj,
-                speed=traj[0][2],
-                color=(200, 0, 150),
-            )
+            v_length = meta["length"]
+            v_width = meta["width"]
+
+        spawn_idx = None
+        spawn_heading = 0.0
+        for idx in range(len(traj) - 1):
+            pos = np.array(traj[idx][:2], dtype=float)
+            if not np.any(pos != 0.0):
+                continue
+            heading = _heading_from_traj(traj, idx)
+            if not _intersects_existing(pos, heading, v_length, v_width):
+                spawn_idx = idx
+                spawn_heading = heading
+                break
+
+        if spawn_idx is None:
+            continue
+
+        traj = traj[spawn_idx:]
+        if len(traj) < 2:
+            continue
+        
+        v = NGSIMVehicle.create(
+            road=road,
+            vehicle_ID=vid,
+            position=traj[0][:2],
+            v_length=v_length,
+            v_width=v_width,
+            ngsim_traj=traj,
+            scene=scene,
+            heading=spawn_heading,
+            speed=traj[0][2],
+            color=(200, 0, 150),
+        )
         road.vehicles.append(v)
         spawned += 1

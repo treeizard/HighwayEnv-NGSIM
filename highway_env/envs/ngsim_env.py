@@ -1,9 +1,10 @@
 # Modified by: Yide Tao (yide.tao@monash.edu)
 from __future__ import annotations
 
+import logging
 import os
 from copy import deepcopy
-from typing import Any, Dict
+from typing import Any
 
 import numpy as np
 
@@ -28,9 +29,14 @@ from highway_env.ngsim_utils.ego_vehicle import EgoVehicle
 
 
 # Constants
+logger = logging.getLogger(__name__)
 f2m_conv = 3.281
 MAX_ACCEL = 5.0
 MAX_STEER = np.pi / 4
+ROAD_BUILDERS = {
+    "us-101": create_ngsim_101_road,
+    "japanese": create_japanese_road,
+}
 
 
 def _deep_update(base: dict, override: dict) -> dict:
@@ -104,38 +110,41 @@ class NGSimEnv(AbstractEnv):
         cfg = self.default_config() if config is None else _deep_update(self.default_config(), config)
 
         # Normalize control/action mode before AbstractEnv constructs action_type
-        self.control_mode = str(cfg.get("action_mode", "continuous")).lower()
-        if self.control_mode == "continuous":
-            cfg["action"] = {"type": "ContinuousAction"}
-        elif self.control_mode == "discrete":
-            cfg["action"] = {"type": "DiscreteSteerMetaAction"}
-        else:
-            raise ValueError(f"Unknown action_mode={self.control_mode!r}")
+        self.control_mode = self._normalize_action_mode(cfg)
+        self.scene = str(cfg["scene"])
 
         self._episodes: list[str] = []
-        self._episode_root: str | None = None
         self._valid_ids_by_episode: dict[str, np.ndarray] = {}
-        self._episode_cache: Dict[str, Dict[str, Any]] = {}
         self.ego_id: int | None = None
-        self._ego_id: int | None = None
 
         # Expert debug
-        self._expert_actions_sim: np.ndarray | None = None
-        self._expert_times: np.ndarray | None = None
         self._max_traj_policy_steps: int | None = None
         self._replay_xy_pol: list[np.ndarray] = []
 
-        # Prebuilt trajectories
-        # cfg["scene"] WARNING TEsting
-        self._prebuilt_dir = os.path.join(cfg["episode_root"], cfg["scene"], "prebuilt")
-        veh_ids_path = os.path.join(self._prebuilt_dir, "veh_ids_train.npy")
-        traj_path = os.path.join(self._prebuilt_dir, "trajectory_train.npy")
+        self._load_prebuilt_data(cfg["episode_root"], self.scene)
 
+        super().__init__(config=cfg, render_mode=render_mode)
+
+    def _normalize_action_mode(self, cfg: dict) -> str:
+        control_mode = str(cfg.get("action_mode", "continuous")).lower()
+        action_types = {
+            "continuous": "ContinuousAction",
+            "discrete": "DiscreteSteerMetaAction",
+        }
+        if control_mode not in action_types:
+            raise ValueError(f"Unknown action_mode={control_mode!r}")
+        cfg["action"] = {"type": action_types[control_mode]}
+        return control_mode
+
+    def _load_prebuilt_data(self, episode_root: str, scene: str) -> None:
+        prebuilt_dir = os.path.join(episode_root, scene, "prebuilt")
+        veh_ids_path = os.path.join(prebuilt_dir, "veh_ids_train.npy")
+        traj_path = os.path.join(prebuilt_dir, "trajectory_train.npy")
+
+        self._prebuilt_dir = prebuilt_dir
         self._valid_ids_by_episode = np.load(veh_ids_path, allow_pickle=True).item()
         self._traj_all_by_episode = np.load(traj_path, allow_pickle=True).item()
         self._episodes = sorted(self._traj_all_by_episode.keys())
-
-        super().__init__(config=cfg, render_mode=render_mode)
 
     @property
     def dt(self) -> float:
@@ -148,6 +157,10 @@ class NGSimEnv(AbstractEnv):
     @property
     def expert_cfg(self) -> dict:
         return self.config.get("expert_v", {})
+
+    @property
+    def expert_test_mode(self) -> bool:
+        return bool(self.config.get("expert_test_mode", False))
 
     # -------------------------------------------------------------------------
     # RESET
@@ -163,7 +176,7 @@ class NGSimEnv(AbstractEnv):
         self._create_road()
         self._create_vehicles()
 
-        if self.config.get("expert_test_mode", False):
+        if self.expert_test_mode:
             self._replay_xy_pol = [self.vehicle.position.copy()]
 
     # -------------------------------------------------------------------------
@@ -173,41 +186,44 @@ class NGSimEnv(AbstractEnv):
         sim_period = self.config.get("simulation_period", None)
         explicit_ego_id = self.config.get("ego_vehicle_ID", None)
 
+        self.episode_name = self._select_episode_name(sim_period)
+        valid_ids = self._valid_ids_by_episode[self.episode_name]
+        self.ego_id = self._select_ego_id(valid_ids, explicit_ego_id)
+        self.trajectory_set = self._build_trajectory_set(self.episode_name, self.ego_id)
+
+        logger.info("Loaded episode=%s ego_id=%s", self.episode_name, self.ego_id)
+
+    def _select_episode_name(self, sim_period: Any) -> str:
         if isinstance(sim_period, dict) and "episode_name" in sim_period:
             episode_name = sim_period["episode_name"]
             if episode_name not in self._traj_all_by_episode:
                 raise ValueError(f"Episode {episode_name} not found.")
-            self.episode_name = episode_name
-        else:
-            self.episode_name = self.np_random.choice(self._episodes)
+            return str(episode_name)
+        return str(self.np_random.choice(self._episodes))
 
-        valid_ids = self._valid_ids_by_episode[self.episode_name]
+    def _select_ego_id(self, valid_ids: np.ndarray, explicit_ego_id: int | None) -> int:
         if explicit_ego_id is None:
-            self.ego_id = int(self.np_random.choice(valid_ids))
-        else:
-            if explicit_ego_id not in valid_ids:
-                #print(valid_ids)
-                raise ValueError(f"Ego ID {explicit_ego_id} not in {self.episode_name}")
-            self.ego_id = int(explicit_ego_id)
+            return int(self.np_random.choice(valid_ids))
+        if explicit_ego_id not in valid_ids:
+            raise ValueError(f"Ego ID {explicit_ego_id} not in {self.episode_name}")
+        return int(explicit_ego_id)
 
-        traj_all = self._traj_all_by_episode[self.episode_name]
-        traj_set = {"ego": traj_all[self.ego_id]}
-        for vid, meta in traj_all.items():
-            if vid == self.ego_id:
-                continue
-            traj_set[vid] = meta
-        self.trajectory_set = traj_set
-        print(self.episode_name, self.ego_id)
+    def _build_trajectory_set(self, episode_name: str, ego_id: int) -> dict[Any, Any]:
+        traj_all = self._traj_all_by_episode[episode_name]
+        return {
+            "ego": traj_all[ego_id],
+            **{vid: meta for vid, meta in traj_all.items() if vid != ego_id},
+        }
 
     
     # -------------------------------------------------------------------------
     # ROAD + VEHICLES + Test Mode
     # -------------------------------------------------------------------------
     def _create_road(self):
-        if self.config["scene"] == "japanese":
-            net = create_japanese_road()
-        else:    
-            net = create_ngsim_101_road()
+        builder = ROAD_BUILDERS.get(self.scene)
+        if builder is None:
+            raise ValueError(f"Unsupported scene={self.scene!r}")
+        net = builder()
         self.net = net
         self.road = Road(
             network=net,
@@ -216,44 +232,32 @@ class NGSimEnv(AbstractEnv):
         )
 
     def _create_vehicles(self):
-        self.scene = self.config['scene']
-
         ego_rec = self.trajectory_set["ego"]
         ego_traj_full = load_ego_trajectory(ego_rec, self.scene)
         ego_len, ego_wid = get_ego_dimensions(ego_rec, f2m_conv, self.scene)
+        self._replay_xy_pol.clear()
 
-        if not hasattr(self, "_replay_xy_pol"):
-            self._replay_xy_pol = []
-        else:
-            self._replay_xy_pol.clear()
+        ego_traj = self._prepare_ego_trajectory(ego_rec, ego_traj_full, ego_len)
+        ego = self._build_ego_vehicle(ego_traj, ego_len, ego_wid)
+        self.road.vehicles.append(ego)
+        self.vehicle = ego
 
-        expert_mode = bool(self.config.get("expert_test_mode", False))
+        if self.expert_test_mode:
+            self._replay_xy_pol.append(self.vehicle.position.copy())
 
-        if expert_mode:
-            ref_xy_pol, ref_v_pol, lane_pol, start_idx = setup_expert_tracker(
-                self.net, ego_traj_full, ego_len, self.config
-            )
-            self._expert_ref_xy_pol = ref_xy_pol
-            self._expert_ref_v_pol = ref_v_pol
-            self._expert_ref_lane_pol = lane_pol - 1
-            self._ego_start_index = start_idx
+        self._spawn_surrounding_vehicles()
 
-            self._tracker = PurePursuitTracker(
-                ref_xy=self._expert_ref_xy_pol,
-                ref_v=self._expert_ref_v_pol,
-                ref_lanes=self._expert_ref_lane_pol,
-                dt=1.0 / self.config["policy_frequency"],
-                L_forward=ego_len,
-                max_steer=MAX_STEER,
-                Ld0=5.0,
-                Ld_k=0.6,
-                kp_v=0.8,
-                steer_rate_limit=6.0,
-                steer_lpf_tau=0.15,
-                jerk_limit=10.0,
-            )
-            self._expert_actions_policy = []
-            self._tracker_dbg = []
+        if self.expert_test_mode:
+            self._replay_xy_pol.append(self.vehicle.position.copy())
+
+    def _prepare_ego_trajectory(
+        self,
+        ego_rec: dict[str, Any],
+        ego_traj_full: np.ndarray,
+        ego_len: float,
+    ) -> np.ndarray:
+        if self.expert_test_mode:
+            self._setup_expert_tracker(ego_traj_full, ego_len)
         else:
             ego_start_i = first_valid_index(ego_rec["trajectory"])
             if ego_start_i is None:
@@ -264,21 +268,46 @@ class NGSimEnv(AbstractEnv):
         if len(ego_traj) < 2:
             raise RuntimeError("Ego trajectory too short.")
 
-        n_sim_steps = len(ego_traj)
         sim_freq = float(self.config["simulation_frequency"])
         pol_freq = float(self.config["policy_frequency"])
         sim_per_policy = max(1, int(sim_freq // pol_freq))
-        self._max_traj_policy_steps = int(np.ceil(n_sim_steps / float(sim_per_policy)))
+        self._max_traj_policy_steps = int(np.ceil(len(ego_traj) / float(sim_per_policy)))
+        return ego_traj
 
-        x0, y0, ego_speed, lane0 = ego_traj[0]
+    def _setup_expert_tracker(self, ego_traj_full: np.ndarray, ego_len: float) -> None:
+        ref_xy_pol, ref_v_pol, lane_pol, start_idx = setup_expert_tracker(
+            self.net, ego_traj_full, ego_len, self.config
+        )
+        self._expert_ref_xy_pol = ref_xy_pol
+        self._expert_ref_v_pol = ref_v_pol
+        self._expert_ref_lane_pol = lane_pol - 1
+        self._ego_start_index = start_idx
+        self._tracker = PurePursuitTracker(
+            ref_xy=self._expert_ref_xy_pol,
+            ref_v=self._expert_ref_v_pol,
+            ref_lanes=self._expert_ref_lane_pol,
+            dt=1.0 / self.config["policy_frequency"],
+            L_forward=ego_len,
+            max_steer=MAX_STEER,
+            Ld0=5.0,
+            Ld_k=0.6,
+            kp_v=0.8,
+            steer_rate_limit=6.0,
+            steer_lpf_tau=0.15,
+            jerk_limit=10.0,
+        )
+        self._expert_actions_policy = []
+        self._tracker_dbg = []
+
+    def _build_ego_vehicle(
+        self,
+        ego_traj: np.ndarray,
+        ego_len: float,
+        ego_wid: float,
+    ) -> EgoVehicle:
+        x0, y0, ego_speed, _lane0 = ego_traj[0]
         ego_xy = np.array([x0, y0], dtype=float)
-
-        # Initial heading from first displacement
-        dx0 = ego_traj[1, 0] - ego_traj[0, 0]
-        dy0 = ego_traj[1, 1] - ego_traj[0, 1]
-        disp = np.hypot(dx0, dy0)
-        heading_raw = float(np.arctan2(dy0, dx0)) if disp >= 0.1 else 0.0
-
+        heading_raw = self._estimate_initial_heading(ego_traj)
         target_speeds_cfg = self.action_cfg.get("target_speeds", None)
         target_speeds = (
             np.array(target_speeds_cfg, dtype=float) if target_speeds_cfg is not None else None
@@ -308,27 +337,28 @@ class NGSimEnv(AbstractEnv):
             ),
         )
         ego.set_ego_dimension(width=ego_wid, length=ego_len)
-        self.road.vehicles.append(ego)
-        self.vehicle = ego
+        return ego
 
-        if self.config.get("expert_test_mode", False):
-            self._replay_xy_pol.append(self.vehicle.position.copy())
+    def _estimate_initial_heading(self, ego_traj: np.ndarray) -> float:
+        dx0 = ego_traj[1, 0] - ego_traj[0, 0]
+        dy0 = ego_traj[1, 1] - ego_traj[0, 1]
+        disp = np.hypot(dx0, dy0)
+        return float(np.arctan2(dy0, dx0)) if disp >= 0.1 else 0.0
 
+    def _spawn_surrounding_vehicles(self) -> None:
         max_surr_raw = self.config.get("max_surrounding", 0)
         spawn_all = max_surr_raw == "all"
         max_surr = None if spawn_all else int(max_surr_raw)
+        if not spawn_all and max_surr <= 0:
+            return
 
-        if spawn_all or max_surr > 0:
-            spawn_surrounding_vehicles(
-                self.trajectory_set,
-                self._ego_start_index,
-                max_surr,
-                self.road,
-                scene = self.scene
-            )
-
-        if expert_mode:
-            self._replay_xy_pol.append(self.vehicle.position.copy())
+        spawn_surrounding_vehicles(
+            self.trajectory_set,
+            self._ego_start_index,
+            max_surr,
+            self.road,
+            scene=self.scene,
+        )
     
     def visualize(
         self,
@@ -485,6 +515,76 @@ class NGSimEnv(AbstractEnv):
 
         return {"T": T, "ADE_m": ade, "FDE_m": fde, "err_per_step_m": err}
 
+    def _compute_lateral_error(self, pos: np.ndarray, heading: float) -> float:
+        if not hasattr(self, "_expert_ref_xy_pol") or self.steps >= len(self._expert_ref_xy_pol):
+            return 0.0
+        expert_pos = self._expert_ref_xy_pol[self.steps]
+        dx = expert_pos[0] - pos[0]
+        dy = expert_pos[1] - pos[1]
+        return float(-np.sin(heading) * dx + np.cos(heading) * dy)
+
+    def _resolve_expert_action(self) -> tuple[Action, np.ndarray | None, str | None, int | None]:
+        pos = self.vehicle.position
+        hdg = float(self.vehicle.heading)
+        spd = float(self.vehicle.speed)
+
+        steer_cmd, accel_cmd, i_near, i_tgt, expert_target_lane_id = self._tracker.step(
+            pos, hdg, spd
+        )
+        lateral_error = self._compute_lateral_error(pos, hdg)
+
+        expert_action: np.ndarray | None = None
+        expert_action_str: str | None = None
+        expert_action_idx: int | None = None
+
+        if self.control_mode == "continuous":
+            accel_norm = float(np.clip(accel_cmd / MAX_ACCEL, -1.0, 1.0))
+            steer_norm = float(np.clip(steer_cmd / MAX_STEER, -1.0, 1.0))
+            expert_action = np.array([accel_norm, steer_norm], dtype=np.float32)
+            action: Action = expert_action
+        elif self.control_mode == "discrete":
+            ego_current_id = 0
+            if getattr(self.vehicle, "target_lane_index", None):
+                ego_current_id = int(self.vehicle.target_lane_index[2])
+
+            if expert_target_lane_id != -1:
+                valid_target_id = clamp_lane_id_for_x(self.net, pos[0], expert_target_lane_id)
+                delta = valid_target_id - ego_current_id
+                if delta > 0 and self.vehicle._adjacent_lane_index(1) is not None:
+                    expert_action_str = "LANE_RIGHT"
+                elif delta < 0 and self.vehicle._adjacent_lane_index(-1) is not None:
+                    expert_action_str = "LANE_LEFT"
+
+            if expert_action_str is None:
+                expert_action_str = self._discrete_expert_action_from_tracker(
+                    steer_cmd, accel_cmd, lateral_error=lateral_error
+                )
+
+            actions_indexes = getattr(self.action_type, "actions_indexes", None)
+            if actions_indexes is None:
+                raise RuntimeError("Action type mismatch. Config must use DiscreteSteerMetaAction.")
+
+            if expert_action_str not in actions_indexes:
+                logger.warning(
+                    "Expert action %s invalid for current action type. Defaulting to IDLE.",
+                    expert_action_str,
+                )
+                expert_action_str = "IDLE"
+
+            expert_action_idx = int(actions_indexes[expert_action_str])
+            action = expert_action_idx
+        else:
+            raise ValueError(f"Unknown action_mode={self.control_mode!r}")
+
+        if hasattr(self, "_expert_actions_policy") and self._expert_actions_policy is not None:
+            self._expert_actions_policy.append(
+                expert_action.copy() if expert_action is not None else expert_action_str
+            )
+        if hasattr(self, "_tracker_dbg") and self._tracker_dbg is not None:
+            self._tracker_dbg.append((int(i_near), int(i_tgt)))
+
+        return action, expert_action, expert_action_str, expert_action_idx
+
     # -------------------------------------------------------------------------
     # STEP
     # -------------------------------------------------------------------------
@@ -493,83 +593,8 @@ class NGSimEnv(AbstractEnv):
         expert_action_str = None
         expert_action_idx = None
 
-        expert_test = bool(self.config.get("expert_test_mode", False))
-
-        if expert_test:
-            pos = self.vehicle.position
-            hdg = float(self.vehicle.heading)
-            spd = float(self.vehicle.speed)
-
-            steer_cmd, accel_cmd, i_near, i_tgt, expert_target_lane_id = self._tracker.step(
-                pos, hdg, spd
-            )
-
-            lateral_error = 0.0
-            if hasattr(self, "_expert_ref_xy_pol") and self.steps < len(self._expert_ref_xy_pol):
-                expert_pos = self._expert_ref_xy_pol[self.steps]
-                dx = expert_pos[0] - pos[0]
-                dy = expert_pos[1] - pos[1]
-                lateral_error = -np.sin(hdg) * dx + np.cos(hdg) * dy
-
-            # -----------------------------------------------------------
-            # MODE A: CONTINUOUS EXPERT
-            # -----------------------------------------------------------
-            if self.control_mode == "continuous":
-                accel_norm = float(np.clip(accel_cmd / MAX_ACCEL, -1.0, 1.0))
-                steer_norm = float(np.clip(steer_cmd / MAX_STEER, -1.0, 1.0))
-                expert_action = np.array([accel_norm, steer_norm], dtype=np.float32)
-                action = expert_action
-
-            # -----------------------------------------------------------
-            # MODE B: DISCRETE EXPERT
-            # -----------------------------------------------------------
-            elif self.control_mode == "discrete":
-                ego_current_id = 0
-                if getattr(self.vehicle, "target_lane_index", None):
-                    ego_current_id = int(self.vehicle.target_lane_index[2])
-
-                if expert_target_lane_id != -1:
-                    valid_target_id = clamp_lane_id_for_x(self.net, pos[0], expert_target_lane_id)
-                    delta = valid_target_id - ego_current_id
-
-                    if delta > 0:
-                        if self.vehicle._adjacent_lane_index(1) is not None:
-                            expert_action_str = "LANE_RIGHT"
-                    elif delta < 0:
-                        if self.vehicle._adjacent_lane_index(-1) is not None:
-                            expert_action_str = "LANE_LEFT"
-
-                if expert_action_str is None:
-                    expert_action_str = self._discrete_expert_action_from_tracker(
-                        steer_cmd, accel_cmd, lateral_error=lateral_error
-                    )
-
-                if not hasattr(self, "action_type") or not hasattr(self.action_type, "actions_indexes"):
-                    raise RuntimeError(
-                        "Action type mismatch. Config must use DiscreteSteerMetaAction."
-                    )
-
-                if expert_action_str not in self.action_type.actions_indexes:
-                    print(f"Warning: Expert action {expert_action_str} invalid. Defaulting to IDLE.")
-                    expert_action_str = "IDLE"
-
-                expert_action_idx = int(self.action_type.actions_indexes[expert_action_str])
-                action = expert_action_idx
-
-            else:
-                raise ValueError(f"Unknown action_mode={self.control_mode!r}")
-
-            # -----------------------------------------------------------
-            # LOGGING
-            # -----------------------------------------------------------
-            if hasattr(self, "_expert_actions_policy") and self._expert_actions_policy is not None:
-                if expert_action is not None:
-                    self._expert_actions_policy.append(expert_action.copy())
-                elif expert_action_str is not None:
-                    self._expert_actions_policy.append(expert_action_str)
-
-            if hasattr(self, "_tracker_dbg") and self._tracker_dbg is not None:
-                self._tracker_dbg.append((int(i_near), int(i_tgt)))
+        if self.expert_test_mode:
+            action, expert_action, expert_action_str, expert_action_idx = self._resolve_expert_action()
 
         # -----------------------------------------------------------
         # EXECUTE SIMULATION STEP
@@ -586,10 +611,7 @@ class NGSimEnv(AbstractEnv):
             info["expert_action_discrete"] = expert_action_str
             info["expert_action_discrete_idx"] = expert_action_idx
 
-        if expert_test:
+        if self.expert_test_mode:
             self._replay_xy_pol.append(self.vehicle.position.copy())
-
-        if not truncated and self._is_truncated():
-            truncated = True
 
         return obs, reward, terminated, truncated, info

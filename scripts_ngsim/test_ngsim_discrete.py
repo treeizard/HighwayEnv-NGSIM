@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os, sys
+import warnings
 import numpy as np
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
@@ -79,14 +80,24 @@ def main():
 
     env = gym.make("NGSim-US101-v0", render_mode="rgb_array", config=base_cfg)
 
-    env = RecordVideo(
-        env,
-        video_folder=out_dir,
-        episode_trigger=lambda ep_idx: True,     # record every episode
-        name_prefix="ngsim_expert_discrete",
-    )
+    try:
+        import moviepy  # noqa: F401
 
-    N_EPISODES = 20
+        env = RecordVideo(
+            env,
+            video_folder=out_dir,
+            episode_trigger=lambda ep_idx: True,     # record every episode
+            name_prefix="ngsim_expert_discrete",
+        )
+        record_video = True
+    except ModuleNotFoundError:
+        warnings.warn(
+            "moviepy is not installed; continuing without RecordVideo.",
+            stacklevel=2,
+        )
+        record_video = False
+
+    N_EPISODES = 1
     MAX_STEPS = 300
 
     for ep in range(N_EPISODES):
@@ -103,7 +114,10 @@ def main():
             print("label counts:", dict(zip(labs.tolist(), cnt.tolist())))
 
     env.close()
-    print(f"\nSaved videos to: {out_dir}")
+    if record_video:
+        print(f"\nSaved videos to: {out_dir}")
+    else:
+        print("\nVideo recording skipped because moviepy is not installed.")
 
 
 if __name__ == "__main__":

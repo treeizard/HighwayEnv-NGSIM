@@ -3,24 +3,110 @@ from highway_env.ngsim_utils.trajectory_gen import process_raw_trajectory
 from highway_env.ngsim_utils.trajectory_to_action import traj_to_expert_actions
 
 # -------------------------------------------------------------------------
-# NGSIM SECTION HELPERS (consistent with create_ngsim_101_road)
+# ROAD / LANE HELPERS
 # -------------------------------------------------------------------------
-def main_edge_from_x(x: float) -> tuple[str, str]:
-        length = 2150 / 3.281
-        ends = [0.0, 560 / 3.281, (698 + 578 + 150) / 3.281, length]
-        x_m = float(x)
-        if x_m < ends[1]:
-            return ("s1", "s2")  # 5 lanes
-        elif x_m < ends[2]:
-            return ("s2", "s3")  # 6 lanes
-        else:
-            return ("s3", "s4")  # 5 lanes
+def us101_edge_from_x(x: float) -> tuple[str, str]:
+    length = 2150 / 3.281
+    ends = [0.0, 560 / 3.281, (698 + 578 + 150) / 3.281, length]
+    x_m = float(x)
+    if x_m < ends[1]:
+        return ("s1", "s2")
+    if x_m < ends[2]:
+        return ("s2", "s3")
+    return ("s3", "s4")
 
-def clamp_lane_id_for_x(net, 
+
+def i80_edge_from_x(x: float) -> tuple[str, str]:
+    x_m = float(x)
+    if x_m <= 600 / 3.281:
+        return ("s1", "s2")
+    if x_m <= 700 / 3.281:
+        return ("s2", "s3")
+    if x_m <= 900 / 3.281:
+        return ("s3", "s4")
+    return ("s4", "s5")
+
+def edge_from_x(net, x: float) -> tuple[str, str]:
+    """
+    Infer the active mainline edge for a longitudinal position x from the road graph.
+
+    This works for both the US-101 graph (s1->s2->s3->s4) and the Japanese
+    graph (a->b->c->d), and avoids assuming specific node names.
+    """
+    x_m = float(x)
+    candidates = []
+
+    for src, dsts in net.graph.items():
+        for dst, lanes in dsts.items():
+            if not lanes:
+                continue
+
+            lane0 = lanes[0]
+            start_x = float(min(lane0.start[0], lane0.end[0]))
+            end_x = float(max(lane0.start[0], lane0.end[0]))
+
+            # Prefer edges with multiple lanes, which represent the main carriageway.
+            score = len(lanes)
+            if start_x <= x_m <= end_x:
+                return (src, dst)
+
+            dist = min(abs(x_m - start_x), abs(x_m - end_x))
+            candidates.append((dist, -score, start_x, src, dst))
+
+    if not candidates:
+        raise KeyError("Road network graph does not contain any lane edges.")
+
+    _, _, _, src, dst = min(candidates)
+    return (src, dst)
+
+def clamp_lane_id_for_x(net,
                         x: float, lane_id: int) -> int:
-    edge = main_edge_from_x(x)
+    edge = edge_from_x(net, x)
     n_lanes = len(net.graph[edge[0]][edge[1]])
     return int(np.clip(int(lane_id), 0, n_lanes - 1))
+
+
+def target_lane_index_from_lane_id(
+    net,
+    scene: str,
+    x: float,
+    lane_id: int,
+) -> tuple[str, str, int] | None:
+    """
+    Map a recorded dataset lane id to a highway-env LaneIndex on the active road graph.
+
+    Returns None when the lane id does not map to a drivable lane in the current scene.
+    """
+    lane_id = int(lane_id)
+    x = float(x)
+    scene = str(scene)
+
+    if scene == "us-101":
+        if lane_id <= 5:
+            edge = us101_edge_from_x(x)
+            return (edge[0], edge[1], lane_id - 1)
+        if lane_id == 6:
+            return ("s2", "s3", -1)
+        if lane_id == 7:
+            return ("merge_in", "s2", -1)
+        if lane_id == 8:
+            return ("s3", "merge_out", -1)
+        return None
+
+    if scene == "i-80":
+        if lane_id <= 6:
+            edge = i80_edge_from_x(x)
+            return (edge[0], edge[1], lane_id - 1)
+        if lane_id == 7:
+            return ("s1", "s2", -1)
+        return None
+
+    if scene == "japanese":
+        edge = edge_from_x(net, x)
+        n_lanes = len(net.graph[edge[0]][edge[1]])
+        return (edge[0], edge[1], int(np.clip(lane_id - 1, 0, n_lanes - 1)))
+
+    return None
 
 
 # -------------------------------------------------------------------------

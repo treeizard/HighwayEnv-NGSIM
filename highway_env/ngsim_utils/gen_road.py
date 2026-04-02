@@ -78,27 +78,46 @@ def create_japanese_road() -> None:
             )
 
         # Merging lane
+        # Example lane width
+        lane_width = width  # typically 3.75
+
+        # Main-road target lane center
+        target_y = -lane_width
+
+        # Start the merge lane closer to the main road
+        merge_start_y = -6.0   # adjust this value as needed
+
+        # 1) Straight ramp approach
         ljk = StraightLane(
-            [0, -(7.5 + width)], 
-            [ends[0], -(7.5 + width)], 
-            line_types=[c, c], 
+            [0, merge_start_y],
+            [ends[0], merge_start_y],
+            line_types=[c, c],
             forbidden=True
         )
+
+        # 2) Smooth merge toward the target lane
+        # Reference line is the midpoint between start_y and target_y
+        mid_y = 0.5 * (merge_start_y + target_y)
+        amplitude = 0.5 * (merge_start_y - target_y)
+
         lkb = SineLane(
-            ljk.position(ends[0], width),
-            ljk.position(sum(ends[:2]), width),
-            -width,
-            2 * np.pi / (2 * ends[1]),
+            [ends[0], mid_y],                 # start of sine reference line
+            [sum(ends[:2]), mid_y],           # end of sine reference line
+            amplitude,                        # chosen so actual path goes start_y -> target_y
+            2 * np.pi / (2 * ends[1]),        # = pi / ends[1]
             np.pi / 2,
             line_types=[c, c],
             forbidden=True,
         )
+
+        # 3) Straight lane after merge, aligned with the main-road lane
         lbc = StraightLane(
-            lkb.position(ends[1], 0),
-            lkb.position(ends[1], 0) + [ends[2], 0],
+            [sum(ends[:2]), target_y],
+            [sum(ends[:3]), target_y],
             line_types=[c, n],
             forbidden=True,
         )
+
         net.add_lane("j", "k", ljk)
         net.add_lane("k", "b", lkb)
         net.add_lane("b", "c", lbc)
