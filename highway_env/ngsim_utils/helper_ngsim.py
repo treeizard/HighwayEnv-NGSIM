@@ -26,15 +26,20 @@ def clamp_lane_id_for_x(net,
 # -------------------------------------------------------------------------
 # EXPERT HELPERS (consistent with create_ngsim_101_road)
 # -------------------------------------------------------------------------
-def load_ego_trajectory(ego_rec):
+def load_ego_trajectory(ego_rec, scene = 'us-101'):
     """Process and return the ego trajectory data."""
-    ego_traj_full = process_raw_trajectory(ego_rec["trajectory"])  # [T,4]: x, y, v, lane_id
+    ego_traj_full = process_raw_trajectory(ego_rec["trajectory"], scene)  # [T,4]: x, y, v, lane_id
     return ego_traj_full
 
-def get_ego_dimensions(ego_rec, f2m_conv):
+def get_ego_dimensions(ego_rec, f2m_conv, scene):
     """Return the ego vehicle's length and width in meters."""
-    ego_len = ego_rec["length"] / f2m_conv
-    ego_wid = ego_rec["width"] / f2m_conv
+    if scene == "us-101":
+        ego_len = ego_rec["length"] / f2m_conv
+        ego_wid = ego_rec["width"] / f2m_conv
+    else:
+        ego_len = ego_rec["length"]
+        ego_wid = ego_rec["width"]
+        
     return ego_len, ego_wid
 
 # highway_env/ngsim_utils/helper_ngsim.py

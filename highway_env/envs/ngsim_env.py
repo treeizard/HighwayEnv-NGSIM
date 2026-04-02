@@ -18,7 +18,7 @@ from highway_env.ngsim_utils.helper_ngsim import (
     setup_expert_tracker,
 )
 from highway_env.ngsim_utils.obs_vehicle import spawn_surrounding_vehicles
-from highway_env.ngsim_utils.gen_road import create_ngsim_101_road
+from highway_env.ngsim_utils.gen_road import create_ngsim_101_road, create_japanese_road
 from highway_env.ngsim_utils.trajectory_to_action import (
     PurePursuitTracker,
     map_discrete_expert_action,
@@ -89,7 +89,7 @@ class NGSimEnv(AbstractEnv):
                 "ego_vehicle_ID": None,
                 "simulation_period": None,
                 "episode_root": "highway_env/data/processed_10s",
-                "max_surrounding": 80,
+                "max_surrounding": "all",
                 "show_trajectories": True,
                 "seed": None,
                 "expert_test_mode": False,
@@ -126,6 +126,7 @@ class NGSimEnv(AbstractEnv):
         self._replay_xy_pol: list[np.ndarray] = []
 
         # Prebuilt trajectories
+        # cfg["scene"] WARNING TEsting
         self._prebuilt_dir = os.path.join(cfg["episode_root"], cfg["scene"], "prebuilt")
         veh_ids_path = os.path.join(self._prebuilt_dir, "veh_ids_train.npy")
         traj_path = os.path.join(self._prebuilt_dir, "trajectory_train.npy")
@@ -185,6 +186,7 @@ class NGSimEnv(AbstractEnv):
             self.ego_id = int(self.np_random.choice(valid_ids))
         else:
             if explicit_ego_id not in valid_ids:
+                #print(valid_ids)
                 raise ValueError(f"Ego ID {explicit_ego_id} not in {self.episode_name}")
             self.ego_id = int(explicit_ego_id)
 
@@ -195,12 +197,17 @@ class NGSimEnv(AbstractEnv):
                 continue
             traj_set[vid] = meta
         self.trajectory_set = traj_set
+        print(self.episode_name, self.ego_id)
 
+    
     # -------------------------------------------------------------------------
-    # ROAD + VEHICLES
+    # ROAD + VEHICLES + Test Mode
     # -------------------------------------------------------------------------
     def _create_road(self):
-        net = create_ngsim_101_road()
+        if self.config["scene"] == "japanese":
+            net = create_japanese_road()
+        else:    
+            net = create_ngsim_101_road()
         self.net = net
         self.road = Road(
             network=net,
@@ -209,9 +216,11 @@ class NGSimEnv(AbstractEnv):
         )
 
     def _create_vehicles(self):
+        self.scene = self.config['scene']
+
         ego_rec = self.trajectory_set["ego"]
-        ego_traj_full = load_ego_trajectory(ego_rec)
-        ego_len, ego_wid = get_ego_dimensions(ego_rec, f2m_conv)
+        ego_traj_full = load_ego_trajectory(ego_rec, self.scene)
+        ego_len, ego_wid = get_ego_dimensions(ego_rec, f2m_conv, self.scene)
 
         if not hasattr(self, "_replay_xy_pol"):
             self._replay_xy_pol = []
@@ -305,17 +314,104 @@ class NGSimEnv(AbstractEnv):
         if self.config.get("expert_test_mode", False):
             self._replay_xy_pol.append(self.vehicle.position.copy())
 
-        max_surr = int(self.config.get("max_surrounding", 0))
-        if max_surr > 0:
+        max_surr_raw = self.config.get("max_surrounding", 0)
+        spawn_all = max_surr_raw == "all"
+        max_surr = None if spawn_all else int(max_surr_raw)
+
+        if spawn_all or max_surr > 0:
             spawn_surrounding_vehicles(
                 self.trajectory_set,
                 self._ego_start_index,
                 max_surr,
                 self.road,
+                scene = self.scene
             )
 
         if expert_mode:
             self._replay_xy_pol.append(self.vehicle.position.copy())
+    
+    def visualize(
+        self,
+        steps: int | None = None,
+        width: int = 1200,
+        height: int = 600,
+        scaling: float = 5.5,
+        mode: str = "all"
+    ):
+        """
+        Visualize the environment.
+
+        Args:
+            steps: maximum rollout steps to render. If None, run until terminated/truncated.
+            width: render window width in pixels.
+            height: render window height in pixels.
+            scaling: zoom factor for rendering.
+            mode:
+                - "road": render only the road layout
+                - "all": reset env, create vehicles, and rollout
+        Returns:
+            Last observation if a rollout is executed, else None.
+        """
+        # --- set rendering config ---
+        self.config["screen_width"] = width
+        self.config["screen_height"] = height
+        self.config["scaling"] = scaling
+
+        # Ensure render mode is compatible with display
+        if self.render_mode is None:
+            self.render_mode = "human"
+
+        if mode == "road":
+            # Build an empty road scene and render once
+            self._create_road()
+
+            # Make sure road-side state expected by renderer exists
+            if not hasattr(self, "vehicle"):
+                self.vehicle = None
+
+            self.render()
+            return None
+
+        elif mode == "all":
+            # --- reset env ---
+            reset_out = self.reset()
+            if isinstance(reset_out, tuple) and len(reset_out) == 2:
+                obs, info = reset_out
+            else:
+                obs = reset_out
+                info = {}
+
+            done = False
+            step_count = 0
+
+            while not done:
+                # no-op action
+                if self.control_mode == "continuous":
+                    action = np.zeros(self.action_space.shape, dtype=np.float32)
+                else:
+                    # for discrete meta-action env, IDLE is the proper no-op if available
+                    if hasattr(self, "action_type") and hasattr(self.action_type, "actions_indexes"):
+                        action = self.action_type.actions_indexes.get("IDLE", 0)
+                    else:
+                        action = 0
+
+                obs, reward, terminated, truncated, info = self.step(action)
+
+                # render frame
+                self.render()
+
+                done = terminated or truncated
+                step_count += 1
+
+                if steps is not None and step_count >= steps:
+                    break
+
+            return obs
+
+        else:
+            raise ValueError(f"Unknown mode={mode!r}. Expected 'road' or 'all'.")
+            
+
 
     # -------------------------------------------------------------------------
     # REWARDS & TERMINATION

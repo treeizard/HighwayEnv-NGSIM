@@ -1,5 +1,5 @@
 import numpy as np
-from highway_env.road.lane import LineType, StraightLane
+from highway_env.road.lane import LineType, StraightLane, SineLane
 from highway_env.road.road import RoadNetwork
 
 def create_ngsim_101_road():
@@ -39,6 +39,70 @@ def create_ngsim_101_road():
     
     return net
 
+def create_japanese_road() -> None:
+        """
+        Make a road composed of a straight highway and a merging lane.
+
+        :return: the road
+        """
+        net = RoadNetwork()
+
+        # Highway lanes
+        ends = [100, 50, 50, 600]  # Before, converging, merge, after
+        c, s, n = LineType.CONTINUOUS_LINE, LineType.STRIPED, LineType.NONE
+        width = 3.75
+        y = [0, width]
+        line_type = [[c, s], [n, c]]
+        line_type_merge = [[s, s], [n, c]]
+        for i in range(2):
+            net.add_lane(
+                "a",
+                "b",
+                StraightLane([0, y[i]], [sum(ends[:2]), y[i]], line_types=line_type[i]),
+            )
+            net.add_lane(
+                "b",
+                "c",
+                StraightLane(
+                    [sum(ends[:2]), y[i]],
+                    [sum(ends[:3]), y[i]],
+                    line_types=line_type_merge[i],
+                ),
+            )
+            net.add_lane(
+                "c",
+                "d",
+                StraightLane(
+                    [sum(ends[:3]), y[i]], [sum(ends), y[i]], line_types=line_type[i]
+                ),
+            )
+
+        # Merging lane
+        ljk = StraightLane(
+            [0, -(7.5 + width)], 
+            [ends[0], -(7.5 + width)], 
+            line_types=[c, c], 
+            forbidden=True
+        )
+        lkb = SineLane(
+            ljk.position(ends[0], width),
+            ljk.position(sum(ends[:2]), width),
+            -width,
+            2 * np.pi / (2 * ends[1]),
+            np.pi / 2,
+            line_types=[c, c],
+            forbidden=True,
+        )
+        lbc = StraightLane(
+            lkb.position(ends[1], 0),
+            lkb.position(ends[1], 0) + [ends[2], 0],
+            line_types=[c, n],
+            forbidden=True,
+        )
+        net.add_lane("j", "k", ljk)
+        net.add_lane("k", "b", lkb)
+        net.add_lane("b", "c", lbc)
+        return net
 
 
 def clamp_location_ngsim(x_pos, lane0, net, warning=False):

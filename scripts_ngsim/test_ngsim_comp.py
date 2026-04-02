@@ -136,43 +136,52 @@ def _run_one(env, steps: int, mode_name: str, trajectory_save_path: str = None):
 
 def main():
     # ---------------------- Target episode + ego ----------------------
-    TARGET_EPISODE = "t1118849169700"
-    TARGET_EGO_ID = 785
+    TARGET_EPISODE = "t1118847679700"
+    TARGET_EGO_ID = 2362
     
     # Output directory
     out_dir = os.path.abspath("./videos_discrete_test")
     os.makedirs(out_dir, exist_ok=True)
 
     DISCRETE_ACTION_TYPE_NAME = "DiscreteSteerMetaAction"
-    MAX_SURROUNDING = 40000000
+    MAX_SURROUNDING = "all"
 
     # ---------------------- Common Config ----------------------
     common_cfg = {
-        "scene": "us-101",
-        "observation": {
-            "type": "LidarObservation",
-            "cells": 128,
-            "maximum_range": 64,
-            "normalize": True,
-        },
-        "show_trajectories": True,
-        "simulation_frequency": 10,
-        "policy_frequency": 10,
-        "screen_width": 400,
-        "screen_height": 150,
-        "scaling": 2.0,
-        "offscreen_rendering": True,
-        "episode_root": "highway_env/data/processed_10s",
-        "replay_period": None,
-        "ego_vehicle_ID": TARGET_EGO_ID,
-        "simulation_period": {"episode_name": TARGET_EPISODE},
-        "max_surrounding": MAX_SURROUNDING,
-        "expert_test_mode": True,
-        "expert_speed_deadband_mps": 0.5,
-        "expert_steer_deadband_rad": 0.05,
-        "expert_one_action_per_step": True,
-        "expert_prefer_speed": False,
-    }
+                "scene": "us-101",
+                "observation": {
+                    "type": "LidarObservation",
+                    "cells": 128,
+                    "maximum_range": 64,
+                    "normalize": True,
+                },
+                # Will be normalized from action_mode inside __init__
+                "action": {"type": "ContinuousAction"},
+                "action_mode": "discrete",  # "continuous" or "discrete"
+                "action_config": {
+                    "lateral_offset_step": 0.10,
+                    "lateral_offset_max": 1.50,
+                    "lane_change_cooldown_steps": 10,
+                    "lane_change_commit_hyst_steps": 2,
+                    "target_speeds": list(np.arange(0.0, 35.0 + 1e-6, 2.0)),
+                },
+                "expert_v": {
+                    "expert_speed_deadband_mps": 0.5,
+                    "expert_steer_deadband_rad": 0.05,
+                    "expert_one_action_per_step": True,
+                    "expert_prefer_speed": False,
+                },
+                "simulation_frequency": 10,
+                "policy_frequency": 10,
+                "max_episode_steps": 300,
+                "ego_vehicle_ID": TARGET_EGO_ID,
+                "simulation_period": TARGET_EPISODE,
+                "episode_root": "highway_env/data/processed_10s",
+                "max_surrounding": MAX_SURROUNDING,
+                "show_trajectories": True,
+                "seed": None,
+                "expert_test_mode": False,
+            }
 
     # ---------------------------
     # 1) Continuous expert run

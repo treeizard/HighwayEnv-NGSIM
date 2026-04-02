@@ -345,23 +345,43 @@ def build_all_trajectories_for_scene(
 
 
 
-def process_raw_trajectory(trajectory):
-    trajectory = np.array(trajectory)
-    for i in range(trajectory.shape[0]):
-        '''
-        if np.all(trajectory[i] == 0):
-            trajectory[i][0] = 0
-            trajectory[i][1] = 0
-            trajectory[i][2] = 0
-        
-        else:
-        '''
-        x = trajectory[i][0] - 6
-        y = trajectory[i][1]
-        speed = trajectory[i][2]
-        trajectory[i][0] = y / 3.281
-        trajectory[i][1] = x / 3.281
-        trajectory[i][2] = speed / 3.281
+def process_raw_trajectory(trajectory, scene):
+    if scene == "us-101":
+        trajectory = np.array(trajectory)
+        for i in range(trajectory.shape[0]):
+            '''
+            if np.all(trajectory[i] == 0):
+                trajectory[i][0] = 0
+                trajectory[i][1] = 0
+                trajectory[i][2] = 0
+            
+            else:
+            '''
+            x = trajectory[i][0] - 6
+            y = trajectory[i][1]
+            speed = trajectory[i][2]
+            trajectory[i][0] = y / 3.281
+            trajectory[i][1] = x / 3.281
+            trajectory[i][2] = speed / 3.281
+    elif scene == "japanese":
+        trajectory = np.array(trajectory)
+        for i in range(trajectory.shape[0]):
+            '''
+            if np.all(trajectory[i] == 0):
+                trajectory[i][0] = 0
+                trajectory[i][1] = 0
+                trajectory[i][2] = 0
+            
+            else:
+            '''
+            x = trajectory[i][0]
+            y = trajectory[i][1]
+            speed = trajectory[i][2]
+            trajectory[i][0] = y 
+            trajectory[i][1] = x 
+            trajectory[i][2] = speed 
+    else:
+        raise UserWarning("The Scene is not Recognised Please Try Again")
 
     return trajectory
 

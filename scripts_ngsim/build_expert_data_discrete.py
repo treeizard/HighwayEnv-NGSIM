@@ -306,7 +306,7 @@ def build_base_config() -> Dict[str, Any]:
         "replay_period": None,
         "reset_step_offset": 1,
         "ego_vehicle_ID": None,
-        "max_surrounding": 20000,
+        "max_surrounding": "all",
         "expert_test_mode": True,
         "action_mode": "discrete",   # keep this aligned with your env implementation
         "expert_prefer_speed": False,

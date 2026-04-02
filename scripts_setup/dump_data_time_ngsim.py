@@ -40,7 +40,7 @@ import random
 from collections import defaultdict
 
 from highway_env.data.ngsim import ngsim_data
-from highway_env.data.traj_to_action import traj_cont_action
+#from highway_env.data.traj_to_action import traj_cont_action
 
 
 def build_episodes(

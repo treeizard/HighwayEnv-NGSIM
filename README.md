@@ -42,13 +42,15 @@ python3 scripts/sb3_highway_dqn.py
 ```
 You should see rendering of the highway env environment and video playing. 
 
-### 2.3. Data set up
+### 2.3. Data setup
+#### 2.3.1. NGSIM Data setup
 1. Download the raw NGSIM data from the [link](https://data.transportation.gov/Automobiles/Next-Generation-Simulation-NGSIM-Vehicle-Trajector/8ect-6jqj/about_data), the download process may take some time. 
 2. Place the csv trajectory file inside the `raw_data` folder. If you do not change the name of the raw Data, you can just run:
 ```
-python dump_data.py raw_data/Next_Generation_Simulation__NGSIM__Vehicle_Trajectories_and_Supporting_Data.csv 
+python scripts_setup/dump_data_ngsim.py raw_data/Next_Generation_Simulation__NGSIM__Vehicle_Trajectories_and_Supporting_Data.csv 
 ```
 in development:
 ```
-python dump_data_time_v2.py raw_data/Next_Generation_Simulation__NGSIM__Vehicle_Trajectories_and_Supporting_Data.csv
+python scripts_setup/dump_data_time_ngsim.py raw_data/Next_Generation_Simulation__NGSIM__Vehicle_Trajectories_and_Supporting_Data.csv
 ```
+#### 2.3.2. Morinomiya Datasetup Data setup

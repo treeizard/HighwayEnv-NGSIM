@@ -50,25 +50,31 @@ def main():
 
     base_cfg = {
         "scene": "us-101",
-        "observation": {"type": "LidarObservation", "cells": 128, "maximum_range": 64, "normalize": True},
-        "action": {"type": DISCRETE_ACTION_TYPE_NAME, "target_speeds": list(np.arange(0.0, 35.0 + 1e-6, 2.0))},
-        "show_trajectories": True,
+        "observation": {
+            "type": "LidarObservation",
+            "cells": 128,
+            "maximum_range": 64,
+            "normalize": True,
+        },
+        "action": {
+            "type": "DiscreteSteerMetaAction",
+        },
+        "show_trajectories": False,
         "simulation_frequency": 10,
         "policy_frequency": 10,
         "screen_width": 400,
         "screen_height": 150,
         "scaling": 2.0,
         "offscreen_rendering": True,
-        "ego_vehicle_ID": None,
         "episode_root": "highway_env/data/processed_10s",
-        "replay_period": None,          # random episode each reset
-        "max_surrounding": 20000,         
+        "replay_period": None,
+        "reset_step_offset": 1,
+        "ego_vehicle_ID": None,
+        "max_surrounding": "all",
         "expert_test_mode": True,
-        "expert_action_mode": "discrete",
-        "expert_speed_deadband_mps": 0.5,
-        "expert_steer_deadband_rad": 0.05,
-        "expert_one_action_per_step": True,
+        "action_mode": "discrete",   # keep this aligned with your env implementation
         "expert_prefer_speed": False,
+        "lane_change_cooldown_steps": 10,
     }
 
     env = gym.make("NGSim-US101-v0", render_mode="rgb_array", config=base_cfg)
