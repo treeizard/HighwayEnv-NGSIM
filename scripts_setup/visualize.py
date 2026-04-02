@@ -64,7 +64,7 @@ def save_highres_snapshot(
         "policy_frequency": 10,
         "simulation_frequency": 10,
         "max_episode_steps": 300,
-        "centering_position": [0.65, 0.5],
+        "centering_position": [0.2, 0.5],
     }
 
     env = gym.make(
@@ -129,11 +129,11 @@ if __name__ == "__main__":
     # -------------------------------------------------------------
     save_highres_snapshot(
         out_path="plots/japanese_road_only.png",
-        width=5000,
-        height=700,
+        width=7000,
+        height=500,
         scaling=7.0,
         seed=42,
-        road_only=True,
+        road_only=False,
     )
 
     

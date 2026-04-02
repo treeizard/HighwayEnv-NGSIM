@@ -375,11 +375,13 @@ def process_raw_trajectory(trajectory, scene):
             else:
             '''
             x = trajectory[i][0]
-            y = trajectory[i][1]
+            y = trajectory[i][1] + 2
             speed = trajectory[i][2]
-            trajectory[i][0] = y 
-            trajectory[i][1] = x 
+
+            trajectory[i][0] = x 
+            trajectory[i][1] = y 
             trajectory[i][2] = speed 
+            #print(x, y, speed)
     else:
         raise UserWarning("The Scene is not Recognised Please Try Again")
 
