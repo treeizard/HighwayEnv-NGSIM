@@ -161,8 +161,6 @@ def main():
                 "action_config": {
                     "lateral_offset_step": 0.10,
                     "lateral_offset_max": 1.50,
-                    "lane_change_cooldown_steps": 10,
-                    "lane_change_commit_hyst_steps": 2,
                     "target_speeds": list(np.arange(0.0, 35.0 + 1e-6, 2.0)),
                 },
                 "expert_v": {

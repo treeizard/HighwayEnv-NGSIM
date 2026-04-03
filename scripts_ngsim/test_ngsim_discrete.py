@@ -48,14 +48,24 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     DISCRETE_ACTION_TYPE_NAME = "DiscreteSteerMetaAction"
+    video_width = 1600
+    video_height = 600
 
     base_cfg = {
         "scene": "us-101",
         "observation": {
-            "type": "LidarObservation",
-            "cells": 128,
-            "maximum_range": 64,
-            "normalize": True,
+            "type": "LidarCameraObservations",
+            "lidar": {
+                "cells": 128,
+                "maximum_range": 64,
+                "normalize": True,
+            },
+            "camera": {
+                "cells": 21,
+                "maximum_range": 64,
+                "field_of_view": np.pi / 2,   # 90 deg forward cone
+                "normalize": True,
+            },
         },
         "action": {
             "type": "DiscreteSteerMetaAction",
@@ -63,9 +73,9 @@ def main():
         "show_trajectories": False,
         "simulation_frequency": 10,
         "policy_frequency": 10,
-        "screen_width": 400,
-        "screen_height": 150,
-        "scaling": 2.0,
+        "screen_width": video_width,
+        "screen_height": video_height,
+        "scaling": 10.0,
         "offscreen_rendering": True,
         "episode_root": "highway_env/data/processed_10s",
         "replay_period": None,
@@ -75,7 +85,6 @@ def main():
         "expert_test_mode": True,
         "action_mode": "discrete",   # keep this aligned with your env implementation
         "expert_prefer_speed": False,
-        "lane_change_cooldown_steps": 10,
     }
 
     env = gym.make("NGSim-US101-v0", render_mode="rgb_array", config=base_cfg)
@@ -118,6 +127,7 @@ def main():
         print(f"\nSaved videos to: {out_dir}")
     else:
         print("\nVideo recording skipped because moviepy is not installed.")
+    print(f"Configured render resolution: {video_width}x{video_height}")
 
 
 if __name__ == "__main__":

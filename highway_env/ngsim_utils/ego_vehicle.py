@@ -17,21 +17,16 @@ class EgoVehicle(Vehicle):
     Ego vehicle with two control modes:
       - continuous: expects low-level dict action {"steering": float, "acceleration": float}
       - discrete:   expects high-level string action:
-          {"FASTER","SLOWER","IDLE","STEER_LEFT","STEER_RIGHT","LANE_LEFT","LANE_RIGHT"}
+          {"FASTER","SLOWER","IDLE","STEER_LEFT","STEER_RIGHT"}
 
     Discrete semantics:
       - Speed: discrete ladder (FASTER/SLOWER) + IDLE
       - Steering bias: within-lane lateral offset setpoint (STEER_LEFT/RIGHT)
-      - Lane change: switches target lane index (LANE_LEFT/RIGHT)
 
     NGSIM road considerations (your create_ngsim_101_road):
       - lane count changes by section: ("s1","s2")=5, ("s2","s3")=6, ("s3","s4")=5
-      - to be robust, lane changes must be computed on the *current section edge* based on x-position
+      - to be robust, lane tracking must be computed on the *current section edge* based on x-position
       - within-lane offsets must be clamped using lane width and vehicle width
-
-    Notes:
-      - "LANE_LEFT/RIGHT" below follow highway-env convention: lane_id - 1 is left, lane_id + 1 is right.
-        If this appears visually flipped in your renderer, swap the direction signs in _apply_lane_change().
     """
 
     # --------------------------
@@ -60,9 +55,6 @@ class EgoVehicle(Vehicle):
     DEFAULT_LATERAL_OFFSET_MAX = 1.50   # [m] absolute max cap (further clamped by lane & vehicle width)
     DEFAULT_OFFSET_MARGIN = 0.10        # [m] keep some clearance to lane boundary
 
-    # Lane change behavior
-    DEFAULT_LANE_CHANGE_COOLDOWN_STEPS = 10  # e.g., 1s at 10Hz
-
     # Fallback lane width if geometry doesn't expose it (should not happen for StraightLane)
     DEFAULT_LANE_WIDTH_FALLBACK = 12 / 3.281  # ~3.66m, matches your road builder
 
@@ -78,7 +70,6 @@ class EgoVehicle(Vehicle):
         target_speeds: Optional[Vector] = None,
         lateral_offset_step: float = DEFAULT_LATERAL_OFFSET_STEP,
         lateral_offset_max: float = DEFAULT_LATERAL_OFFSET_MAX,
-        lane_change_cooldown_steps: int = DEFAULT_LANE_CHANGE_COOLDOWN_STEPS,
     ) -> None:
         super().__init__(road, position, heading, speed)
 
@@ -115,13 +106,6 @@ class EgoVehicle(Vehicle):
         self.lateral_offset = 0.0
         self.lateral_offset_step = float(lateral_offset_step)
         self.lateral_offset_max = float(lateral_offset_max)
-
-        # Lane-change cooldown
-        self.lane_change_cooldown_steps = int(max(0, lane_change_cooldown_steps))
-        self._lane_change_cooldown = 0
-
-        # Lane-change direction: -1 left, +1 right, 0 none.
-        self.lane_change_direction = 0
 
     # --------------------------
     # Utility setters
@@ -249,8 +233,8 @@ class EgoVehicle(Vehicle):
         max_right = half_lane
 
         # Check whether adjacent lanes exist
-        has_left_lane = self._adjacent_lane_index(-1) is not None
-        has_right_lane = self._adjacent_lane_index(1) is not None
+        has_left_lane = self._adjacent_lane_index(-1, lane_index=lane_index) is not None
+        has_right_lane = self._adjacent_lane_index(1, lane_index=lane_index) is not None
 
         # If this side is the road edge, stop center earlier so body stays on-road
         if not has_left_lane:
@@ -266,12 +250,14 @@ class EgoVehicle(Vehicle):
         # Returned as (min, max)
         return (-max_right, max_left)
 
-    def _adjacent_lane_index(self, direction: int) -> LaneIndex | None:
+    def _adjacent_lane_index(
+        self, direction: int, lane_index: LaneIndex | None = None
+    ) -> LaneIndex | None:
         """
         direction: -1 means lane_id-1, +1 means lane_id+1 (highway-env lane id convention).
         Uses section-aware lane counts based on current x-position.
         """
-        base = self._current_edge_lane_index()
+        base = lane_index or self._current_edge_lane_index()
         _from, _to, _id = base
 
         try:
@@ -292,6 +278,51 @@ class EgoVehicle(Vehicle):
                 return new_index
         except Exception:
             return None
+
+    def _closest_lane_index_on_current_edge(self) -> LaneIndex:
+        edge = self._main_edge_from_x(self.position[0])
+        lanes = self.road.network.graph[edge[0]][edge[1]]
+        best_index = (edge[0], edge[1], 0)
+        best_distance = np.inf
+
+        for lane_id in range(len(lanes)):
+            lane_index = (edge[0], edge[1], lane_id)
+            lane = self.road.network.get_lane(lane_index)
+            try:
+                distance = float(lane.distance(self.position))
+            except Exception:
+                continue
+            if distance < best_distance:
+                best_distance = distance
+                best_index = lane_index
+        return best_index
+
+    def _sync_lane_reference_from_position(self) -> None:
+        """
+        If the vehicle center drifts across a lane boundary, switch the internal lane-relative
+        coordinate system to the closest lane and preserve the current center position in that frame.
+        """
+        current_lane_index = self._closest_lane_index_on_current_edge()
+        previous_lane_index = self.target_lane_index or self.lane_index
+
+        previous_error = self.lateral_offset
+        if previous_lane_index is not None:
+            try:
+                previous_lane = self.road.network.get_lane(previous_lane_index)
+                previous_error += float(previous_lane.local_coordinates(self.position)[1])
+            except Exception:
+                pass
+
+        self.target_lane_index = current_lane_index
+        self.lane_index = current_lane_index
+        self.lane = self.road.network.get_lane(current_lane_index)
+
+        if previous_lane_index != current_lane_index:
+            try:
+                _, lateral = self.lane.local_coordinates(self.position)
+            except Exception:
+                lateral = 0.0
+            self.lateral_offset = previous_error - float(lateral)
 
     # --------------------------
     # Controllers
@@ -362,32 +393,12 @@ class EgoVehicle(Vehicle):
 
         self.lateral_offset = float(np.clip(self.lateral_offset, min_off, max_off))
 
-    def _apply_lane_change(self, act: str) -> None:
-        """
-        Initiates a Ramped Lane Change.
-        We do NOT change the lane index yet. We just tell the controller to start
-        walking the lateral offset towards the new lane.
-        """
-        if self._lane_change_cooldown > 0 or self.lane_change_direction != 0:
-            return
-
-        # Highway-env convention: -1 is Left (lower ID), +1 is Right (higher ID)
-        direction = -1 if act == "LANE_LEFT" else 1
-        
-        # Verify the target lane actually exists before starting
-        if self._adjacent_lane_index(direction) is not None:
-            self.lane_change_direction = direction
-            self._lane_change_cooldown = self.lane_change_cooldown_steps
-            
     # --------------------------
     # Control loop entrypoint
     # --------------------------
     def act(self, action: Union[dict, str, int, None] = None) -> None:
-        if self._lane_change_cooldown > 0:
-            self._lane_change_cooldown -= 1
-
         if self.control_mode == "continuous":
-            self.target_lane_index = self._current_edge_lane_index()
+            self._sync_lane_reference_from_position()
             self.follow_road()
 
             if action is not None:
@@ -410,51 +421,15 @@ class EgoVehicle(Vehicle):
 
         # Only process NEW discrete commands when explicitly provided
         if act is not None:
-            if act in ("LANE_LEFT", "LANE_RIGHT"):
-                self._apply_lane_change(act)
-            elif act in ("FASTER", "SLOWER"):
+            if act in ("FASTER", "SLOWER"):
                 self._apply_speed_action(act)
-            elif act in ("STEER_LEFT", "STEER_RIGHT") and self.lane_change_direction == 0:
+            elif act in ("STEER_LEFT", "STEER_RIGHT"):
                 self._apply_steer_bias_action(act)
 
-        # Continue internal lane-change controller
-        if self.lane_change_direction != 0:
-            step = self.lateral_offset_step
-            if self.lane_change_direction == -1:
-                self.lateral_offset += step
-            else:
-                self.lateral_offset -= step
-
-            lane_width = self._lane_width(self.target_lane_index)
-            threshold = lane_width / 2.0
-
-            if self.lane_change_direction == -1 and self.lateral_offset > threshold:
-                new_idx = self._adjacent_lane_index(-1)
-                if new_idx:
-                    self.target_lane_index = new_idx
-                    self.lateral_offset -= lane_width
-                else:
-                    self.lane_change_direction = 0
-
-            elif self.lane_change_direction == 1 and self.lateral_offset < -threshold:
-                new_idx = self._adjacent_lane_index(1)
-                if new_idx:
-                    self.target_lane_index = new_idx
-                    self.lateral_offset += lane_width
-                else:
-                    self.lane_change_direction = 0
-
-            if abs(self.lateral_offset) < step:
-                self.lateral_offset = 0.0
-                self.lane_change_direction = 0
-
-        if self.lane_change_direction == 0:
-            self.follow_road()
-            if self._lane_change_cooldown == 0:
-                self.target_lane_index = self._current_edge_lane_index()
-
-            min_off, max_off = self._safe_lateral_offset_bounds(self.target_lane_index)
-            self.lateral_offset = float(np.clip(self.lateral_offset, min_off, max_off))
+        self._sync_lane_reference_from_position()
+        self.follow_road()
+        min_off, max_off = self._safe_lateral_offset_bounds(self.target_lane_index)
+        self.lateral_offset = float(np.clip(self.lateral_offset, min_off, max_off))
 
         low_level_action = {
             "steering": self.steering_control_with_offset(self.target_lane_index, self.lateral_offset),

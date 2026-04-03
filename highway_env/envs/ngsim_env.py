@@ -13,7 +13,6 @@ from highway_env.envs.common.action import Action
 from highway_env.road.road import Road
 
 from highway_env.ngsim_utils.helper_ngsim import (
-    clamp_lane_id_for_x,
     get_ego_dimensions,
     load_ego_trajectory,
     setup_expert_tracker,
@@ -79,8 +78,6 @@ class NGSimEnv(AbstractEnv):
                 "action_config": {
                     "lateral_offset_step": 0.10,
                     "lateral_offset_max": 1.50,
-                    "lane_change_cooldown_steps": 10,
-                    "lane_change_commit_hyst_steps": 2,
                     "target_speeds": list(np.arange(0.0, 35.0 + 1e-6, 2.0)),
                 },
                 "expert_v": {
@@ -320,9 +317,6 @@ class NGSimEnv(AbstractEnv):
             heading=heading_raw,
             control_mode=self.control_mode,
             target_speeds=target_speeds,
-            lane_change_cooldown_steps=int(
-                self.action_cfg.get("lane_change_cooldown_steps", 10)
-            ),
             lateral_offset_step=float(
                 self.action_cfg.get(
                     "lateral_offset_step",
@@ -543,22 +537,9 @@ class NGSimEnv(AbstractEnv):
             expert_action = np.array([accel_norm, steer_norm], dtype=np.float32)
             action: Action = expert_action
         elif self.control_mode == "discrete":
-            ego_current_id = 0
-            if getattr(self.vehicle, "target_lane_index", None):
-                ego_current_id = int(self.vehicle.target_lane_index[2])
-
-            if expert_target_lane_id != -1:
-                valid_target_id = clamp_lane_id_for_x(self.net, pos[0], expert_target_lane_id)
-                delta = valid_target_id - ego_current_id
-                if delta > 0 and self.vehicle._adjacent_lane_index(1) is not None:
-                    expert_action_str = "LANE_RIGHT"
-                elif delta < 0 and self.vehicle._adjacent_lane_index(-1) is not None:
-                    expert_action_str = "LANE_LEFT"
-
-            if expert_action_str is None:
-                expert_action_str = self._discrete_expert_action_from_tracker(
-                    steer_cmd, accel_cmd, lateral_error=lateral_error
-                )
+            expert_action_str = self._discrete_expert_action_from_tracker(
+                steer_cmd, accel_cmd, lateral_error=lateral_error
+            )
 
             actions_indexes = getattr(self.action_type, "actions_indexes", None)
             if actions_indexes is None:

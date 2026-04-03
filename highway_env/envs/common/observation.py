@@ -985,6 +985,199 @@ class LidarObservation(ObservationType):
         return np.array([np.cos(theta), np.sin(theta)], dtype=float)
 
 
+class LaneCameraObservation(LidarObservation):
+    """
+    Forward-facing topology camera.
+
+    The sensor ignores dynamic/static obstacles and only returns road/lane boundary
+    points that fall within an ego-centric cone. Each row is:
+      [presence, x, y]
+    where (x, y) is the boundary point expressed in the ego frame.
+    """
+
+    PRESENCE = 0
+    X = 1
+    Y = 2
+
+    def __init__(
+        self,
+        env,
+        cells: int = 21,
+        maximum_range: float = 60.0,
+        field_of_view: float = np.pi / 2,
+        normalize: bool = True,
+        longitudinal_resolution: float = 1.0,
+        coarse_step: float | None = None,
+        refine_iters: int = 8,
+        **kwargs,
+    ):
+        super().__init__(
+            env,
+            cells=cells,
+            maximum_range=maximum_range,
+            normalize=normalize,
+            edge_as_return=True,
+            coarse_step=coarse_step,
+            refine_iters=refine_iters,
+            **kwargs,
+        )
+        self.field_of_view = float(field_of_view)
+        self.longitudinal_resolution = float(longitudinal_resolution)
+        self.grid = np.zeros((self.cells, 3), dtype=np.float32)
+        self._boundary_points_cache = self._collect_boundary_points()
+
+    def space(self) -> spaces.Space:
+        high = 1.0 if self.normalize else self.maximum_range
+        low = np.tile(np.array([0.0, -high, -high], dtype=np.float32), (self.cells, 1))
+        high_arr = np.tile(np.array([1.0, high, high], dtype=np.float32), (self.cells, 1))
+        return spaces.Box(
+            shape=(self.cells, 3),
+            low=low,
+            high=high_arr,
+            dtype=np.float32,
+        )
+
+    def observe(self) -> np.ndarray:
+        vehicle = self.observer_vehicle
+        heading = float(getattr(vehicle, "heading", 0.0))
+        obs = self.trace_topology(vehicle.position, heading).copy()
+        if self.normalize:
+            obs[:, 1:] /= self.maximum_range
+        return obs
+
+    def trace_topology(self, origin: np.ndarray, heading: float) -> np.ndarray:
+        self.origin = np.array(origin, dtype=float).copy()
+        self.grid = np.zeros((self.cells, 3), dtype=np.float32)
+
+        if self._lanes_cache is None or getattr(self.env, "road", None) is None:
+            self._lanes_cache = self._collect_lanes()
+        if self._boundary_points_cache is None:
+            self._boundary_points_cache = self._collect_boundary_points()
+
+        if self._boundary_points_cache is None or len(self._boundary_points_cache) == 0:
+            return self.grid
+
+        relative_points = self._boundary_points_cache - self.origin
+        cos_h = np.cos(heading)
+        sin_h = np.sin(heading)
+        world_to_ego = np.array([[cos_h, sin_h], [-sin_h, cos_h]], dtype=float)
+        ego_points = relative_points @ world_to_ego.T
+
+        distances = np.linalg.norm(ego_points, axis=1)
+        angles = np.arctan2(ego_points[:, 1], ego_points[:, 0])
+
+        valid = (
+            np.isfinite(distances)
+            & np.isfinite(angles)
+            & (ego_points[:, 0] >= 0.0)
+            & (distances <= self.maximum_range)
+            & (np.abs(angles) <= self.field_of_view / 2.0)
+        )
+        if not np.any(valid):
+            return self.grid
+
+        ego_points = ego_points[valid]
+        distances = distances[valid]
+        angles = angles[valid]
+
+        bin_edges = np.linspace(
+            -self.field_of_view / 2.0, self.field_of_view / 2.0, self.cells + 1
+        )
+        bin_indices = np.digitize(angles, bin_edges[1:-1], right=False)
+        for index in range(self.cells):
+            matches = np.where(bin_indices == index)[0]
+            if matches.size == 0:
+                continue
+            nearest = matches[np.argmin(distances[matches])]
+            self.grid[index, :] = [1.0, ego_points[nearest, 0], ego_points[nearest, 1]]
+
+        return self.grid
+
+    def _collect_boundary_points(self) -> np.ndarray | None:
+        if self._lanes_cache is None:
+            self._lanes_cache = self._collect_lanes()
+        if self._lanes_cache is None:
+            return None
+
+        points = []
+        seen = set()
+        resolution = max(0.5, self.longitudinal_resolution)
+
+        for lane in self._lanes_cache:
+            length = float(getattr(lane, "length", 0.0))
+            if length <= 0.0 or not np.isfinite(length):
+                continue
+
+            longitudinals = np.arange(0.0, length + resolution, resolution, dtype=float)
+            for longitudinal in longitudinals:
+                width = float(lane.width_at(longitudinal))
+                for lateral in (-0.5 * width, 0.5 * width):
+                    point = lane.position(longitudinal, lateral)
+                    if point is None or not np.all(np.isfinite(point)):
+                        continue
+                    key = tuple(np.round(point, 3))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    points.append(np.array(point, dtype=np.float32))
+
+        if not points:
+            return None
+        return np.vstack(points)
+
+
+class LidarCameraObservations(ObservationType):
+    """
+    Composite observation that returns:
+      - full LiDAR obstacle/road-edge scan
+      - forward-facing topology camera scan
+    """
+
+    def __init__(
+        self,
+        env: AbstractEnv,
+        lidar: dict | None = None,
+        camera: dict | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(env, **kwargs)
+        self.lidar_observation = LidarObservation(env, **(lidar or {}))
+        self.camera_observation = LaneCameraObservation(env, **(camera or {}))
+
+    def space(self) -> spaces.Space:
+        return spaces.Tuple(
+            [
+                self.lidar_observation.space(),
+                self.camera_observation.space(),
+                spaces.Box(
+                    low=np.array([-np.inf, -np.pi], dtype=np.float32),
+                    high=np.array([np.inf, np.pi], dtype=np.float32),
+                    dtype=np.float32,
+                ),
+            ]
+        )
+
+    def observe(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        self.lidar_observation.observer_vehicle = self.observer_vehicle
+        self.camera_observation.observer_vehicle = self.observer_vehicle
+        ego_state = np.array(
+            [
+                float(getattr(self.observer_vehicle, "speed", 0.0)),
+                float(getattr(self.observer_vehicle, "heading", 0.0)),
+            ],
+            dtype=np.float32,
+        )
+        return (
+            self.lidar_observation.observe(),
+            self.camera_observation.observe(),
+            ego_state,
+        )
+
+
+# Backward-compatible alias while moving to the clearer name.
+LidarCameraObservation = LaneCameraObservation
+
+
 
 def observation_factory(env: AbstractEnv, config: dict) -> ObservationType:
     if config["type"] == "TimeToCollision":
@@ -1005,6 +1198,12 @@ def observation_factory(env: AbstractEnv, config: dict) -> ObservationType:
         return TupleObservation(env, **config)
     elif config["type"] == "LidarObservation":
         return LidarObservation(env, **config)
+    elif config["type"] == "LaneCameraObservation":
+        return LaneCameraObservation(env, **config)
+    elif config["type"] == "LidarCameraObservation":
+        return LaneCameraObservation(env, **config)
+    elif config["type"] == "LidarCameraObservations":
+        return LidarCameraObservations(env, **config)
     elif config["type"] == "ExitObservation":
         return ExitObservation(env, **config)
     else:

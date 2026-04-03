@@ -16,8 +16,6 @@ def get_terminal_action_discrete(env, cmd: str):
     cmd = cmd.strip().lower()
 
     cmd_to_act = {
-        "a": "LANE_LEFT",
-        "d": "LANE_RIGHT",
         "w": "FASTER",
         "s": "SLOWER",
         "l": "STEER_LEFT",   # l = left steer
@@ -95,8 +93,6 @@ Commands:
     else:
         print("""
 Commands:
-  a   lane left
-  d   lane right
   w   faster
   s   slower
   l   steer left
@@ -154,7 +150,6 @@ def run_manual_terminal(env, continuous: bool, max_steps=10_000):
             f"spd={v.speed:.2f} hdg={float(v.heading):.2f} "
             f"tgt_lane={getattr(v, 'target_lane_index', None)} "
             f"lat_off={getattr(v, 'lateral_offset', np.nan):.2f} "
-            f"lanechg_dir={getattr(v, 'lane_change_direction', 0)} "
             f"crash={bool(v.crashed)} "
             f"reward={reward:.4f} term={terminated} trunc={truncated}"
         )

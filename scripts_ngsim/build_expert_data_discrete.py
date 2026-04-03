@@ -310,7 +310,6 @@ def build_base_config() -> Dict[str, Any]:
         "expert_test_mode": True,
         "action_mode": "discrete",   # keep this aligned with your env implementation
         "expert_prefer_speed": False,
-        "lane_change_cooldown_steps": 10,
     }
 
 

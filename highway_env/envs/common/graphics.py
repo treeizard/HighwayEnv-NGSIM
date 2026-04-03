@@ -253,13 +253,24 @@ class EventHandler:
 
 class ObservationGraphics:
     COLOR = (0, 0, 0)
+    CAMERA_COLOR = (0, 120, 255)
+    CAMERA_BOUNDARY_COLOR = (220, 30, 30)
 
     @classmethod
     def display(cls, obs, sim_surface):
-        from highway_env.envs.common.observation import LidarObservation
+        from highway_env.envs.common.observation import (
+            LidarCameraObservations,
+            LaneCameraObservation,
+            LidarObservation,
+        )
 
         if isinstance(obs, LidarObservation):
             cls.display_grid(obs, sim_surface)
+        elif isinstance(obs, LaneCameraObservation):
+            cls.display_camera(obs, sim_surface)
+        elif isinstance(obs, LidarCameraObservations):
+            cls.display_grid(obs.lidar_observation, sim_surface)
+            cls.display_camera(obs.camera_observation, sim_surface)
 
     @classmethod
     def display_grid(cls, lidar_observation, surface):
@@ -285,3 +296,43 @@ class ObservationGraphics:
             for i in range(np.size(psi))
         ]
         pygame.draw.lines(surface, ObservationGraphics.COLOR, True, points, 1)
+
+    @classmethod
+    def display_camera(cls, camera_observation, surface):
+        if camera_observation.origin is None:
+            return
+
+        vehicle = getattr(camera_observation, "observer_vehicle", None)
+        if vehicle is None:
+            return
+
+        heading = float(getattr(vehicle, "heading", 0.0))
+        c, s = np.cos(heading), np.sin(heading)
+        ego_to_world = np.array([[c, -s], [s, c]], dtype=float)
+        origin_pix = surface.pos2pix(
+            camera_observation.origin[0], camera_observation.origin[1]
+        )
+        max_range = float(getattr(camera_observation, "maximum_range", 0.0))
+        fov = float(getattr(camera_observation, "field_of_view", 0.0))
+
+        # Draw the camera cone limits as thin red rays.
+        for boundary_angle in (-fov / 2.0, fov / 2.0):
+            boundary_dir = ego_to_world @ np.array(
+                [np.cos(boundary_angle), np.sin(boundary_angle)], dtype=float
+            )
+            boundary_point = (
+                camera_observation.origin + max_range * boundary_dir
+            )
+            boundary_pix = surface.pos2pix(boundary_point[0], boundary_point[1])
+            pygame.draw.line(
+                surface, cls.CAMERA_BOUNDARY_COLOR, origin_pix, boundary_pix, 1
+            )
+
+        for presence, x_rel, y_rel in camera_observation.grid:
+            if presence <= 0:
+                continue
+            world_point = camera_observation.origin + ego_to_world @ np.array(
+                [x_rel, y_rel], dtype=float
+            )
+            point_pix = surface.pos2pix(world_point[0], world_point[1])
+            pygame.draw.circle(surface, cls.CAMERA_COLOR, point_pix, 5)

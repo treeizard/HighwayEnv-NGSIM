@@ -153,7 +153,7 @@ It supports:
 
 - continuous low-level control
 - discrete meta-actions
-- lane-change cooldown and within-lane offset control
+- automatic lane-reference switching and within-lane offset control
 - scene-aware lane projection using road-edge helpers
 
 ### NGSIMVehicle
