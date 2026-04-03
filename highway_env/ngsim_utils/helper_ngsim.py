@@ -102,9 +102,30 @@ def target_lane_index_from_lane_id(
         return None
 
     if scene == "japanese":
-        edge = edge_from_x(net, x)
-        n_lanes = len(net.graph[edge[0]][edge[1]])
-        return (edge[0], edge[1], int(np.clip(lane_id - 1, 0, n_lanes - 1)))
+        # Dataset convention:
+        #   lane_id 2 -> right mainline lane
+        #   lane_id 1 -> left mainline lane
+        #   lane_id 3 -> left merge lane
+        if lane_id == 2:
+            if x < 150.0:
+                return ("a", "b", 0)
+            if x < 260.0:
+                return ("b", "c", 0)
+            return ("c", "d", 0)
+        if lane_id == 1:
+            if x < 150.0:
+                return ("a", "b", 1)
+            if x < 260.0:
+                return ("b", "c", 1)
+            return ("c", "d", 1)
+        if lane_id == 3:
+            if x < 150.0:
+                return ("j", "b", 0)
+            if x < 260.0:
+                return ("b", "c", 2)
+            # After the merge lane disappears, fold back onto the left mainline lane.
+            return ("c", "d", 1)
+        return None
 
     return None
 

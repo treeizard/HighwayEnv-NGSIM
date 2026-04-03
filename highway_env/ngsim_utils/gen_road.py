@@ -40,88 +40,88 @@ def create_ngsim_101_road():
     return net
 
 def create_japanese_road() -> None:
-        """
-        Make a road composed of a straight highway and a merging lane.
+    """
+    Japanese road layout matched to the processed dataset convention:
 
-        :return: the road
-        """
-        net = RoadNetwork()
+    - lane_id 2: right/main lane
+    - lane_id 1: left/main lane
+    - lane_id 3: left-side merge lane
 
-        # Highway lanes
-        ends = [100, 50, 50, 600]  # Before, converging, merge, after
-        c, s, n = LineType.CONTINUOUS_LINE, LineType.STRIPED, LineType.NONE
-        width = 3.75
-        y = [0, width]
-        line_type = [[c, s], [n, c]]
-        line_type_merge = [[s, s], [n, c]]
-        for i in range(2):
-            net.add_lane(
-                "a",
-                "b",
-                StraightLane([0, y[i]], [sum(ends[:2]), y[i]], line_types=line_type[i]),
-            )
-            net.add_lane(
-                "b",
-                "c",
-                StraightLane(
-                    [sum(ends[:2]), y[i]],
-                    [sum(ends[:3]), y[i]],
-                    line_types=line_type_merge[i],
-                ),
-            )
-            net.add_lane(
-                "c",
-                "d",
-                StraightLane(
-                    [sum(ends[:3]), y[i]], [sum(ends), y[i]], line_types=line_type[i]
-                ),
-            )
+    The dataset lateral positions are approximately centered around:
+      lane 2 -> y ~= -1.9
+      lane 1 -> y ~= +1.9
+      lane 3 -> y ~= +5.6
+    """
+    net = RoadNetwork()
 
-        # Merging lane
-        # Example lane width
-        lane_width = width  # typically 3.75
+    c, s, n = LineType.CONTINUOUS_LINE, LineType.STRIPED, LineType.NONE
+    width = 3.75
+    x_merge_start = 150.0
+    x_merge_end = 260.0
+    x_end = 800.0
 
-        # Main-road target lane center
-        target_y = -lane_width
+    y_right = -0.5 * width
+    y_left = 0.5 * width
+    y_merge = 1.5 * width
 
-        # Start the merge lane closer to the main road
-        merge_start_y = -6.0   # adjust this value as needed
+    # Two-lane mainline before the merge segment.
+    net.add_lane(
+        "a",
+        "b",
+        StraightLane([0.0, y_right], [x_merge_start, y_right], width=width, line_types=[c, s]),
+    )
+    net.add_lane(
+        "a",
+        "b",
+        StraightLane([0.0, y_left], [x_merge_start, y_left], width=width, line_types=[n, c]),
+    )
 
-        # 1) Straight ramp approach
-        ljk = StraightLane(
-            [0, merge_start_y],
-            [ends[0], merge_start_y],
-            line_types=[c, c],
-            forbidden=True
-        )
-
-        # 2) Smooth merge toward the target lane
-        # Reference line is the midpoint between start_y and target_y
-        mid_y = 0.5 * (merge_start_y + target_y)
-        amplitude = 0.5 * (merge_start_y - target_y)
-
-        lkb = SineLane(
-            [ends[0], mid_y],                 # start of sine reference line
-            [sum(ends[:2]), mid_y],           # end of sine reference line
-            amplitude,                        # chosen so actual path goes start_y -> target_y
-            2 * np.pi / (2 * ends[1]),        # = pi / ends[1]
-            np.pi / 2,
-            line_types=[c, c],
+    # Three-lane section while the left merge lane exists.
+    net.add_lane(
+        "b",
+        "c",
+        StraightLane([x_merge_start, y_right], [x_merge_end, y_right], width=width, line_types=[c, s]),
+    )
+    net.add_lane(
+        "b",
+        "c",
+        StraightLane([x_merge_start, y_left], [x_merge_end, y_left], width=width, line_types=[n, s]),
+    )
+    net.add_lane(
+        "b",
+        "c",
+        SineLane(
+            [x_merge_start, 0.5 * (y_merge + y_left)],
+            [x_merge_end, 0.5 * (y_merge + y_left)],
+            amplitude=0.5 * (y_merge - y_left),
+            pulsation=np.pi / (x_merge_end - x_merge_start),
+            phase=np.pi / 2.0,
+            width=width,
+            line_types=[n, c],
             forbidden=True,
-        )
+        ),
+    )
 
-        # 3) Straight lane after merge, aligned with the main-road lane
-        lbc = StraightLane(
-            [sum(ends[:2]), target_y],
-            [sum(ends[:3]), target_y],
-            line_types=[c, n],
-            forbidden=True,
-        )
+    # Two-lane mainline after the merge.
+    net.add_lane(
+        "c",
+        "d",
+        StraightLane([x_merge_end, y_right], [x_end, y_right], width=width, line_types=[c, s]),
+    )
+    net.add_lane(
+        "c",
+        "d",
+        StraightLane([x_merge_end, y_left], [x_end, y_left], width=width, line_types=[n, c]),
+    )
 
-        net.add_lane("j", "k", ljk)
-        net.add_lane("k", "b", lkb)
-        net.add_lane("b", "c", lbc)
-        return net
+    # Left-side merge approach feeding the temporary merge lane.
+    net.add_lane(
+        "j",
+        "b",
+        StraightLane([100.0, y_merge], [x_merge_start, y_merge], width=width, line_types=[c, c], forbidden=True),
+    )
+
+    return net
 
 
 def clamp_location_ngsim(x_pos, lane0, net, warning=False):

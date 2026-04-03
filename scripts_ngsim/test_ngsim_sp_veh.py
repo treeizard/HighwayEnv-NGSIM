@@ -68,24 +68,35 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     # ---------------------- Debug Config ----------------------
-    TARGET_EPISODE = "t1118849169700"
-    TARGET_EGO_ID = 785
+    TARGET_SCENE = "japanese"
+    TARGET_EPISODE = "t1577932220000"
+    TARGET_EGO_ID = 2513
+    VIDEO_WIDTH = 1600
+    VIDEO_HEIGHT = 600
 
     base_cfg = {
-        "scene": "us-101",
+        "scene": TARGET_SCENE,
         "observation": {
-            "type": "LidarObservation",
-            "cells": 128,
-            "maximum_range": 64,
-            "normalize": True,
+            "type": "LidarCameraObservations",
+            "lidar": {
+                "cells": 128,
+                "maximum_range": 64,
+                "normalize": True,
+            },
+            "camera": {
+                "cells": 21,
+                "maximum_range": 64,
+                "field_of_view": np.pi / 2,
+                "normalize": True,
+            },
         },
         "action": {"type": "DiscreteSteerMetaAction"},
         "show_trajectories": True,
         "simulation_frequency": 10,
         "policy_frequency": 10,
-        "screen_width": 400,
-        "screen_height": 150,
-        "scaling": 2.0,
+        "screen_width": VIDEO_WIDTH,
+        "screen_height": VIDEO_HEIGHT,
+        "scaling": 5.0,
         "offscreen_rendering": True,
         "ego_vehicle_ID": TARGET_EGO_ID,
         "simulation_period": {"episode_name": TARGET_EPISODE},
@@ -102,6 +113,7 @@ def main():
 
     for i in range(NUM_REPLAYS):
         print(f"\n=== Generating debug video #{i+1}/{NUM_REPLAYS} ===")
+        print(f"Scene: {TARGET_SCENE}")
         print(f"Episode: {TARGET_EPISODE}, Ego ID: {TARGET_EGO_ID}")
 
         env = gym.make(
@@ -114,22 +126,40 @@ def main():
             env,
             video_folder=out_dir,
             episode_trigger=lambda ep_idx: True,
-            name_prefix=f"ngsim_{TARGET_EPISODE}_ego{TARGET_EGO_ID}",
+            name_prefix=f"ngsim_{TARGET_SCENE}_{TARGET_EPISODE}_ego{TARGET_EGO_ID}",
         )
 
         obs, info = env.reset(seed=0)
+        vehicle = env.unwrapped.vehicle
+        print(
+            "initial:",
+            f"pos={vehicle.position}",
+            f"heading={float(vehicle.heading):.3f}",
+            f"speed={float(vehicle.speed):.3f}",
+            f"lane_index={getattr(vehicle, 'lane_index', None)}",
+            f"target_lane_index={getattr(vehicle, 'target_lane_index', None)}",
+        )
 
         STEPS = 450
         for t in range(STEPS):
             # In expert_test_mode, actual action input is ignored
-            a = 0 
+            a = 0
             obs, r, terminated, truncated, info = env.step(a)
+            if t < 10:
+                vehicle = env.unwrapped.vehicle
+                print(
+                    f"step={t:03d}",
+                    f"pos={vehicle.position}",
+                    f"lane_index={getattr(vehicle, 'lane_index', None)}",
+                    f"target_lane_index={getattr(vehicle, 'target_lane_index', None)}",
+                    f"crashed={bool(vehicle.crashed)}",
+                    f"expert_action={info.get('expert_action_discrete')}",
+                )
             if terminated or truncated:
                 print(f"Terminated at step {t}")
                 break
 
-        # --- NEW: Generate Plot before closing ---
-        # We access the internal environment via env.unwrapped
+        # --- Generate Plot before closing ---
         plot_trajectory_comparison(env.unwrapped, TARGET_EPISODE, TARGET_EGO_ID, out_dir)
 
         env.close()

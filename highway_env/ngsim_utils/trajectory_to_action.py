@@ -257,11 +257,18 @@ def map_discrete_expert_action(steer_cmd: float, accel_cmd: float,
                                v_dead: float = 0.5, 
                                s_dead: float = 0.05,        # Curvature fallback threshold
                                lat_dead: float = 0.15,      # Deadband for lateral position (15cm)
-                               prefer_speed: bool = False) -> str:
+                               prefer_speed: bool = False,
+                               front_gap: float | None = None,
+                               merge_priority: bool = False) -> str:
     """
     Map (steer_cmd, accel_cmd, lateral_error) to:
       {"SLOWER", "IDLE", "FASTER", "STEER_LEFT", "STEER_RIGHT"}
     """
+
+    if merge_priority:
+        lat_dead = min(lat_dead, 0.10)
+        s_dead = min(s_dead, 0.03)
+        prefer_speed = False
 
     # Speed Desire Calculation (FASTER / SLOWER)
     speed_des = 0
@@ -281,6 +288,15 @@ def map_discrete_expert_action(steer_cmd: float, accel_cmd: float,
         elif accel_cmd < -0.2:
             speed_des = -1
 
+    # Gap-aware speed moderation to avoid replay-time rear-ending/merge conflicts.
+    if front_gap is not None and np.isfinite(front_gap):
+        hard_gap = max(4.0, 0.30 * float(vehicle_speed))
+        soft_gap = max(8.0, 0.60 * float(vehicle_speed))
+        if front_gap < hard_gap:
+            speed_des = -1
+        elif front_gap < soft_gap and speed_des > 0:
+            speed_des = 0
+
     # Steering Desire Calculation (STEER_LEFT / STEER_RIGHT)
     steer_des = 0
     
@@ -293,6 +309,16 @@ def map_discrete_expert_action(steer_cmd: float, accel_cmd: float,
     # Secondary logic: Curvature (only when no significant positional error)
     elif abs(steer_cmd) > s_dead:
         steer_des = 1 if steer_cmd > 0 else -1
+
+    if merge_priority:
+        if abs(lateral_error) > 0.30:
+            speed_des = min(speed_des, 0)
+        if abs(lateral_error) > 0.75:
+            speed_des = -1
+        # In merge mode, never accelerate and prefer deceleration while crossing over.
+        speed_des = min(speed_des, 0)
+        if abs(lateral_error) > 0.20 and vehicle_speed > 12.0:
+            speed_des = -1
 
     # Conflict Resolution: If both steering and speed desire are set, handle critical overrides
     if steer_des != 0 and speed_des != 0:

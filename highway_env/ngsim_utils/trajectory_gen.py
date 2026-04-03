@@ -375,12 +375,14 @@ def process_raw_trajectory(trajectory, scene):
             else:
             '''
             x = trajectory[i][0]
-            y = trajectory[i][1] + 2
+            y = trajectory[i][1]
             speed = trajectory[i][2]
 
-            trajectory[i][0] = x 
-            trajectory[i][1] = y 
-            trajectory[i][2] = speed 
+            trajectory[i][0] = x
+            trajectory[i][1] = y
+            # Japanese trajectory coordinates are already in meters, while speed is stored in km/h.
+            # Convert only the speed channel so the processed trajectory is consistently in SI units.
+            trajectory[i][2] = speed / 3.6
             #print(x, y, speed)
     else:
         raise UserWarning("The Scene is not Recognised Please Try Again")

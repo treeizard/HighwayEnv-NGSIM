@@ -52,7 +52,7 @@ def main():
     video_height = 600
 
     base_cfg = {
-        "scene": "us-101",
+        "scene": "japanese",
         "observation": {
             "type": "LidarCameraObservations",
             "lidar": {
@@ -75,7 +75,7 @@ def main():
         "policy_frequency": 10,
         "screen_width": video_width,
         "screen_height": video_height,
-        "scaling": 10.0,
+        "scaling": 6.0,
         "offscreen_rendering": True,
         "episode_root": "highway_env/data/processed_10s",
         "replay_period": None,

@@ -1,6 +1,8 @@
 # Modified by: Yide Tao (yide.tao@monash.edu)
 from __future__ import annotations
 
+import copy
+import itertools
 import logging
 import os
 from copy import deepcopy
@@ -16,12 +18,12 @@ from highway_env.ngsim_utils.helper_ngsim import (
     get_ego_dimensions,
     load_ego_trajectory,
     setup_expert_tracker,
+    target_lane_index_from_lane_id,
 )
 from highway_env.ngsim_utils.obs_vehicle import spawn_surrounding_vehicles
 from highway_env.ngsim_utils.gen_road import create_ngsim_101_road, create_japanese_road
 from highway_env.ngsim_utils.trajectory_to_action import (
     PurePursuitTracker,
-    map_discrete_expert_action,
 )
 from highway_env.ngsim_utils.trajectory_gen import first_valid_index
 from highway_env.ngsim_utils.ego_vehicle import EgoVehicle
@@ -81,10 +83,14 @@ class NGSimEnv(AbstractEnv):
                     "target_speeds": list(np.arange(0.0, 35.0 + 1e-6, 2.0)),
                 },
                 "expert_v": {
-                    "expert_speed_deadband_mps": 0.5,
-                    "expert_steer_deadband_rad": 0.05,
-                    "expert_one_action_per_step": True,
-                    "expert_prefer_speed": False,
+                    "planner_horizon": 2,
+                    "planner_branching": 5,
+                    "planner_position_weight": 3.0,
+                    "planner_heading_weight": 0.5,
+                    "planner_speed_weight": 0.2,
+                    "planner_clearance_weight": 8.0,
+                    "planner_collision_cost": 1e6,
+                    "planner_action_change_weight": 0.05,
                 },
                 "simulation_frequency": 10,
                 "policy_frequency": 10,
@@ -302,13 +308,10 @@ class NGSimEnv(AbstractEnv):
         ego_len: float,
         ego_wid: float,
     ) -> EgoVehicle:
-        x0, y0, ego_speed, _lane0 = ego_traj[0]
+        x0, y0, ego_speed, lane0 = ego_traj[0]
         ego_xy = np.array([x0, y0], dtype=float)
         heading_raw = self._estimate_initial_heading(ego_traj)
-        target_speeds_cfg = self.action_cfg.get("target_speeds", None)
-        target_speeds = (
-            np.array(target_speeds_cfg, dtype=float) if target_speeds_cfg is not None else None
-        )
+        target_speeds = self._target_speeds_for_trajectory(ego_traj)
 
         ego = EgoVehicle(
             road=self.road,
@@ -331,7 +334,57 @@ class NGSimEnv(AbstractEnv):
             ),
         )
         ego.set_ego_dimension(width=ego_wid, length=ego_len)
+
+        mapped_lane_index = target_lane_index_from_lane_id(
+            self.road.network, self.scene, x0, int(lane0)
+        )
+        if mapped_lane_index is not None:
+            ego.target_lane_index = mapped_lane_index
+            ego.lane_index = mapped_lane_index
+            ego.lane = self.road.network.get_lane(mapped_lane_index)
+            s0, r0 = ego.lane.local_coordinates(ego.position)
+            if not ego.lane.on_lane(ego.position, s0, r0):
+                lane_margin = max(0.1, 0.5 * ego_wid)
+                r0 = float(
+                    np.clip(
+                        r0,
+                        -ego.lane.width_at(s0) / 2.0 + lane_margin,
+                        ego.lane.width_at(s0) / 2.0 - lane_margin,
+                    )
+                )
+                ego.position = ego.lane.position(s0, r0)
+            ego.heading = float(ego.lane.heading_at(s0))
+
         return ego
+
+    def _target_speeds_for_trajectory(self, ego_traj: np.ndarray) -> np.ndarray | None:
+        if self.control_mode != "discrete":
+            target_speeds_cfg = self.action_cfg.get("target_speeds", None)
+            return np.array(target_speeds_cfg, dtype=float) if target_speeds_cfg is not None else None
+
+        target_speeds_cfg = self.action_cfg.get("target_speeds", None)
+        if target_speeds_cfg is None:
+            base = np.array(EgoVehicle.DEFAULT_TARGET_SPEEDS, dtype=float)
+        else:
+            base = np.array(target_speeds_cfg, dtype=float)
+
+        if base.ndim != 1 or base.size < 2 or not np.all(np.isfinite(base)):
+            return np.array(EgoVehicle.DEFAULT_TARGET_SPEEDS, dtype=float)
+
+        diffs = np.diff(base)
+        positive_diffs = diffs[diffs > 1e-6]
+        step = float(np.median(positive_diffs)) if positive_diffs.size else 2.0
+        step = max(0.5, step)
+
+        valid_speeds = ego_traj[:, 2]
+        valid_speeds = valid_speeds[np.isfinite(valid_speeds) & (valid_speeds >= 0.0)]
+        if valid_speeds.size == 0:
+            return base
+
+        max_speed = max(float(base[-1]), float(np.max(valid_speeds)) + step)
+        count = int(np.ceil(max_speed / step)) + 1
+        adaptive = np.arange(count, dtype=float) * step
+        return adaptive
 
     def _estimate_initial_heading(self, ego_traj: np.ndarray) -> float:
         dx0 = ego_traj[1, 0] - ego_traj[0, 0]
@@ -458,37 +511,173 @@ class NGSimEnv(AbstractEnv):
     # -------------------------------------------------------------------------
     # EXPERT METRICS & HELPERS
     # -------------------------------------------------------------------------
-    def _discrete_expert_action_from_tracker(
-        self,
-        steer_cmd: float,
-        accel_cmd: float,
-        lateral_error: float = 0.0,
-    ) -> str:
-        """
-        Map (steer_cmd, accel_cmd, lateral_error) to one of:
-        {"SLOWER", "IDLE", "FASTER", "STEER_LEFT", "STEER_RIGHT"}
-        """
-        v_dead = float(self.expert_cfg.get("expert_speed_deadband_mps", 0.5))
-        s_dead = float(self.expert_cfg.get("expert_steer_deadband_rad", 0.05))
-        lat_dead = 0.15
-        prefer_speed = bool(self.expert_cfg.get("expert_prefer_speed", False))
-        steps = self.steps
+    def _expert_action_strings(self) -> list[str]:
+        if not hasattr(self.action_type, "actions"):
+            return ["IDLE"]
+        return [self.action_type.actions[i] for i in sorted(self.action_type.actions)]
 
-        expert_ref_v_pol = self._expert_ref_v_pol
-        vehicle_speed = self.vehicle.speed
-
-        return map_discrete_expert_action(
-            steer_cmd,
-            accel_cmd,
-            expert_ref_v_pol,
-            vehicle_speed,
-            steps,
-            lateral_error=lateral_error,
-            v_dead=v_dead,
-            s_dead=s_dead,
-            lat_dead=lat_dead,
-            prefer_speed=prefer_speed,
+    def _planning_vehicle_clone(self) -> EgoVehicle:
+        vehicle = self.vehicle
+        sim_vehicle = EgoVehicle(
+            road=None,
+            position=np.array(vehicle.position, dtype=float),
+            heading=float(vehicle.heading),
+            speed=float(vehicle.speed),
+            target_speed=float(getattr(vehicle, "target_speed", vehicle.speed)),
+            route=copy.deepcopy(getattr(vehicle, "route", None)),
+            control_mode=str(getattr(vehicle, "control_mode", "discrete")),
+            target_speeds=np.array(getattr(vehicle, "target_speeds", EgoVehicle.DEFAULT_TARGET_SPEEDS), dtype=float),
+            lateral_offset_step=float(getattr(vehicle, "lateral_offset_step", EgoVehicle.DEFAULT_LATERAL_OFFSET_STEP)),
+            lateral_offset_max=float(getattr(vehicle, "lateral_offset_max", EgoVehicle.DEFAULT_LATERAL_OFFSET_MAX)),
         )
+        sim_vehicle.set_ego_dimension(
+            width=float(getattr(vehicle, "WIDTH", sim_vehicle.WIDTH)),
+            length=float(getattr(vehicle, "LENGTH", sim_vehicle.LENGTH)),
+        )
+        sim_vehicle.target_lane_index = copy.deepcopy(getattr(vehicle, "target_lane_index", None))
+        sim_vehicle.lane_index = copy.deepcopy(getattr(vehicle, "lane_index", None))
+        sim_vehicle.lane = self.road.network.get_lane(sim_vehicle.lane_index)
+        sim_vehicle.target_speed = float(getattr(vehicle, "target_speed", sim_vehicle.target_speed))
+        sim_vehicle.speed_index = int(getattr(vehicle, "speed_index", sim_vehicle.speed_index))
+        sim_vehicle.lateral_offset = float(getattr(vehicle, "lateral_offset", 0.0))
+        sim_vehicle._last_low_level_action = dict(getattr(vehicle, "_last_low_level_action", {"steering": 0.0, "acceleration": 0.0}))
+        sim_vehicle.action = dict(getattr(vehicle, "action", {"steering": 0.0, "acceleration": 0.0}))
+        sim_vehicle.crashed = bool(getattr(vehicle, "crashed", False))
+        sim_vehicle.color = getattr(vehicle, "color", None)
+
+        sim_vehicle.road = copy.copy(self.road)
+        sim_vehicle.road.network = self.road.network
+        sim_vehicle.road.objects = list(self.road.objects)
+        sim_vehicle.road.vehicles = [sim_vehicle, *[v for v in self.road.vehicles if v is not self.vehicle]]
+        return sim_vehicle
+
+    def _planning_reference_index(self, offset: int) -> int:
+        ref = getattr(self, "_expert_ref_xy_pol", None)
+        if ref is None or len(ref) == 0:
+            return 0
+        return int(np.clip(self.steps + offset, 0, len(ref) - 1))
+
+    def _reference_heading_at(self, ref_idx: int) -> float:
+        ref = self._expert_ref_xy_pol
+        if len(ref) < 2:
+            return float(self.vehicle.heading)
+        i0 = int(np.clip(ref_idx, 0, len(ref) - 2))
+        i1 = i0 + 1
+        dx = float(ref[i1, 0] - ref[i0, 0])
+        dy = float(ref[i1, 1] - ref[i0, 1])
+        return float(np.arctan2(dy, dx))
+
+    def _planning_clearance_cost(self, sim_vehicle: EgoVehicle) -> float:
+        weight = float(self.expert_cfg.get("planner_clearance_weight", 8.0))
+        collision_cost = float(self.expert_cfg.get("planner_collision_cost", 1e6))
+        min_clearance = np.inf
+
+        for other in self.road.vehicles:
+            if other is self.vehicle:
+                continue
+            center_dist = float(np.linalg.norm(sim_vehicle.position - other.position))
+            clearance = center_dist - 0.5 * (
+                float(getattr(sim_vehicle, "diagonal", np.hypot(sim_vehicle.LENGTH, sim_vehicle.WIDTH)))
+                + float(getattr(other, "diagonal", np.hypot(other.LENGTH, other.WIDTH)))
+            )
+            min_clearance = min(min_clearance, clearance)
+            if clearance < 0.0:
+                return collision_cost
+
+        if not np.isfinite(min_clearance):
+            return 0.0
+
+        soft_margin = max(3.0, 0.20 * float(sim_vehicle.speed))
+        if min_clearance >= soft_margin:
+            return 0.0
+        return weight * float((soft_margin - min_clearance) ** 2)
+
+    def _rollout_action_sequence(
+        self, action_sequence: tuple[str, ...]
+    ) -> tuple[float, list[EgoVehicle]]:
+        sim_vehicle = self._planning_vehicle_clone()
+        frames_per_action = max(
+            1,
+            int(self.config["simulation_frequency"] // self.config["policy_frequency"]),
+        )
+        dt = 1.0 / float(self.config["simulation_frequency"])
+        position_weight = float(self.expert_cfg.get("planner_position_weight", 3.0))
+        heading_weight = float(self.expert_cfg.get("planner_heading_weight", 0.5))
+        speed_weight = float(self.expert_cfg.get("planner_speed_weight", 0.2))
+        action_change_weight = float(
+            self.expert_cfg.get("planner_action_change_weight", 0.05)
+        )
+
+        score = 0.0
+        states: list[EgoVehicle] = []
+        previous_action = None
+
+        for offset, action_str in enumerate(action_sequence, start=1):
+            sim_vehicle.act(action_str)
+            for frame in range(frames_per_action):
+                sim_vehicle.act(None)
+                sim_vehicle.step(dt)
+
+            states.append(copy.deepcopy(sim_vehicle))
+
+            ref_idx = self._planning_reference_index(offset)
+            ref_pos = self._expert_ref_xy_pol[ref_idx]
+            ref_speed = float(self._expert_ref_v_pol[ref_idx])
+
+            pos_err = float(np.linalg.norm(sim_vehicle.position - ref_pos))
+            ref_heading = self._reference_heading_at(ref_idx)
+            heading_err = float(
+                np.arctan2(
+                    np.sin(sim_vehicle.heading - ref_heading),
+                    np.cos(sim_vehicle.heading - ref_heading),
+                )
+            )
+            speed_err = float(sim_vehicle.speed - ref_speed)
+
+            score += position_weight * pos_err * pos_err
+            score += heading_weight * heading_err * heading_err
+            score += speed_weight * speed_err * speed_err
+            score += self._planning_clearance_cost(sim_vehicle)
+
+            if previous_action is not None and previous_action != action_str:
+                score += action_change_weight
+            previous_action = action_str
+
+        return score, states
+
+    def _select_discrete_expert_action(self) -> str:
+        actions = self._expert_action_strings()
+        if len(actions) == 1:
+            return actions[0]
+
+        horizon = int(max(1, self.expert_cfg.get("planner_horizon", 2)))
+        branching = int(max(1, self.expert_cfg.get("planner_branching", len(actions))))
+        prioritized = []
+
+        # Keep the previous expert action early in the ordering to reduce jitter.
+        if self._expert_actions_policy:
+            last_action = self._expert_actions_policy[-1]
+            if isinstance(last_action, str) and last_action in actions:
+                prioritized.append(last_action)
+
+        for candidate in ["IDLE", "STEER_LEFT", "STEER_RIGHT", "FASTER", "SLOWER"]:
+            if candidate in actions and candidate not in prioritized:
+                prioritized.append(candidate)
+        for candidate in actions:
+            if candidate not in prioritized:
+                prioritized.append(candidate)
+
+        candidate_actions = prioritized[:branching]
+        best_first_action = candidate_actions[0]
+        best_score = np.inf
+
+        for sequence in itertools.product(candidate_actions, repeat=horizon):
+            score, _ = self._rollout_action_sequence(sequence)
+            if score < best_score:
+                best_score = score
+                best_first_action = sequence[0]
+
+        return best_first_action
 
     def expert_replay_metrics(self):
         if not hasattr(self, "_expert_ref_xy_pol"):
@@ -509,23 +698,12 @@ class NGSimEnv(AbstractEnv):
 
         return {"T": T, "ADE_m": ade, "FDE_m": fde, "err_per_step_m": err}
 
-    def _compute_lateral_error(self, pos: np.ndarray, heading: float) -> float:
-        if not hasattr(self, "_expert_ref_xy_pol") or self.steps >= len(self._expert_ref_xy_pol):
-            return 0.0
-        expert_pos = self._expert_ref_xy_pol[self.steps]
-        dx = expert_pos[0] - pos[0]
-        dy = expert_pos[1] - pos[1]
-        return float(-np.sin(heading) * dx + np.cos(heading) * dy)
-
     def _resolve_expert_action(self) -> tuple[Action, np.ndarray | None, str | None, int | None]:
         pos = self.vehicle.position
         hdg = float(self.vehicle.heading)
         spd = float(self.vehicle.speed)
 
-        steer_cmd, accel_cmd, i_near, i_tgt, expert_target_lane_id = self._tracker.step(
-            pos, hdg, spd
-        )
-        lateral_error = self._compute_lateral_error(pos, hdg)
+        _, _, i_near, i_tgt, _expert_target_lane_id = self._tracker.step(pos, hdg, spd)
 
         expert_action: np.ndarray | None = None
         expert_action_str: str | None = None
@@ -537,9 +715,7 @@ class NGSimEnv(AbstractEnv):
             expert_action = np.array([accel_norm, steer_norm], dtype=np.float32)
             action: Action = expert_action
         elif self.control_mode == "discrete":
-            expert_action_str = self._discrete_expert_action_from_tracker(
-                steer_cmd, accel_cmd, lateral_error=lateral_error
-            )
+            expert_action_str = self._select_discrete_expert_action()
 
             actions_indexes = getattr(self.action_type, "actions_indexes", None)
             if actions_indexes is None:
