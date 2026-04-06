@@ -1,4 +1,5 @@
 import numpy as np
+from highway_env.ngsim_utils.constants import FEET_PER_METER, US101_SECTION_ENDS_M
 from highway_env.ngsim_utils.trajectory_gen import process_raw_trajectory
 from highway_env.ngsim_utils.trajectory_to_action import traj_to_expert_actions
 
@@ -6,8 +7,7 @@ from highway_env.ngsim_utils.trajectory_to_action import traj_to_expert_actions
 # ROAD / LANE HELPERS
 # -------------------------------------------------------------------------
 def us101_edge_from_x(x: float) -> tuple[str, str]:
-    length = 2150 / 3.281
-    ends = [0.0, 560 / 3.281, (698 + 578 + 150) / 3.281, length]
+    ends = US101_SECTION_ENDS_M
     x_m = float(x)
     if x_m < ends[1]:
         return ("s1", "s2")
@@ -18,11 +18,11 @@ def us101_edge_from_x(x: float) -> tuple[str, str]:
 
 def i80_edge_from_x(x: float) -> tuple[str, str]:
     x_m = float(x)
-    if x_m <= 600 / 3.281:
+    if x_m <= 600 / FEET_PER_METER:
         return ("s1", "s2")
-    if x_m <= 700 / 3.281:
+    if x_m <= 700 / FEET_PER_METER:
         return ("s2", "s3")
-    if x_m <= 900 / 3.281:
+    if x_m <= 900 / FEET_PER_METER:
         return ("s3", "s4")
     return ("s4", "s5")
 

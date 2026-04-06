@@ -21,6 +21,7 @@ from scipy import signal
 import matplotlib.pyplot as plt
 from highway_env.data.ngsim import *
 from typing import Any, Dict
+from highway_env.ngsim_utils.constants import FEET_PER_METER
 """
 def trajectory_smoothing(trajectory):
     trajectory = np.array(trajectory)
@@ -360,9 +361,9 @@ def process_raw_trajectory(trajectory, scene):
             x = trajectory[i][0] - 6
             y = trajectory[i][1]
             speed = trajectory[i][2]
-            trajectory[i][0] = y / 3.281
-            trajectory[i][1] = x / 3.281
-            trajectory[i][2] = speed / 3.281
+            trajectory[i][0] = y / FEET_PER_METER
+            trajectory[i][1] = x / FEET_PER_METER
+            trajectory[i][2] = speed / FEET_PER_METER
     elif scene == "japanese":
         trajectory = np.array(trajectory)
         for i in range(trajectory.shape[0]):

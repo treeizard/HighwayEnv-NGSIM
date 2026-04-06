@@ -24,6 +24,7 @@ from typing import Tuple, Optional
 
 from highway_env import utils
 from highway_env.vehicle.behavior import IDMVehicle
+from highway_env.ngsim_utils.constants import FEET_PER_METER
 from highway_env.ngsim_utils.ego_vehicle import EgoVehicle
 from highway_env.ngsim_utils.helper_ngsim import target_lane_index_from_lane_id
 from highway_env.ngsim_utils.trajectory_gen import process_raw_trajectory
@@ -117,6 +118,7 @@ class NGSIMVehicle(IDMVehicle):
         # Replay state
         self.sim_steps = 0
         self.overtaken = False
+        self.remove_from_road = False
 
         # ---- Initialise from trajectory instead of dummy (0,0) ----
         if self.ngsim_traj is not None and len(self.ngsim_traj) > 0:
@@ -204,12 +206,37 @@ class NGSIMVehicle(IDMVehicle):
     def _record_position(self) -> None:
         self.traj = np.vstack([self.traj, self.position.copy()])
 
+    def _mark_for_removal(self) -> None:
+        """Hide the vehicle and flag it for pruning from the road."""
+        self.remove_from_road = True
+        self.speed = 0.0
+        self.target_speed = 0.0
+        self._set_visibility_from_appearance(False)
+
+    def _reached_terminal_lane_end(self) -> bool:
+        """
+        Return True when the vehicle is on a lane with no downstream edge and has
+        progressed beyond the usable end of that lane.
+        """
+        if self.lane is None or self.lane_index is None:
+            return False
+
+        lane = self.lane
+        lane_index = self.lane_index
+        downstream = self.road.network.graph.get(lane_index[1], {})
+        if downstream:
+            return False
+
+        local_s, _ = lane.local_coordinates(self.position)
+        removal_margin = 0.5 * max(float(self.real_length), 0.0)
+        return bool(local_s >= lane.length - removal_margin)
+
     def act(self, action: dict | str = None):
         """
         Only act (IDM/MOBIL) once we are overtaken.
         While in replay mode (not overtaken), we don't call Vehicle.act().
         """
-        if self.crashed:
+        if self.crashed or self.remove_from_road:
             return
         if not self.overtaken:
             return
@@ -304,10 +331,15 @@ class NGSIMVehicle(IDMVehicle):
         - Otherwise (trajectory exhausted OR ego too close ahead):
               → mark as overtaken and use IDM/MOBIL dynamics.
         """
+        if self.remove_from_road:
+            return
+
         # No trajectory: behave as a pure IDM vehicle
         if self.ngsim_traj is None or len(self.ngsim_traj) == 0:
             self.overtaken = True
             super().step(dt)
+            if self._reached_terminal_lane_end():
+                self._mark_for_removal()
             return
 
         # Timer / histories
@@ -320,7 +352,8 @@ class NGSIMVehicle(IDMVehicle):
         gap, desired_gap, ego_ahead = self._front_gap_logic()
 
         # Still have replay data?
-        can_replay = (not self.overtaken) and (self.sim_steps + 1 < len(self.ngsim_traj))
+        replay_exhausted = self.sim_steps + 1 >= len(self.ngsim_traj)
+        can_replay = (not self.overtaken) and (not replay_exhausted)
 
         # --- Replay vs takeover logic ---
         #  - If no ego ahead: ignore gaps, just replay while we have data.
@@ -328,8 +361,17 @@ class NGSIMVehicle(IDMVehicle):
         if can_replay and (not ego_ahead or gap >= desired_gap):
             # Keep replaying the NGSIM trajectory
             self._update_from_trajectory()
+            if self._reached_terminal_lane_end():
+                self._mark_for_removal()
+                self._record_position()
+                return
             self.sim_steps += 1
         else:
+            if not self.overtaken and replay_exhausted:
+                self._mark_for_removal()
+                self._record_position()
+                return
+
             # Handover to IDM/MOBIL
             self.overtaken = True
             self.color = (100, 200, 255)
@@ -355,6 +397,8 @@ class NGSIMVehicle(IDMVehicle):
 
             # Now evolve with IDM/MOBIL dynamics
             super().step(dt)
+            if self._reached_terminal_lane_end():
+                self._mark_for_removal()
 
         # Record replayed / simulated position
         self._record_position()
@@ -376,6 +420,8 @@ class NGSIMVehicle(IDMVehicle):
         """
 
         # 1. Global toggle: if either side disabled, do nothing.
+        if self.remove_from_road or getattr(other, "remove_from_road", False):
+            return
         if not getattr(self, "COLLISIONS_ENABLED", True) or \
         not getattr(other, "COLLISIONS_ENABLED", True):
             return
@@ -416,7 +462,7 @@ def spawn_surrounding_vehicles(
     ego_start_index,
     max_surrounding,
     road,
-    f2m_conv=3.281,
+    f2m_conv=FEET_PER_METER,
     scene = "us-101"
 ):
     """Spawn surrounding vehicles based on the given trajectory set.

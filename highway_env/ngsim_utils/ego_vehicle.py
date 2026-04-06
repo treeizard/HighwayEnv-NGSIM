@@ -9,6 +9,7 @@ from highway_env.road.road import LaneIndex, Road, Route
 from highway_env.utils import Vector
 from highway_env.vehicle.kinematics import Vehicle
 
+from highway_env.ngsim_utils.constants import MAX_STEER, US101_LANE_WIDTH_M
 from highway_env.ngsim_utils.helper_ngsim import edge_from_x
 
 
@@ -41,7 +42,7 @@ class EgoVehicle(Vehicle):
     KP_HEADING = 1.0 / TAU_HEADING
     KP_LATERAL = 1.0 / TAU_LATERAL
 
-    MAX_STEERING_ANGLE = np.pi / 4
+    MAX_STEERING_ANGLE = MAX_STEER
 
     # --------------------------
     # Discrete speed grid defaults
@@ -56,7 +57,7 @@ class EgoVehicle(Vehicle):
     DEFAULT_OFFSET_MARGIN = 0.10        # [m] keep some clearance to lane boundary
 
     # Fallback lane width if geometry doesn't expose it (should not happen for StraightLane)
-    DEFAULT_LANE_WIDTH_FALLBACK = 12 / 3.281  # ~3.66m, matches your road builder
+    DEFAULT_LANE_WIDTH_FALLBACK = US101_LANE_WIDTH_M
 
     def __init__(
         self,
@@ -350,7 +351,11 @@ class EgoVehicle(Vehicle):
         heading_command = np.arcsin(
             np.clip(lateral_speed_command / utils.not_zero(self.speed), -1.0, 1.0)
         )
-        heading_ref = lane_future_heading + np.clip(heading_command, -np.pi / 4, np.pi / 4)
+        heading_ref = lane_future_heading + np.clip(
+            heading_command,
+            -self.MAX_STEERING_ANGLE,
+            self.MAX_STEERING_ANGLE,
+        )
 
         heading_rate_command = self.KP_HEADING * utils.wrap_to_pi(heading_ref - self.heading)
 

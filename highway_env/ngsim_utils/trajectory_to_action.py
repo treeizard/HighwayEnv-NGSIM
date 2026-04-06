@@ -1,4 +1,5 @@
 import numpy as np
+from highway_env.ngsim_utils.constants import MAX_STEER
 
 try:
     from scipy.interpolate import UnivariateSpline
@@ -16,7 +17,7 @@ def wrap_to_pi_scalar(a: float) -> float:
 def steering_from_curvature_vehicle_model(
     kappa: np.ndarray,
     L_forward: float,
-    max_steer: float = np.pi / 4,
+    max_steer: float = MAX_STEER,
 ) -> np.ndarray:
     kappa = np.asarray(kappa, dtype=float)
     arg = kappa * float(L_forward) / 2.0
@@ -30,7 +31,7 @@ def traj_to_expert_actions(
     traj: np.ndarray,
     dt: float,
     L_forward: float,
-    MAX_STEER: float = np.pi / 4,
+    MAX_STEER: float = MAX_STEER,
     s_xy: float | None = None,
     v_turn_min: float = 0.3,
     hold_steer_when_stopped: bool = True,
@@ -379,7 +380,7 @@ class PurePursuitTracker:
         *,
         dt: float,
         L_forward: float,
-        max_steer: float = np.pi / 4,
+        max_steer: float = MAX_STEER,
         # lookahead (meters): Ld = Ld0 + Ld_k * v
         Ld0: float = 4.0,
         Ld_k: float = 0.4,

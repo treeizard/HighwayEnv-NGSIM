@@ -1,14 +1,21 @@
 import numpy as np
 from highway_env.road.lane import LineType, StraightLane, SineLane
 from highway_env.road.road import RoadNetwork
+from highway_env.ngsim_utils.constants import (
+    US101_LANE_WIDTH_M,
+    US101_MAINLINE_LENGTH_M,
+    US101_MERGE_IN_START_M,
+    US101_MERGE_OUT_END_M,
+    US101_SECTION_ENDS_M,
+)
 
 def create_ngsim_101_road():
     net = RoadNetwork()
     c, s, n = LineType.CONTINUOUS_LINE, LineType.STRIPED, LineType.NONE
 
-    length = 2150 / 3.281  # m
-    width = 12 / 3.281     # m
-    ends = [0, 560/3.281, (698+578+150)/3.281, length]
+    length = US101_MAINLINE_LENGTH_M
+    width = US101_LANE_WIDTH_M
+    ends = US101_SECTION_ENDS_M
 
     # first section (5 lanes)
     line_types = [[c, n], [s, n], [s, n], [s, n], [s, c]]
@@ -18,7 +25,7 @@ def create_ngsim_101_road():
         net.add_lane("s1", "s2", StraightLane(origin, end, width=width, line_types=line_types[lane]))
 
     # merge_in (forbidden)
-    net.add_lane("merge_in", "s2", StraightLane([480/3.281, 5.5*width], [ends[1], 5*width], width=width, line_types=[c, c], forbidden=True))
+    net.add_lane("merge_in", "s2", StraightLane([US101_MERGE_IN_START_M, 5.5*width], [ends[1], 5*width], width=width, line_types=[c, c], forbidden=True))
 
     # second section (6 lanes)
     line_types = [[c, n], [s, n], [s, n], [s, n], [s, n], [s, c]]
@@ -35,7 +42,7 @@ def create_ngsim_101_road():
         net.add_lane("s3", "s4", StraightLane(origin, end, width=width, line_types=line_types[lane]))
 
     # merge_out (forbidden)
-    net.add_lane("s3", "merge_out", StraightLane([ends[2], 5*width], [1550/3.281, 7*width], width=width, line_types=[c, c], forbidden=True))
+    net.add_lane("s3", "merge_out", StraightLane([ends[2], 5*width], [US101_MERGE_OUT_END_M, 7*width], width=width, line_types=[c, c], forbidden=True))
     
     return net
 
@@ -57,7 +64,7 @@ def create_japanese_road() -> None:
     c, s, n = LineType.CONTINUOUS_LINE, LineType.STRIPED, LineType.NONE
     width = 3.75
     x_merge_start = 150.0
-    x_merge_end = 260.0
+    x_merge_end = 315.0
     x_end = 800.0
 
     y_right = -0.5 * width
@@ -133,9 +140,8 @@ def clamp_location_ngsim(x_pos, lane0, net, warning=False):
     :param net: the general RoadNetwork() class from highway env
     :param warning: show warning
     """
-    length = 2150 / 3.281  # m
-    width = 12 / 3.281     # m
-    ends = [0, 560/3.281, (698+578+150)/3.281, length] # m
+    width = US101_LANE_WIDTH_M
+    ends = US101_SECTION_ENDS_M
 
     x_m = float(x_pos)
     if x_m < ends[1]:
@@ -172,9 +178,8 @@ def clamp_location_ngsim(x_pos, lane0, net, warning = False):
     :param net: the general RoadNetwork() class from highway env
     :param warning: show warning
     """
-    length = 2150 / 3.281  # m
-    width = 12 / 3.281     # m
-    ends = [0, 560/3.281, (698+578+150)/3.281, length] # m
+    width = US101_LANE_WIDTH_M
+    ends = US101_SECTION_ENDS_M
 
     x_m =  float(x_pos)
     if x_m < ends[1]:
