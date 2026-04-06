@@ -471,6 +471,11 @@ def spawn_surrounding_vehicles(
         - int > 0: spawn up to that many vehicles
         - None: spawn all available vehicles
     """
+    if isinstance(ego_start_index, dict):
+        shared_start_index = max(int(idx) for idx in ego_start_index.values()) if ego_start_index else 0
+    else:
+        shared_start_index = int(ego_start_index)
+
     spawned = 0
     unlimited = max_surrounding is None
 
@@ -521,10 +526,10 @@ def spawn_surrounding_vehicles(
             break
 
         traj_full = process_raw_trajectory(meta["trajectory"], scene)
-        if len(traj_full) <= ego_start_index:
+        if len(traj_full) <= shared_start_index:
             continue
 
-        traj = traj_full[ego_start_index:]
+        traj = traj_full[shared_start_index:]
         nonzero = np.any(traj[:, :3] != 0.0, axis=1)
         if not np.any(nonzero):
             continue

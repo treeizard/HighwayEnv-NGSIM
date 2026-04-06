@@ -1,4 +1,4 @@
-# Modified by: Yide Tao (yide.tao@monash.edu)
+# Developed by: Yide Tao (yide.tao@monash.edu)
 from __future__ import annotations
 
 import logging
@@ -25,7 +25,7 @@ from highway_env.ngsim_utils.constants import FEET_PER_METER, MAX_STEER
 from highway_env.ngsim_utils.trajectory_to_action import (
     PurePursuitTracker,
 )
-from highway_env.ngsim_utils.trajectory_gen import first_valid_index
+from highway_env.ngsim_utils.trajectory_gen import common_first_valid_index
 from highway_env.ngsim_utils.ego_vehicle import EgoVehicle
 
 
@@ -98,6 +98,9 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 "show_trajectories": True,
                 "seed": None,
                 "expert_test_mode": False,
+                "controlled_vehicles": 1,
+                "terminate_when_all_controlled_crashed": True,
+                "truncate_to_trajectory_length": False,
             }
         )
         return config
@@ -116,6 +119,8 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         self._episodes: list[str] = []
         self._valid_ids_by_episode: dict[str, np.ndarray] = {}
         self.ego_id: int | None = None
+        self.ego_ids: list[int] = []
+        self._ego_start_indices: dict[int, int] = {}
 
         # Expert debug
         self._max_traj_policy_steps: int | None = None
@@ -171,6 +176,30 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
     @property
     def expert_test_mode(self) -> bool:
         return bool(self.config.get("expert_test_mode", False))
+
+    def _policy_controlled_vehicles(self) -> list[EgoVehicle]:
+        """
+        Return the vehicles that are directly controlled by the action interface.
+
+        With a single-agent action space only ``self.vehicle`` receives the user or
+        policy action, even if additional ego vehicles are spawned for interaction.
+        """
+        if self.config.get("action", {}).get("type") == "MultiAgentAction":
+            return list(self.controlled_vehicles)
+        return [self.vehicle] if self.vehicle is not None else []
+
+    def _termination_vehicles(self) -> list[EgoVehicle]:
+        """
+        Vehicles that participate in the episode termination condition.
+
+        For multi-vehicle training we want all spawned controlled vehicles to be
+        considered together, even when the action interface is still single-agent.
+        """
+        if len(self.controlled_vehicles) > 1:
+            vehicles = list(self.controlled_vehicles)
+        else:
+            vehicles = self._policy_controlled_vehicles()
+        return [vehicle for vehicle in vehicles if vehicle is not None]
 
     # -------------------------------------------------------------------------
     # RESET
@@ -233,10 +262,11 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
 
         self.episode_name = self._select_episode_name(sim_period)
         valid_ids = self._valid_ids_by_episode[self.episode_name]
-        self.ego_id = self._select_ego_id(valid_ids, explicit_ego_id)
-        self.trajectory_set = self._build_trajectory_set(self.episode_name, self.ego_id)
+        self.ego_ids = self._select_ego_ids(valid_ids, explicit_ego_id, self.config['controlled_vehicles'])
+        self.ego_id = self.ego_ids[0] if self.ego_ids else None
+        self.trajectory_set = self._build_trajectory_set(self.episode_name, self.ego_ids)
 
-        logger.info("Loaded episode=%s ego_id=%s", self.episode_name, self.ego_id)
+        logger.info("Loaded episode=%s ego_ids=%s", self.episode_name, self.ego_ids)
 
     def _select_episode_name(self, sim_period: Any) -> str:
         if isinstance(sim_period, dict) and "episode_name" in sim_period:
@@ -246,18 +276,55 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             return str(episode_name)
         return str(self.np_random.choice(self._episodes))
 
-    def _select_ego_id(self, valid_ids: np.ndarray, explicit_ego_id: int | None) -> int:
-        if explicit_ego_id is None:
-            return int(self.np_random.choice(valid_ids))
-        if explicit_ego_id not in valid_ids:
-            raise ValueError(f"Ego ID {explicit_ego_id} not in {self.episode_name}")
-        return int(explicit_ego_id)
+    def _select_ego_ids(
+        self,
+        valid_ids: np.ndarray,
+        explicit_ego_ids: int | list[int] | tuple[int, ...] | np.ndarray | None,
+        num_vehicles: int = 1,
+    ) -> list[int]:
+        if num_vehicles < 1:
+            raise ValueError(f"num_vehicles must be >= 1, got {num_vehicles}")
 
-    def _build_trajectory_set(self, episode_name: str, ego_id: int) -> dict[Any, Any]:
+        if explicit_ego_ids is None:
+            if num_vehicles > len(valid_ids):
+                raise ValueError(
+                    f"Requested {num_vehicles} ego vehicles, but only "
+                    f"{len(valid_ids)} valid ids are available"
+                )
+            return list(
+                map(int, self.np_random.choice(valid_ids, size=num_vehicles, replace=False))
+            )
+
+        if np.isscalar(explicit_ego_ids):
+            explicit_ego_ids = [int(explicit_ego_ids)]
+        else:
+            explicit_ego_ids = [int(eid) for eid in explicit_ego_ids]
+
+        invalid_ids = [eid for eid in explicit_ego_ids if eid not in valid_ids]
+        if invalid_ids:
+            raise ValueError(
+                f"Ego IDs {invalid_ids} not in episode {self.episode_name}"
+            )
+
+        if len(explicit_ego_ids) != num_vehicles:
+            raise ValueError(
+                f"Expected {num_vehicles} explicit ego ids, got {len(explicit_ego_ids)}"
+            )
+
+        return [int(eid) for eid in explicit_ego_ids]
+
+
+    def _build_trajectory_set(
+        self,
+        episode_name: str,
+        ego_ids: list[int],
+    ) -> dict[Any, Any]:
         traj_all = self._traj_all_by_episode[episode_name]
+        ego_id_set = set(ego_ids)
+
         return {
-            "ego": traj_all[ego_id],
-            **{vid: meta for vid, meta in traj_all.items() if vid != ego_id},
+            "ego": {eid: traj_all[eid] for eid in ego_ids},
+            **{vid: meta for vid, meta in traj_all.items() if vid not in ego_id_set},
         }
 
     
@@ -277,47 +344,87 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         )
 
     def _create_vehicles(self):
-        ego_rec = self.trajectory_set["ego"]
-        ego_traj_full = load_ego_trajectory(ego_rec, self.scene)
-        ego_len, ego_wid = get_ego_dimensions(ego_rec, FEET_PER_METER, self.scene)
+        if self.expert_test_mode and len(self.ego_ids) > 1:
+            raise NotImplementedError(
+                "expert_test_mode currently supports exactly one controlled vehicle."
+            )
+
+        self.controlled_vehicles = []
+        self._ego_start_indices = {}
         self._replay_xy_pol.clear()
+        ego_records = self.trajectory_set["ego"]
+        shared_start_index = self._resolve_shared_ego_start_index(ego_records)
+        max_traj_steps = []
 
-        ego_traj = self._prepare_ego_trajectory(ego_rec, ego_traj_full, ego_len)
-        ego = self._build_ego_vehicle(ego_traj, ego_len, ego_wid)
-        self.road.vehicles.append(ego)
-        self.vehicle = ego
+        for ego_index, ego_id in enumerate(self.ego_ids):
+            ego_rec = ego_records[ego_id]
+            ego_traj_full = load_ego_trajectory(ego_rec, self.scene)
+            ego_len, ego_wid = get_ego_dimensions(ego_rec, FEET_PER_METER, self.scene)
+            ego_traj, ego_start_index, ego_policy_steps = self._prepare_ego_trajectory(
+                ego_id=ego_id,
+                ego_rec=ego_rec,
+                ego_traj_full=ego_traj_full,
+                ego_len=ego_len,
+                shared_start_index=shared_start_index,
+            )
+            ego = self._build_ego_vehicle(ego_traj, ego_len, ego_wid)
+            ego.vehicle_ID = ego_id
+            self.road.vehicles.append(ego)
+            self.controlled_vehicles.append(ego)
+            self._ego_start_indices[int(ego_id)] = int(ego_start_index)
+            max_traj_steps.append(int(ego_policy_steps))
 
-        if self.expert_test_mode:
-            self._replay_xy_pol.append(self.vehicle.position.copy())
+            if self.expert_test_mode and ego_index == 0:
+                self._replay_xy_pol.append(ego.position.copy())
+
+        if not self.controlled_vehicles:
+            raise RuntimeError("Failed to create any controlled vehicles.")
+
+        self._max_traj_policy_steps = min(max_traj_steps) if max_traj_steps else None
 
         self._spawn_surrounding_vehicles()
 
         if self.expert_test_mode:
             self._replay_xy_pol.append(self.vehicle.position.copy())
 
+    def _resolve_shared_ego_start_index(
+        self, ego_records: dict[int, dict[str, Any]]
+    ) -> int:
+        if self.expert_test_mode:
+            return 0
+
+        start_idx = common_first_valid_index(
+            [ego_records[ego_id]["trajectory"] for ego_id in self.ego_ids]
+        )
+        if start_idx is None:
+            raise RuntimeError("At least one controlled trajectory contains no valid motion data.")
+        return int(start_idx)
+
     def _prepare_ego_trajectory(
         self,
+        ego_id: int,
         ego_rec: dict[str, Any],
         ego_traj_full: np.ndarray,
         ego_len: float,
-    ) -> np.ndarray:
+        shared_start_index: int,
+    ) -> tuple[np.ndarray, int, int]:
         if self.expert_test_mode:
             self._setup_expert_tracker(ego_traj_full, ego_len)
+            ego_start_index = int(self._ego_start_index)
         else:
-            ego_start_i = first_valid_index(ego_rec["trajectory"])
-            if ego_start_i is None:
-                raise RuntimeError("Ego trajectory contains no valid motion data.")
-            self._ego_start_index = int(ego_start_i)
+            ego_start_index = int(shared_start_index)
 
-        ego_traj = ego_traj_full[self._ego_start_index :]
+        ego_traj = ego_traj_full[ego_start_index:]
         if len(ego_traj) < 2:
-            raise RuntimeError("Ego trajectory too short.")
+            raise RuntimeError(f"Ego trajectory too short for vehicle {ego_id}.")
 
         sim_freq = float(self.config["simulation_frequency"])
         pol_freq = float(self.config["policy_frequency"])
         sim_per_policy = max(1, int(sim_freq // pol_freq))
-        self._max_traj_policy_steps = int(np.ceil(len(ego_traj) / float(sim_per_policy)))
-        return ego_traj
+        max_traj_policy_steps = int(np.ceil(len(ego_traj) / float(sim_per_policy)))
+        if ego_id == self.ego_id or self.ego_id is None:
+            self._ego_start_index = ego_start_index
+        return ego_traj, ego_start_index, max_traj_policy_steps
 
     def _setup_expert_tracker(self, ego_traj_full: np.ndarray, ego_len: float) -> None:
         ref_xy_pol, ref_v_pol, lane_pol, start_idx = setup_expert_tracker(
@@ -443,7 +550,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
 
         spawn_surrounding_vehicles(
             self.trajectory_set,
-            self._ego_start_index,
+            self._ego_start_indices,
             max_surr,
             self.road,
             scene=self.scene,
@@ -533,22 +640,67 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
 
 
     # -------------------------------------------------------------------------
+    # INFO / REWARDS / TERMINATION
+    # -------------------------------------------------------------------------
+    def _info(self, obs: Any, action: Action | None = None) -> dict[str, Any]:
+        info = super()._info(obs, action)
+        policy_vehicles = self._policy_controlled_vehicles()
+        termination_vehicles = self._termination_vehicles()
+        info["speed"] = [float(vehicle.speed) for vehicle in policy_vehicles]
+        info["all_controlled_vehicle_speeds"] = [
+            float(vehicle.speed) for vehicle in self.controlled_vehicles
+        ]
+        info["crashed"] = all(
+            vehicle.crashed for vehicle in termination_vehicles
+        ) if termination_vehicles else False
+        info["alive_controlled_vehicle_ids"] = [
+            getattr(vehicle, "vehicle_ID", None)
+            for vehicle in self.controlled_vehicles
+            if not vehicle.crashed
+        ]
+        info["support_vehicle_ids"] = [
+            getattr(vehicle, "vehicle_ID", None)
+            for vehicle in self.controlled_vehicles
+            if vehicle not in policy_vehicles
+        ]
+        info["controlled_vehicle_ids"] = list(self.ego_ids)
+        info["controlled_vehicle_crashes"] = [
+            bool(vehicle.crashed) for vehicle in self.controlled_vehicles
+        ]
+        return info
+
+    # -------------------------------------------------------------------------
     # REWARDS & TERMINATION
     # -------------------------------------------------------------------------
     def _rewards(self, action: Any) -> dict[str, float]:
-        return {"collision_reward": float(self.vehicle.crashed)}
+        termination_vehicles = self._termination_vehicles()
+        crashes = [float(vehicle.crashed) for vehicle in termination_vehicles]
+        return {
+            "collision_reward": max(crashes) if crashes else 0.0,
+            "all_controlled_crashed": float(
+                all(vehicle.crashed for vehicle in termination_vehicles)
+            ) if termination_vehicles else 0.0,
+        }
 
     def _reward(self, action: Any) -> float:
         return 0.0
 
     def _is_terminated(self) -> bool:
-        return bool(self.vehicle.crashed)
+        termination_vehicles = self._termination_vehicles()
+        if not termination_vehicles:
+            return False
+
+        if self.config.get("terminate_when_all_controlled_crashed", True):
+            return all(vehicle.crashed for vehicle in termination_vehicles)
+        return any(vehicle.crashed for vehicle in termination_vehicles)
 
     def _is_truncated(self) -> bool:
         max_steps_cfg = self.config.get("max_episode_steps", None)
         max_steps_traj = getattr(self, "_max_traj_policy_steps", None)
-        candidates = [v for v in (max_steps_cfg, max_steps_traj) if v is not None]
-        return self.steps >= min(candidates) if candidates else False
+        if self.config.get("truncate_to_trajectory_length", False):
+            candidates = [v for v in (max_steps_cfg, max_steps_traj) if v is not None]
+            return self.steps >= min(candidates) if candidates else False
+        return self.steps >= max_steps_cfg if max_steps_cfg is not None else False
 
     # -------------------------------------------------------------------------
     # STEP

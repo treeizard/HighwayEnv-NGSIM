@@ -1,10 +1,11 @@
 # scripts/make_videos_multi.py
-import os, sys
+import os
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
-from gymnasium.envs.registration import register
+from gymnasium.envs.registration import register, registry
 
 # Make sure project root is importable
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -12,7 +13,8 @@ if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
 # Register NGSimEnv
-register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
+if "NGSim-US101-v0" not in registry:
+    register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
 
 
 def plot_trajectory_comparison(env_unwrapped, episode_name, ego_id, out_dir):
@@ -105,7 +107,7 @@ def main():
         "max_surrounding": 20000,
         "reset_step_offset": 1,
         "expert_test_mode": True,
-        "expert_action_mode": "discrete"
+        "action_mode": "discrete",
     }
 
     # --------------------- Generate 1 Debug Replay ---------------------
@@ -122,12 +124,19 @@ def main():
             config=base_cfg,
         )
 
-        env = RecordVideo(
-            env,
-            video_folder=out_dir,
-            episode_trigger=lambda ep_idx: True,
-            name_prefix=f"ngsim_{TARGET_SCENE}_{TARGET_EPISODE}_ego{TARGET_EGO_ID}",
-        )
+        try:
+            import moviepy  # noqa: F401
+
+            env = RecordVideo(
+                env,
+                video_folder=out_dir,
+                episode_trigger=lambda ep_idx: True,
+                name_prefix=f"ngsim_{TARGET_SCENE}_{TARGET_EPISODE}_ego{TARGET_EGO_ID}",
+            )
+            record_video = True
+        except ModuleNotFoundError:
+            print("moviepy not installed; continuing without video recording.")
+            record_video = False
 
         obs, info = env.reset(seed=0)
         vehicle = env.unwrapped.vehicle
@@ -163,7 +172,8 @@ def main():
         plot_trajectory_comparison(env.unwrapped, TARGET_EPISODE, TARGET_EGO_ID, out_dir)
 
         env.close()
-        print(f"✓ Saved video {i+1} to {out_dir}")
+        if record_video:
+            print(f"✓ Saved video {i+1} to {out_dir}")
 
     print(f"\nAll {NUM_REPLAYS} videos and plots written to: {out_dir}")
 

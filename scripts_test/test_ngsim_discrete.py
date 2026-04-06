@@ -4,13 +4,14 @@ import warnings
 import numpy as np
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
-from gymnasium.envs.registration import register
+from gymnasium.envs.registration import register, registry
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
+if "NGSim-US101-v0" not in registry:
+    register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
 
 
 def run_one_episode(env, max_steps=300):
@@ -54,21 +55,25 @@ def main():
     base_cfg = {
         "scene": "japanese",
         "observation": {
-            "type": "LidarCameraObservations",
-            "lidar": {
-                "cells": 128,
-                "maximum_range": 64,
-                "normalize": True,
-            },
-            "camera": {
-                "cells": 21,
-                "maximum_range": 64,
-                "field_of_view": np.pi / 2,   # 90 deg forward cone
-                "normalize": True,
+            "type": "MultiAgentObservation",
+            "observation_config": {
+                "type": "LidarCameraObservations",
+                "lidar": {
+                    "cells": 128,
+                    "maximum_range": 64,
+                    "normalize": True,
+                },
+                "camera": {
+                    "cells": 21,
+                    "maximum_range": 64,
+                    "field_of_view": np.pi / 2,   # 90 deg forward cone
+                    "normalize": True,
+                },
             },
         },
         "action": {
-            "type": "DiscreteSteerMetaAction",
+            "type": "MultiAgentAction",
+            "action_config": {"type": "DiscreteSteerMetaAction"},
         },
         "show_trajectories": False,
         "simulation_frequency": 10,

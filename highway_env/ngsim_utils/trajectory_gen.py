@@ -397,6 +397,24 @@ def first_valid_index(traj):
             return i
     return None
 
+
+def common_first_valid_index(trajectories):
+    """
+    Return the first episode index at which every trajectory has valid data.
+
+    The environment uses this shared reset index when spawning multiple
+    controlled vehicles so all egos are present from step 0.
+    """
+    start_indices = []
+    for traj in trajectories:
+        start_idx = first_valid_index(traj)
+        if start_idx is None:
+            return None
+        start_indices.append(int(start_idx))
+    if not start_indices:
+        return None
+    return max(start_indices)
+
 if __name__ == "__main__":
     scene  = "us-101"
     period = 0

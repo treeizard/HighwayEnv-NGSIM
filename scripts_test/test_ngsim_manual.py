@@ -3,13 +3,14 @@ import os
 import sys
 import numpy as np
 import gymnasium as gym
-from gymnasium.envs.registration import register
+from gymnasium.envs.registration import register, registry
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
+if "NGSim-US101-v0" not in registry:
+    register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
 
 
 def get_terminal_action_discrete(env, cmd: str):

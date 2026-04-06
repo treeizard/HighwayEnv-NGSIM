@@ -1,8 +1,10 @@
 # scripts/make_videos_multi.py
-import os, sys, random
+import os
+import sys
+import warnings
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
-from gymnasium.envs.registration import register
+from gymnasium.envs.registration import register, registry
 
 # Make sure project root is importable
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -10,7 +12,8 @@ if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
 # Register NGSimEnv
-register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
+if "NGSim-US101-v0" not in registry:
+    register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
 
 
 def main():
@@ -24,7 +27,7 @@ def main():
             "type": "LidarObservation",
             "cells": 128,
             "maximum_range": 64,
-            "normalise": True,
+            "normalize": True,
         },
         "action": {"type": "ContinuousAction"},
         "show_trajectories": True,
@@ -71,13 +74,22 @@ def main():
         # (Optional) you can still tweak things AFTER init if needed:
         # env.unwrapped.configure({...})
 
-        # Activate video recording
-        env = RecordVideo(
-            env,
-            video_folder=out_dir,
-            episode_trigger=lambda ep_idx: True,
-            name_prefix=f"ngsim_random_{i}"
-        )
+        try:
+            import moviepy  # noqa: F401
+
+            env = RecordVideo(
+                env,
+                video_folder=out_dir,
+                episode_trigger=lambda ep_idx: True,
+                name_prefix=f"ngsim_random_{i}"
+            )
+            record_video = True
+        except ModuleNotFoundError:
+            warnings.warn(
+                "moviepy is not installed; continuing without RecordVideo.",
+                stacklevel=2,
+            )
+            record_video = False
 
         # Reset (this triggers random chunk + random ego)
         obs, info = env.reset(seed=i)
@@ -92,9 +104,13 @@ def main():
                 break
 
         env.close()
-        print(f"✓ Saved video {i+1} to {out_dir}")
+        if record_video:
+            print(f"✓ Saved video {i+1} to {out_dir}")
 
-    print(f"\n🎉 All {NUM_REPLAYS} videos written to: {out_dir}")
+    if record_video:
+        print(f"\n🎉 All {NUM_REPLAYS} videos written to: {out_dir}")
+    else:
+        print("\nVideo recording skipped because moviepy is not installed.")
 
 
 if __name__ == "__main__":
