@@ -157,7 +157,7 @@ videos_discrete_test/
 
 highway_env/data/processed
 highway_env/data/processed_10s
-
+highway_env/data/processed_20s
 logs
 tb_logs
 

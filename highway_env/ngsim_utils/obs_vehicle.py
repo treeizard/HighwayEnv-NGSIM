@@ -479,6 +479,12 @@ def spawn_surrounding_vehicles(
     spawned = 0
     unlimited = max_surrounding is None
 
+    def _first_valid_index(traj: np.ndarray) -> int | None:
+        nonzero = np.any(traj[:, :3] != 0.0, axis=1)
+        if not np.any(nonzero):
+            return None
+        return int(np.argmax(nonzero))
+
     def _heading_from_traj(traj: np.ndarray, idx: int) -> float:
         """Estimate heading from the current and next non-zero trajectory samples."""
         if len(traj) < 2:
@@ -518,23 +524,56 @@ def spawn_surrounding_vehicles(
                 return True
         return False
 
+    ego_anchor_positions: list[np.ndarray] = []
+    ego_records = trajectory_set.get("ego", {})
+    if isinstance(ego_records, dict):
+        for ego_id, ego_meta in ego_records.items():
+            ego_traj_full = process_raw_trajectory(ego_meta["trajectory"], scene)
+            if len(ego_traj_full) <= shared_start_index:
+                continue
+            ego_traj = ego_traj_full[shared_start_index:]
+            ego_first_idx = _first_valid_index(ego_traj)
+            if ego_first_idx is None:
+                continue
+            ego_anchor_positions.append(
+                np.array(ego_traj[ego_first_idx][:2], dtype=float)
+            )
+
+    candidates = []
     for vid, meta in trajectory_set.items():
         if vid == "ego":
             continue
-
-        if not unlimited and spawned >= max_surrounding:
-            break
 
         traj_full = process_raw_trajectory(meta["trajectory"], scene)
         if len(traj_full) <= shared_start_index:
             continue
 
         traj = traj_full[shared_start_index:]
-        nonzero = np.any(traj[:, :3] != 0.0, axis=1)
-        if not np.any(nonzero):
+        first_idx = _first_valid_index(traj)
+        if first_idx is None:
             continue
 
-        first_idx = np.argmax(nonzero)
+        if len(traj[first_idx:]) < 2:
+            continue
+
+        first_pos = np.array(traj[first_idx][:2], dtype=float)
+        if ego_anchor_positions:
+            priority = min(
+                float(np.linalg.norm(first_pos - ego_pos))
+                for ego_pos in ego_anchor_positions
+            )
+        else:
+            priority = float("inf")
+
+        candidates.append((priority, int(vid), meta, traj, first_idx))
+
+    if not unlimited:
+        candidates.sort(key=lambda item: (item[0], item[1]))
+
+    for _priority, vid, meta, traj, first_idx in candidates:
+        if not unlimited and spawned >= max_surrounding:
+            break
+
         traj = traj[first_idx:]
         if len(traj) < 2:
             continue

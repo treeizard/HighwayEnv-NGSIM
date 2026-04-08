@@ -38,6 +38,11 @@ import os
 import argparse
 import random
 from collections import defaultdict
+import sys
+
+PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
 
 from highway_env.data.ngsim import ngsim_data
 #from highway_env.data.traj_to_action import traj_cont_action

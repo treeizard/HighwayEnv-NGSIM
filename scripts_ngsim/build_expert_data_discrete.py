@@ -25,12 +25,11 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional
 
 import gymnasium as gym
 import numpy as np
 from gymnasium.envs.registration import register, registry
-from gymnasium.wrappers import FlattenObservation
 
 # ----------------------------------------------------------------------
 # Import project root so `highway_env` is importable
@@ -71,17 +70,33 @@ def resolve_output_path(out_arg: str) -> str:
 # ----------------------------------------------------------------------
 def make_env(config: Dict[str, Any]) -> gym.Env:
     """
-    Construct NGSim env using gym.make and flatten the observation to 1D.
+    Construct NGSim env using gym.make.
+
+    For multiple controlled expert vehicles we request multi-agent observation and
+    action spaces, then flatten each per-agent observation during export.
     """
+    config = dict(config)
+    controlled_vehicles = int(config.get("controlled_vehicles", 1))
+    if controlled_vehicles > 1:
+        obs_cfg = dict(config.get("observation", {}))
+        action_cfg = dict(config.get("action", {}))
+        config["observation"] = {
+            "type": "MultiAgentObservation",
+            "observation_config": obs_cfg,
+        }
+        config["action"] = {
+            "type": "MultiAgentAction",
+            "action_config": action_cfg,
+        }
+
     env = gym.make(ENV_ID, config=config)
-    env = FlattenObservation(env)
     return env
 
 
 # ----------------------------------------------------------------------
 # Action extraction
 # ----------------------------------------------------------------------
-def extract_expert_action(info: Optional[Dict[str, Any]]) -> np.ndarray:
+def extract_expert_actions(info: Optional[Dict[str, Any]]) -> list[np.ndarray]:
     """
     Extract the discrete expert action actually applied by the environment.
 
@@ -92,18 +107,40 @@ def extract_expert_action(info: Optional[Dict[str, Any]]) -> np.ndarray:
         info["applied_action"]
 
     Returns:
-        np.ndarray of shape (1,) and dtype int64.
+        One discrete action per controlled expert vehicle.
     """
     info = info or {}
 
+    if "expert_action_discrete_idx_all" in info:
+        return [
+            np.array([int(idx)], dtype=np.int64)
+            for idx in info["expert_action_discrete_idx_all"]
+        ]
+
     if "expert_action_discrete_idx" in info:
         idx = int(info["expert_action_discrete_idx"])
-        return np.array([idx], dtype=np.int64)
+        return [np.array([idx], dtype=np.int64)]
+
+    if "applied_actions" in info:
+        actions = []
+        for val in info["applied_actions"]:
+            if np.isscalar(val):
+                actions.append(np.array([int(val)], dtype=np.int64))
+                continue
+
+            arr = np.asarray(val).ravel()
+            if arr.size != 1:
+                raise RuntimeError(
+                    "Expected scalar discrete actions in info['applied_actions'], "
+                    f"but got shape {arr.shape}."
+                )
+            actions.append(np.array([int(arr[0])], dtype=np.int64))
+        return actions
 
     if "applied_action" in info:
         val = info["applied_action"]
         if np.isscalar(val):
-            return np.array([int(val)], dtype=np.int64)
+            return [np.array([int(val)], dtype=np.int64)]
 
         arr = np.asarray(val).ravel()
         if arr.size != 1:
@@ -111,7 +148,7 @@ def extract_expert_action(info: Optional[Dict[str, Any]]) -> np.ndarray:
                 "Expected a scalar discrete action in info['applied_action'], "
                 f"but got shape {arr.shape}."
             )
-        return np.array([int(arr[0])], dtype=np.int64)
+        return [np.array([int(arr[0])], dtype=np.int64)]
 
     raise RuntimeError(
         "expert_test_mode=True but env.step() did not expose "
@@ -119,7 +156,7 @@ def extract_expert_action(info: Optional[Dict[str, Any]]) -> np.ndarray:
     )
 
 
-def dummy_action(env: gym.Env) -> int:
+def dummy_action(env: gym.Env) -> Any:
     """
     Return a valid placeholder action.
 
@@ -128,15 +165,27 @@ def dummy_action(env: gym.Env) -> int:
     """
     if not hasattr(env.action_space, "sample"):
         raise RuntimeError("Environment action_space does not support sampling.")
-    return int(env.action_space.sample())
+    return env.action_space.sample()
+
+
+def flatten_observations(obs: Any) -> list[np.ndarray]:
+    if isinstance(obs, tuple):
+        return [np.asarray(obs_i, dtype=np.float32).ravel() for obs_i in obs]
+    return [np.asarray(obs, dtype=np.float32).ravel()]
 
 
 # ----------------------------------------------------------------------
 # Scenario enumeration
 # ----------------------------------------------------------------------
-def build_unique_scenarios(env: gym.Env) -> list[tuple[str, int]]:
+def build_unique_scenarios(
+    env: gym.Env, controlled_vehicles: int
+) -> list[tuple[str, tuple[int, ...]]]:
     """
-    Extract all unique (episode_name, ego_id) pairs from the unwrapped NGSim env.
+    Extract unique scenario groups from the unwrapped NGSim env.
+
+    For a single controlled vehicle, each scenario is a single ego id.
+    For multiple controlled vehicles, use sliding windows over sorted valid ids to
+    keep the scenario count tractable while still providing diverse groupings.
     """
     base = env.unwrapped
 
@@ -145,22 +194,34 @@ def build_unique_scenarios(env: gym.Env) -> list[tuple[str, int]]:
     if not hasattr(base, "_valid_ids_by_episode"):
         raise AttributeError("Env is missing attribute '_valid_ids_by_episode'.")
 
-    scenarios: list[tuple[str, int]] = []
-    seen: set[tuple[str, int]] = set()
+    scenarios: list[tuple[str, tuple[int, ...]]] = []
+    seen: set[tuple[str, tuple[int, ...]]] = set()
 
     for ep_name in base._episodes:
         if ep_name not in base._valid_ids_by_episode:
             continue
 
-        for ego_id in base._valid_ids_by_episode[ep_name]:
-            key = (str(ep_name), int(ego_id))
+        valid_ids = sorted(int(ego_id) for ego_id in base._valid_ids_by_episode[ep_name])
+        if len(valid_ids) < controlled_vehicles:
+            continue
+
+        if controlled_vehicles == 1:
+            ego_groups = [(ego_id,) for ego_id in valid_ids]
+        else:
+            ego_groups = [
+                tuple(valid_ids[i : i + controlled_vehicles])
+                for i in range(len(valid_ids) - controlled_vehicles + 1)
+            ]
+
+        for ego_group in ego_groups:
+            key = (str(ep_name), tuple(int(ego_id) for ego_id in ego_group))
             if key in seen:
                 continue
             seen.add(key)
             scenarios.append(key)
 
     if not scenarios:
-        raise RuntimeError("No valid (episode_name, ego_id) scenarios found.")
+        raise RuntimeError("No valid expert replay scenarios found.")
 
     return scenarios
 
@@ -184,10 +245,13 @@ def collect_expert_rollouts_unique(
     ep_id_buf: list[int] = []
     episode_name_buf: list[str] = []
     ego_id_buf: list[int] = []
+    scenario_ids_buf: list[str] = []
+
+    controlled_vehicles = int(base_cfg.get("controlled_vehicles", 1))
 
     probe_env = make_env(base_cfg)
     try:
-        scenarios = build_unique_scenarios(probe_env)
+        scenarios = build_unique_scenarios(probe_env, controlled_vehicles)
     finally:
         probe_env.close()
 
@@ -197,30 +261,34 @@ def collect_expert_rollouts_unique(
     if n_episodes > len(scenarios):
         raise ValueError(
             f"Requested {n_episodes} episodes, but only {len(scenarios)} unique "
-            "(episode_name, ego_id) pairs are available."
+            "scenario groups are available."
         )
 
     selected = scenarios[:n_episodes]
-    used_keys: set[tuple[str, int]] = set()
+    used_keys: set[tuple[str, tuple[int, ...]]] = set()
 
-    for ep_idx, (episode_name, ego_id) in enumerate(selected):
-        key = (episode_name, ego_id)
+    for ep_idx, (episode_name, ego_ids) in enumerate(selected):
+        key = (episode_name, ego_ids)
         if key in used_keys:
             raise RuntimeError(f"Duplicate scenario selected unexpectedly: {key}")
         used_keys.add(key)
 
         cfg = dict(base_cfg)
         cfg["simulation_period"] = {"episode_name": episode_name}
-        cfg["ego_vehicle_ID"] = int(ego_id)
+        cfg["ego_vehicle_ID"] = (
+            int(ego_ids[0]) if controlled_vehicles == 1 else list(map(int, ego_ids))
+        )
+        cfg["controlled_vehicles"] = controlled_vehicles
 
         env = make_env(cfg)
         try:
             obs, info = env.reset(seed=seed + ep_idx)
-            obs = np.asarray(obs, dtype=np.float32).ravel()
+            obs_list = flatten_observations(obs)
+            scenario_label = ",".join(str(ego_id) for ego_id in ego_ids)
 
             print(
                 f"[ExpertCollect] Episode {ep_idx + 1}/{n_episodes} | "
-                f"episode={episode_name} ego_id={ego_id}"
+                f"episode={episode_name} ego_ids=[{scenario_label}]"
             )
 
             done = False
@@ -234,20 +302,34 @@ def collect_expert_rollouts_unique(
                 next_obs, reward, terminated, truncated, info = env.step(act_in)
                 del reward  # reward is not used for dataset export
 
-                next_obs = np.asarray(next_obs, dtype=np.float32).ravel()
+                next_obs_list = flatten_observations(next_obs)
                 done = bool(terminated or truncated)
 
-                a_used = extract_expert_action(info)
+                actions_used = extract_expert_actions(info)
+                vehicle_ids = info.get("expert_controlled_vehicle_ids") or list(ego_ids)
 
-                obs_buf.append(obs.copy())
-                act_buf.append(a_used.copy())
-                next_obs_buf.append(next_obs.copy())
-                done_buf.append(done)
-                ep_id_buf.append(ep_idx)
-                episode_name_buf.append(episode_name)
-                ego_id_buf.append(int(ego_id))
+                if not (
+                    len(obs_list) == len(next_obs_list) == len(actions_used) == len(vehicle_ids)
+                ):
+                    raise RuntimeError(
+                        "Mismatch between controlled-vehicle observations/actions: "
+                        f"obs={len(obs_list)} next_obs={len(next_obs_list)} "
+                        f"acts={len(actions_used)} ids={len(vehicle_ids)}"
+                    )
 
-                obs = next_obs
+                for obs_i, action_i, next_obs_i, vehicle_id in zip(
+                    obs_list, actions_used, next_obs_list, vehicle_ids
+                ):
+                    obs_buf.append(obs_i.copy())
+                    act_buf.append(action_i.copy())
+                    next_obs_buf.append(next_obs_i.copy())
+                    done_buf.append(done)
+                    ep_id_buf.append(ep_idx)
+                    episode_name_buf.append(episode_name)
+                    ego_id_buf.append(int(vehicle_id))
+                    scenario_ids_buf.append(scenario_label)
+
+                obs_list = next_obs_list
                 steps_in_ep += 1
 
         finally:
@@ -264,6 +346,7 @@ def collect_expert_rollouts_unique(
         "ep_id": np.asarray(ep_id_buf, dtype=np.int32),
         "episode_name": np.asarray(episode_name_buf, dtype="<U64"),
         "ego_id": np.asarray(ego_id_buf, dtype=np.int32),
+        "scenario_ego_ids": np.asarray(scenario_ids_buf, dtype="<U128"),
     }
 
     print(f"[ExpertCollect] Finished: {data['obs'].shape[0]} transitions.")
@@ -310,6 +393,7 @@ def build_base_config() -> Dict[str, Any]:
         "expert_test_mode": True,
         "action_mode": "discrete",   # keep this aligned with your env implementation
         "expert_prefer_speed": False,
+        "controlled_vehicles": 1,
     }
 
 
@@ -347,6 +431,12 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Base RNG seed used for scenario shuffle and env reset.",
     )
+    parser.add_argument(
+        "--controlled_vehicles",
+        type=int,
+        default=10,
+        help="Number of expert-controlled vehicles to replay per environment step.",
+    )
     return parser.parse_args()
 
 
@@ -360,6 +450,7 @@ def main() -> None:
     print(f"[ExpertCollect] SLURM_SUBMIT_DIR: {os.environ.get('SLURM_SUBMIT_DIR', '<not set>')}")
 
     base_cfg = build_base_config()
+    base_cfg["controlled_vehicles"] = int(args.controlled_vehicles)
 
     dataset = collect_expert_rollouts_unique(
         base_cfg=base_cfg,

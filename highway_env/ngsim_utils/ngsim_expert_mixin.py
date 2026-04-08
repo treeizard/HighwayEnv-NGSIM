@@ -15,13 +15,91 @@ logger = logging.getLogger(__name__)
 
 
 class NGSimExpertMixin:
-    def _expert_action_strings(self) -> list[str]:
-        if not hasattr(self.action_type, "actions"):
-            return ["IDLE"]
-        return [self.action_type.actions[i] for i in sorted(self.action_type.actions)]
+    def _expert_runtime(self) -> dict[str, Any]:
+        cache = getattr(self, "_expert_runtime_cache", None)
+        token = id(self.action_type)
+        if cache is not None and cache.get("token") == token:
+            return cache
 
-    def _planning_vehicle_clone(self) -> EgoVehicle:
-        vehicle = self.vehicle
+        action_interface = self._expert_action_interface()
+        if hasattr(action_interface, "actions"):
+            actions = [
+                action_interface.actions[i]
+                for i in sorted(action_interface.actions)
+            ]
+        else:
+            actions = ["IDLE"]
+
+        prioritized_base: list[str] = []
+        for candidate in ["IDLE", "STEER_LEFT", "STEER_RIGHT", "FASTER", "SLOWER"]:
+            if candidate in actions and candidate not in prioritized_base:
+                prioritized_base.append(candidate)
+        for candidate in actions:
+            if candidate not in prioritized_base:
+                prioritized_base.append(candidate)
+
+        cache = {
+            "token": token,
+            "action_interface": action_interface,
+            "actions": actions,
+            "prioritized_base": prioritized_base,
+            "horizon": int(max(1, self.expert_cfg.get("planner_horizon", 2))),
+            "branching": int(
+                max(1, self.expert_cfg.get("planner_branching", len(actions)))
+            ),
+            "frames_per_action": getattr(
+                self,
+                "_frames_per_action",
+                max(
+                    1,
+                    int(
+                        self.config["simulation_frequency"]
+                        // self.config["policy_frequency"]
+                    ),
+                ),
+            ),
+            "dt": 1.0 / float(self.config["simulation_frequency"]),
+            "position_weight": float(
+                self.expert_cfg.get("planner_position_weight", 3.0)
+            ),
+            "heading_weight": float(
+                self.expert_cfg.get("planner_heading_weight", 0.5)
+            ),
+            "speed_weight": float(
+                self.expert_cfg.get("planner_speed_weight", 0.2)
+            ),
+            "action_change_weight": float(
+                self.expert_cfg.get("planner_action_change_weight", 0.05)
+            ),
+        }
+        self._expert_runtime_cache = cache
+        return cache
+
+    def _expert_action_interface(self):
+        if hasattr(self.action_type, "actions_indexes"):
+            return self.action_type
+        if hasattr(self.action_type, "agents_action_types") and self.action_type.agents_action_types:
+            return self.action_type.agents_action_types[0]
+        return self.action_type
+
+    def _expert_action_strings(self) -> list[str]:
+        return list(self._expert_runtime()["actions"])
+
+    def _expert_state_for_vehicle(self, vehicle: EgoVehicle | None = None) -> dict[str, Any]:
+        vehicle = vehicle or self.vehicle
+        if vehicle is None:
+            raise RuntimeError("No controlled vehicle available for expert replay.")
+
+        vehicle_id = int(getattr(vehicle, "vehicle_ID"))
+        state_map = getattr(self, "_expert_state_by_vehicle_id", None) or {}
+        if vehicle_id not in state_map:
+            raise RuntimeError(f"No expert replay state found for vehicle {vehicle_id}.")
+        return state_map[vehicle_id]
+
+    def _planning_vehicle_clone(self, vehicle: EgoVehicle | None = None) -> EgoVehicle:
+        vehicle = vehicle or self.vehicle
+        if vehicle is None:
+            raise RuntimeError("No controlled vehicle available for planning clone.")
         sim_vehicle = EgoVehicle(
             road=None,
             position=np.array(vehicle.position, dtype=float),
@@ -83,7 +161,7 @@ class NGSimExpertMixin:
         sim_vehicle.road.objects = list(self.road.objects)
         sim_vehicle.road.vehicles = [
             sim_vehicle,
-            *[v for v in self.road.vehicles if v is not self.vehicle],
+            *[v for v in self.road.vehicles if v is not vehicle],
         ]
         return sim_vehicle
 
@@ -132,8 +210,11 @@ class NGSimExpertMixin:
             else np.array(state["impact"], dtype=float)
         )
 
-    def _planning_static_obstacles(self) -> tuple[np.ndarray, np.ndarray]:
-        others = [other for other in self.road.vehicles if other is not self.vehicle]
+    def _planning_static_obstacles(
+        self, vehicle: EgoVehicle | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        vehicle = vehicle or self.vehicle
+        others = [other for other in self.road.vehicles if other is not vehicle]
         if not others:
             return np.empty((0, 2), dtype=float), np.empty((0,), dtype=float)
 
@@ -147,16 +228,23 @@ class NGSimExpertMixin:
         )
         return positions, diagonals
 
-    def _planning_reference_index(self, offset: int) -> int:
-        ref = getattr(self, "_expert_ref_xy_pol", None)
+    def _planning_reference_index(
+        self, offset: int, ref_xy: np.ndarray | None = None
+    ) -> int:
+        ref = ref_xy if ref_xy is not None else getattr(self, "_expert_ref_xy_pol", None)
         if ref is None or len(ref) == 0:
             return 0
         return int(np.clip(self.steps + offset, 0, len(ref) - 1))
 
-    def _reference_heading_at(self, ref_idx: int) -> float:
-        ref = self._expert_ref_xy_pol
+    def _reference_heading_at(
+        self,
+        ref_idx: int,
+        ref_xy: np.ndarray | None = None,
+        vehicle: EgoVehicle | None = None,
+    ) -> float:
+        ref = ref_xy if ref_xy is not None else self._expert_ref_xy_pol
         if len(ref) < 2:
-            return float(self.vehicle.heading)
+            return float((vehicle or self.vehicle).heading)
         i0 = int(np.clip(ref_idx, 0, len(ref) - 2))
         i1 = i0 + 1
         dx = float(ref[i1, 0] - ref[i0, 0])
@@ -208,18 +296,20 @@ class NGSimExpertMixin:
         action_change_weight: float,
         other_positions: np.ndarray,
         other_diagonals: np.ndarray,
+        ref_xy: np.ndarray,
+        ref_v: np.ndarray,
     ) -> float:
         sim_vehicle.act(action_str)
         for _ in range(frames_per_action):
             sim_vehicle.act(None)
             sim_vehicle.step(dt)
 
-        ref_idx = self._planning_reference_index(offset)
-        ref_pos = self._expert_ref_xy_pol[ref_idx]
-        ref_speed = float(self._expert_ref_v_pol[ref_idx])
+        ref_idx = self._planning_reference_index(offset, ref_xy=ref_xy)
+        ref_pos = ref_xy[ref_idx]
+        ref_speed = float(ref_v[ref_idx])
 
         pos_err = float(np.linalg.norm(sim_vehicle.position - ref_pos))
-        ref_heading = self._reference_heading_at(ref_idx)
+        ref_heading = self._reference_heading_at(ref_idx, ref_xy=ref_xy, vehicle=sim_vehicle)
         heading_err = float(
             np.arctan2(
                 np.sin(sim_vehicle.heading - ref_heading),
@@ -255,6 +345,8 @@ class NGSimExpertMixin:
         action_change_weight: float,
         other_positions: np.ndarray,
         other_diagonals: np.ndarray,
+        ref_xy: np.ndarray,
+        ref_v: np.ndarray,
     ) -> tuple[str, float]:
         base_state = self._planning_vehicle_state(sim_vehicle)
 
@@ -284,6 +376,8 @@ class NGSimExpertMixin:
                     action_change_weight=action_change_weight,
                     other_positions=other_positions,
                     other_diagonals=other_diagonals,
+                    ref_xy=ref_xy,
+                    ref_v=ref_v,
                 )
                 candidate_score = search(
                     depth + 1,
@@ -313,6 +407,8 @@ class NGSimExpertMixin:
                 action_change_weight=action_change_weight,
                 other_positions=other_positions,
                 other_diagonals=other_diagonals,
+                ref_xy=ref_xy,
+                ref_v=ref_v,
             )
             total_score = search(
                 depth=2,
@@ -327,65 +423,64 @@ class NGSimExpertMixin:
         self._restore_planning_vehicle_state(sim_vehicle, base_state)
         return best_first_action, float(best_score)
 
-    def _select_discrete_expert_action(self) -> str:
-        actions = self._expert_action_strings()
+    def _select_discrete_expert_action(
+        self, vehicle: EgoVehicle | None = None
+    ) -> str:
+        vehicle = vehicle or self.vehicle
+        expert_state = self._expert_state_for_vehicle(vehicle)
+        runtime = self._expert_runtime()
+        actions = runtime["actions"]
         if len(actions) == 1:
             return actions[0]
 
-        horizon = int(max(1, self.expert_cfg.get("planner_horizon", 2)))
-        branching = int(max(1, self.expert_cfg.get("planner_branching", len(actions))))
+        horizon = runtime["horizon"]
+        branching = runtime["branching"]
         prioritized = []
 
-        if self._expert_actions_policy:
-            last_action = self._expert_actions_policy[-1]
+        if expert_state["actions_policy"]:
+            last_action = expert_state["actions_policy"][-1]
             if isinstance(last_action, str) and last_action in actions:
                 prioritized.append(last_action)
 
-        for candidate in ["IDLE", "STEER_LEFT", "STEER_RIGHT", "FASTER", "SLOWER"]:
-            if candidate in actions and candidate not in prioritized:
-                prioritized.append(candidate)
-        for candidate in actions:
+        for candidate in runtime["prioritized_base"]:
             if candidate not in prioritized:
                 prioritized.append(candidate)
 
         candidate_actions = prioritized[:branching]
-        frames_per_action = max(
-            1,
-            int(self.config["simulation_frequency"] // self.config["policy_frequency"]),
-        )
-        dt = 1.0 / float(self.config["simulation_frequency"])
-        position_weight = float(self.expert_cfg.get("planner_position_weight", 3.0))
-        heading_weight = float(self.expert_cfg.get("planner_heading_weight", 0.5))
-        speed_weight = float(self.expert_cfg.get("planner_speed_weight", 0.2))
-        action_change_weight = float(
-            self.expert_cfg.get("planner_action_change_weight", 0.05)
-        )
-        other_positions, other_diagonals = self._planning_static_obstacles()
-        sim_vehicle = self._planning_vehicle_clone()
+        other_positions, other_diagonals = self._planning_static_obstacles(vehicle=vehicle)
+        sim_vehicle = self._planning_vehicle_clone(vehicle=vehicle)
 
         best_first_action, _ = self._rollout_action_tree(
             sim_vehicle=sim_vehicle,
             candidate_actions=candidate_actions,
             horizon=horizon,
-            frames_per_action=frames_per_action,
-            dt=dt,
-            position_weight=position_weight,
-            heading_weight=heading_weight,
-            speed_weight=speed_weight,
-            action_change_weight=action_change_weight,
+            frames_per_action=runtime["frames_per_action"],
+            dt=runtime["dt"],
+            position_weight=runtime["position_weight"],
+            heading_weight=runtime["heading_weight"],
+            speed_weight=runtime["speed_weight"],
+            action_change_weight=runtime["action_change_weight"],
             other_positions=other_positions,
             other_diagonals=other_diagonals,
+            ref_xy=expert_state["ref_xy"],
+            ref_v=expert_state["ref_v"],
         )
         return best_first_action
 
-    def expert_replay_metrics(self):
-        if not hasattr(self, "_expert_ref_xy_pol"):
-            raise RuntimeError("No expert reference.")
-        if not hasattr(self, "_replay_xy_pol"):
-            raise RuntimeError("No replay recorded.")
-
-        ref = np.asarray(self._expert_ref_xy_pol, dtype=float)
-        rep = np.asarray(self._replay_xy_pol, dtype=float)
+    def expert_replay_metrics(self, ego_id: int | None = None):
+        if ego_id is None:
+            if not hasattr(self, "_expert_ref_xy_pol"):
+                raise RuntimeError("No expert reference.")
+            if not hasattr(self, "_replay_xy_pol"):
+                raise RuntimeError("No replay recorded.")
+            ref = np.asarray(self._expert_ref_xy_pol, dtype=float)
+            rep = np.asarray(self._replay_xy_pol, dtype=float)
+        else:
+            state = self._expert_state_by_vehicle_id.get(int(ego_id))
+            if state is None:
+                raise RuntimeError(f"No expert reference found for vehicle {ego_id}.")
+            ref = np.asarray(state["ref_xy"], dtype=float)
+            rep = np.asarray(state["replay_xy"], dtype=float)
 
         T = min(len(ref), len(rep))
         ref = ref[:T]
@@ -399,12 +494,16 @@ class NGSimExpertMixin:
 
     def _resolve_expert_action(
         self,
+        vehicle: EgoVehicle | None = None,
     ) -> tuple[Action, np.ndarray | None, str | None, int | None]:
-        pos = self.vehicle.position
-        hdg = float(self.vehicle.heading)
-        spd = float(self.vehicle.speed)
+        vehicle = vehicle or self.vehicle
+        expert_state = self._expert_state_for_vehicle(vehicle)
 
-        steer_cmd, accel_cmd, i_near, i_tgt, _expert_target_lane_id = self._tracker.step(
+        pos = vehicle.position
+        hdg = float(vehicle.heading)
+        spd = float(vehicle.speed)
+
+        steer_cmd, accel_cmd, i_near, i_tgt, _expert_target_lane_id = expert_state["tracker"].step(
             pos, hdg, spd
         )
 
@@ -418,9 +517,10 @@ class NGSimExpertMixin:
             expert_action = np.array([accel_norm, steer_norm], dtype=np.float32)
             action: Action = expert_action
         elif self.control_mode == "discrete":
-            expert_action_str = self._select_discrete_expert_action()
+            expert_action_str = self._select_discrete_expert_action(vehicle=vehicle)
 
-            actions_indexes = getattr(self.action_type, "actions_indexes", None)
+            action_interface = self._expert_runtime()["action_interface"]
+            actions_indexes = getattr(action_interface, "actions_indexes", None)
             if actions_indexes is None:
                 raise RuntimeError(
                     "Action type mismatch. Config must use DiscreteSteerMetaAction."
@@ -438,14 +538,9 @@ class NGSimExpertMixin:
         else:
             raise ValueError(f"Unknown action_mode={self.control_mode!r}")
 
-        if (
-            hasattr(self, "_expert_actions_policy")
-            and self._expert_actions_policy is not None
-        ):
-            self._expert_actions_policy.append(
-                expert_action.copy() if expert_action is not None else expert_action_str
-            )
-        if hasattr(self, "_tracker_dbg") and self._tracker_dbg is not None:
-            self._tracker_dbg.append((int(i_near), int(i_tgt)))
+        expert_state["actions_policy"].append(
+            expert_action.copy() if expert_action is not None else expert_action_str
+        )
+        expert_state["tracker_dbg"].append((int(i_near), int(i_tgt)))
 
         return action, expert_action, expert_action_str, expert_action_idx

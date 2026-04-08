@@ -24,7 +24,6 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import gymnasium as gym
 from gymnasium.envs.registration import register
-from gymnasium.wrappers import FlattenObservation
 
 # ----------------------------------------------------------------------
 # Import project root so `highway_env` is importable
@@ -47,33 +46,62 @@ def make_env(config: Dict[str, Any]) -> gym.Env:
     Construct NGSim env using gym.make so config is passed into NGSimEnv.__init__.
 
     We do NOT set render_mode (defaults to None). No video recording is used.
+    For multi-vehicle expert replay we request multi-agent action/observation spaces
+    and flatten each per-agent observation during export.
     """
+    config = dict(config)
+    controlled_vehicles = int(config.get("controlled_vehicles", 1))
+    if controlled_vehicles > 1:
+        obs_cfg = dict(config.get("observation", {}))
+        action_cfg = dict(config.get("action", {}))
+        config["observation"] = {
+            "type": "MultiAgentObservation",
+            "observation_config": obs_cfg,
+        }
+        config["action"] = {
+            "type": "MultiAgentAction",
+            "action_config": action_cfg,
+        }
+
     env = gym.make(
         "NGSim-US101-v0",
         config=config,
     )
-    # Flatten obs to 1D float32 vector
-    env = FlattenObservation(env)
     return env
 
 
 # ----------------------------------------------------------------------
 # Utilities for extracting expert/applied action
 # ----------------------------------------------------------------------
-def _extract_applied_action(info: Optional[Dict[str, Any]]) -> np.ndarray:
+def _extract_applied_actions(info: Optional[Dict[str, Any]]) -> List[np.ndarray]:
     """
     Extract the action actually applied by the environment.
 
-    Prefer info["expert_action"], fall back to info["applied_action"].
+    Prefer the multi-vehicle expert keys when available, otherwise fall back to the
+    single-vehicle applied action fields.
     Raise a clear error if neither exists.
     """
     if info is None:
         info = {}
 
-    #if "expert_action" in info:
-        #return np.asarray(info["expert_action"], dtype=np.float32).ravel()
+    if "expert_action_continuous_all" in info:
+        return [
+            np.asarray(action, dtype=np.float32).ravel()
+            for action in info["expert_action_continuous_all"]
+            if action is not None
+        ]
+
+    if "expert_action_continuous" in info:
+        return [np.asarray(info["expert_action_continuous"], dtype=np.float32).ravel()]
+
+    if "applied_actions" in info:
+        return [
+            np.asarray(action, dtype=np.float32).ravel()
+            for action in info["applied_actions"]
+        ]
+
     if "applied_action" in info:
-        return np.asarray(info["applied_action"], dtype=np.float32).ravel()
+        return [np.asarray(info["applied_action"], dtype=np.float32).ravel()]
 
     raise RuntimeError(
         "expert_test_mode=True but env.step() did not expose the applied/expert action.\n"
@@ -84,19 +112,23 @@ def _extract_applied_action(info: Optional[Dict[str, Any]]) -> np.ndarray:
     )
 
 
-def _dummy_action(env: gym.Env) -> np.ndarray:
+def _dummy_action(env: gym.Env) -> Any:
     """
     Create a valid dummy action; will be ignored if expert_test_mode=True.
 
-    For ContinuousAction, the action space is a Box; we just construct zeros of the
-    appropriate shape.
+    For multi-agent action spaces we return a sampled placeholder tuple. In
+    expert_test_mode the semantic content is ignored by the environment.
     """
     shape = getattr(env.action_space, "shape", None)
     if shape is None:
-        # Fallback: sample once and zero-like it
-        a = env.action_space.sample()
-        return np.zeros_like(np.asarray(a, dtype=np.float32)).ravel()
+        return env.action_space.sample()
     return np.zeros(shape, dtype=np.float32)
+
+
+def _flatten_observations(obs: Any) -> List[np.ndarray]:
+    if isinstance(obs, tuple):
+        return [np.asarray(obs_i, dtype=np.float32).ravel() for obs_i in obs]
+    return [np.asarray(obs, dtype=np.float32).ravel()]
 
 
 # ----------------------------------------------------------------------
@@ -126,11 +158,12 @@ def collect_expert_rollouts_expert_mode(
     next_obs_buf: List[np.ndarray] = []
     done_buf: List[bool] = []
     ep_id_buf: List[int] = []
+    ego_id_buf: List[int] = []
 
     for ep in range(n_episodes):
         env = make_env(base_cfg)
         obs, info = env.reset(seed=seed + ep)
-        obs = np.asarray(obs, dtype=np.float32).ravel()
+        obs_list = _flatten_observations(obs)
 
         print(f"[ExpertCollect] Episode {ep + 1}/{n_episodes}")
 
@@ -143,19 +176,35 @@ def collect_expert_rollouts_expert_mode(
 
             dummy = _dummy_action(env)
             next_obs, reward, terminated, truncated, info = env.step(dummy)
-            next_obs = np.asarray(next_obs, dtype=np.float32).ravel()
+            next_obs_list = _flatten_observations(next_obs)
             done = bool(terminated or truncated)
 
             # Key: pull the expert-applied action out of info
-            a_used = _extract_applied_action(info)
+            actions_used = _extract_applied_actions(info)
+            vehicle_ids = info.get("expert_controlled_vehicle_ids") or info.get(
+                "controlled_vehicle_ids", [env.unwrapped.ego_id]
+            )
 
-            obs_buf.append(obs.copy())
-            act_buf.append(a_used.copy())
-            next_obs_buf.append(next_obs.copy())
-            done_buf.append(done)
-            ep_id_buf.append(ep)
+            if not (
+                len(obs_list) == len(next_obs_list) == len(actions_used) == len(vehicle_ids)
+            ):
+                raise RuntimeError(
+                    "Mismatch between multi-vehicle observations/actions: "
+                    f"obs={len(obs_list)} next_obs={len(next_obs_list)} "
+                    f"acts={len(actions_used)} ids={len(vehicle_ids)}"
+                )
 
-            obs = next_obs
+            for obs_i, action_i, next_obs_i, vehicle_id in zip(
+                obs_list, actions_used, next_obs_list, vehicle_ids
+            ):
+                obs_buf.append(obs_i.copy())
+                act_buf.append(action_i.copy())
+                next_obs_buf.append(next_obs_i.copy())
+                done_buf.append(done)
+                ep_id_buf.append(ep)
+                ego_id_buf.append(int(vehicle_id))
+
+            obs_list = next_obs_list
             steps_in_ep += 1
 
         print(f"[ExpertCollect]   Collected {steps_in_ep} steps.")
@@ -175,6 +224,7 @@ def collect_expert_rollouts_expert_mode(
         "next_obs": np.stack(next_obs_buf, axis=0).astype(np.float32),
         "dones": np.asarray(done_buf, dtype=bool),
         "ep_id": np.asarray(ep_id_buf, dtype=np.int32),
+        "ego_id": np.asarray(ego_id_buf, dtype=np.int32),
     }
 
     print(f"[ExpertCollect] Finished: {data['obs'].shape[0]} transitions.")
@@ -198,6 +248,12 @@ def main() -> None:
         help="Output NPZ path.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Base RNG seed.")
+    parser.add_argument(
+        "--controlled_vehicles",
+        type=int,
+        default=1,
+        help="Number of expert-controlled vehicles to replay per environment step.",
+    )
     args = parser.parse_args()
 
     # ---------------------- YOUR CONFIG (unchanged) ----------------------
@@ -235,6 +291,7 @@ def main() -> None:
 
         # Critical: environment applies expert actions internally
         "expert_test_mode": True,
+        "controlled_vehicles": int(args.controlled_vehicles),
     }
 
     dataset = collect_expert_rollouts_expert_mode(

@@ -50,6 +50,14 @@ def _deep_update(base: dict, override: dict) -> dict:
 
 
 class NGSimEnv(NGSimExpertMixin, AbstractEnv):
+    _PREBUILT_CACHE: dict[tuple[str, str], tuple[dict[str, np.ndarray], dict[str, dict[Any, Any]], list[str]]] = {}
+    _NETWORK_CACHE: dict[str, Any] = {}
+    _PROCESSED_TRAJECTORY_CACHE: dict[tuple[str, str, str, int], np.ndarray] = {}
+    _EXPERT_REFERENCE_CACHE: dict[
+        tuple[str, str, str, int, int, float],
+        tuple[np.ndarray, np.ndarray, np.ndarray, int],
+    ] = {}
+
     metadata = {
         "render_modes": ["human", "rgb_array"],
         "render_fps": 15,
@@ -121,10 +129,12 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         self.ego_id: int | None = None
         self.ego_ids: list[int] = []
         self._ego_start_indices: dict[int, int] = {}
+        self._expert_state_by_vehicle_id: dict[int, dict[str, Any]] = {}
 
         # Expert debug
         self._max_traj_policy_steps: int | None = None
         self._replay_xy_pol: list[np.ndarray] = []
+        self._frames_per_action: int = 1
 
         self._load_prebuilt_data(cfg["episode_root"], self.scene)
 
@@ -132,10 +142,30 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
 
     def _normalize_action_mode(self, cfg: dict, raw_config: dict | None = None) -> str:
         raw_config = raw_config or {}
+        raw_action_cfg = raw_config.get("action", {})
+        cfg_action_cfg = cfg.get("action", {})
+        raw_action_type = str(raw_action_cfg.get("type", ""))
+        cfg_action_type = str(cfg_action_cfg.get("type", ""))
+
+        if raw_action_type == "MultiAgentAction" or cfg_action_type == "MultiAgentAction":
+            nested_action = raw_action_cfg.get("action_config", cfg_action_cfg.get("action_config", {}))
+            nested_type = str(nested_action.get("type", ""))
+            if nested_type == "ContinuousAction":
+                control_mode = "continuous"
+            elif nested_type == "DiscreteSteerMetaAction":
+                control_mode = "discrete"
+            else:
+                raise ValueError(
+                    "MultiAgentAction requires action_config.type to be "
+                    "'ContinuousAction' or 'DiscreteSteerMetaAction'."
+                )
+            cfg["action"] = _deep_update(cfg_action_cfg, raw_action_cfg)
+            return control_mode
+
         if "action_mode" in raw_config:
             control_mode = str(raw_config["action_mode"]).lower()
         else:
-            action_type = str(raw_config.get("action", {}).get("type", cfg.get("action", {}).get("type", ""))).lower()
+            action_type = str(raw_action_cfg.get("type", cfg_action_cfg.get("type", ""))).lower()
             if action_type == "continuousaction":
                 control_mode = "continuous"
             elif action_type == "discretesteermetaaction":
@@ -152,14 +182,22 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         return control_mode
 
     def _load_prebuilt_data(self, episode_root: str, scene: str) -> None:
-        prebuilt_dir = os.path.join(episode_root, scene, "prebuilt")
-        veh_ids_path = os.path.join(prebuilt_dir, "veh_ids_train.npy")
-        traj_path = os.path.join(prebuilt_dir, "trajectory_train.npy")
-
+        episode_root_abs = os.path.abspath(episode_root)
+        cache_key = (episode_root_abs, scene)
+        cached = self._PREBUILT_CACHE.get(cache_key)
+        if cached is None:
+            prebuilt_dir = os.path.join(episode_root_abs, scene, "prebuilt")
+            veh_ids_path = os.path.join(prebuilt_dir, "veh_ids_train.npy")
+            traj_path = os.path.join(prebuilt_dir, "trajectory_train.npy")
+            valid_ids = np.load(veh_ids_path, allow_pickle=True).item()
+            traj_all = np.load(traj_path, allow_pickle=True).item()
+            episodes = sorted(traj_all.keys())
+            cached = (valid_ids, traj_all, episodes)
+            self._PREBUILT_CACHE[cache_key] = cached
+        else:
+            prebuilt_dir = os.path.join(episode_root_abs, scene, "prebuilt")
         self._prebuilt_dir = prebuilt_dir
-        self._valid_ids_by_episode = np.load(veh_ids_path, allow_pickle=True).item()
-        self._traj_all_by_episode = np.load(traj_path, allow_pickle=True).item()
-        self._episodes = sorted(self._traj_all_by_episode.keys())
+        self._valid_ids_by_episode, self._traj_all_by_episode, self._episodes = cached
 
     @property
     def dt(self) -> float:
@@ -206,6 +244,13 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
     # -------------------------------------------------------------------------
     def _reset(self):
         self.steps = 0
+        self._frames_per_action = max(
+            1,
+            int(
+                self.config["simulation_frequency"]
+                // self.config["policy_frequency"]
+            ),
+        )
 
         seed = self.config.get("seed", None)
         if seed is not None and hasattr(self, "seed"):
@@ -215,10 +260,17 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         self._create_road()
         self._create_vehicles()
 
-        if self.expert_test_mode:
-            self._replay_xy_pol = [self.vehicle.position.copy()]
+        if self.expert_test_mode and self.vehicle is not None:
+            expert_state = self._expert_state_by_vehicle_id.get(int(self.vehicle.vehicle_ID))
+            if expert_state is not None:
+                self._replay_xy_pol = list(expert_state["replay_xy"])
 
     def _prune_removed_vehicles(self) -> None:
+        if not any(
+            getattr(vehicle, "remove_from_road", False)
+            for vehicle in self.road.vehicles
+        ):
+            return
         self.road.vehicles = [
             vehicle
             for vehicle in self.road.vehicles
@@ -227,24 +279,18 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
 
     def _simulate(self, action: Action | None = None) -> None:
         """Run simulation frames and prune replay vehicles that have despawned."""
-        frames = int(
-            self.config["simulation_frequency"] // self.config["policy_frequency"]
-        )
+        frames = self._frames_per_action
+        dt = 1 / self.config["simulation_frequency"]
         for frame in range(frames):
             if (
                 action is not None
                 and not self.config["manual_control"]
-                and self.steps
-                % int(
-                    self.config["simulation_frequency"]
-                    // self.config["policy_frequency"]
-                )
-                == 0
+                and self.steps % frames == 0
             ):
                 self.action_type.act(action)
 
             self.road.act()
-            self.road.step(1 / self.config["simulation_frequency"])
+            self.road.step(dt)
             self._prune_removed_vehicles()
             self.steps += 1
 
@@ -335,7 +381,10 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         builder = ROAD_BUILDERS.get(self.scene)
         if builder is None:
             raise ValueError(f"Unsupported scene={self.scene!r}")
-        net = builder()
+        net = self._NETWORK_CACHE.get(self.scene)
+        if net is None:
+            net = builder()
+            self._NETWORK_CACHE[self.scene] = net
         self.net = net
         self.road = Road(
             network=net,
@@ -344,13 +393,9 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         )
 
     def _create_vehicles(self):
-        if self.expert_test_mode and len(self.ego_ids) > 1:
-            raise NotImplementedError(
-                "expert_test_mode currently supports exactly one controlled vehicle."
-            )
-
         self.controlled_vehicles = []
         self._ego_start_indices = {}
+        self._expert_state_by_vehicle_id = {}
         self._replay_xy_pol.clear()
         ego_records = self.trajectory_set["ego"]
         shared_start_index = self._resolve_shared_ego_start_index(ego_records)
@@ -358,7 +403,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
 
         for ego_index, ego_id in enumerate(self.ego_ids):
             ego_rec = ego_records[ego_id]
-            ego_traj_full = load_ego_trajectory(ego_rec, self.scene)
+            ego_traj_full = self._load_processed_ego_trajectory(ego_id, ego_rec)
             ego_len, ego_wid = get_ego_dimensions(ego_rec, FEET_PER_METER, self.scene)
             ego_traj, ego_start_index, ego_policy_steps = self._prepare_ego_trajectory(
                 ego_id=ego_id,
@@ -374,8 +419,11 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             self._ego_start_indices[int(ego_id)] = int(ego_start_index)
             max_traj_steps.append(int(ego_policy_steps))
 
-            if self.expert_test_mode and ego_index == 0:
-                self._replay_xy_pol.append(ego.position.copy())
+            if self.expert_test_mode:
+                expert_state = self._expert_state_by_vehicle_id[int(ego_id)]
+                expert_state["replay_xy"].append(ego.position.copy())
+                if ego_index == 0:
+                    self._replay_xy_pol = list(expert_state["replay_xy"])
 
         if not self.controlled_vehicles:
             raise RuntimeError("Failed to create any controlled vehicles.")
@@ -383,9 +431,6 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         self._max_traj_policy_steps = min(max_traj_steps) if max_traj_steps else None
 
         self._spawn_surrounding_vehicles()
-
-        if self.expert_test_mode:
-            self._replay_xy_pol.append(self.vehicle.position.copy())
 
     def _resolve_shared_ego_start_index(
         self, ego_records: dict[int, dict[str, Any]]
@@ -409,7 +454,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         shared_start_index: int,
     ) -> tuple[np.ndarray, int, int]:
         if self.expert_test_mode:
-            self._setup_expert_tracker(ego_traj_full, ego_len)
+            self._setup_expert_tracker(ego_id, ego_traj_full, ego_len)
             ego_start_index = int(self._ego_start_index)
         else:
             ego_start_index = int(shared_start_index)
@@ -426,18 +471,47 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             self._ego_start_index = ego_start_index
         return ego_traj, ego_start_index, max_traj_policy_steps
 
-    def _setup_expert_tracker(self, ego_traj_full: np.ndarray, ego_len: float) -> None:
-        ref_xy_pol, ref_v_pol, lane_pol, start_idx = setup_expert_tracker(
-            self.net, ego_traj_full, ego_len, self.config
+    def _processed_trajectory_cache_key(
+        self, episode_name: str, vehicle_id: int
+    ) -> tuple[str, str, str, int]:
+        return (self._prebuilt_dir, self.scene, episode_name, int(vehicle_id))
+
+    def _load_processed_ego_trajectory(
+        self, ego_id: int, ego_rec: dict[str, Any]
+    ) -> np.ndarray:
+        cache_key = self._processed_trajectory_cache_key(self.episode_name, ego_id)
+        cached = self._PROCESSED_TRAJECTORY_CACHE.get(cache_key)
+        if cached is None:
+            cached = load_ego_trajectory(ego_rec, self.scene)
+            self._PROCESSED_TRAJECTORY_CACHE[cache_key] = cached
+        return cached
+
+    def _expert_reference_cache_key(
+        self, ego_id: int, ego_len: float
+    ) -> tuple[str, str, str, int, int, float]:
+        return (
+            self._prebuilt_dir,
+            self.scene,
+            self.episode_name,
+            int(ego_id),
+            int(self.config["policy_frequency"]),
+            round(float(ego_len), 4),
         )
-        self._expert_ref_xy_pol = ref_xy_pol
-        self._expert_ref_v_pol = ref_v_pol
-        self._expert_ref_lane_pol = lane_pol - 1
-        self._ego_start_index = start_idx
-        self._tracker = PurePursuitTracker(
-            ref_xy=self._expert_ref_xy_pol,
-            ref_v=self._expert_ref_v_pol,
-            ref_lanes=self._expert_ref_lane_pol,
+
+    def _setup_expert_tracker(
+        self, ego_id: int, ego_traj_full: np.ndarray, ego_len: float
+    ) -> None:
+        cache_key = self._expert_reference_cache_key(ego_id, ego_len)
+        cached = self._EXPERT_REFERENCE_CACHE.get(cache_key)
+        if cached is None:
+            cached = setup_expert_tracker(self.net, ego_traj_full, ego_len, self.config)
+            self._EXPERT_REFERENCE_CACHE[cache_key] = cached
+        ref_xy_pol, ref_v_pol, lane_pol, start_idx = cached
+        ref_lane_pol = lane_pol - 1
+        tracker = PurePursuitTracker(
+            ref_xy=ref_xy_pol,
+            ref_v=ref_v_pol,
+            ref_lanes=ref_lane_pol,
             dt=1.0 / self.config["policy_frequency"],
             L_forward=ego_len,
             max_steer=MAX_STEER,
@@ -448,8 +522,26 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             steer_lpf_tau=0.15,
             jerk_limit=10.0,
         )
-        self._expert_actions_policy = []
-        self._tracker_dbg = []
+        state = {
+            "ref_xy": ref_xy_pol,
+            "ref_v": ref_v_pol,
+            "ref_lane": ref_lane_pol,
+            "start_idx": int(start_idx),
+            "tracker": tracker,
+            "actions_policy": [],
+            "tracker_dbg": [],
+            "replay_xy": [],
+        }
+        self._expert_state_by_vehicle_id[int(ego_id)] = state
+        self._ego_start_index = int(start_idx)
+
+        if ego_id == self.ego_id or self.ego_id is None:
+            self._expert_ref_xy_pol = state["ref_xy"]
+            self._expert_ref_v_pol = state["ref_v"]
+            self._expert_ref_lane_pol = state["ref_lane"]
+            self._tracker = state["tracker"]
+            self._expert_actions_policy = state["actions_policy"]
+            self._tracker_dbg = state["tracker_dbg"]
 
     def _build_ego_vehicle(
         self,
@@ -709,9 +801,38 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         expert_action = None
         expert_action_str = None
         expert_action_idx = None
+        expert_actions: list[np.ndarray | None] = []
+        expert_action_strs: list[str | None] = []
+        expert_action_idxs: list[int | None] = []
 
         if self.expert_test_mode:
-            action, expert_action, expert_action_str, expert_action_idx = self._resolve_expert_action()
+            if self.config.get("action", {}).get("type") == "MultiAgentAction":
+                resolved_actions = []
+                for vehicle in self.controlled_vehicles:
+                    a_i, a_cont_i, a_str_i, a_idx_i = self._resolve_expert_action(
+                        vehicle=vehicle
+                    )
+                    resolved_actions.append(a_i)
+                    expert_actions.append(
+                        a_cont_i.copy() if a_cont_i is not None else None
+                    )
+                    expert_action_strs.append(a_str_i)
+                    expert_action_idxs.append(a_idx_i)
+
+                action = tuple(resolved_actions)
+                if expert_actions:
+                    expert_action = expert_actions[0]
+                    expert_action_str = expert_action_strs[0]
+                    expert_action_idx = expert_action_idxs[0]
+            else:
+                action, expert_action, expert_action_str, expert_action_idx = (
+                    self._resolve_expert_action()
+                )
+                expert_actions = [
+                    expert_action.copy() if expert_action is not None else None
+                ]
+                expert_action_strs = [expert_action_str]
+                expert_action_idxs = [expert_action_idx]
 
         # -----------------------------------------------------------
         # EXECUTE SIMULATION STEP
@@ -722,13 +843,36 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             info = {}
 
         info["applied_action"] = action
+        info["expert_controlled_vehicle_ids"] = [
+            int(getattr(vehicle, "vehicle_ID", -1))
+            for vehicle in self.controlled_vehicles
+        ]
+        if isinstance(action, tuple):
+            info["applied_actions"] = tuple(action)
         if expert_action is not None:
             info["expert_action_continuous"] = expert_action.copy()
+        if expert_actions:
+            info["expert_action_continuous_all"] = [
+                a.copy() if a is not None else None for a in expert_actions
+            ]
         if expert_action_str is not None:
             info["expert_action_discrete"] = expert_action_str
             info["expert_action_discrete_idx"] = expert_action_idx
+        if expert_action_strs:
+            info["expert_action_discrete_all"] = list(expert_action_strs)
+            info["expert_action_discrete_idx_all"] = list(expert_action_idxs)
 
         if self.expert_test_mode:
-            self._replay_xy_pol.append(self.vehicle.position.copy())
+            for vehicle in self.controlled_vehicles:
+                vehicle_id = int(getattr(vehicle, "vehicle_ID", -1))
+                expert_state = self._expert_state_by_vehicle_id.get(vehicle_id)
+                if expert_state is not None:
+                    expert_state["replay_xy"].append(vehicle.position.copy())
+            if self.vehicle is not None:
+                expert_state = self._expert_state_by_vehicle_id.get(
+                    int(self.vehicle.vehicle_ID)
+                )
+                if expert_state is not None:
+                    self._replay_xy_pol = list(expert_state["replay_xy"])
 
         return obs, reward, terminated, truncated, info

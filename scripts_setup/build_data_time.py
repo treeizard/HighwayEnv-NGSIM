@@ -12,11 +12,12 @@ from highway_env.ngsim_utils.trajectory_gen import (
 )
 
 
-def main():
-    episode_root = "highway_env/data/processed_10s"
-    scene = "us-101"
-    train_val_div = "train"
-
+def build_prebuilt_split(
+    episode_root: str,
+    scene: str,
+    train_val_div: str,
+    presence_frac_threshold: float = 0.6,
+):
     # Build all trajectories
     traj_all_by_episode = build_all_trajectories_for_scene(
         scene=scene,
@@ -26,9 +27,6 @@ def main():
 
     valid_ids_by_episode = {}
     episodes = sorted(traj_all_by_episode.keys())
-
-    # Threshold: must be present (non-zero) for at least 60% of the episode
-    presence_frac_threshold = 0.6
 
     for ep_name, veh_dict in traj_all_by_episode.items():
         valid_ids = []
@@ -62,6 +60,20 @@ def main():
     print(f"Saved {len(episodes)} episodes to {out_path_id}")
     np.save(out_path_traj, traj_all_by_episode)
     print(f"Saved {len(episodes)} episodes to {out_path_traj}")
+
+
+def main():
+    episode_root = "highway_env/data/processed_20s"
+    scene = "us-101"
+
+    for train_val_div in ("train", "val"):
+        print(f"Building prebuilt data for split: {train_val_div}")
+        build_prebuilt_split(
+            episode_root=episode_root,
+            scene=scene,
+            train_val_div=train_val_div,
+        )
+
 
 if __name__ == "__main__":
     main()

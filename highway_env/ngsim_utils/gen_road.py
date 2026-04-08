@@ -98,9 +98,9 @@ def create_japanese_road() -> None:
         "b",
         "c",
         SineLane(
-            [x_merge_start, 0.5 * (y_merge + y_left)],
-            [x_merge_end, 0.5 * (y_merge + y_left)],
-            amplitude=0.5 * (y_merge - y_left),
+            [x_merge_start, 0.8 * (y_merge + y_left)],
+            [x_merge_end, 0.8 * (y_merge + y_left)],
+            amplitude=0.8 * (y_merge - y_left),
             pulsation=np.pi / (x_merge_end - x_merge_start),
             phase=np.pi / 2.0,
             width=width,
@@ -125,7 +125,7 @@ def create_japanese_road() -> None:
     net.add_lane(
         "j",
         "b",
-        StraightLane([100.0, y_merge], [x_merge_start, y_merge], width=width, line_types=[c, c], forbidden=True),
+        StraightLane([100.0, y_merge+2.4], [x_merge_start, y_merge+2.4], width=width+2.5, line_types=[c, c], forbidden=True),
     )
 
     return net

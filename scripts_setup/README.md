@@ -1,0 +1,193 @@
+# `scripts_setup`
+
+Utility scripts for preparing NGSIM-style data and generating simple visualizations for this repository.
+
+## Before You Run Anything
+
+Run these commands from the repository root:
+
+```bash
+pip install -e .
+```
+
+Most scripts assume the project root is the current working directory so that paths like `highway_env/data/...` resolve correctly.
+
+## Typical Workflow
+
+1. Convert a raw NGSIM CSV into the repository's processed format with `dump_data_ngsim.py`.
+2. Optionally split a raw CSV into fixed-length train/validation episodes with `dump_data_time_ngsim.py`.
+3. Use `visualize.py` to render a high-resolution snapshot of a configured scene.
+
+## Scripts
+
+### `dump_data_ngsim.py`
+
+Converts a raw NGSIM CSV file into the repository's base processed format used by older loading utilities.
+
+#### Usage
+
+```bash
+python scripts_setup/dump_data_ngsim.py <path-to-csv> [--scene us-101]
+```
+
+#### Arguments
+
+- `path`: path to the raw NGSIM CSV file.
+- `--scene`: scene/location filter passed into `ngsim_data`. Default: `us-101`.
+
+#### What It Does
+
+- loads the raw CSV with `highway_env.data.ngsim.ngsim_data`
+- filters rows by the selected `scene` when the CSV contains a `Location` column
+- cleans the loaded data via `reader.clean()`
+- writes processed files into:
+
+```text
+highway_env/data/processed/<scene>/
+```
+
+#### Output Files
+
+- `vehicle_record_file.csv`
+- `vehicle_file.csv`
+- `snapshot_file.csv`
+
+#### Example
+
+```bash
+python scripts_setup/dump_data_ngsim.py data/us101.csv --scene us-101
+```
+
+### `dump_data_time_ngsim.py`
+
+Reads a raw NGSIM CSV and writes fixed-duration episodes, primarily for faster episode-based loading.
+
+By default it creates 10-second non-overlapping windows and randomly splits them into `train` and `val` sets with an 80/20 split.
+
+#### Usage
+
+```bash
+python scripts_setup/dump_data_time_ngsim.py <path-to-csv> \
+  [--scene us-101] \
+  [--out_root highway_env/data/processed_10s] \
+  [--episode_len_sec 10.0] \
+  [--stride_sec 10.0]
+```
+
+#### Arguments
+
+- `path`: path to the raw NGSIM CSV file.
+- `--scene`: scene/location name. Default: `us-101`.
+- `--out_root`: root directory for windowed output. Default: `highway_env/data/processed_10s`.
+- `--episode_len_sec`: episode length in seconds. Default: `10.0`.
+- `--stride_sec`: time between episode starts in seconds. Default: `10.0`.
+
+#### What It Does
+
+- loads and cleans the raw CSV
+- groups snapshots into fixed-length time windows
+- shuffles episodes randomly
+- writes episodes into `train/` and `val/` folders
+- stores each episode in its own `t<unix_time>` directory
+
+#### Output Layout
+
+```text
+highway_env/data/processed_10s/<scene>/
+  train/
+    t1118846663000/
+      vehicle_record_file.csv
+      vehicle_file.csv
+      snapshot_file.csv
+  val/
+    t1118846673000/
+      vehicle_record_file.csv
+      vehicle_file.csv
+      snapshot_file.csv
+```
+
+#### Notes
+
+- if `stride_sec == episode_len_sec`, episodes do not overlap
+- if `stride_sec < episode_len_sec`, windows overlap
+- the train/validation split is randomized on each run because the script uses `random.shuffle(...)` without a fixed seed
+
+#### Example
+
+```bash
+python scripts_setup/dump_data_time_ngsim.py data/us101.csv --scene us-101
+```
+
+Example with overlapping 5-second stride and 10-second windows:
+
+```bash
+python scripts_setup/dump_data_time_ngsim.py data/us101.csv \
+  --scene us-101 \
+  --episode_len_sec 10 \
+  --stride_sec 5
+```
+
+### `visualize.py`
+
+Renders and saves a high-resolution PNG snapshot from the registered `NGSim-US101-v0` environment.
+
+This script is currently written as a Python utility/example rather than a command-line tool. Running the file directly executes the hardcoded example at the bottom of the script.
+
+#### Direct Run
+
+```bash
+python scripts_setup/visualize.py
+```
+
+With the current code, this saves:
+
+```text
+plots/japanese_road_only.png
+```
+
+#### Current Default Behavior
+
+The built-in example:
+
+- creates an environment with `scene="japanese"`
+- renders a full scene (`road_only=False`)
+- saves a large PNG image to `plots/japanese_road_only.png`
+
+#### Programmatic Use
+
+You can also import and call `save_highres_snapshot(...)` yourself:
+
+```python
+from scripts_setup.visualize import save_highres_snapshot
+
+save_highres_snapshot(
+    out_path="plots/example.png",
+    width=5000,
+    height=700,
+    scaling=7.0,
+    episode_name=None,
+    ego_vehicle_ID=None,
+    seed=42,
+    road_only=False,
+)
+```
+
+#### Parameters of `save_highres_snapshot(...)`
+
+- `out_path`: output PNG path
+- `width`: render width in pixels
+- `height`: render height in pixels
+- `scaling`: renderer zoom factor
+- `episode_name`: optional fixed episode folder name
+- `ego_vehicle_ID`: optional fixed ego vehicle id
+- `seed`: random seed for environment reset
+- `road_only`: if `True`, renders only the road layout
+
+## Scene Notes
+
+This repository contains scene-specific logic for at least:
+
+- `us-101`
+- `japanese`
+
+Some older helper code also references `i-80`, but support depends on the downstream road-building and environment code you intend to use.
