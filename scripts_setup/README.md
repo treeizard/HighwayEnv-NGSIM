@@ -183,6 +183,64 @@ save_highres_snapshot(
 - `seed`: random seed for environment reset
 - `road_only`: if `True`, renders only the road layout
 
+### `build_prebuilt_japanese.py`
+
+Builds Japanese prebuilt trajectory caches directly from the filtered Morinomiya `.npy` artifact produced by the scripts in `raw_data/`.
+
+This is useful when you want to regenerate:
+
+- `veh_ids_train.npy`
+- `trajectory_train.npy`
+- `veh_ids_val.npy`
+- `trajectory_val.npy`
+
+for a target folder such as `highway_env/data/processed_20s/japanese/prebuilt/`.
+
+#### Usage
+
+```bash
+python scripts_setup/build_prebuilt_japanese.py
+```
+
+#### Default Inputs and Outputs
+
+- input: `raw_data/morinomiya_filtered_without_duplicates.npy`
+- output root: `highway_env/data/processed_20s`
+- scene: `japanese`
+- window size: `20` seconds
+- JST time filter: `09:00:00 <= time < 12:00:00`
+
+#### What It Does
+
+- loads the filtered Morinomiya record array
+- reconstructs local XY coordinates
+- estimates a curved-road remap using the mainline lanes
+- smooths each vehicle trajectory
+- slices the data into fixed-duration windows
+- splits episode windows into `train` and `val`
+- writes prebuilt `.npy` files under:
+
+```text
+highway_env/data/processed_20s/japanese/prebuilt/
+```
+
+#### Example
+
+```bash
+python scripts_setup/build_prebuilt_japanese.py \
+  --input_npy raw_data/morinomiya_filtered_without_duplicates.npy \
+  --episode_root highway_env/data/processed_20s \
+  --window_sec 20
+```
+
+Example with an explicit JST clock filter:
+
+```bash
+python scripts_setup/build_prebuilt_japanese.py \
+  --start_clock 09:00:00 \
+  --end_clock 12:00:00
+```
+
 ## Scene Notes
 
 This repository contains scene-specific logic for at least:
