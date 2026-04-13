@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
         help="Number of controlled ego vehicles to spawn.",
     )
     parser.add_argument(
+        "--control-all-vehicles",
+        action="store_true",
+        help="Control all valid vehicles in the selected traffic segment.",
+    )
+    parser.add_argument(
         "--episode-name",
         type=str,
         default=None,
@@ -145,6 +150,7 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
         "action": {"type": action_type},
         "action_mode": args.action_mode,
         "controlled_vehicles": int(args.controlled_vehicles),
+        "control_all_vehicles": bool(args.control_all_vehicles),
         "ego_vehicle_ID": args.ego_ids,
         "simulation_period": simulation_period,
         "show_trajectories": True,
@@ -159,8 +165,9 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
         "screen_height": int(args.screen_height),
         "scaling": float(args.scaling),
         "offscreen_rendering": args.render_mode == "rgb_array",
-        "episode_root": "highway_env/data/processed_10s",
-        "max_surrounding": args.max_surrounding,
+        "episode_root": "highway_env/data/processed_20s",
+        "prebuilt_split": "train",
+        "max_surrounding": 0 if args.control_all_vehicles else args.max_surrounding,
         "expert_test_mode": False,
     }
 

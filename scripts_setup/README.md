@@ -15,7 +15,7 @@ Most scripts assume the project root is the current working directory so that pa
 ## Typical Workflow
 
 1. Convert a raw NGSIM CSV into the repository's processed format with `dump_data_ngsim.py`.
-2. Optionally split a raw CSV into fixed-length train/validation episodes with `dump_data_time_ngsim.py`.
+2. Optionally split a raw CSV into fixed-length train/validation/test episodes with `dump_data_time_ngsim.py`.
 3. Use `visualize.py` to render a high-resolution snapshot of a configured scene.
 
 ## Scripts
@@ -62,38 +62,44 @@ python scripts_setup/dump_data_ngsim.py data/us101.csv --scene us-101
 
 Reads a raw NGSIM CSV and writes fixed-duration episodes, primarily for faster episode-based loading.
 
-By default it creates 10-second non-overlapping windows and randomly splits them into `train` and `val` sets with an 80/20 split.
+By default it creates 20-second non-overlapping windows and splits them chronologically into consecutive `train`, `val`, and `test` segments.
 
 #### Usage
 
 ```bash
 python scripts_setup/dump_data_time_ngsim.py <path-to-csv> \
   [--scene us-101] \
-  [--out_root highway_env/data/processed_10s] \
-  [--episode_len_sec 10.0] \
-  [--stride_sec 10.0]
+  [--out_root highway_env/data/processed_20s] \
+  [--episode_len_sec 20.0] \
+  [--stride_sec 20.0] \
+  [--val_ratio 0.1] \
+  [--test_ratio 0.1] \
+  [--car_only]
 ```
 
 #### Arguments
 
 - `path`: path to the raw NGSIM CSV file.
 - `--scene`: scene/location name. Default: `us-101`.
-- `--out_root`: root directory for windowed output. Default: `highway_env/data/processed_10s`.
-- `--episode_len_sec`: episode length in seconds. Default: `10.0`.
-- `--stride_sec`: time between episode starts in seconds. Default: `10.0`.
+- `--out_root`: root directory for windowed output. Default: `highway_env/data/processed_20s`.
+- `--episode_len_sec`: episode length in seconds. Default: `20.0`.
+- `--stride_sec`: time between episode starts in seconds. Default: `20.0`.
+- `--val_ratio`: fraction of windows assigned to validation. Default: `0.1`.
+- `--test_ratio`: fraction of windows assigned to test. Default: `0.1`.
+- `--car_only`: keep only car-sized vehicles in the written episode folders.
 
 #### What It Does
 
 - loads and cleans the raw CSV
 - groups snapshots into fixed-length time windows
-- shuffles episodes randomly
-- writes episodes into `train/` and `val/` folders
+- optionally filters non-car vehicles using length/width thresholds
+- splits windows by time into consecutive `train/`, `val/`, and `test/` folders
 - stores each episode in its own `t<unix_time>` directory
 
 #### Output Layout
 
 ```text
-highway_env/data/processed_10s/<scene>/
+highway_env/data/processed_20s/<scene>/
   train/
     t1118846663000/
       vehicle_record_file.csv
@@ -104,13 +110,19 @@ highway_env/data/processed_10s/<scene>/
       vehicle_record_file.csv
       vehicle_file.csv
       snapshot_file.csv
+  test/
+    t1118846683000/
+      vehicle_record_file.csv
+      vehicle_file.csv
+      snapshot_file.csv
 ```
 
 #### Notes
 
 - if `stride_sec == episode_len_sec`, episodes do not overlap
 - if `stride_sec < episode_len_sec`, windows overlap
-- the train/validation split is randomized on each run because the script uses `random.shuffle(...)` without a fixed seed
+- `--car_only` is useful when downstream expert replay should only model passenger cars
+- `train` gets the earliest windows, `val` the next windows, and `test` the latest windows
 
 #### Example
 
@@ -193,6 +205,8 @@ This is useful when you want to regenerate:
 - `trajectory_train.npy`
 - `veh_ids_val.npy`
 - `trajectory_val.npy`
+- `veh_ids_test.npy`
+- `trajectory_test.npy`
 
 for a target folder such as `highway_env/data/processed_20s/japanese/prebuilt/`.
 
@@ -217,7 +231,8 @@ python scripts_setup/build_prebuilt_japanese.py
 - estimates a curved-road remap using the mainline lanes
 - smooths each vehicle trajectory
 - slices the data into fixed-duration windows
-- splits episode windows into `train` and `val`
+- optionally filters to car-sized vehicles only
+- splits episode windows into consecutive `train`, `val`, and `test`
 - writes prebuilt `.npy` files under:
 
 ```text

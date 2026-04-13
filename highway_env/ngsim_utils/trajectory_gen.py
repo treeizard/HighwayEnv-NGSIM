@@ -147,10 +147,10 @@ def build_trajectory(scene, period, vehicle_ID):
 
 def build_trajectory_from_chunk(scene, vehicle_ID, episode_dir):
     """
-    Load only one 10s episode folder instead of the full us-101 dataset.
+    Load only one processed episode folder instead of the full us-101 dataset.
 
     episode_dir example:
-        "highway_env/data/processed_10s/us-101/t1118846663000"
+        "highway_env/data/processed_20s/us-101/t1118846663000"
     """
     ng = ngsim_data(scene)
     ng.load(episode_dir)          # <-- loads only that small episode
@@ -165,7 +165,7 @@ def build_trajectory_from_chunk(scene, vehicle_ID, episode_dir):
     ego_vehicle.build_trajectory()
     ego_trajectories = ego_vehicle.trajectory
     #print('trajectory:',ego_trajectories)
-    # With a 10s chunk you'll almost always have a single period = 0
+    # With a fixed-length chunk you'll almost always have a single period = 0
     selected_trajectory = ego_trajectories[0]
 
     D = 200 if scene == 'us-101' else 20
@@ -228,14 +228,14 @@ def build_all_trajectories_for_scene(
     train_val_div: str,
 ) -> Dict[str, Dict[int, Dict[str, Any]]]:
     """
-    Preload and preprocess trajectories for *all* 10-second intervals (episodes)
+    Preload and preprocess trajectories for all processed intervals (episodes)
     of a given scene.
 
     Args:
         scene:
             Name of the NGSIM scene, e.g. "us-101".
         episodes_root:
-            Path to the directory that contains the 10s episode folders
+            Path to the directory that contains the processed episode folders
             for this scene. Typical layout:
 
                 episodes_root/
@@ -244,7 +244,7 @@ def build_all_trajectories_for_scene(
                     t1118846673000/
                     ...
 
-            In that case you would pass episodes_root=".../processed_10s"
+            In that case you would pass episodes_root=".../processed_20s"
             and scene="us-101", and this function will look under
             episodes_root/scene for folders starting with "t".
 

@@ -11,6 +11,8 @@ the same prebuilt format consumed by `NGSimEnv`:
     trajectory_train.npy
     veh_ids_val.npy
     trajectory_val.npy
+    veh_ids_test.npy
+    trajectory_test.npy
 
 It follows the existing notebook / raw-data workflow:
 1. load filtered Morinomiya records
@@ -18,14 +20,13 @@ It follows the existing notebook / raw-data workflow:
 3. estimate a curved-road remap using mainline lanes
 4. smooth each vehicle trajectory
 5. slice into fixed-duration windows
-6. split windows into train / val
+6. split windows into consecutive train / val / test sets
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import random
 import sys
 from pathlib import Path
 import datetime as dt
@@ -56,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--input_npy",
-        default="raw_data/morinomiya_merged.npy",
+        default="raw_data/morinomiya_filtered_800.npy",
         help="Filtered Morinomiya .npy produced by the raw_data preprocessing pipeline.",
     )
     parser.add_argument(
@@ -78,20 +79,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--val_ratio",
         type=float,
-        default=0.2,
-        help="Fraction of episode windows assigned to validation.",
+        default=0.1,
+        help="Fraction of episode windows assigned to validation from the middle time segment.",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed used for train/val episode splitting.",
+        "--test_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of episode windows assigned to test from the latest time segment.",
     )
     parser.add_argument(
         "--presence_ratio_threshold",
         type=float,
         default=0.8,
         help="Minimum fraction of expected frames required for a vehicle to be considered valid.",
+    )
+    parser.add_argument(
+        "--car_only",
+        action="store_true",
+        default=True,
+        help="Keep only car-sized vehicles when building expert replay caches.",
+    )
+    parser.add_argument(
+        "--no-car_only",
+        dest="car_only",
+        action="store_false",
+        help="Disable car-only filtering and keep all vehicle classes.",
+    )
+    parser.add_argument(
+        "--car_length_min",
+        type=float,
+        default=3.0,
+        help="Minimum vehicle length in meters for the Japanese car filter.",
+    )
+    parser.add_argument(
+        "--car_length_max",
+        type=float,
+        default=5.5,
+        help="Maximum vehicle length in meters for the Japanese car filter.",
+    )
+    parser.add_argument(
+        "--car_width_min",
+        type=float,
+        default=1.3,
+        help="Minimum vehicle width in meters for the Japanese car filter.",
+    )
+    parser.add_argument(
+        "--car_width_max",
+        type=float,
+        default=2.2,
+        help="Maximum vehicle width in meters for the Japanese car filter.",
     )
     parser.add_argument(
         "--x_m_max",
@@ -208,15 +245,23 @@ def load_filtered_morinomiya(
     Memory-saving behavior:
     - apply the JST clock filter immediately after reconstructing timestamps
     - compute local XY only if needed for the early x-range crop
-    - apply `x_m_max` before curvature remapping / smoothing
+    - apply `x_m_max` before constructing the large pandas DataFrame
     - drop unused raw columns as soon as the spatial filter is done
     """
     arr = np.load(npy_path, allow_pickle=True)
-    df = pd.DataFrame(arr).copy()
-    del arr
-    gc.collect()
+    field_names = list(arr.dtype.names or [])
+    if not field_names:
+        raise ValueError(
+            f"{npy_path} does not contain a structured array with named columns."
+        )
 
-    numeric_cols = [
+    def field_to_numeric(name: str) -> np.ndarray:
+        if name not in field_names:
+            raise KeyError(name)
+        return pd.to_numeric(pd.Series(arr[name], copy=False), errors="coerce").to_numpy()
+
+    numeric_data: dict[str, np.ndarray] = {}
+    for col in [
         "vehicle_id",
         "datetime",
         "vehicle_type",
@@ -226,56 +271,81 @@ def load_filtered_morinomiya(
         "latitude",
         "vehicle_length",
         "detected_flag",
-    ]
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna(subset=["vehicle_id", "datetime", "traffic_lane"]).copy()
-    df["vehicle_id"] = df["vehicle_id"].astype(np.int64)
-    df["datetime"] = df["datetime"].astype(np.int64)
-    df["traffic_lane"] = df["traffic_lane"].astype(np.int64)
-
-    if "datetime_jst" in df.columns:
-        df["datetime_jst"] = pd.to_datetime(df["datetime_jst"], errors="coerce")
-    else:
-        df["datetime_jst"] = MORINOMIYA_START_JST + pd.to_timedelta(df["datetime"], unit="ms")
-
-    df = filter_by_jst_clock(
-        df,
-        start_clock=start_clock,
-        end_clock=end_clock,
-    )
-    gc.collect()
-
-    if "x_m" not in df.columns or "y_m" not in df.columns:
-        df = add_local_xy_fast(
-            df,
-            basis_lat=basis_lat,
-            basis_lon=basis_lon,
-        )
-
-    df["x_m"] = pd.to_numeric(df["x_m"], errors="coerce")
-    df["y_m"] = pd.to_numeric(df["y_m"], errors="coerce")
-    df = df.dropna(subset=["x_m", "y_m"]).copy()
-
-    if x_m_max is not None:
-        df = df[df["x_m"] <= float(x_m_max)].copy()
-
-    # Keep only the columns needed by the downstream preprocessing stages.
-    keep_cols = [
-        "vehicle_id",
-        "datetime",
-        "datetime_jst",
-        "vehicle_type",
-        "velocity",
-        "traffic_lane",
-        "vehicle_length",
         "x_m",
         "y_m",
-    ]
-    present_keep_cols = [col for col in keep_cols if col in df.columns]
-    df = df[present_keep_cols].copy()
+    ]:
+        if col in field_names:
+            numeric_data[col] = field_to_numeric(col)
+
+    required_mask = (
+        np.isfinite(numeric_data["vehicle_id"])
+        & np.isfinite(numeric_data["datetime"])
+        & np.isfinite(numeric_data["traffic_lane"])
+    )
+
+    if "datetime_jst" in field_names:
+        datetime_jst = pd.to_datetime(
+            pd.Series(arr["datetime_jst"], copy=False),
+            errors="coerce",
+        )
+    else:
+        datetime_jst = pd.Series(
+            MORINOMIYA_START_JST + pd.to_timedelta(
+                numeric_data["datetime"],
+                unit="ms",
+            ),
+            copy=False,
+        )
+
+    datetime_jst_mask = datetime_jst.notna().to_numpy()
+    if not np.any(datetime_jst_mask & required_mask):
+        raise ValueError("No valid datetime rows remained after parsing JST timestamps.")
+
+    clock_times = datetime_jst.dt.time
+    time_mask = (
+        (clock_times >= start_clock)
+        & (clock_times < end_clock)
+    ).to_numpy()
+    mask = required_mask & datetime_jst_mask & time_mask
+
+    if "x_m" in numeric_data and "y_m" in numeric_data:
+        x_m = numeric_data["x_m"]
+        y_m = numeric_data["y_m"]
+    else:
+        radius = 6378137.0
+        lat0 = np.deg2rad(basis_lat)
+        lon0 = np.deg2rad(basis_lon)
+        lat = np.deg2rad(numeric_data["latitude"])
+        lon = np.deg2rad(numeric_data["longitude"])
+        x_m = radius * (lon - lon0) * np.cos(lat0)
+        y_m = radius * (lat - lat0)
+
+    xy_mask = np.isfinite(x_m) & np.isfinite(y_m)
+    mask &= xy_mask
+
+    if x_m_max is not None:
+        mask &= x_m <= float(x_m_max)
+
+    if not np.any(mask):
+        raise ValueError("No rows remained after applying JST and x_m_max filtering.")
+
+    # Materialize only the post-crop subset needed downstream.
+    data = {
+        "vehicle_id": numeric_data["vehicle_id"][mask].astype(np.int64, copy=False),
+        "datetime": numeric_data["datetime"][mask].astype(np.int64, copy=False),
+        "datetime_jst": datetime_jst[mask].reset_index(drop=True),
+        "traffic_lane": numeric_data["traffic_lane"][mask].astype(np.int64, copy=False),
+        "x_m": x_m[mask],
+        "y_m": y_m[mask],
+    }
+    for col in ["vehicle_type", "velocity", "vehicle_length"]:
+        if col in numeric_data:
+            data[col] = numeric_data[col][mask]
+
+    df = pd.DataFrame(data)
+    del arr
+    gc.collect()
+
     gc.collect()
 
     return df.sort_values(["vehicle_id", "datetime"]).reset_index(drop=True)
@@ -322,6 +392,29 @@ def smooth_vehicle_trajectories(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("No vehicle trajectories were available for smoothing.")
 
     return pd.concat(smoothed_groups, ignore_index=True)
+
+
+def filter_car_like_vehicles(
+    df: pd.DataFrame,
+    *,
+    length_col: str,
+    width_col: str,
+    length_min: float,
+    length_max: float,
+    width_min: float,
+    width_max: float,
+) -> pd.DataFrame:
+    """
+    Keep only vehicles whose dimensions are consistent with passenger cars.
+    """
+    out = df.copy()
+    out[length_col] = pd.to_numeric(out[length_col], errors="coerce")
+    out[width_col] = pd.to_numeric(out[width_col], errors="coerce")
+    mask = (
+        out[length_col].between(float(length_min), float(length_max), inclusive="both")
+        & out[width_col].between(float(width_min), float(width_max), inclusive="both")
+    )
+    return out.loc[mask].copy()
 
 
 def build_episode_dicts(
@@ -424,21 +517,27 @@ def build_episode_dicts(
 def split_episode_keys(
     episode_keys: list[str],
     val_ratio: float,
-    seed: int,
-) -> tuple[list[str], list[str]]:
-    """Split episode keys into train and validation sets."""
+    test_ratio: float,
+) -> tuple[list[str], list[str], list[str]]:
+    """Split episode keys into consecutive train, validation, and test sets."""
     if not 0.0 <= val_ratio < 1.0:
         raise ValueError("--val_ratio must be in [0, 1).")
+    if not 0.0 <= test_ratio < 1.0:
+        raise ValueError("--test_ratio must be in [0, 1).")
+    if val_ratio + test_ratio >= 1.0:
+        raise ValueError("--val_ratio + --test_ratio must be < 1.0.")
 
-    shuffled = list(episode_keys)
-    rng = random.Random(seed)
-    rng.shuffle(shuffled)
-
-    n_val = int(round(len(shuffled) * val_ratio))
-    n_val = min(max(n_val, 0), len(shuffled))
-    val_keys = sorted(shuffled[:n_val])
-    train_keys = sorted(shuffled[n_val:])
-    return train_keys, val_keys
+    ordered = sorted(episode_keys)
+    n_total = len(ordered)
+    n_test = int(round(n_total * test_ratio))
+    n_val = int(round(n_total * val_ratio))
+    n_test = min(max(n_test, 0), n_total)
+    n_val = min(max(n_val, 0), n_total - n_test)
+    n_train = n_total - n_val - n_test
+    train_keys = ordered[:n_train]
+    val_keys = ordered[n_train : n_train + n_val]
+    test_keys = ordered[n_train + n_val :]
+    return train_keys, val_keys, test_keys
 
 
 def subset_dict(d: dict, keys: list[str]) -> dict:
@@ -506,10 +605,28 @@ def main() -> None:
     if not episode_keys:
         raise RuntimeError("No episodes were created from the filtered Japanese dataset.")
 
-    train_keys, val_keys = split_episode_keys(
+    if args.car_only:
+        before_rows = len(df)
+        before_vehicles = df["vehicle_id"].nunique()
+        df = filter_car_like_vehicles(
+            df,
+            length_col="vehicle_length",
+            width_col="vehicle_width",
+            length_min=args.car_length_min,
+            length_max=args.car_length_max,
+            width_min=args.car_width_min,
+            width_max=args.car_width_max,
+        )
+        print(
+            "Applied Japanese car-only filter: "
+            f"{before_rows} -> {len(df)} rows, "
+            f"{before_vehicles} -> {df['vehicle_id'].nunique()} vehicles"
+        )
+
+    train_keys, val_keys, test_keys = split_episode_keys(
         episode_keys=episode_keys,
         val_ratio=args.val_ratio,
-        seed=args.seed,
+        test_ratio=args.test_ratio,
     )
 
     out_dir = os.path.join(args.episode_root, args.scene, "prebuilt")
@@ -517,7 +634,7 @@ def main() -> None:
 
     print(
         f"Built {len(episode_keys)} total episodes: "
-        f"{len(train_keys)} train, {len(val_keys)} val"
+        f"{len(train_keys)} train, {len(val_keys)} val, {len(test_keys)} test"
     )
 
     save_split(
@@ -532,6 +649,13 @@ def main() -> None:
         split="val",
         veh_ids_by_episode=subset_dict(veh_ids_all, val_keys),
         trajectories_by_episode=subset_dict(traj_all, val_keys),
+    )
+
+    save_split(
+        out_dir=out_dir,
+        split="test",
+        veh_ids_by_episode=subset_dict(veh_ids_all, test_keys),
+        trajectories_by_episode=subset_dict(traj_all, test_keys),
     )
 
 

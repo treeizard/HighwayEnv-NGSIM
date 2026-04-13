@@ -124,6 +124,7 @@ def estimate_centerline_from_lanes(
 def project_points_to_centerline(
     xy: np.ndarray,
     centerline_df: pd.DataFrame,
+    chunk_size: int | None = 20000,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Project world-frame points to a centerline and return:
@@ -143,33 +144,52 @@ def project_points_to_centerline(
     seg_len2 = np.sum(seg_vec * seg_vec, axis=1)
     seg_len = np.sqrt(seg_len2)
 
-    # Project every point onto every segment and keep the closest valid projection.
-    rel = xy[:, None, :] - seg_start[None, :, :]
-    dot = np.sum(rel * seg_vec[None, :, :], axis=2)
-    t = np.divide(dot, seg_len2[None, :], out=np.zeros_like(dot), where=seg_len2[None, :] > 0)
-    t = np.clip(t, 0.0, 1.0)
+    if chunk_size is None or chunk_size <= 0:
+        chunk_size = len(xy)
 
-    proj = seg_start[None, :, :] + t[:, :, None] * seg_vec[None, :, :]
-    resid = xy[:, None, :] - proj
-    dist2 = np.sum(resid * resid, axis=2)
-    seg_idx = np.argmin(dist2, axis=1)
+    s_out = np.empty(len(xy), dtype=float)
+    d_out = np.empty(len(xy), dtype=float)
+    idx_out = np.empty(len(xy), dtype=int)
 
-    chosen_t = t[np.arange(len(xy)), seg_idx]
-    chosen_proj = proj[np.arange(len(xy)), seg_idx]
-    chosen_vec = seg_vec[seg_idx]
-    chosen_len = seg_len[seg_idx]
+    # Chunking avoids the massive [n_points, n_segments, ...] temporary arrays
+    # that otherwise trigger OOM on the full Japanese dataset.
+    for start in range(0, len(xy), chunk_size):
+        end = min(start + chunk_size, len(xy))
+        xy_chunk = xy[start:end]
 
-    tangent = np.divide(
-        chosen_vec,
-        chosen_len[:, None],
-        out=np.zeros_like(chosen_vec),
-        where=chosen_len[:, None] > 0,
-    )
-    normal = np.column_stack([-tangent[:, 1], tangent[:, 0]])
+        rel = xy_chunk[:, None, :] - seg_start[None, :, :]
+        dot = np.sum(rel * seg_vec[None, :, :], axis=2)
+        t = np.divide(
+            dot,
+            seg_len2[None, :],
+            out=np.zeros_like(dot),
+            where=seg_len2[None, :] > 0,
+        )
+        t = np.clip(t, 0.0, 1.0)
 
-    signed_d = np.sum((xy - chosen_proj) * normal, axis=1)
-    s = s_values[seg_idx] + chosen_t * chosen_len
-    return s, signed_d, seg_idx
+        proj = seg_start[None, :, :] + t[:, :, None] * seg_vec[None, :, :]
+        resid = xy_chunk[:, None, :] - proj
+        dist2 = np.sum(resid * resid, axis=2)
+        seg_idx = np.argmin(dist2, axis=1)
+
+        chosen_t = t[np.arange(len(xy_chunk)), seg_idx]
+        chosen_proj = proj[np.arange(len(xy_chunk)), seg_idx]
+        chosen_vec = seg_vec[seg_idx]
+        chosen_len = seg_len[seg_idx]
+
+        tangent = np.divide(
+            chosen_vec,
+            chosen_len[:, None],
+            out=np.zeros_like(chosen_vec),
+            where=chosen_len[:, None] > 0,
+        )
+        normal = np.column_stack([-tangent[:, 1], tangent[:, 0]])
+
+        d_out[start:end] = np.sum((xy_chunk - chosen_proj) * normal, axis=1)
+        s_out[start:end] = s_values[seg_idx] + chosen_t * chosen_len
+        idx_out[start:end] = seg_idx
+
+    return s_out, d_out, idx_out
 
 
 def remap_dataframe_to_frenet(
@@ -179,13 +199,18 @@ def remap_dataframe_to_frenet(
     y_col: str = "y_m",
     s_col: str = "x_curved",
     d_col: str = "y_curved",
+    chunk_size: int | None = 20000,
 ) -> pd.DataFrame:
     """Attach curvature-aware straightened coordinates to a dataframe."""
     out = df.copy()
     valid_mask = out[[x_col, y_col]].notna().all(axis=1)
     xy = out.loc[valid_mask, [x_col, y_col]].to_numpy(dtype=float)
 
-    s, d, idx = project_points_to_centerline(xy, centerline_df)
+    s, d, idx = project_points_to_centerline(
+        xy,
+        centerline_df,
+        chunk_size=chunk_size,
+    )
     out.loc[valid_mask, s_col] = s
     out.loc[valid_mask, d_col] = d
     out.loc[valid_mask, "centerline_idx"] = idx
@@ -200,6 +225,7 @@ def estimate_curvature_remap(
     lanes: list[int] | None = None,
     bin_size_m: float = 5.0,
     spline_smooth: float | None = None,
+    projection_chunk_size: int | None = 20000,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Convenience wrapper returning:
@@ -220,5 +246,6 @@ def estimate_curvature_remap(
         centerline_df=centerline_df,
         x_col=x_col,
         y_col=y_col,
+        chunk_size=projection_chunk_size,
     )
     return remapped_df, centerline_df

@@ -62,7 +62,8 @@ def load_expert_transitions(path: str) -> Transitions:
 def make_env(render_mode=None):
     config = {
         "scene": "us-101",
-        "episode_root": "highway_env/data/processed_10s",
+        "episode_root": "highway_env/data/processed_20s",
+        "prebuilt_split": "train",
         "observation": {
             "type": "LidarObservation",
             "cells": 128,

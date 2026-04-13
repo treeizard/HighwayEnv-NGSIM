@@ -101,7 +101,9 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 "max_episode_steps": 300,
                 "ego_vehicle_ID": None,
                 "simulation_period": None,
-                "episode_root": "highway_env/data/processed_10s",
+                "episode_root": "highway_env/data/processed_20s",
+                "prebuilt_split": "train",
+                "control_all_vehicles": False,
                 "max_surrounding": "all",
                 "show_trajectories": True,
                 "seed": None,
@@ -136,7 +138,11 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         self._replay_xy_pol: list[np.ndarray] = []
         self._frames_per_action: int = 1
 
-        self._load_prebuilt_data(cfg["episode_root"], self.scene)
+        self._load_prebuilt_data(
+            cfg["episode_root"],
+            self.scene,
+            str(cfg.get("prebuilt_split", "train")),
+        )
 
         super().__init__(config=cfg, render_mode=render_mode)
 
@@ -181,14 +187,23 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         cfg["action"] = {"type": action_types[control_mode]}
         return control_mode
 
-    def _load_prebuilt_data(self, episode_root: str, scene: str) -> None:
+    def _load_prebuilt_data(self, episode_root: str, scene: str, prebuilt_split: str) -> None:
         episode_root_abs = os.path.abspath(episode_root)
-        cache_key = (episode_root_abs, scene)
+        split = str(prebuilt_split)
+        cache_key = (episode_root_abs, scene, split)
         cached = self._PREBUILT_CACHE.get(cache_key)
         if cached is None:
             prebuilt_dir = os.path.join(episode_root_abs, scene, "prebuilt")
-            veh_ids_path = os.path.join(prebuilt_dir, "veh_ids_train.npy")
-            traj_path = os.path.join(prebuilt_dir, "trajectory_train.npy")
+            veh_ids_path = os.path.join(prebuilt_dir, f"veh_ids_{split}.npy")
+            traj_path = os.path.join(prebuilt_dir, f"trajectory_{split}.npy")
+            if not os.path.exists(veh_ids_path):
+                raise FileNotFoundError(
+                    f"Missing prebuilt vehicle id file for split={split!r}: {veh_ids_path}"
+                )
+            if not os.path.exists(traj_path):
+                raise FileNotFoundError(
+                    f"Missing prebuilt trajectory file for split={split!r}: {traj_path}"
+                )
             valid_ids = np.load(veh_ids_path, allow_pickle=True).item()
             traj_all = np.load(traj_path, allow_pickle=True).item()
             episodes = sorted(traj_all.keys())
@@ -328,6 +343,9 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         explicit_ego_ids: int | list[int] | tuple[int, ...] | np.ndarray | None,
         num_vehicles: int = 1,
     ) -> list[int]:
+        if bool(self.config.get("control_all_vehicles", False)):
+            return [int(eid) for eid in valid_ids]
+
         if num_vehicles < 1:
             raise ValueError(f"num_vehicles must be >= 1, got {num_vehicles}")
 

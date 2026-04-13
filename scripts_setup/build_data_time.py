@@ -17,6 +17,11 @@ def build_prebuilt_split(
     scene: str,
     train_val_div: str,
     presence_frac_threshold: float = 0.6,
+    car_only: bool = True,
+    car_length_min: float = 10.0,
+    car_length_max: float = 22.0,
+    car_width_min: float = 4.0,
+    car_width_max: float = 8.0,
 ):
     # Build all trajectories
     traj_all_by_episode = build_all_trajectories_for_scene(
@@ -32,6 +37,14 @@ def build_prebuilt_split(
         valid_ids = []
         for vid, meta in veh_dict.items():
             traj = meta["trajectory"]
+            length = float(meta.get("length", 0.0))
+            width = float(meta.get("width", 0.0))
+
+            if car_only and not (
+                car_length_min <= length <= car_length_max
+                and car_width_min <= width <= car_width_max
+            ):
+                continue
 
             # Skip trivial trajectories
             if traj.shape[0] < 2:
@@ -66,7 +79,7 @@ def main():
     episode_root = "highway_env/data/processed_20s"
     scene = "us-101"
 
-    for train_val_div in ("train", "val"):
+    for train_val_div in ("train", "val", "test"):
         print(f"Building prebuilt data for split: {train_val_div}")
         build_prebuilt_split(
             episode_root=episode_root,

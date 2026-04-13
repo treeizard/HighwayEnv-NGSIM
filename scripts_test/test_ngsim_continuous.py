@@ -44,7 +44,8 @@ def main():
         "ego_vehicle_ID": None,
 
         # Replay chunk root directory
-        "episode_root": "highway_env/data/processed_10s",
+        "episode_root": "highway_env/data/processed_20s",
+        "prebuilt_split": "train",
 
         # Random episode selection each reset
         "replay_period": None,

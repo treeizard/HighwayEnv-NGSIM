@@ -279,7 +279,8 @@ def main() -> None:
         "offscreen_rendering": True,
 
         # Random episode selection each reset
-        "episode_root": "highway_env/data/processed_10s",
+        "episode_root": "highway_env/data/processed_20s",
+        "prebuilt_split": "train",
         "replay_period": None,
         "reset_step_offset": 1,
 

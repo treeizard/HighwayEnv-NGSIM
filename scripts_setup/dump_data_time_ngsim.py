@@ -17,10 +17,10 @@
 # dump_data_time.py
 #
 # Read an NGSIM CSV (e.g. us-101) using ngsim_data, then dump the data
-# into 10-second (or configurable) time windows. This file is constructed to improve the data processing efficiency later on
+# into 20-second (or configurable) time windows. This file is constructed to improve the data processing efficiency later on
 #
 # For example, with default settings:
-#    highway_env/data/processed_10s/us-101/
+#    highway_env/data/processed_20s/us-101/
 #        train/
 #            t1118846663000/
 #                vehicle_record_file.csv
@@ -36,7 +36,6 @@
 
 import os
 import argparse
-import random
 from collections import defaultdict
 import sys
 
@@ -96,7 +95,17 @@ def build_episodes(
     return episodes
 
 
-def dump_episode(reader: ngsim_data, snap_times, out_dir: str):
+def dump_episode(
+    reader: ngsim_data,
+    snap_times,
+    out_dir: str,
+    *,
+    car_only: bool = False,
+    car_length_min: float = 10.0,
+    car_length_max: float = 22.0,
+    car_width_min: float = 4.0,
+    car_width_max: float = 8.0,
+):
     """
     Dump one episode (subset of time) in the same format as ngsim_data.dump(),
     but restricted to:
@@ -115,6 +124,14 @@ def dump_episode(reader: ngsim_data, snap_times, out_dir: str):
     for t in snap_times:
         snap = reader.snap_dict[t]
         for vr in snap.vr_list:
+            if car_only:
+                vr_length = float(getattr(vr, "len", 0.0))
+                vr_width = float(getattr(vr, "wid", 0.0))
+                if not (
+                    car_length_min <= vr_length <= car_length_max
+                    and car_width_min <= vr_width <= car_width_max
+                ):
+                    continue
             if vr.ID not in episode_vr_by_id:
                 episode_vr_by_id[vr.ID] = vr
                 episode_vr_ids.append(vr.ID)
@@ -160,9 +177,38 @@ def dump_episode(reader: ngsim_data, snap_times, out_dir: str):
             f_ss.write(line + "\n")
 
 
+def split_episodes_by_time(
+    episodes,
+    val_ratio: float,
+    test_ratio: float,
+):
+    """
+    Split episode windows into consecutive train/val/test segments ordered by time.
+    """
+    if not 0.0 <= val_ratio < 1.0:
+        raise ValueError("--val_ratio must be in [0, 1).")
+    if not 0.0 <= test_ratio < 1.0:
+        raise ValueError("--test_ratio must be in [0, 1).")
+    if val_ratio + test_ratio >= 1.0:
+        raise ValueError("--val_ratio + --test_ratio must be < 1.0.")
+
+    ordered = sorted(episodes, key=lambda item: item[0])
+    n_total = len(ordered)
+    n_test = int(round(n_total * test_ratio))
+    n_val = int(round(n_total * val_ratio))
+    n_test = min(max(n_test, 0), n_total)
+    n_val = min(max(n_val, 0), n_total - n_test)
+    n_train = n_total - n_val - n_test
+
+    train_episodes = ordered[:n_train]
+    val_episodes = ordered[n_train : n_train + n_val]
+    test_episodes = ordered[n_train + n_val :]
+    return train_episodes, val_episodes, test_episodes
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Dump NGSIM data into 10-second (or custom) time windows."
+        description="Dump NGSIM data into 20-second (or custom) time windows."
     )
     parser.add_argument(
         "path",
@@ -176,19 +222,60 @@ def main():
     parser.add_argument(
         "--out_root",
         help="Root folder to store time-windowed processed data.",
-        default="highway_env/data/processed_10s",
+        default="highway_env/data/processed_20s",
     )
     parser.add_argument(
         "--episode_len_sec",
         type=float,
-        default=10.0,
-        help="Episode length in seconds (default: 10.0).",
+        default=20.0,
+        help="Episode length in seconds (default: 20.0).",
     )
     parser.add_argument(
         "--stride_sec",
         type=float,
+        default=20.0,
+        help="Stride between episode starts in seconds (default: 20.0 = non-overlapping).",
+    )
+    parser.add_argument(
+        "--val_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of episodes assigned to validation from the middle time segment.",
+    )
+    parser.add_argument(
+        "--test_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of episodes assigned to test from the latest time segment.",
+    )
+    parser.add_argument(
+        "--car_only",
+        action="store_true",
+        help="Keep only car-sized vehicles when writing episode folders.",
+    )
+    parser.add_argument(
+        "--car_length_min",
+        type=float,
         default=10.0,
-        help="Stride between episode starts in seconds (default: 10.0 = non-overlapping).",
+        help="Minimum vehicle length in feet for the US/NGSIM car filter.",
+    )
+    parser.add_argument(
+        "--car_length_max",
+        type=float,
+        default=22.0,
+        help="Maximum vehicle length in feet for the US/NGSIM car filter.",
+    )
+    parser.add_argument(
+        "--car_width_min",
+        type=float,
+        default=4.0,
+        help="Minimum vehicle width in feet for the US/NGSIM car filter.",
+    )
+    parser.add_argument(
+        "--car_width_max",
+        type=float,
+        default=8.0,
+        help="Maximum vehicle width in feet for the US/NGSIM car filter.",
     )
 
     args = parser.parse_args()
@@ -212,18 +299,22 @@ def main():
         f"of length {args.episode_len_sec} s (stride {args.stride_sec} s)."
     )
 
-    # 2.5) Randomly split episodes into train (0.8) and val (0.2)
-    random.shuffle(episodes)
-    n_total = len(episodes)
-    n_train = int(0.8 * n_total)
-    train_episodes = episodes[:n_train]
-    val_episodes = episodes[n_train:]
+    # 2.5) Chronological split into train / val / test
+    train_episodes, val_episodes, test_episodes = split_episodes_by_time(
+        episodes=episodes,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
+    )
 
     base_dir = os.path.join(out_root, scene)
     os.makedirs(base_dir, exist_ok=True)
 
-    # 3) Dump each episode into train/ and val/ subfolders
-    for split_name, split_episodes in [("train", train_episodes), ("val", val_episodes)]:
+    # 3) Dump each episode into split subfolders
+    for split_name, split_episodes in [
+        ("train", train_episodes),
+        ("val", val_episodes),
+        ("test", test_episodes),
+    ]:
         split_dir = os.path.join(base_dir, split_name)
         os.makedirs(split_dir, exist_ok=True)
 
@@ -235,9 +326,22 @@ def main():
                 f"Dumping episode starting at {t_start} "
                 f"with {len(snap_times)} snapshots -> {ep_dir}"
             )
-            dump_episode(reader, snap_times, ep_dir)
+            dump_episode(
+                reader,
+                snap_times,
+                ep_dir,
+                car_only=args.car_only,
+                car_length_min=args.car_length_min,
+                car_length_max=args.car_length_max,
+                car_width_min=args.car_width_min,
+                car_width_max=args.car_width_max,
+            )
             #traj_cont_action(ep_dir)
 
+    print(
+        f"Chronological split summary: "
+        f"{len(train_episodes)} train, {len(val_episodes)} val, {len(test_episodes)} test"
+    )
     print("Done.")
 
 

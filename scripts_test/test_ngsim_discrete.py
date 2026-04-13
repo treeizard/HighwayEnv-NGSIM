@@ -33,14 +33,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--episode-root",
         type=str,
-        default="highway_env/data/processed_10s",
-        help="Dataset root containing <scene>/prebuilt/*.npy. The bundled default is a 10-second dataset.",
+        default="highway_env/data/processed_20s",
+        help="Dataset root containing <scene>/prebuilt/*.npy. The bundled default is a 20-second dataset.",
+    )
+    parser.add_argument(
+        "--prebuilt-split",
+        choices=["train", "val"],
+        default="train",
+        help="Which prebuilt split to sample replay scenarios from.",
     )
     parser.add_argument(
         "--controlled-vehicles",
         type=int,
         default=1,
         help="Number of expert-controlled vehicles to replay.",
+    )
+    parser.add_argument(
+        "--control-all-vehicles",
+        action="store_true",
+        help="Replay all valid vehicles in the selected traffic segment as controlled experts.",
     )
     parser.add_argument(
         "--episode-name",
@@ -149,6 +160,21 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
         }
         action_cfg = {"type": "DiscreteSteerMetaAction"}
 
+    if args.control_all_vehicles:
+        observation_cfg = {
+            "type": "MultiAgentObservation",
+            "observation_config": {
+                "type": "LidarObservation",
+                "cells": 128,
+                "maximum_range": 64,
+                "normalize": True,
+            },
+        }
+        action_cfg = {
+            "type": "MultiAgentAction",
+            "action_config": {"type": "DiscreteSteerMetaAction"},
+        }
+
     simulation_period = (
         {"episode_name": args.episode_name}
         if args.episode_name is not None
@@ -167,10 +193,12 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
         "scaling": float(args.scaling),
         "offscreen_rendering": args.render_mode == "rgb_array",
         "episode_root": args.episode_root,
+        "prebuilt_split": args.prebuilt_split,
         "simulation_period": simulation_period,
         "ego_vehicle_ID": args.ego_ids,
         "controlled_vehicles": int(args.controlled_vehicles),
-        "max_surrounding": args.max_surrounding,
+        "control_all_vehicles": bool(args.control_all_vehicles),
+        "max_surrounding": 0 if args.control_all_vehicles else args.max_surrounding,
         "expert_test_mode": True,
         "action_mode": "discrete",
         "expert_prefer_speed": False,
