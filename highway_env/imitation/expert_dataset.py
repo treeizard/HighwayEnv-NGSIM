@@ -1,3 +1,20 @@
+"""Expert dataset utilities for NGSIM replay and imitation learning.
+
+This module is the canonical entry point for building, validating, and loading
+expert datasets generated from ``NGSimEnv`` replay episodes.
+
+It provides three layers of functionality:
+
+- replay-driven dataset collection via :func:`build_expert_dataset`
+- metadata and schema validation for saved ``.npz`` archives
+- PyTorch ``Dataset`` wrappers for per-transition and scene-level training
+
+The core design choice is to collect data from the simulator's expert replay
+path rather than directly from raw trajectory tables. That keeps observations
+and actions aligned with the environment conventions used by the rest of the
+repository.
+"""
+
 from __future__ import annotations
 
 import json
@@ -80,6 +97,7 @@ def build_env_config(
     seed: int | None = None,
     simulation_period: dict[str, Any] | None = None,
     ego_vehicle_id: int | list[int] | None = None,
+    scene_dataset_collection_mode: bool = False,
 ) -> dict[str, Any]:
     """
     Build a repo-native NGSim config for expert replay collection.
@@ -127,6 +145,9 @@ def build_env_config(
         "truncate_to_trajectory_length": True,
         "max_episode_steps": int(max_episode_steps),
         "seed": seed,
+        "scene_dataset_collection_mode": bool(scene_dataset_collection_mode),
+        "disable_controlled_vehicle_collisions": bool(scene_dataset_collection_mode),
+        "terminate_when_all_controlled_crashed": not bool(scene_dataset_collection_mode),
     }
 
 
@@ -238,6 +259,12 @@ def _stack_actions(actions: list[np.ndarray], action_mode: str) -> np.ndarray:
         action_dtype,
         copy=False,
     )
+
+
+def _inactive_action_placeholder(action_mode: str) -> np.ndarray:
+    if str(action_mode).lower() == "discrete":
+        return np.asarray(1, dtype=np.int64)  # IDLE
+    return np.zeros((2,), dtype=np.float32)
 
 
 def _build_episode_trajectory(
@@ -380,6 +407,7 @@ def build_expert_dataset(
         policy_frequency=policy_frequency,
         max_episode_steps=max_episode_steps,
         seed=seed,
+        scene_dataset_collection_mode=(dataset_mode == "scene"),
     )
     probe_env = gym.make(ENV_ID, config=probe_cfg)
     try:
@@ -426,6 +454,7 @@ def build_expert_dataset(
             seed=seed + scenario_index,
             simulation_period={"episode_name": episode_name},
             ego_vehicle_id=list(ego_ids),
+            scene_dataset_collection_mode=(dataset_mode == "scene"),
         )
 
         env = gym.make(ENV_ID, config=scenario_cfg)
@@ -453,6 +482,7 @@ def build_expert_dataset(
 
             step_index = 0
             done = False
+            scene_vehicle_ids = [int(ego_id) for ego_id in ego_ids]
             while not done:
                 if max_horizon is not None and step_index >= max_horizon:
                     break
@@ -475,16 +505,59 @@ def build_expert_dataset(
                 reward_value = float(reward)
                 if dataset_mode == "scene":
                     alive_ids = {int(v) for v in info.get("alive_controlled_vehicle_ids", vehicle_ids)}
-                    scene_obs_steps.append(np.stack(obs_views, axis=0).astype(np.float32, copy=False))
-                    scene_act_steps.append([np.asarray(a).copy() for a in action_views])
+                    obs_by_id = {
+                        int(vehicle_id): np.asarray(obs_i, dtype=np.float32).copy()
+                        for obs_i, vehicle_id in zip(obs_views, vehicle_ids)
+                    }
+                    next_obs_by_id = {
+                        int(vehicle_id): np.asarray(next_obs_i, dtype=np.float32).copy()
+                        for next_obs_i, vehicle_id in zip(next_obs_views, vehicle_ids)
+                    }
+                    action_by_id = {
+                        int(vehicle_id): np.asarray(action_i).copy()
+                        for action_i, vehicle_id in zip(action_views, vehicle_ids)
+                    }
+
+                    padded_obs: list[np.ndarray] = []
+                    padded_actions: list[np.ndarray] = []
+                    padded_next_obs: list[np.ndarray] = []
+                    padded_alive: list[bool] = []
+                    zero_obs = None
+                    zero_next_obs = None
+                    inactive_action = _inactive_action_placeholder(action_mode)
+
+                    for vehicle_id in scene_vehicle_ids:
+                        obs_i = obs_by_id.get(vehicle_id)
+                        next_obs_i = next_obs_by_id.get(vehicle_id)
+                        action_i = action_by_id.get(vehicle_id)
+                        is_alive = bool(vehicle_id in alive_ids)
+                        if zero_obs is None and obs_i is not None:
+                            zero_obs = np.zeros_like(obs_i, dtype=np.float32)
+                        if zero_next_obs is None and next_obs_i is not None:
+                            zero_next_obs = np.zeros_like(next_obs_i, dtype=np.float32)
+                        if is_alive and obs_i is not None and next_obs_i is not None and action_i is not None:
+                            padded_obs.append(obs_i)
+                            padded_actions.append(action_i)
+                            padded_next_obs.append(next_obs_i)
+                            padded_alive.append(True)
+                        else:
+                            if zero_obs is None or zero_next_obs is None:
+                                raise RuntimeError("Could not infer observation shape for scene padding.")
+                            padded_obs.append(zero_obs.copy())
+                            padded_actions.append(inactive_action.copy())
+                            padded_next_obs.append(zero_next_obs.copy())
+                            padded_alive.append(False)
+
+                    scene_obs_steps.append(np.stack(padded_obs, axis=0).astype(np.float32, copy=False))
+                    scene_act_steps.append([np.asarray(a).copy() for a in padded_actions])
                     scene_next_obs_steps.append(
-                        np.stack(next_obs_views, axis=0).astype(np.float32, copy=False)
+                        np.stack(padded_next_obs, axis=0).astype(np.float32, copy=False)
                     )
                     scene_done_steps.append(done)
                     scene_reward_steps.append(reward_value)
                     scene_timestep_steps.append(step_index)
                     scene_alive_mask_steps.append(
-                        np.asarray([vehicle_id in alive_ids for vehicle_id in vehicle_ids], dtype=bool)
+                        np.asarray(padded_alive, dtype=bool)
                     )
 
                 for obs_i, action_i, next_obs_i, vehicle_id in zip(

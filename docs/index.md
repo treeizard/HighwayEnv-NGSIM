@@ -33,6 +33,7 @@ installation
 quickstart
 user_guide
 faq
+README_expert_dataset
 bibliography/index
 ```
 

@@ -9,12 +9,69 @@ import numpy as np
 from highway_env.envs.common.action import Action
 from highway_env.ngsim_utils.constants import MAX_ACCEL, MAX_STEER
 from highway_env.ngsim_utils.ego_vehicle import EgoVehicle
+from highway_env.ngsim_utils.trajectory_to_action import map_discrete_expert_action
 
 
 logger = logging.getLogger(__name__)
 
 
 class NGSimExpertMixin:
+    def _expert_action_index(self, action_str: str) -> int:
+        action_interface = self._expert_runtime()["action_interface"]
+        actions_indexes = getattr(action_interface, "actions_indexes", None)
+        if actions_indexes is None:
+            raise RuntimeError(
+                "Action type mismatch. Config must use DiscreteSteerMetaAction."
+            )
+        if action_str not in actions_indexes:
+            logger.warning(
+                "Expert action %s invalid for current action type. Defaulting to IDLE.",
+                action_str,
+            )
+            action_str = "IDLE"
+        return int(actions_indexes[action_str])
+
+    def _inactive_scene_collection_action(
+        self,
+        expert_state: dict[str, Any],
+    ) -> tuple[Action, np.ndarray | None, str | None, int | None]:
+        expert_action_str = "IDLE"
+        expert_action_idx = None
+        action: Action
+
+        if self.control_mode == "continuous":
+            expert_action = np.zeros(2, dtype=np.float32)
+            action = expert_action
+        elif self.control_mode == "discrete":
+            expert_action = None
+            expert_action_idx = self._expert_action_index(expert_action_str)
+            action = expert_action_idx
+        else:
+            raise ValueError(f"Unknown action_mode={self.control_mode!r}")
+
+        expert_state["actions_policy"].append(
+            expert_action.copy() if expert_action is not None else expert_action_str
+        )
+        expert_state["tracker_dbg"].append((-1, -1))
+        return action, expert_action, expert_action_str, expert_action_idx
+
+    def _select_scene_collection_discrete_action(
+        self,
+        *,
+        vehicle: EgoVehicle,
+        expert_state: dict[str, Any],
+        steer_cmd: float,
+        accel_cmd: float,
+        tracker_step_index: int,
+    ) -> str:
+        return map_discrete_expert_action(
+            steer_cmd=float(steer_cmd),
+            accel_cmd=float(accel_cmd),
+            expert_ref_v_pol=expert_state["ref_v"],
+            vehicle_speed=float(vehicle.speed),
+            steps=int(tracker_step_index),
+        )
+
     def _expert_runtime(self) -> dict[str, Any]:
         cache = getattr(self, "_expert_runtime_cache", None)
         token = id(self.action_type)
@@ -499,6 +556,11 @@ class NGSimExpertMixin:
         vehicle = vehicle or self.vehicle
         expert_state = self._expert_state_for_vehicle(vehicle)
 
+        if self.scene_dataset_collection_mode and not bool(
+            getattr(vehicle, "scene_collection_is_active", True)
+        ):
+            return self._inactive_scene_collection_action(expert_state)
+
         pos = vehicle.position
         hdg = float(vehicle.heading)
         spd = float(vehicle.speed)
@@ -517,23 +579,18 @@ class NGSimExpertMixin:
             expert_action = np.array([accel_norm, steer_norm], dtype=np.float32)
             action: Action = expert_action
         elif self.control_mode == "discrete":
-            expert_action_str = self._select_discrete_expert_action(vehicle=vehicle)
-
-            action_interface = self._expert_runtime()["action_interface"]
-            actions_indexes = getattr(action_interface, "actions_indexes", None)
-            if actions_indexes is None:
-                raise RuntimeError(
-                    "Action type mismatch. Config must use DiscreteSteerMetaAction."
+            if self.scene_dataset_collection_mode:
+                expert_action_str = self._select_scene_collection_discrete_action(
+                    vehicle=vehicle,
+                    expert_state=expert_state,
+                    steer_cmd=steer_cmd,
+                    accel_cmd=accel_cmd,
+                    tracker_step_index=int(i_near),
                 )
+            else:
+                expert_action_str = self._select_discrete_expert_action(vehicle=vehicle)
 
-            if expert_action_str not in actions_indexes:
-                logger.warning(
-                    "Expert action %s invalid for current action type. Defaulting to IDLE.",
-                    expert_action_str,
-                )
-                expert_action_str = "IDLE"
-
-            expert_action_idx = int(actions_indexes[expert_action_str])
+            expert_action_idx = self._expert_action_index(expert_action_str)
             action = expert_action_idx
         else:
             raise ValueError(f"Unknown action_mode={self.control_mode!r}")

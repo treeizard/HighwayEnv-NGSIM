@@ -1,4 +1,4 @@
-"""Utilities for imitation-learning datasets built from the simulator."""
+"""Public imitation-learning dataset helpers built on top of NGSIM replay."""
 
 from highway_env.imitation.expert_dataset import (
     ExpertTransitionDataset,

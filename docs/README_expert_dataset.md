@@ -1,68 +1,92 @@
 # Expert Dataset Pipeline
 
-## Source
+This module turns processed NGSIM trajectory replays into saved imitation-learning datasets.
+Instead of reading low-level CSV action tables directly, it replays the real trajectories through
+`NGSimEnv` and records the observations and expert actions that the simulator actually uses.
 
-The first expert dataset pipeline uses the repository's existing processed real trajectory data through `NGSimEnv` expert replay mode.
+That gives us:
 
-Why this source was chosen:
+- observations in the same format used everywhere else in the repo
+- actions aligned with the environment's discrete or continuous control interface
+- episode metadata that is still rich enough for replay, debugging, and scene-level methods
 
-- `highway_env/envs/ngsim_env.py` already loads processed trajectory episodes from `highway_env/data/processed_20s/<scene>/prebuilt/`
-- `NGSimEnv.step()` already exposes the internally applied expert action in `info`
-- this produces observation/action pairs in the exact simulator convention used by the rest of the repo
+## Main Entry Points
 
-This is preferable to reading lower-level CSV action tables directly because GAIL needs simulator observations as well as actions.
+- `highway_env/imitation/expert_dataset.py`
+  Canonical implementation for dataset collection, validation, metadata loading, and PyTorch datasets.
+- `scripts_ngsim/build_expert_dataset.py`
+  CLI wrapper for building a dataset from processed replay episodes.
+- `scripts_ngsim/inspect_expert_dataset.py`
+  CLI tool for checking dataset stats and printing a replay command for one saved episode.
 
-## Files
+## Data Source
 
-- `scripts_ngsim/build_expert_dataset.py`: builds a sample expert dataset
-- `scripts_ngsim/inspect_expert_dataset.py`: prints dataset summary statistics and a replay command
-- `highway_env/imitation/expert_dataset.py`: reusable collection and PyTorch loading utilities
+The pipeline uses `NGSimEnv` expert replay mode with processed trajectories under:
 
-## Saved Format
+`highway_env/data/processed_20s/<scene>/prebuilt/`
 
-Datasets are stored as compressed `.npz` files with episode-preserving arrays.
+It relies on two existing properties of the environment:
 
-Two dataset modes are supported:
+- `NGSimEnv` already knows how to load processed replay episodes from the repo's prebuilt files
+- `NGSimEnv.step()` exposes the internally applied expert action in `info`
 
-- `per_vehicle`: one saved episode per controlled vehicle
-- `scene`: one saved episode per full traffic segment, with all controlled vehicles stored together
+This makes the saved dataset match the simulator's actual observation and action conventions.
 
-Top-level fields:
+## Dataset Modes
+
+Two save formats are supported.
+
+### `per_vehicle`
+
+Each saved dataset episode corresponds to one controlled vehicle rollout.
+If multiple expert vehicles are replayed together, they are still written as separate saved episodes
+that share the same `scenario_id`.
+
+Saved top-level fields:
 
 - `episode_id`: `int32 [E]`
 - `scenario_id`: `object [E]`
 - `episode_name`: `object [E]`
 - `ego_id`: `int32 [E]`
 - `source_split`: `object [E]`
-- `observations`: `object [E]`, each item is `float32 [T, *obs_shape]`
-- `actions`: `object [E]`, each item is:
-  - discrete mode: `int64 [T]`
-  - continuous mode: `float32 [T, *action_shape]`
-- `next_observations`: `object [E]`, each item is `float32 [T, *obs_shape]`
-- `dones`: `object [E]`, each item is `bool [T]`
-- `rewards`: `object [E]`, each item is `float32 [T]`
-- `timesteps`: `object [E]`, each item is `int32 [T]`
-- `metadata_json`: JSON string with dataset-level config and schema metadata
+- `observations`: `object [E]`, each item `float32 [T, *obs_shape]`
+- `actions`: `object [E]`
+- `next_observations`: `object [E]`, each item `float32 [T, *obs_shape]`
+- `dones`: `object [E]`, each item `bool [T]`
+- `rewards`: `object [E]`, each item `float32 [T]`
+- `timesteps`: `object [E]`, each item `int32 [T]`
+- `metadata_json`: JSON string with dataset-level metadata
 
-Each saved dataset episode corresponds to one controlled vehicle rollout. If multiple controlled vehicles are replayed together in the same simulator scenario, they are saved as separate episodes that share the same `scenario_id`.
+Action storage:
 
-In `scene` mode, the saved fields are:
+- discrete mode: `int64 [T]`
+- continuous mode: `float32 [T, *action_shape]`
+
+### `scene`
+
+Each saved dataset episode corresponds to one full traffic segment with all controlled vehicles kept
+together. This is the right fit for multi-agent or PS-GAIL-style demonstrations.
+
+Saved top-level fields:
 
 - `episode_id`: `int32 [E]`
 - `scenario_id`: `object [E]`
 - `episode_name`: `object [E]`
-- `agent_ids`: `object [E]`, each item is `int32 [N]`
+- `agent_ids`: `object [E]`, each item `int32 [N]`
 - `source_split`: `object [E]`
-- `observations`: `object [E]`, each item is `float32 [T, N, *obs_shape]`
-- `actions`: `object [E]`, each item is:
-  - discrete mode: `int64 [T, N]`
-  - continuous mode: `float32 [T, N, *action_shape]`
-- `next_observations`: `object [E]`, each item is `float32 [T, N, *obs_shape]`
-- `dones`: `object [E]`, each item is `bool [T]`
-- `rewards`: `object [E]`, each item is `float32 [T]`
-- `timesteps`: `object [E]`, each item is `int32 [T]`
-- `alive_mask`: `object [E]`, each item is `bool [T, N]`
-- `metadata_json`
+- `observations`: `object [E]`, each item `float32 [T, N, *obs_shape]`
+- `actions`: `object [E]`
+- `next_observations`: `object [E]`, each item `float32 [T, N, *obs_shape]`
+- `dones`: `object [E]`, each item `bool [T]`
+- `rewards`: `object [E]`, each item `float32 [T]`
+- `timesteps`: `object [E]`, each item `int32 [T]`
+- `alive_mask`: `object [E]`, each item `bool [T, N]`
+- `metadata_json`: JSON string with dataset-level metadata
+
+Action storage:
+
+- discrete mode: `int64 [T, N]`
+- continuous mode: `float32 [T, N, *action_shape]`
 
 ## Observation and Action Conventions
 
@@ -70,16 +94,16 @@ Default observation:
 
 - `LidarObservation`
 - shape `(128, 2)` before batching
-- typically flattened to `256` features for simple MLP baselines
+- commonly flattened to `256` features for MLP-style imitation baselines
 
 Supported action modes:
 
-- `discrete`: `DiscreteSteerMetaAction`, scalar action in `{0,1,2,3,4}`
+- `discrete`: `DiscreteSteerMetaAction`, scalar action in `{0, 1, 2, 3, 4}`
 - `continuous`: `ContinuousAction`, normalized `float32 [2]` for acceleration and steering
 
-## Build
+## Build a Dataset
 
-Example discrete dataset:
+Example single-vehicle discrete dataset:
 
 ```bash
 python scripts_ngsim/build_expert_dataset.py \
@@ -89,7 +113,7 @@ python scripts_ngsim/build_expert_dataset.py \
   --out expert_data/ngsim_expert_dataset_discrete.npz
 ```
 
-Example continuous dataset:
+Example single-vehicle continuous dataset:
 
 ```bash
 python scripts_ngsim/build_expert_dataset.py \
@@ -99,7 +123,7 @@ python scripts_ngsim/build_expert_dataset.py \
   --out expert_data/ngsim_expert_dataset_continuous.npz
 ```
 
-Example full-scene dataset for PS-GAIL-style demonstrations:
+Example full-scene discrete dataset:
 
 ```bash
 python scripts_ngsim/build_expert_dataset.py \
@@ -112,7 +136,7 @@ python scripts_ngsim/build_expert_dataset.py \
   --out expert_data/ngsim_expert_scene_dataset_discrete.npz
 ```
 
-Example targeted benchmark on one known small scene:
+Example targeted debug run on one known episode:
 
 ```bash
 python scripts_ngsim/build_expert_dataset.py \
@@ -127,18 +151,26 @@ python scripts_ngsim/build_expert_dataset.py \
   --out /tmp/ngsim_scene_debug.npz
 ```
 
-Optional controls:
+Useful CLI options:
 
-- `--episode-root` to point at another processed dataset root
-- `--prebuilt-split train|val` to choose the prebuilt split
-- `--episode-name` to target a specific scene
-- `--max-horizon` to cap steps per scenario
-- `--controlled-vehicles` to replay multiple expert vehicles together
-- `--control-all-vehicles` to control all valid vehicles in the selected traffic segment
-- `--dataset-mode scene` to keep the whole traffic segment together
-- `--max-surrounding` to control replay context
+- `--episode-root`
+  Override the processed trajectory root.
+- `--prebuilt-split train|val`
+  Choose which prebuilt split to sample from.
+- `--episode-name`
+  Restrict collection to one replay episode.
+- `--max-horizon`
+  Cap the number of collected steps per scenario.
+- `--controlled-vehicles`
+  Replay a fixed number of expert-controlled vehicles together.
+- `--control-all-vehicles`
+  Control every valid vehicle in the selected traffic segment.
+- `--dataset-mode scene`
+  Save one scene-level sequence instead of separate per-vehicle rollouts.
+- `--max-surrounding`
+  Limit how many replay vehicles are spawned as context.
 
-## Inspect
+## Inspect a Saved Dataset
 
 ```bash
 python scripts_ngsim/inspect_expert_dataset.py expert_data/ngsim_expert_dataset_discrete.npz
@@ -146,17 +178,19 @@ python scripts_ngsim/inspect_expert_dataset.py expert_data/ngsim_expert_dataset_
 
 The inspector prints:
 
-- number of dataset episodes
+- number of saved dataset episodes
 - total transitions
 - trajectory length statistics
 - observation and action shapes
 - a few sample transitions
-- a ready-to-run replay command for one recorded episode
+- a ready-to-run replay command for the first recorded episode
 
-## Python Loader
+## Load from Python
+
+Use `ExpertTransitionDataset` for standard per-transition supervised or adversarial imitation learning:
 
 ```python
-from highway_env.imitation import ExpertTransitionDataset, SceneTransitionDataset
+from highway_env.imitation import ExpertTransitionDataset
 
 dataset = ExpertTransitionDataset(
     "expert_data/ngsim_expert_dataset_discrete.npz",
@@ -168,7 +202,11 @@ print(sample["observation"].shape)
 print(sample["action"])
 ```
 
+Use `SceneTransitionDataset` when the saved dataset was built in `scene` mode:
+
 ```python
+from highway_env.imitation import SceneTransitionDataset
+
 scene_dataset = SceneTransitionDataset(
     "expert_data/ngsim_expert_scene_dataset_discrete.npz",
     flatten_observations=True,
@@ -178,20 +216,21 @@ sample = scene_dataset[0]
 print(sample["agent_id"], sample["observation"].shape)
 ```
 
-## Full-Scene Replay Notes
+## Scene-Mode Notes
 
-`scene` mode is the closest fit to PS-GAIL style demonstrations because one dataset episode corresponds to one traffic segment and includes all controlled interacting vehicles together.
+`scene` mode keeps interacting controlled vehicles in one trajectory, so it is the most natural
+format for methods that need scene-level coordination.
 
-Performance notes:
+Practical notes:
 
-- `--control-all-vehicles` automatically disables surrounding replay vehicles, because controlled vehicles already cover the valid scene participants
-- dense scenes can still be expensive with `LidarObservation`, since each controlled vehicle computes its own local observation
-- use `--episode-name` and `--max-horizon` first when benchmarking or debugging scene-level replay
-- smaller scenes and shorter horizons are the fastest way to validate the pipeline before scaling collection up
+- `--control-all-vehicles` automatically disables surrounding replay vehicles because the controlled
+  set already covers the relevant scene participants
+- dense scenes are still expensive with `LidarObservation`, because each controlled vehicle computes
+  its own local observation
+- `--episode-name` and `--max-horizon` are the fastest way to debug scene collection before scaling up
 
 ## Assumptions
 
-- The dataset root already contains repo-compatible processed trajectory files.
-- Expert actions come from `NGSimEnv` expert replay rather than a learned policy.
-- Rewards are stored when available from the environment; for the current `NGSimEnv`, reward is typically `0.0`.
-- The first version targets a reliable single-agent transition dataset for later GAIL, while preserving episode metadata for future sequence batching and driver/scenario analysis.
+- the dataset root already contains repo-compatible processed trajectory files
+- expert actions come from `NGSimEnv` expert replay, not from a learned policy
+- rewards are saved when available; in the current `NGSimEnv` pipeline they are usually `0.0`
