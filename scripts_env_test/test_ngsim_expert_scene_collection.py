@@ -27,10 +27,10 @@ def parse_args() -> argparse.Namespace:
             "activity windows and hidden-vehicle ghosting without lidar/camera cost."
         )
     )
-    parser.add_argument("--scene", default="us-101")
+    parser.add_argument("--scene", default="japanese")
     parser.add_argument("--episode-root", default="highway_env/data/processed_20s")
     parser.add_argument("--prebuilt-split", choices=["train", "val", "test"], default="train")
-    parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--max-surrounding", default="all")
@@ -93,13 +93,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--screen-height",
         type=int,
-        default=600,
+        default=300,
         help="Render height used for video/offscreen rendering.",
     )
     parser.add_argument(
         "--scaling",
         type=float,
-        default=5.5,
+        default=1.5,
         help="Scene zoom factor. Larger values zoom in more.",
     )
     return parser.parse_args()
