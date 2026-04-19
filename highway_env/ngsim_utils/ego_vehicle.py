@@ -47,7 +47,7 @@ class EgoVehicle(Vehicle):
     # --------------------------
     # Discrete speed grid defaults
     # --------------------------
-    DEFAULT_TARGET_SPEEDS = np.arange(0.0, 30.0 + 1e-6, 2.0)
+    DEFAULT_TARGET_SPEEDS = np.arange(0.0, 33.0 + 1e-6, 1.50)
 
     # --------------------------
     # Discrete steering setpoint defaults
@@ -74,8 +74,8 @@ class EgoVehicle(Vehicle):
     ) -> None:
         super().__init__(road, position, heading, speed)
 
-        if control_mode not in ("discrete", "continuous"):
-            raise ValueError("control_mode must be 'discrete' or 'continuous'.")
+        if control_mode not in ("discrete", "continuous", "teleport"):
+            raise ValueError("control_mode must be 'discrete', 'continuous', or 'teleport'.")
 
         self.route = route
         self.control_mode = control_mode
@@ -402,6 +402,16 @@ class EgoVehicle(Vehicle):
     # Control loop entrypoint
     # --------------------------
     def act(self, action: Union[dict, str, int, None] = None) -> None:
+        if hasattr(self, "scene_collection_is_active") and not bool(
+            getattr(self, "scene_collection_is_active", True)
+        ):
+            super().act({"steering": 0.0, "acceleration": 0.0})
+            return
+
+        if self.control_mode == "teleport":
+            super().act({"steering": 0.0, "acceleration": 0.0})
+            return
+
         if self.control_mode == "continuous":
             self._sync_lane_reference_from_position()
             self.follow_road()
@@ -442,6 +452,14 @@ class EgoVehicle(Vehicle):
         }
 
         super().act(low_level_action)
+
+    def step(self, dt: float) -> None:
+        if hasattr(self, "scene_collection_is_active") and not bool(
+            getattr(self, "scene_collection_is_active", True)
+        ):
+            self.action = {"steering": 0.0, "acceleration": 0.0}
+            return
+        super().step(dt)
 
     # --------------------------
     # Routing helpers (unchanged)

@@ -210,6 +210,39 @@ This is useful when you want to regenerate:
 
 for a target folder such as `highway_env/data/processed_20s/japanese/prebuilt/`.
 
+### `plot_vehicle_size_distribution.py`
+
+Plots vehicle length/width distributions for both the repository's US-101 (NGSIM) and Japanese prebuilt datasets on a shared metric scale.
+
+By default it reads:
+
+- `highway_env/data/processed_20s/us-101/prebuilt/trajectory_train.npy`
+- `highway_env/data/processed_10s/japanese/prebuilt/trajectory_train.npy`
+
+and converts US-101 dimensions from feet to meters before plotting.
+
+#### Usage
+
+```bash
+python scripts_setup/plot_vehicle_size_distribution.py
+```
+
+#### Outputs
+
+By default the script writes:
+
+```text
+plots/vehicle_dimensions/vehicle_size_distribution_train.png
+plots/vehicle_dimensions/vehicle_size_summary_train.txt
+```
+
+#### Useful Arguments
+
+- `--split`: choose `train`, `val`, or `test`
+- `--us-root`: root folder for the US-101 prebuilt files
+- `--japanese-root`: root folder for the Japanese prebuilt files
+- `--out-dir`: output directory for plots and summary text
+
 #### Usage
 
 ```bash

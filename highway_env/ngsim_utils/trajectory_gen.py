@@ -390,10 +390,196 @@ def process_raw_trajectory(trajectory, scene):
 
     return trajectory
 
+def trajectory_row_is_active(row):
+    """
+    Return whether a processed trajectory row represents an active vehicle.
+
+    Some processed padding rows preserve a lateral sentinel value in y, so y
+    alone is not enough to mark a vehicle as present.
+    """
+    x, y, spd, lane = np.asarray(row, dtype=float)[:4]
+    invalid_sentinel = (
+        np.isclose(x, 0.0)
+        and np.isclose(y, -1.82871076)
+        and np.isclose(spd, 0.0)
+        and np.isclose(lane, 0.0)
+    )
+    inactive_padding = (
+        np.isclose(x, 0.0)
+        and np.isclose(spd, 0.0)
+        and np.isclose(lane, 0.0)
+    )
+    return not (invalid_sentinel or inactive_padding)
+
+
+def trajectory_rows_are_continuous(
+    prev_row,
+    next_row,
+    *,
+    data_dt: float = 0.1,
+    speed_scale: float = 3.0,
+    margin_m: float = 4.0,
+    min_jump_threshold_m: float = 8.0,
+) -> bool:
+    """
+    Return whether two active trajectory rows look physically continuous.
+
+    A pair is considered discontinuous when the measured position jump is far
+    larger than what the recorded speeds could plausibly cover in one sample.
+    """
+    prev_arr = np.asarray(prev_row, dtype=float)
+    next_arr = np.asarray(next_row, dtype=float)
+    if not trajectory_row_is_active(prev_arr) or not trajectory_row_is_active(next_arr):
+        return False
+
+    prev_xy = prev_arr[:2]
+    next_xy = next_arr[:2]
+    jump_m = float(np.linalg.norm(next_xy - prev_xy))
+    prev_speed = max(float(prev_arr[2]), 0.0)
+    next_speed = max(float(next_arr[2]), 0.0)
+    speed_bound_m = max(prev_speed, next_speed) * float(data_dt)
+    allowed_jump_m = max(float(min_jump_threshold_m), speed_scale * speed_bound_m + float(margin_m))
+    return jump_m <= allowed_jump_m
+
+
+def longest_continuous_active_span(
+    traj,
+    *,
+    data_dt: float = 0.1,
+    speed_scale: float = 3.0,
+    margin_m: float = 4.0,
+    min_jump_threshold_m: float = 8.0,
+) -> int:
+    """
+    Return the longest active-and-continuous span length in a trajectory.
+
+    A span breaks on either padded/inactive rows or on implausibly large jumps
+    between consecutive active positions.
+    """
+    traj_arr = np.asarray(traj, dtype=float)
+    if traj_arr.ndim != 2 or traj_arr.shape[0] == 0:
+        return 0
+
+    best = 0
+    current = 0
+    prev_active_row = None
+
+    for row in traj_arr:
+        if not trajectory_row_is_active(row):
+            current = 0
+            prev_active_row = None
+            continue
+
+        if prev_active_row is None:
+            current = 1
+        elif trajectory_rows_are_continuous(
+            prev_active_row,
+            row,
+            data_dt=data_dt,
+            speed_scale=speed_scale,
+            margin_m=margin_m,
+            min_jump_threshold_m=min_jump_threshold_m,
+        ):
+            current += 1
+        else:
+            current = 1
+
+        best = max(best, current)
+        prev_active_row = np.asarray(row, dtype=float)
+
+    return int(best)
+
+
+def longest_continuous_active_span_bounds(
+    traj,
+    *,
+    data_dt: float = 0.1,
+    speed_scale: float = 3.0,
+    margin_m: float = 4.0,
+    min_jump_threshold_m: float = 8.0,
+) -> tuple[int | None, int | None, int]:
+    """
+    Return ``(start_idx, end_idx, length)`` for the longest continuous active span.
+    """
+    traj_arr = np.asarray(traj, dtype=float)
+    if traj_arr.ndim != 2 or traj_arr.shape[0] == 0:
+        return None, None, 0
+
+    best_start = None
+    best_end = None
+    best_len = 0
+
+    current_start = None
+    current_len = 0
+    prev_active_row = None
+
+    for idx, row in enumerate(traj_arr):
+        if not trajectory_row_is_active(row):
+            current_start = None
+            current_len = 0
+            prev_active_row = None
+            continue
+
+        if prev_active_row is None:
+            current_start = idx
+            current_len = 1
+        elif trajectory_rows_are_continuous(
+            prev_active_row,
+            row,
+            data_dt=data_dt,
+            speed_scale=speed_scale,
+            margin_m=margin_m,
+            min_jump_threshold_m=min_jump_threshold_m,
+        ):
+            current_len += 1
+        else:
+            current_start = idx
+            current_len = 1
+
+        if current_len > best_len:
+            best_len = current_len
+            best_start = current_start
+            best_end = idx
+
+        prev_active_row = np.asarray(row, dtype=float)
+
+    return best_start, best_end, int(best_len)
+
+
+def trajectory_has_min_continuous_occupancy(
+    traj,
+    *,
+    min_presence_ratio: float = 0.8,
+    data_dt: float = 0.1,
+    speed_scale: float = 3.0,
+    margin_m: float = 4.0,
+    min_jump_threshold_m: float = 8.0,
+) -> bool:
+    """
+    Return whether one continuous active span occupies enough of the scene.
+
+    This is stricter than counting all active rows: a vehicle must stay present
+    without gaps or teleporting jumps for at least ``min_presence_ratio`` of the
+    full episode/window length.
+    """
+    traj_arr = np.asarray(traj, dtype=float)
+    if traj_arr.ndim != 2 or traj_arr.shape[0] == 0:
+        return False
+
+    _start_idx, _end_idx, longest_span = longest_continuous_active_span_bounds(
+        traj_arr,
+        data_dt=data_dt,
+        speed_scale=speed_scale,
+        margin_m=margin_m,
+        min_jump_threshold_m=min_jump_threshold_m,
+    )
+    return float(longest_span) / float(traj_arr.shape[0]) >= float(min_presence_ratio)
+
+
 def first_valid_index(traj):
-    """Return index of first non-zero trajectory entry, or None if all zero."""
-    for i, (x, y, spd, lane) in enumerate(traj):
-        if not (x == 0 and y == 0 and spd == 0 and lane == 0):
+    """Return index of first active trajectory entry, or None if all padding."""
+    for i, row in enumerate(np.asarray(traj, dtype=float)):
+        if trajectory_row_is_active(row):
             return i
     return None
 

@@ -45,7 +45,10 @@ if str(RAW_DATA_DIR) not in sys.path:
     sys.path.insert(0, str(RAW_DATA_DIR))
 
 from highway_env.data.curvature_remap import estimate_curvature_remap
-from highway_env.ngsim_utils.trajectory_gen import trajectory_smoothing
+from highway_env.ngsim_utils.trajectory_gen import (
+    trajectory_has_min_continuous_occupancy,
+    trajectory_smoothing,
+)
 
 
 MORINOMIYA_START_JST = pd.Timestamp("2020-01-01 09:00:00", tz="Asia/Tokyo")
@@ -79,13 +82,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--val_ratio",
         type=float,
-        default=0.1,
+        default=0.3333,
         help="Fraction of episode windows assigned to validation from the middle time segment.",
     )
     parser.add_argument(
         "--test_ratio",
         type=float,
-        default=0.1,
+        default=0.3333,
         help="Fraction of episode windows assigned to test from the latest time segment.",
     )
     parser.add_argument(
@@ -504,7 +507,10 @@ def build_episode_dicts(
                 "trajectory": traj,
             }
 
-            if len(ordered) >= min_presence_frames:
+            if len(ordered) >= min_presence_frames and trajectory_has_min_continuous_occupancy(
+                traj,
+                min_presence_ratio=presence_ratio_threshold,
+            ):
                 valid_ids.append(np.int64(veh_id))
 
         if traj_dict:

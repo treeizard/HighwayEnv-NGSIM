@@ -9,6 +9,7 @@ if parent_dir not in sys.path:
 
 from highway_env.ngsim_utils.trajectory_gen import (
     build_all_trajectories_for_scene,
+    trajectory_has_min_continuous_occupancy,
 )
 
 
@@ -16,7 +17,7 @@ def build_prebuilt_split(
     episode_root: str,
     scene: str,
     train_val_div: str,
-    presence_frac_threshold: float = 0.6,
+    presence_frac_threshold: float = 0.8,
     car_only: bool = True,
     car_length_min: float = 10.0,
     car_length_max: float = 22.0,
@@ -50,14 +51,10 @@ def build_prebuilt_split(
             if traj.shape[0] < 2:
                 continue
 
-            total_steps = traj.shape[0]
-
-            # Non-zero presence mask over (x, y, v) columns
-            nonzero = np.any(traj[:, :3] != 0.0, axis=1)
-            nonzero_count = int(nonzero.sum())
-
-            # Require at least 60% of the episode to be "active" (non-zero)
-            if nonzero_count / float(total_steps) >= presence_frac_threshold:
+            if trajectory_has_min_continuous_occupancy(
+                traj,
+                min_presence_ratio=presence_frac_threshold,
+            ):
                 valid_ids.append(vid)
 
         valid_ids_by_episode[ep_name] = valid_ids

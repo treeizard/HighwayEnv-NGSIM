@@ -25,10 +25,18 @@ def build_base_config(scene: str, action_mode: str) -> dict[str, Any]:
     return {
         "scene": scene,
         "observation": {
-            "type": "LidarObservation",
-            "cells": 128,
-            "maximum_range": 64,
-            "normalize": True,
+            "type": "LidarCameraObservations",
+            "lidar": {
+                "cells": 128,
+                "maximum_range": 64,
+                "normalize": True,
+            },
+            "camera": {
+                "cells": 21,
+                "maximum_range": 64,
+                "field_of_view": np.pi / 2,
+                "normalize": True,
+            },
         },
         "action": {"type": action_type},
         "action_mode": action_mode,

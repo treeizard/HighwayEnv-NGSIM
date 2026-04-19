@@ -10,7 +10,6 @@ from gymnasium import spaces
 
 from highway_env import utils
 from highway_env.envs.common.finite_mdp import compute_ttc_grid
-from highway_env.envs.common.graphics import EnvViewer
 from highway_env.road.lane import AbstractLane
 from highway_env.utils import Vector
 from highway_env.vehicle.kinematics import Vehicle
@@ -92,6 +91,8 @@ class GrayscaleObservation(ObservationType):
                 or viewer_config["centering_position"],
             }
         )
+        from highway_env.envs.common.graphics import EnvViewer
+
         self.viewer = EnvViewer(env, config=viewer_config)
 
     def space(self) -> spaces.Space:
@@ -603,6 +604,73 @@ class MultiAgentObservation(ObservationType):
         return tuple(obs_type.observe() for obs_type in self.agents_observation_types)
 
 
+class SharedMultiAgentLidarCameraObservations(ObservationType):
+    """
+    Multi-agent LiDAR + lane-camera observation that shares static road caches.
+
+    Each controlled vehicle still receives its own observation, but the expensive
+    lane list / boundary-point structures are built only once for the entire
+    multi-agent observer instead of once per controlled vehicle.
+    """
+
+    def __init__(
+        self,
+        env: AbstractEnv,
+        lidar: dict | None = None,
+        camera: dict | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(env, **kwargs)
+        self.lidar_observation = LidarObservation(env, **(lidar or {}))
+        self.camera_observation = LaneCameraObservation(env, **(camera or {}))
+
+    @staticmethod
+    def _ego_state_space() -> spaces.Box:
+        return spaces.Box(
+            low=np.array([-np.inf, -np.pi, 0.0, 0.0], dtype=np.float32),
+            high=np.array([np.inf, np.pi, np.inf, np.inf], dtype=np.float32),
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _build_ego_state(vehicle) -> np.ndarray:
+        return np.array(
+            [
+                float(getattr(vehicle, "speed", 0.0)),
+                float(getattr(vehicle, "heading", 0.0)),
+                float(max(getattr(vehicle, "WIDTH", 0.0), 0.0)),
+                float(max(getattr(vehicle, "LENGTH", 0.0), 0.0)),
+            ],
+            dtype=np.float32,
+        )
+
+    def space(self) -> spaces.Space:
+        single_space = spaces.Tuple(
+            [
+                self.lidar_observation.space(),
+                self.camera_observation.space(),
+                self._ego_state_space(),
+            ]
+        )
+        return spaces.Tuple([single_space for _ in self.env.controlled_vehicles])
+
+    def observe(self) -> tuple:
+        obstacle_entries = self.lidar_observation.collect_obstacle_entries()
+        observations = []
+        for vehicle in self.env.controlled_vehicles:
+            self.lidar_observation.observer_vehicle = vehicle
+            self.camera_observation.observer_vehicle = vehicle
+            ego_state = self._build_ego_state(vehicle)
+            observations.append(
+                (
+                    self.lidar_observation.observe(obstacle_entries=obstacle_entries),
+                    self.camera_observation.observe(),
+                    ego_state,
+                )
+            )
+        return tuple(observations)
+
+
 class TupleObservation(ObservationType):
     def __init__(
         self, env: AbstractEnv, observation_configs: list[dict], **kwargs
@@ -701,12 +769,14 @@ class LidarObservation(ObservationType):
         edge_as_return: bool = True,
         coarse_step: float | None = None,
         refine_iters: int = 8,
+        use_topology_fast_path: bool = True,
         **kwargs,
     ):
         super().__init__(env, **kwargs)
         self.cells = int(cells)
         self.maximum_range = float(maximum_range)
         self.normalize = bool(normalize)
+        self.use_topology_fast_path = bool(use_topology_fast_path)
 
         # If True: empty beams return road-edge distance; else they return maximum_range.
         self.edge_as_return = bool(edge_as_return)
@@ -718,9 +788,15 @@ class LidarObservation(ObservationType):
         self.angle = 2 * np.pi / self.cells
         self.grid = np.ones((self.cells, 2), dtype=np.float32) * self.maximum_range
         self.origin = None
+        self._directions = np.stack(
+            [self.index_to_direction(i) for i in range(self.cells)],
+            axis=0,
+        )
 
         # Cache lanes for faster on-road checks (safe for typical static road networks)
         self._lanes_cache = self._collect_lanes()
+        self._edge_lane_cache = self._collect_edge_lanes()
+        self._edge_bounds_cache = self._collect_edge_bounds()
 
     # ----------------- Gym space -----------------
 
@@ -735,9 +811,14 @@ class LidarObservation(ObservationType):
 
     # ----------------- Main API -----------------
 
-    def observe(self) -> np.ndarray:
+    def observe(
+        self,
+        obstacle_entries: list[tuple[object, np.ndarray, np.ndarray, float, np.ndarray]] | None = None,
+    ) -> np.ndarray:
         obs = self.trace(
-            self.observer_vehicle.position, self.observer_vehicle.velocity
+            self.observer_vehicle.position,
+            self.observer_vehicle.velocity,
+            obstacle_entries=obstacle_entries,
         ).copy()
         if self.normalize:
             obs /= self.maximum_range
@@ -745,7 +826,50 @@ class LidarObservation(ObservationType):
 
     # ----------------- Core LiDAR logic -----------------
 
-    def trace(self, origin: np.ndarray, origin_velocity: np.ndarray) -> np.ndarray:
+    def collect_obstacle_entries(self) -> list[tuple[object, np.ndarray, np.ndarray, float, np.ndarray]]:
+        road = getattr(self.env, "road", None)
+        if road is None:
+            return []
+
+        entries: list[tuple[object, np.ndarray, np.ndarray, float, np.ndarray]] = []
+        for obstacle in list(road.vehicles) + list(road.objects):
+            if not getattr(obstacle, "solid", True):
+                continue
+            if hasattr(obstacle, "appear") and not getattr(obstacle, "appear", True):
+                continue
+            if hasattr(obstacle, "visible") and not getattr(obstacle, "visible", True):
+                continue
+
+            length = float(getattr(obstacle, "LENGTH", 0.0))
+            width = float(getattr(obstacle, "WIDTH", 0.0))
+            if length == 0.0 and width == 0.0:
+                continue
+
+            position = getattr(obstacle, "position", None)
+            if position is None or not np.all(np.isfinite(position)):
+                continue
+            obstacle_pos = np.array(position, dtype=float)
+
+            obs_vel = getattr(obstacle, "velocity", np.zeros(2, dtype=float))
+            if obs_vel is None or not np.all(np.isfinite(obs_vel)):
+                obs_vel = np.zeros(2, dtype=float)
+            else:
+                obs_vel = np.array(obs_vel, dtype=float)
+
+            heading = float(getattr(obstacle, "heading", 0.0))
+            corners = np.asarray(
+                utils.rect_corners(obstacle_pos, length, width, heading),
+                dtype=float,
+            )
+            entries.append((obstacle, obstacle_pos, obs_vel, width, corners))
+        return entries
+
+    def trace(
+        self,
+        origin: np.ndarray,
+        origin_velocity: np.ndarray,
+        obstacle_entries: list[tuple[object, np.ndarray, np.ndarray, float, np.ndarray]] | None = None,
+    ) -> np.ndarray:
         self.origin = np.array(origin, dtype=float).copy()
 
         # Ensure velocity is finite
@@ -758,10 +882,13 @@ class LidarObservation(ObservationType):
         if self._lanes_cache is None or getattr(self.env, "road", None) is None:
             self._lanes_cache = self._collect_lanes()
 
+        if obstacle_entries is None:
+            obstacle_entries = self.collect_obstacle_entries()
+
         # Precompute per-ray road edge distance
         edge_dists = np.empty((self.cells,), dtype=np.float32)
         for i in range(self.cells):
-            d = self.index_to_direction(i)
+            d = self._directions[i]
             edge = self._distance_to_road_edge(
                 origin=self.origin,
                 direction=d,
@@ -772,7 +899,7 @@ class LidarObservation(ObservationType):
             edge_dists[i] = np.float32(np.clip(edge, 0.0, self.maximum_range))
 
         # Initialize grid distances
-        self.grid = np.zeros((self.cells, 2), dtype=np.float32)
+        self.grid.fill(0.0)
         if self.edge_as_return:
             self.grid[:, self.DISTANCE] = edge_dists
         else:
@@ -780,28 +907,9 @@ class LidarObservation(ObservationType):
         self.grid[:, self.SPEED] = 0.0
 
         # Iterate over road vehicles + static objects
-        for obstacle in (self.env.road.vehicles + self.env.road.objects):
-            # Skip self
+        for obstacle, obstacle_pos, obs_vel, width, corners in obstacle_entries:
             if obstacle is self.observer_vehicle:
                 continue
-
-            # Skip non-solid objects
-            if not getattr(obstacle, "solid", True):
-                continue
-
-            # -------- Ghost / not-yet-appeared guards --------
-            if hasattr(obstacle, "appear") and not getattr(obstacle, "appear", True):
-                continue
-            if hasattr(obstacle, "visible") and not getattr(obstacle, "visible", True):
-                continue
-            if getattr(obstacle, "LENGTH", 0.0) == 0.0 and getattr(obstacle, "WIDTH", 0.0) == 0.0:
-                continue
-
-            # -------- Basic validity --------
-            if obstacle.position is None or not np.all(np.isfinite(obstacle.position)):
-                continue
-
-            obstacle_pos = np.array(obstacle.position, dtype=float)
             center_vec = obstacle_pos - self.origin
             center_distance = float(np.linalg.norm(center_vec))
             if (not np.isfinite(center_distance)) or (center_distance > self.maximum_range):
@@ -812,23 +920,9 @@ class LidarObservation(ObservationType):
             center_index = self.angle_to_index(center_angle)
 
             # Quick cull: if obstacle center beyond the road edge for its bin plus its half width, likely irrelevant
-            width = float(getattr(obstacle, "WIDTH", 0.0))
             if center_distance > float(edge_dists[center_index]) + 0.5 * width:
                 # Still might intersect another bin, but this removes many far obstacles cheaply
                 pass  # keep conservative; do not continue
-
-            # Obstacle kinematics
-            obs_vel = getattr(obstacle, "velocity", np.zeros(2, dtype=float))
-            if obs_vel is None or not np.all(np.isfinite(obs_vel)):
-                obs_vel = np.zeros(2, dtype=float)
-            else:
-                obs_vel = np.array(obs_vel, dtype=float)
-
-            length = float(getattr(obstacle, "LENGTH", 0.0))
-            heading = float(getattr(obstacle, "heading", 0.0))
-
-            # Geometry
-            corners = utils.rect_corners(obstacle_pos, length, width, heading)
             angles = [self.position_to_angle(corner, self.origin) for corner in corners]
             angles = [a for a in angles if np.isfinite(a)]
             if len(angles) == 0:
@@ -854,7 +948,7 @@ class LidarObservation(ObservationType):
                 if max_t <= 0.0:
                     continue
 
-                direction = self.index_to_direction(int(index))
+                direction = self._directions[int(index)]
 
                 # IMPORTANT: clamp ray segment to road edge
                 ray = [self.origin, self.origin + max_t * direction]
@@ -896,6 +990,116 @@ class LidarObservation(ObservationType):
 
         return lanes if lanes else None
 
+    def _collect_edge_lanes(self) -> dict[tuple[str, str], list[AbstractLane]] | None:
+        road = getattr(self.env, "road", None)
+        if road is None or getattr(road, "network", None) is None:
+            return None
+
+        edge_lanes: dict[tuple[str, str], list[AbstractLane]] = {}
+        try:
+            for src, tos in road.network.graph.items():
+                for dst, lane_list in tos.items():
+                    edge_lanes[(src, dst)] = list(lane_list)
+        except Exception:
+            return None
+        return edge_lanes if edge_lanes else None
+
+    def _lane_bounds(self, lane: AbstractLane) -> tuple[float, float, float, float] | None:
+        try:
+            length = float(getattr(lane, "length", 0.0))
+            if not np.isfinite(length) or length <= 0.0:
+                sample_s = np.array([0.0], dtype=float)
+            else:
+                num = max(3, min(9, int(np.ceil(length / 40.0)) + 1))
+                sample_s = np.linspace(0.0, length, num=num, dtype=float)
+
+            points = []
+            for longitudinal in sample_s:
+                center = lane.position(float(longitudinal), 0.0)
+                width = float(lane.width_at(float(longitudinal)))
+                if center is None or not np.all(np.isfinite(center)) or not np.isfinite(width):
+                    continue
+                center = np.asarray(center, dtype=float)
+                points.append(center)
+
+                lateral = 0.5 * width
+                points.append(np.asarray(lane.position(float(longitudinal), lateral), dtype=float))
+                points.append(np.asarray(lane.position(float(longitudinal), -lateral), dtype=float))
+
+            if not points:
+                return None
+
+            stacked = np.vstack(points)
+            return (
+                float(np.min(stacked[:, 0])),
+                float(np.max(stacked[:, 0])),
+                float(np.min(stacked[:, 1])),
+                float(np.max(stacked[:, 1])),
+            )
+        except Exception:
+            return None
+
+    def _collect_edge_bounds(
+        self,
+    ) -> dict[tuple[str, str], tuple[float, float, float, float]] | None:
+        if self._edge_lane_cache is None:
+            return None
+
+        edge_bounds: dict[tuple[str, str], tuple[float, float, float, float]] = {}
+        for edge, lane_list in self._edge_lane_cache.items():
+            lane_bounds = [self._lane_bounds(lane) for lane in lane_list]
+            lane_bounds = [bounds for bounds in lane_bounds if bounds is not None]
+            if not lane_bounds:
+                continue
+
+            edge_bounds[edge] = (
+                min(bounds[0] for bounds in lane_bounds),
+                max(bounds[1] for bounds in lane_bounds),
+                min(bounds[2] for bounds in lane_bounds),
+                max(bounds[3] for bounds in lane_bounds),
+            )
+        return edge_bounds if edge_bounds else None
+
+    def _candidate_lanes_for_point(self, p: np.ndarray) -> list[AbstractLane] | None:
+        if not self.use_topology_fast_path:
+            return None
+        if self._edge_lane_cache is None or self._edge_bounds_cache is None:
+            self._edge_lane_cache = self._collect_edge_lanes()
+            self._edge_bounds_cache = self._collect_edge_bounds()
+            if self._edge_lane_cache is None or self._edge_bounds_cache is None:
+                return None
+
+        x = float(p[0])
+        y = float(p[1])
+        observer_edge = None
+        lane_index = getattr(self.observer_vehicle, "lane_index", None)
+        if lane_index is not None:
+            observer_edge = tuple(lane_index[:2])
+
+        candidates: list[AbstractLane] = []
+        seen: set[int] = set()
+        bounds_margin = max(2.0, self.coarse_step + 1.0)
+
+        def add_edge(edge: tuple[str, str]) -> None:
+            for lane in self._edge_lane_cache.get(edge, []):
+                key = id(lane)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(lane)
+
+        if observer_edge is not None:
+            add_edge(observer_edge)
+
+        for edge, bounds in self._edge_bounds_cache.items():
+            min_x, max_x, min_y, max_y = bounds
+            if (
+                min_x - bounds_margin <= x <= max_x + bounds_margin
+                and min_y - bounds_margin <= y <= max_y + bounds_margin
+            ):
+                add_edge(edge)
+
+        return candidates if candidates else None
+
     def _on_road_at(self, p: np.ndarray) -> bool:
         """
         Conservative point-on-road test: on-road if it lies on any lane surface.
@@ -906,12 +1110,24 @@ class LidarObservation(ObservationType):
                 # Fallback: assume on-road to avoid over-clamping in pathological cases
                 return True
 
-        for lane in self._lanes_cache:
+        candidate_lanes = self._candidate_lanes_for_point(p)
+        lanes = candidate_lanes if candidate_lanes is not None else self._lanes_cache
+
+        for lane in lanes:
             try:
                 if lane.on_lane(p):
                     return True
             except Exception:
                 continue
+        if candidate_lanes is not None:
+            for lane in self._lanes_cache:
+                if lane in lanes:
+                    continue
+                try:
+                    if lane.on_lane(p):
+                        return True
+                except Exception:
+                    continue
         return False
 
     def _distance_to_road_edge(
@@ -1025,6 +1241,11 @@ class LaneCameraObservation(LidarObservation):
         self.longitudinal_resolution = float(longitudinal_resolution)
         self.grid = np.zeros((self.cells, 3), dtype=np.float32)
         self._boundary_points_cache = self._collect_boundary_points()
+        self._bin_edges = np.linspace(
+            -self.field_of_view / 2.0,
+            self.field_of_view / 2.0,
+            self.cells + 1,
+        )
 
     def space(self) -> spaces.Space:
         high = 1.0 if self.normalize else self.maximum_range
@@ -1047,7 +1268,7 @@ class LaneCameraObservation(LidarObservation):
 
     def trace_topology(self, origin: np.ndarray, heading: float) -> np.ndarray:
         self.origin = np.array(origin, dtype=float).copy()
-        self.grid = np.zeros((self.cells, 3), dtype=np.float32)
+        self.grid.fill(0.0)
 
         if self._lanes_cache is None or getattr(self.env, "road", None) is None:
             self._lanes_cache = self._collect_lanes()
@@ -1080,10 +1301,7 @@ class LaneCameraObservation(LidarObservation):
         distances = distances[valid]
         angles = angles[valid]
 
-        bin_edges = np.linspace(
-            -self.field_of_view / 2.0, self.field_of_view / 2.0, self.cells + 1
-        )
-        bin_indices = np.digitize(angles, bin_edges[1:-1], right=False)
+        bin_indices = np.digitize(angles, self._bin_edges[1:-1], right=False)
         for index in range(self.cells):
             matches = np.where(bin_indices == index)[0]
             if matches.size == 0:
@@ -1144,29 +1362,39 @@ class LidarCameraObservations(ObservationType):
         self.lidar_observation = LidarObservation(env, **(lidar or {}))
         self.camera_observation = LaneCameraObservation(env, **(camera or {}))
 
+    @staticmethod
+    def _ego_state_space() -> spaces.Box:
+        return spaces.Box(
+            low=np.array([-np.inf, -np.pi, 0.0, 0.0], dtype=np.float32),
+            high=np.array([np.inf, np.pi, np.inf, np.inf], dtype=np.float32),
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _build_ego_state(vehicle) -> np.ndarray:
+        return np.array(
+            [
+                float(getattr(vehicle, "speed", 0.0)),
+                float(getattr(vehicle, "heading", 0.0)),
+                float(max(getattr(vehicle, "WIDTH", 0.0), 0.0)),
+                float(max(getattr(vehicle, "LENGTH", 0.0), 0.0)),
+            ],
+            dtype=np.float32,
+        )
+
     def space(self) -> spaces.Space:
         return spaces.Tuple(
             [
                 self.lidar_observation.space(),
                 self.camera_observation.space(),
-                spaces.Box(
-                    low=np.array([-np.inf, -np.pi], dtype=np.float32),
-                    high=np.array([np.inf, np.pi], dtype=np.float32),
-                    dtype=np.float32,
-                ),
+                self._ego_state_space(),
             ]
         )
 
     def observe(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         self.lidar_observation.observer_vehicle = self.observer_vehicle
         self.camera_observation.observer_vehicle = self.observer_vehicle
-        ego_state = np.array(
-            [
-                float(getattr(self.observer_vehicle, "speed", 0.0)),
-                float(getattr(self.observer_vehicle, "heading", 0.0)),
-            ],
-            dtype=np.float32,
-        )
+        ego_state = self._build_ego_state(self.observer_vehicle)
         return (
             self.lidar_observation.observe(),
             self.camera_observation.observe(),
@@ -1192,8 +1420,21 @@ def observation_factory(env: AbstractEnv, config: dict) -> ObservationType:
         return GrayscaleObservation(env, **config)
     elif config["type"] == "AttributesObservation":
         return AttributesObservation(env, **config)
+    elif (
+        config["type"] == "MultiAgentObservation"
+        and isinstance(config.get("observation_config"), dict)
+        and config["observation_config"].get("type") == "LidarCameraObservations"
+    ):
+        shared_cfg = config["observation_config"]
+        return SharedMultiAgentLidarCameraObservations(
+            env,
+            lidar=shared_cfg.get("lidar"),
+            camera=shared_cfg.get("camera"),
+        )
     elif config["type"] == "MultiAgentObservation":
         return MultiAgentObservation(env, **config)
+    elif config["type"] == "SharedMultiAgentLidarCameraObservations":
+        return SharedMultiAgentLidarCameraObservations(env, **config)
     elif config["type"] == "TupleObservation":
         return TupleObservation(env, **config)
     elif config["type"] == "LidarObservation":

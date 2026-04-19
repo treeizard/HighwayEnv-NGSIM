@@ -16,6 +16,47 @@ logger = logging.getLogger(__name__)
 
 
 class NGSimExpertMixin:
+    def _reference_lateral_error(
+        self,
+        vehicle: EgoVehicle,
+        expert_state: dict[str, Any],
+        tracker_step_index: int,
+    ) -> float:
+        """
+        Signed cross-track error in the local frame of the expert reference.
+
+        Positive means the vehicle lies to the right of the reference tangent and
+        needs a leftward correction; negative means the opposite.
+        """
+        ref_xy = np.asarray(expert_state["ref_xy"], dtype=float)
+        if len(ref_xy) < 2:
+            return 0.0
+
+        i0 = int(np.clip(tracker_step_index, 0, len(ref_xy) - 2))
+        i1 = i0 + 1
+        p0 = ref_xy[i0]
+        p1 = ref_xy[i1]
+        tangent = np.asarray(p1 - p0, dtype=float)
+        norm = float(np.linalg.norm(tangent))
+        if norm < 1e-6:
+            return 0.0
+
+        tangent /= norm
+        left_normal = np.array([-tangent[1], tangent[0]], dtype=float)
+        error_vec = np.asarray(vehicle.position, dtype=float) - p0
+        # Invert sign so positive error means "vehicle is right of path -> steer left".
+        return float(-np.dot(error_vec, left_normal))
+
+    def _discrete_expert_policy_mode(self) -> str:
+        mode = str(self.config.get("discrete_expert_policy", "planner")).lower()
+        if mode not in {"planner", "tracker_map"}:
+            logger.warning(
+                "Unknown discrete_expert_policy=%s. Falling back to planner.",
+                mode,
+            )
+            mode = "planner"
+        return mode
+
     def _expert_action_index(self, action_str: str) -> int:
         action_interface = self._expert_runtime()["action_interface"]
         actions_indexes = getattr(action_interface, "actions_indexes", None)
@@ -70,6 +111,30 @@ class NGSimExpertMixin:
             expert_ref_v_pol=expert_state["ref_v"],
             vehicle_speed=float(vehicle.speed),
             steps=int(tracker_step_index),
+        )
+
+    def _select_tracker_mapped_discrete_action(
+        self,
+        *,
+        vehicle: EgoVehicle,
+        expert_state: dict[str, Any],
+        steer_cmd: float,
+        accel_cmd: float,
+        tracker_step_index: int,
+    ) -> str:
+        lateral_error = self._reference_lateral_error(
+            vehicle=vehicle,
+            expert_state=expert_state,
+            tracker_step_index=int(tracker_step_index),
+        )
+        return map_discrete_expert_action(
+            steer_cmd=float(steer_cmd),
+            accel_cmd=float(accel_cmd),
+            expert_ref_v_pol=expert_state["ref_v"],
+            vehicle_speed=float(vehicle.speed),
+            steps=int(tracker_step_index),
+            lateral_error=float(lateral_error),
+            prefer_speed=bool(self.config.get("expert_prefer_speed", False)),
         )
 
     def _expert_runtime(self) -> dict[str, Any]:
@@ -581,6 +646,14 @@ class NGSimExpertMixin:
         elif self.control_mode == "discrete":
             if self.scene_dataset_collection_mode:
                 expert_action_str = self._select_scene_collection_discrete_action(
+                    vehicle=vehicle,
+                    expert_state=expert_state,
+                    steer_cmd=steer_cmd,
+                    accel_cmd=accel_cmd,
+                    tracker_step_index=int(i_near),
+                )
+            elif self._discrete_expert_policy_mode() == "tracker_map":
+                expert_action_str = self._select_tracker_mapped_discrete_action(
                     vehicle=vehicle,
                     expert_state=expert_state,
                     steer_cmd=steer_cmd,

@@ -21,6 +21,23 @@ if ENV_ID not in registry:
     register(id=ENV_ID, entry_point="highway_env.envs.ngsim_env:NGSimEnv")
 
 
+def hybrid_observation_config() -> dict[str, Any]:
+    return {
+        "type": "LidarCameraObservations",
+        "lidar": {
+            "cells": 128,
+            "maximum_range": 64,
+            "normalize": True,
+        },
+        "camera": {
+            "cells": 21,
+            "maximum_range": 64,
+            "field_of_view": np.pi / 2,
+            "normalize": True,
+        },
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Visualize multiple controlled vehicles in NGSimEnv."
@@ -141,12 +158,7 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
     )
     return {
         "scene": args.scene,
-        "observation": {
-            "type": "LidarObservation",
-            "cells": 128,
-            "maximum_range": 64,
-            "normalize": True,
-        },
+        "observation": hybrid_observation_config(),
         "action": {"type": action_type},
         "action_mode": args.action_mode,
         "controlled_vehicles": int(args.controlled_vehicles),
@@ -167,7 +179,7 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
         "offscreen_rendering": args.render_mode == "rgb_array",
         "episode_root": "highway_env/data/processed_20s",
         "prebuilt_split": "train",
-        "max_surrounding": 0 if args.control_all_vehicles else args.max_surrounding,
+        "max_surrounding": args.max_surrounding,
         "expert_test_mode": False,
     }
 

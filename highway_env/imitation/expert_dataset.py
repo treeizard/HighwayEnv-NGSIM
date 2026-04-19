@@ -73,10 +73,18 @@ def register_ngsim_env() -> None:
 
 def default_observation_config(cells: int = 128, maximum_range: float = 64.0) -> dict[str, Any]:
     return {
-        "type": "LidarObservation",
-        "cells": int(cells),
-        "maximum_range": float(maximum_range),
-        "normalize": True,
+        "type": "LidarCameraObservations",
+        "lidar": {
+            "cells": int(cells),
+            "maximum_range": float(maximum_range),
+            "normalize": True,
+        },
+        "camera": {
+            "cells": 21,
+            "maximum_range": float(maximum_range),
+            "field_of_view": np.pi / 2,
+            "normalize": True,
+        },
     }
 
 
@@ -98,6 +106,7 @@ def build_env_config(
     simulation_period: dict[str, Any] | None = None,
     ego_vehicle_id: int | list[int] | None = None,
     scene_dataset_collection_mode: bool = False,
+    allow_idm: bool = True,
 ) -> dict[str, Any]:
     """
     Build a repo-native NGSim config for expert replay collection.
@@ -106,11 +115,15 @@ def build_env_config(
     so observations and actions match the actual environment conventions.
     """
     action_mode = str(action_mode).lower()
-    if action_mode not in {"discrete", "continuous"}:
+    if action_mode not in {"discrete", "continuous", "teleport"}:
         raise ValueError(f"Unsupported action_mode={action_mode!r}")
 
     obs_cfg = dict(observation_config or default_observation_config())
-    action_type = "DiscreteSteerMetaAction" if action_mode == "discrete" else "ContinuousAction"
+    action_type = (
+        "ContinuousAction"
+        if action_mode == "continuous"
+        else "DiscreteSteerMetaAction"
+    )
 
     if control_all_vehicles or controlled_vehicles > 1:
         observation = {
@@ -148,6 +161,7 @@ def build_env_config(
         "scene_dataset_collection_mode": bool(scene_dataset_collection_mode),
         "disable_controlled_vehicle_collisions": bool(scene_dataset_collection_mode),
         "terminate_when_all_controlled_crashed": not bool(scene_dataset_collection_mode),
+        "allow_idm": bool(allow_idm),
     }
 
 
@@ -158,10 +172,25 @@ def _flatten_action_for_storage(action: np.ndarray | int | float) -> np.ndarray:
     return arr.astype(arr.dtype, copy=False)
 
 
-def _extract_single_agent_views(value: Any, dtype: np.dtype | None = None) -> list[np.ndarray]:
-    if isinstance(value, tuple):
-        return [_coerce_array(v, dtype=dtype) for v in value]
-    return [_coerce_array(value, dtype=dtype)]
+def _flatten_observation_value(value: Any, dtype: np.dtype | None = None) -> np.ndarray:
+    if isinstance(value, dict):
+        parts = [_flatten_observation_value(value[key], dtype=dtype) for key in sorted(value)]
+        return _coerce_array(np.concatenate(parts, axis=0), dtype=dtype)
+    if isinstance(value, (tuple, list)):
+        parts = [_flatten_observation_value(v, dtype=dtype) for v in value]
+        return _coerce_array(np.concatenate(parts, axis=0), dtype=dtype)
+    return _coerce_array(value, dtype=dtype).reshape(-1)
+
+
+def _extract_single_agent_views(
+    value: Any,
+    dtype: np.dtype | None = None,
+    *,
+    multi_agent: bool = False,
+) -> list[np.ndarray]:
+    if multi_agent and isinstance(value, tuple):
+        return [_flatten_observation_value(v, dtype=dtype) for v in value]
+    return [_flatten_observation_value(value, dtype=dtype)]
 
 
 def _coerce_array(value: Any, dtype: np.dtype | None = None) -> np.ndarray:
@@ -387,8 +416,6 @@ def build_expert_dataset(
         raise ValueError("dataset_mode must be 'per_vehicle' or 'scene'.")
     if dataset_mode == "scene" and not (control_all_vehicles or controlled_vehicles > 1):
         raise ValueError("scene dataset_mode requires multi-agent replay.")
-    if control_all_vehicles and max_surrounding != 0:
-        max_surrounding = 0
 
     register_ngsim_env()
     episode_root = os.path.abspath(episode_root)
@@ -460,7 +487,12 @@ def build_expert_dataset(
         env = gym.make(ENV_ID, config=scenario_cfg)
         try:
             obs, _ = env.reset(seed=seed + scenario_index)
-            obs_views = _extract_single_agent_views(obs, dtype=np.float32)
+            multi_agent_observations = bool(control_all_vehicles or controlled_vehicles > 1)
+            obs_views = _extract_single_agent_views(
+                obs,
+                dtype=np.float32,
+                multi_agent=multi_agent_observations,
+            )
             per_vehicle = {
                 int(ego_id): {
                     "obs": [],
@@ -488,7 +520,11 @@ def build_expert_dataset(
                     break
 
                 next_obs, reward, terminated, truncated, info = env.step(_dummy_action(env))
-                next_obs_views = _extract_single_agent_views(next_obs, dtype=np.float32)
+                next_obs_views = _extract_single_agent_views(
+                    next_obs,
+                    dtype=np.float32,
+                    multi_agent=multi_agent_observations,
+                )
                 action_views = _extract_expert_actions(info, action_mode=action_mode)
                 vehicle_ids = [int(v) for v in info.get("expert_controlled_vehicle_ids", ego_ids)]
 

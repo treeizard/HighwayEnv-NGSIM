@@ -3,6 +3,7 @@ import os
 import sys
 import warnings
 import gymnasium as gym
+import numpy as np
 from gymnasium.wrappers import RecordVideo
 from gymnasium.envs.registration import register, registry
 
@@ -24,10 +25,18 @@ def main():
     base_cfg = {
         "scene": "us-101",
         "observation": {
-            "type": "LidarObservation",
-            "cells": 128,
-            "maximum_range": 64,
-            "normalize": True,
+            "type": "LidarCameraObservations",
+            "lidar": {
+                "cells": 128,
+                "maximum_range": 64,
+                "normalize": True,
+            },
+            "camera": {
+                "cells": 21,
+                "maximum_range": 64,
+                "field_of_view": np.pi / 2,
+                "normalize": True,
+            },
         },
         "action": {"type": "ContinuousAction"},
         "show_trajectories": True,

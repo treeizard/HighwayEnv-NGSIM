@@ -35,10 +35,12 @@ Notes:
 ## 3. `ego_state_obs`
 
 - Type: `np.ndarray`
-- Shape: `(2,)`
+- Shape: `(4,)`
 - Meaning:
   - `ego_state_obs[0]`: ego speed
   - `ego_state_obs[1]`: ego heading
+  - `ego_state_obs[2]`: ego width
+  - `ego_state_obs[3]`: ego length
 
 ## Example
 

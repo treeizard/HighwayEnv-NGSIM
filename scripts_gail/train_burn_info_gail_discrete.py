@@ -865,10 +865,18 @@ def make_env_factory(
                 "episode_root": str(episode_root),
                 "prebuilt_split": str(prebuilt_split),
                 "observation": {
-                    "type": "LidarObservation",
-                    "cells": int(cells),
-                    "maximum_range": float(maximum_range),
-                    "normalize": True,
+                    "type": "LidarCameraObservations",
+                    "lidar": {
+                        "cells": int(cells),
+                        "maximum_range": float(maximum_range),
+                        "normalize": True,
+                    },
+                    "camera": {
+                        "cells": 21,
+                        "maximum_range": float(maximum_range),
+                        "field_of_view": np.pi / 2,
+                        "normalize": True,
+                    },
                 },
                 "action": {"type": "DiscreteSteerMetaAction"},
                 "action_mode": "discrete",

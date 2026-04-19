@@ -6,6 +6,8 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
+
 
 PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PARENT_DIR not in sys.path:
@@ -144,10 +146,18 @@ def main() -> None:
     )
 
     observation_config = {
-        "type": "LidarObservation",
-        "cells": int(args.cells),
-        "maximum_range": float(args.maximum_range),
-        "normalize": True,
+        "type": "LidarCameraObservations",
+        "lidar": {
+            "cells": int(args.cells),
+            "maximum_range": float(args.maximum_range),
+            "normalize": True,
+        },
+        "camera": {
+            "cells": 21,
+            "maximum_range": float(args.maximum_range),
+            "field_of_view": np.pi / 2,
+            "normalize": True,
+        },
     }
 
     dataset_mode = str(args.dataset_mode)

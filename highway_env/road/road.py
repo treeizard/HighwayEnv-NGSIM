@@ -399,6 +399,8 @@ class Road:
         road_objects: list[objects.RoadObject] = None,
         np_random: np.random.RandomState = None,
         record_history: bool = False,
+        use_query_fast_path: bool = False,
+        query_cell_size: float = 25.0,
     ) -> None:
         """
         New road.
@@ -414,8 +416,109 @@ class Road:
         self.objects = road_objects or []
         self.np_random = np_random if np_random else np.random.RandomState()
         self.record_history = record_history
+        self.use_query_fast_path = bool(use_query_fast_path)
+        self.query_cell_size = float(query_cell_size)
+        self._query_cache_dirty = True
+        self._cached_counts = (-1, -1)
+        self._spatial_index: dict[tuple[int, int], list[objects.RoadObject]] = {}
+        self._edge_object_index: dict[tuple[str, str], list[objects.RoadObject]] = {}
+        self._edge_bounds_cache = self._collect_edge_bounds()
 
-    def close_objects_to(
+    def _invalidate_query_cache(self) -> None:
+        self._query_cache_dirty = True
+
+    def _cell_key(self, position: np.ndarray) -> tuple[int, int]:
+        return (
+            int(np.floor(float(position[0]) / self.query_cell_size)),
+            int(np.floor(float(position[1]) / self.query_cell_size)),
+        )
+
+    def _lane_bounds(self, lane: AbstractLane) -> tuple[float, float, float, float] | None:
+        try:
+            length = float(getattr(lane, "length", 0.0))
+            if not np.isfinite(length) or length <= 0.0:
+                sample_s = np.array([0.0], dtype=float)
+            else:
+                num = max(3, min(9, int(np.ceil(length / 40.0)) + 1))
+                sample_s = np.linspace(0.0, length, num=num, dtype=float)
+
+            points = []
+            for longitudinal in sample_s:
+                width = float(lane.width_at(float(longitudinal)))
+                center = lane.position(float(longitudinal), 0.0)
+                if center is None or not np.all(np.isfinite(center)) or not np.isfinite(width):
+                    continue
+                center = np.asarray(center, dtype=float)
+                points.append(center)
+                points.append(np.asarray(lane.position(float(longitudinal), 0.5 * width), dtype=float))
+                points.append(np.asarray(lane.position(float(longitudinal), -0.5 * width), dtype=float))
+            if not points:
+                return None
+            stacked = np.vstack(points)
+            return (
+                float(np.min(stacked[:, 0])),
+                float(np.max(stacked[:, 0])),
+                float(np.min(stacked[:, 1])),
+                float(np.max(stacked[:, 1])),
+            )
+        except Exception:
+            return None
+
+    def _collect_edge_bounds(
+        self,
+    ) -> dict[tuple[str, str], tuple[float, float, float, float]] | None:
+        if self.network is None:
+            return None
+        edge_bounds: dict[tuple[str, str], tuple[float, float, float, float]] = {}
+        try:
+            for src, tos in self.network.graph.items():
+                for dst, lanes in tos.items():
+                    bounds = [self._lane_bounds(lane) for lane in lanes]
+                    bounds = [b for b in bounds if b is not None]
+                    if not bounds:
+                        continue
+                    edge_bounds[(src, dst)] = (
+                        min(b[0] for b in bounds),
+                        max(b[1] for b in bounds),
+                        min(b[2] for b in bounds),
+                        max(b[3] for b in bounds),
+                    )
+        except Exception:
+            return None
+        return edge_bounds if edge_bounds else None
+
+    def _ensure_query_cache(self) -> None:
+        counts = (len(self.vehicles), len(self.objects))
+        if (
+            not self.use_query_fast_path
+            or (
+                not self._query_cache_dirty
+                and counts == self._cached_counts
+            )
+        ):
+            return
+
+        self._spatial_index = {}
+        self._edge_object_index = {}
+        for obj in list(self.vehicles) + list(self.objects):
+            position = getattr(obj, "position", None)
+            if position is None or not np.all(np.isfinite(position)):
+                continue
+            self._spatial_index.setdefault(self._cell_key(np.asarray(position, dtype=float)), []).append(obj)
+
+            lane_index = getattr(obj, "lane_index", None)
+            if lane_index is None or lane_index is np.nan:
+                continue
+            try:
+                edge = (lane_index[0], lane_index[1])
+            except Exception:
+                continue
+            self._edge_object_index.setdefault(edge, []).append(obj)
+
+        self._cached_counts = counts
+        self._query_cache_dirty = False
+
+    def _close_objects_to_legacy(
         self,
         vehicle: kinematics.Vehicle,
         distance: float,
@@ -446,6 +549,137 @@ class Road:
             objects_ = objects_[:count]
         return objects_
 
+    def _candidate_objects_near(
+        self,
+        position: np.ndarray,
+        distance: float,
+        *,
+        include_objects: bool = True,
+    ) -> list[objects.RoadObject]:
+        self._ensure_query_cache()
+        if not self._spatial_index:
+            return []
+
+        cell_radius = max(1, int(np.ceil(float(distance) / self.query_cell_size)))
+        cx, cy = self._cell_key(np.asarray(position, dtype=float))
+        candidates: list[objects.RoadObject] = []
+        seen: set[int] = set()
+        for dx in range(-cell_radius, cell_radius + 1):
+            for dy in range(-cell_radius, cell_radius + 1):
+                for obj in self._spatial_index.get((cx + dx, cy + dy), []):
+                    if not include_objects and obj not in self.vehicles:
+                        continue
+                    key = id(obj)
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append(obj)
+        return candidates
+
+    def _neighbour_vehicles_legacy(
+        self, vehicle: kinematics.Vehicle, lane_index: LaneIndex = None
+    ) -> tuple[kinematics.Vehicle | None, kinematics.Vehicle | None]:
+        lane_index = lane_index or vehicle.lane_index
+        if not lane_index:
+            return None, None
+        lane = self.network.get_lane(lane_index)
+        s = self.network.get_lane(lane_index).local_coordinates(vehicle.position)[0]
+        s_front = s_rear = None
+        v_front = v_rear = None
+        for v in self.vehicles + self.objects:
+            if v is not vehicle and not isinstance(v, Landmark):
+                s_v, lat_v = lane.local_coordinates(v.position)
+                if not lane.on_lane(v.position, s_v, lat_v, margin=1):
+                    continue
+                if s <= s_v and (s_front is None or s_v <= s_front):
+                    s_front = s_v
+                    v_front = v
+                if s_v < s and (s_rear is None or s_v > s_rear):
+                    s_rear = s_v
+                    v_rear = v
+        return v_front, v_rear
+
+    def _candidate_objects_for_lane(
+        self,
+        lane_index: LaneIndex,
+        padding: float = 10.0,
+    ) -> list[objects.RoadObject] | None:
+        self._ensure_query_cache()
+        if not self._edge_object_index or self._edge_bounds_cache is None:
+            return None
+
+        edge = (lane_index[0], lane_index[1])
+        query_bounds = self._edge_bounds_cache.get(edge)
+        if query_bounds is None:
+            return None
+
+        min_x, max_x, min_y, max_y = query_bounds
+        min_x -= padding
+        max_x += padding
+        min_y -= padding
+        max_y += padding
+
+        candidates: list[objects.RoadObject] = []
+        seen: set[int] = set()
+        for candidate_edge, bounds in self._edge_bounds_cache.items():
+            cmin_x, cmax_x, cmin_y, cmax_y = bounds
+            if cmax_x < min_x or cmin_x > max_x or cmax_y < min_y or cmin_y > max_y:
+                continue
+            for obj in self._edge_object_index.get(candidate_edge, []):
+                key = id(obj)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(obj)
+        return candidates
+
+    def close_objects_to(
+        self,
+        vehicle: kinematics.Vehicle,
+        distance: float,
+        count: int | None = None,
+        see_behind: bool = True,
+        sort: bool = True,
+        vehicles_only: bool = False,
+    ) -> object:
+        total_objects = len(self.vehicles) if vehicles_only else len(self.vehicles) + len(self.objects)
+        if (not self.use_query_fast_path) or total_objects < 64:
+            return self._close_objects_to_legacy(
+                vehicle,
+                distance,
+                count=count,
+                see_behind=see_behind,
+                sort=sort,
+                vehicles_only=vehicles_only,
+            )
+
+        candidates = self._candidate_objects_near(
+            vehicle.position,
+            distance,
+            include_objects=not vehicles_only,
+        )
+        if len(candidates) > 0.6 * max(1, total_objects):
+            return self._close_objects_to_legacy(
+                vehicle,
+                distance,
+                count=count,
+                see_behind=see_behind,
+                sort=sort,
+                vehicles_only=vehicles_only,
+            )
+        objects_ = [
+            obj
+            for obj in candidates
+            if obj is not vehicle
+            and (obj in self.vehicles or not vehicles_only)
+            and np.linalg.norm(obj.position - vehicle.position) < distance
+            and (see_behind or -2 * vehicle.LENGTH < vehicle.lane_distance_to(obj))
+        ]
+
+        if sort:
+            objects_ = sorted(objects_, key=lambda o: abs(vehicle.lane_distance_to(o)))
+        if count:
+            objects_ = objects_[:count]
+        return objects_
+
     def close_vehicles_to(
         self,
         vehicle: kinematics.Vehicle,
@@ -460,6 +694,7 @@ class Road:
 
     def act(self) -> None:
         """Decide the actions of each entity on the road."""
+        self._ensure_query_cache()
         for vehicle in self.vehicles:
             vehicle.act()
 
@@ -476,6 +711,7 @@ class Road:
                 vehicle.handle_collisions(other, dt)
             for other in self.objects:
                 vehicle.handle_collisions(other, dt)
+        self._invalidate_query_cache()
 
     def neighbour_vehicles(
         self, vehicle: kinematics.Vehicle, lane_index: LaneIndex = None
@@ -492,24 +728,35 @@ class Road:
         lane_index = lane_index or vehicle.lane_index
         if not lane_index:
             return None, None
+        total_objects = len(self.vehicles) + len(self.objects)
+        if (not self.use_query_fast_path) or total_objects < 64:
+            return self._neighbour_vehicles_legacy(vehicle, lane_index=lane_index)
+
         lane = self.network.get_lane(lane_index)
-        s = self.network.get_lane(lane_index).local_coordinates(vehicle.position)[0]
+        s = lane.local_coordinates(vehicle.position)[0]
         s_front = s_rear = None
         v_front = v_rear = None
-        for v in self.vehicles + self.objects:
-            if v is not vehicle and not isinstance(
-                v, Landmark
-            ):  # self.network.is_connected_road(v.lane_index,
-                # lane_index, same_lane=True):
-                s_v, lat_v = lane.local_coordinates(v.position)
-                if not lane.on_lane(v.position, s_v, lat_v, margin=1):
-                    continue
-                if s <= s_v and (s_front is None or s_v <= s_front):
-                    s_front = s_v
-                    v_front = v
-                if s_v < s and (s_rear is None or s_v > s_rear):
-                    s_rear = s_v
-                    v_rear = v
+        candidates = self._candidate_objects_for_lane(
+            lane_index,
+            padding=max(10.0, float(vehicle.LENGTH) * 2.0),
+        )
+        if not candidates:
+            return self._neighbour_vehicles_legacy(vehicle, lane_index=lane_index)
+
+        for v in candidates:
+            if v is vehicle or isinstance(v, Landmark):
+                continue
+            s_v, lat_v = lane.local_coordinates(v.position)
+            if not lane.on_lane(v.position, s_v, lat_v, margin=1):
+                continue
+            if s <= s_v and (s_front is None or s_v <= s_front):
+                s_front = s_v
+                v_front = v
+            if s_v < s and (s_rear is None or s_v > s_rear):
+                s_rear = s_v
+                v_rear = v
+        if v_front is None and v_rear is None:
+            return self._neighbour_vehicles_legacy(vehicle, lane_index=lane_index)
         return v_front, v_rear
 
     def __repr__(self):

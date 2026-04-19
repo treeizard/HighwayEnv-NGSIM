@@ -25,11 +25,28 @@ if ENV_ID not in registry:
     register(id=ENV_ID, entry_point="highway_env.envs.ngsim_env:NGSimEnv")
 
 
+def hybrid_observation_config() -> dict[str, Any]:
+    return {
+        "type": "LidarCameraObservations",
+        "lidar": {
+            "cells": 128,
+            "maximum_range": 64,
+            "normalize": True,
+        },
+        "camera": {
+            "cells": 21,
+            "maximum_range": 64,
+            "field_of_view": np.pi / 2,
+            "normalize": True,
+        },
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Visualize discrete expert replay in NGSimEnv, including multi-expert cases."
     )
-    parser.add_argument("--scene", type=str, default="japanese", help="Scene name.")
+    parser.add_argument("--scene", type=str, default="us-101", help="Scene name.")
     parser.add_argument(
         "--episode-root",
         type=str,
@@ -80,13 +97,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=100,
+        default=40,
         help="Maximum rollout steps per episode.",
     )
     parser.add_argument(
         "--render-mode",
         choices=["human", "rgb_array"],
-        default="human",
+        default="rgb_array",
         help="Use 'human' for on-screen rendering or 'rgb_array' for off-screen video export.",
     )
     parser.add_argument(
@@ -115,7 +132,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scaling",
         type=float,
-        default=6.0,
+        default=3.0,
         help="Render zoom.",
     )
     parser.add_argument(
@@ -140,35 +157,20 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
     if args.controlled_vehicles > 1:
         observation_cfg = {
             "type": "MultiAgentObservation",
-            "observation_config": {
-                "type": "LidarObservation",
-                "cells": 128,
-                "maximum_range": 64,
-                "normalize": True,
-            },
+            "observation_config": hybrid_observation_config(),
         }
         action_cfg = {
             "type": "MultiAgentAction",
             "action_config": {"type": "DiscreteSteerMetaAction"},
         }
     else:
-        observation_cfg = {
-            "type": "LidarObservation",
-            "cells": 128,
-            "maximum_range": 64,
-            "normalize": True,
-        }
+        observation_cfg = hybrid_observation_config()
         action_cfg = {"type": "DiscreteSteerMetaAction"}
 
     if args.control_all_vehicles:
         observation_cfg = {
             "type": "MultiAgentObservation",
-            "observation_config": {
-                "type": "LidarObservation",
-                "cells": 128,
-                "maximum_range": 64,
-                "normalize": True,
-            },
+            "observation_config": hybrid_observation_config(),
         }
         action_cfg = {
             "type": "MultiAgentAction",
@@ -198,10 +200,12 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
         "ego_vehicle_ID": args.ego_ids,
         "controlled_vehicles": int(args.controlled_vehicles),
         "control_all_vehicles": bool(args.control_all_vehicles),
-        "max_surrounding": 0 if args.control_all_vehicles else args.max_surrounding,
+        "max_surrounding": args.max_surrounding,
         "expert_test_mode": True,
+        "discrete_expert_policy": "tracker_map",
         "action_mode": "discrete",
         "expert_prefer_speed": False,
+        "disable_controlled_vehicle_collisions": True,
     }
 
 

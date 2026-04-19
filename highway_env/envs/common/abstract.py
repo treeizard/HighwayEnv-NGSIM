@@ -13,7 +13,6 @@ from gymnasium.wrappers import RecordVideo
 from highway_env import utils
 from highway_env.envs.common.action import Action, ActionType, action_factory
 from highway_env.envs.common.finite_mdp import finite_mdp
-from highway_env.envs.common.graphics import EnvViewer
 from highway_env.envs.common.observation import ObservationType, observation_factory
 from highway_env.vehicle.behavior import IDMVehicle
 from highway_env.vehicle.kinematics import Vehicle
@@ -296,6 +295,8 @@ class AbstractEnv(gym.Env):
             )
             return
         if self.viewer is None:
+            from highway_env.envs.common.graphics import EnvViewer
+
             self.viewer = EnvViewer(self)
 
         self.enable_auto_render = True
