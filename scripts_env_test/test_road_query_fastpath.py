@@ -47,9 +47,8 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--scenes", nargs="+", default=["us-101", "japanese"])
-    parser.add_argument("--controlled-vehicles", type=int, default=3)
-    parser.add_argument("--control-all-vehicles", action="store_true", default=True)
-    parser.add_argument("--max-controlled-vehicles", type=int, default=3)
+    parser.add_argument("--percentage-controlled-vehicles", type=float, default=0.1)
+    parser.add_argument("--control-all-vehicles", action="store_true", default=False)
     parser.add_argument("--max-surrounding", default=20)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--benchmark-repeats", type=int, default=5)
@@ -69,9 +68,8 @@ def build_config(scene: str, args: argparse.Namespace) -> dict[str, Any]:
             "action_config": {"type": "DiscreteSteerMetaAction"},
         },
         "action_mode": "discrete",
-        "controlled_vehicles": int(args.controlled_vehicles),
+        "percentage_controlled_vehicles": float(args.percentage_controlled_vehicles),
         "control_all_vehicles": bool(args.control_all_vehicles),
-        "max_controlled_vehicles": int(args.max_controlled_vehicles),
         "show_trajectories": False,
         "simulation_frequency": 10,
         "policy_frequency": 10,

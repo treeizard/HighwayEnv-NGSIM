@@ -33,7 +33,7 @@ from highway_env.imitation.expert_dataset import (  # noqa: E402
     build_env_config,
     register_ngsim_env,
 )
-from highway_env.ngsim_utils.trajectory_gen import (  # noqa: E402
+from highway_env.ngsim_utils.data.trajectory_gen import (  # noqa: E402
     trajectory_row_is_active,
 )
 
@@ -80,21 +80,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--control-all-vehicles",
         action="store_true",
-        default=True,
+        default=False,
         help="Collect samples for every viable controlled vehicle in each scene.",
     )
     parser.add_argument(
         "--no-control-all-vehicles",
         dest="control_all_vehicles",
         action="store_false",
-        help="Collect only --controlled-vehicles vehicles.",
+        help="Collect only a percentage of valid vehicles.",
     )
-    parser.add_argument("--controlled-vehicles", type=int, default=4)
     parser.add_argument(
-        "--max-controlled-vehicles",
-        type=int,
-        default=0,
-        help="Optional cap for --control-all-vehicles scenes. 0 keeps every vehicle.",
+        "--percentage-controlled-vehicles",
+        type=float,
+        default=0.1,
+        help="Fraction of valid ego vehicles to collect when not using all vehicles.",
     )
     parser.add_argument("--cells", type=int, default=128)
     parser.add_argument("--maximum-range", type=float, default=64.0)
@@ -211,7 +210,7 @@ def make_expert_scene_env(args: argparse.Namespace, *, render_mode: str | None =
         action_mode=str(args.expert_control_mode),
         episode_root=args.episode_root,
         prebuilt_split=args.prebuilt_split,
-        controlled_vehicles=max(1, int(args.controlled_vehicles)),
+        percentage_controlled_vehicles=float(args.percentage_controlled_vehicles),
         control_all_vehicles=bool(args.control_all_vehicles),
         max_surrounding=args.max_surrounding,
         observation_config=observation_config_from_args(args),
@@ -237,8 +236,6 @@ def make_expert_scene_env(args: argparse.Namespace, *, render_mode: str | None =
     cfg["screen_width"] = int(args.screen_width)
     cfg["screen_height"] = int(args.screen_height)
     cfg["scaling"] = float(args.scaling)
-    if int(args.max_controlled_vehicles) > 0:
-        cfg["max_controlled_vehicles"] = int(args.max_controlled_vehicles)
     return gym.make(ENV_ID, render_mode=render_mode, config=cfg)
 
 
@@ -732,9 +729,8 @@ def main() -> None:
             "episode_index": int(episode_index),
             "max_steps_per_episode": int(args.max_steps_per_episode),
             "max_samples_per_vehicle": int(args.max_samples_per_vehicle),
-            "controlled_vehicles": int(args.controlled_vehicles),
+            "percentage_controlled_vehicles": float(args.percentage_controlled_vehicles),
             "control_all_vehicles": bool(args.control_all_vehicles),
-            "max_controlled_vehicles": int(args.max_controlled_vehicles),
             "max_surrounding": args.max_surrounding,
             "simulation_frequency": int(args.simulation_frequency),
             "policy_frequency": int(args.policy_frequency),
@@ -782,8 +778,7 @@ def main() -> None:
         "trajectory_state_source": str(args.trajectory_state_source),
         "allow_idm": bool(args.allow_idm),
         "control_all_vehicles": bool(args.control_all_vehicles),
-        "controlled_vehicles": int(args.controlled_vehicles),
-        "max_controlled_vehicles": int(args.max_controlled_vehicles),
+        "percentage_controlled_vehicles": float(args.percentage_controlled_vehicles),
         "num_episodes": len(manifest_entries),
         "num_samples": int(total_samples),
         "episodes": manifest_entries,

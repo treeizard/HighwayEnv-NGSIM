@@ -17,12 +17,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from highway_env.ngsim_utils.constants import (  # noqa: E402
+from highway_env.ngsim_utils.core.constants import (  # noqa: E402
     FEET_PER_METER,
     IDM_PARAMETER_PRESETS,
     SCENE_IDM_PARAMETER_KEY,
 )
-from highway_env.ngsim_utils.trajectory_gen import trajectory_row_is_active  # noqa: E402
+from highway_env.ngsim_utils.data.trajectory_gen import trajectory_row_is_active  # noqa: E402
 
 
 US_SCENES = {"us-101", "i-80", "lankershim"}

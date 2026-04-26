@@ -18,9 +18,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-from highway_env.ngsim_utils.gen_road import create_japanese_road, create_ngsim_101_road
-from highway_env.ngsim_utils.helper_ngsim import target_lane_index_from_lane_id
-from highway_env.ngsim_utils.trajectory_gen import (
+from highway_env.ngsim_utils.road.gen_road import create_japanese_road, create_ngsim_101_road
+from highway_env.ngsim_utils.road.lane_mapping import target_lane_index_from_lane_id
+from highway_env.ngsim_utils.data.trajectory_gen import (
     process_raw_trajectory,
     trajectory_row_is_active,
 )

@@ -18,7 +18,7 @@ if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
 
-from highway_env.ngsim_utils.obs_vehicle import NGSIMVehicle
+from highway_env.ngsim_utils.vehicles.replay import NGSIMVehicle
 
 ENV_ID = "NGSim-US101-v0"
 if ENV_ID not in registry:
@@ -60,10 +60,10 @@ def parse_args() -> argparse.Namespace:
         help="Which prebuilt split to sample replay scenarios from.",
     )
     parser.add_argument(
-        "--controlled-vehicles",
-        type=int,
-        default=1,
-        help="Number of expert-controlled vehicles to replay.",
+        "--percentage-controlled-vehicles",
+        type=float,
+        default=0.1,
+        help="Fraction of valid ego vehicles to replay as controlled experts.",
     )
     parser.add_argument(
         "--control-all-vehicles",
@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="*",
         default=None,
-        help="Optional explicit ego ids. Length must match --controlled-vehicles.",
+        help="Optional explicit ego ids. Length must match the resolved controlled-vehicle percentage.",
     )
     parser.add_argument(
         "--max-surrounding",
@@ -154,7 +154,7 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
     observation_cfg: dict[str, Any]
     action_cfg: dict[str, Any]
 
-    if args.controlled_vehicles > 1:
+    if float(args.percentage_controlled_vehicles) > 0:
         observation_cfg = {
             "type": "MultiAgentObservation",
             "observation_config": hybrid_observation_config(),
@@ -198,7 +198,7 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
         "prebuilt_split": args.prebuilt_split,
         "simulation_period": simulation_period,
         "ego_vehicle_ID": args.ego_ids,
-        "controlled_vehicles": int(args.controlled_vehicles),
+        "percentage_controlled_vehicles": float(args.percentage_controlled_vehicles),
         "control_all_vehicles": bool(args.control_all_vehicles),
         "max_surrounding": args.max_surrounding,
         "expert_test_mode": True,
@@ -413,7 +413,7 @@ def main() -> None:
         print("\nVideo recording skipped because moviepy is not installed.")
     print(
         f"Configured render resolution: {args.screen_width}x{args.screen_height} "
-        f"controlled_vehicles={args.controlled_vehicles}"
+        f"percentage_controlled_vehicles={args.percentage_controlled_vehicles}"
     )
 
 

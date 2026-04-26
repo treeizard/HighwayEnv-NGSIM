@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, replace
 import numpy as np
 
 from highway_env import utils
-from highway_env.ngsim_utils.constants import IDM_PARAMETER_PRESETS, SCENE_IDM_PARAMETER_KEY
+from highway_env.ngsim_utils.core.constants import IDM_PARAMETER_PRESETS, SCENE_IDM_PARAMETER_KEY
 from highway_env.road.road import LaneIndex, Road, Route
 from highway_env.utils import Vector
 from highway_env.vehicle.controller import ControlledVehicle

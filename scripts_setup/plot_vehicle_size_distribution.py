@@ -15,7 +15,7 @@ PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
-from highway_env.ngsim_utils.constants import METERS_PER_FOOT  # noqa: E402
+from highway_env.ngsim_utils.core.constants import METERS_PER_FOOT  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

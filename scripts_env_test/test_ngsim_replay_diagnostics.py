@@ -17,7 +17,7 @@ if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
 from highway_env.imitation.expert_dataset import ENV_ID, build_env_config, register_ngsim_env  # noqa: E402
-from highway_env.ngsim_utils.trajectory_gen import (  # noqa: E402
+from highway_env.ngsim_utils.data.trajectory_gen import (  # noqa: E402
     longest_continuous_active_span_bounds,
     trajectory_has_min_continuous_occupancy,
     trajectory_row_is_active,
@@ -39,14 +39,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-surrounding", default="all")
-    parser.add_argument("--controlled-vehicles", type=int, default=4)
-    parser.add_argument("--max-controlled-vehicles", type=int, default=5)
+    parser.add_argument("--percentage-controlled-vehicles", type=float, default=0.1)
     parser.add_argument("--controlled-min-occupancy", type=float, default=0.8)
     parser.add_argument(
         "--control-all-vehicles",
         action="store_true",
-        default=True,
-        help="Use every valid controlled vehicle and cap with --max-controlled-vehicles.",
+        default=False,
+        help="Use every valid controlled vehicle.",
     )
     parser.add_argument(
         "--no-control-all-vehicles",
@@ -88,7 +87,7 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
         action_mode="teleport",
         episode_root=str(args.episode_root),
         prebuilt_split=str(args.prebuilt_split),
-        controlled_vehicles=max(1, int(args.controlled_vehicles)),
+        percentage_controlled_vehicles=float(args.percentage_controlled_vehicles),
         control_all_vehicles=bool(args.control_all_vehicles),
         max_surrounding=args.max_surrounding,
         observation_config=observation_config(),
@@ -104,8 +103,6 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
     cfg["disable_controlled_vehicle_collisions"] = True
     cfg["terminate_when_all_controlled_crashed"] = False
     cfg["controlled_vehicle_min_occupancy"] = float(args.controlled_min_occupancy)
-    if int(args.max_controlled_vehicles) > 0:
-        cfg["max_controlled_vehicles"] = int(args.max_controlled_vehicles)
     return cfg
 
 

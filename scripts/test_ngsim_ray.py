@@ -27,7 +27,7 @@ register(id="NGSim-US101", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Import your NGSIM trajectory tools
-from highway_env.ngsim_utils.trajectory_gen import (
+from highway_env.ngsim_utils.data.trajectory_gen import (
     build_trajectory,
     process_raw_trajectory,
 )

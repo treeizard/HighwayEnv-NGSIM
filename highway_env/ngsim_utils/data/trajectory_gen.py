@@ -21,7 +21,7 @@ from scipy import signal
 import matplotlib.pyplot as plt
 from highway_env.data.ngsim import *
 from typing import Any, Dict
-from highway_env.ngsim_utils.constants import FEET_PER_METER
+from highway_env.ngsim_utils.core.constants import FEET_PER_METER
 """
 def trajectory_smoothing(trajectory):
     trajectory = np.array(trajectory)

@@ -23,10 +23,13 @@ import numpy as np
 
 from highway_env import utils
 from highway_env.vehicle.behavior import IDMVehicle
-from highway_env.ngsim_utils.constants import FEET_PER_METER
-from highway_env.ngsim_utils.ego_vehicle import EgoVehicle
-from highway_env.ngsim_utils.helper_ngsim import target_lane_index_from_lane_id
-from highway_env.ngsim_utils.trajectory_gen import (
+from highway_env.ngsim_utils.core.constants import FEET_PER_METER
+from highway_env.ngsim_utils.vehicles.ego import EgoVehicle
+from highway_env.ngsim_utils.road.lane_mapping import (
+    heading_from_trajectory_row,
+    target_lane_index_from_lane_id,
+)
+from highway_env.ngsim_utils.data.trajectory_gen import (
     first_valid_index as first_active_index,
     process_raw_trajectory,
     trajectory_row_is_active,
@@ -292,22 +295,13 @@ class NGSIMVehicle(IDMVehicle):
         self._set_visibility_from_appearance(False)
 
     def _row_heading(self, row: np.ndarray, next_row: np.ndarray | None = None) -> float:
-        row_arr = np.asarray(row, dtype=float)
-        x, y, _speed, lane_id = row_arr[:4]
-        mapped_lane_index = target_lane_index_from_lane_id(
-            self.road.network, self.SCENE, float(x), int(lane_id)
+        return heading_from_trajectory_row(
+            self.road.network,
+            self.SCENE,
+            row,
+            next_row=next_row,
+            fallback_heading=float(self.heading),
         )
-        if mapped_lane_index is not None:
-            lane = self.road.network.get_lane(mapped_lane_index)
-            local_s, _local_r = lane.local_coordinates(np.array([x, y], dtype=float))
-            return float(lane.heading_at(local_s))
-        if next_row is not None and trajectory_row_is_active(next_row):
-            next_arr = np.asarray(next_row, dtype=float)
-            dx = float(next_arr[0] - x)
-            dy = float(next_arr[1] - y)
-            if math.hypot(dx, dy) > 1e-3:
-                return float(math.atan2(dy, dx))
-        return float(self.heading)
 
     def _spawn_row_is_clear(self, row: np.ndarray, next_row: np.ndarray | None = None) -> bool:
         row_arr = np.asarray(row, dtype=float)
@@ -844,11 +838,19 @@ def spawn_surrounding_vehicles(
         for next_idx in range(idx + 1, len(traj)):
             nxt = traj[next_idx]
             if trajectory_row_is_active(nxt):
-                dx = float(nxt[0] - cur[0])
-                dy = float(nxt[1] - cur[1])
-                if math.hypot(dx, dy) > 1e-3:
-                    return float(math.atan2(dy, dx))
-        return 0.0
+                return heading_from_trajectory_row(
+                    road.network,
+                    scene,
+                    cur,
+                    next_row=nxt,
+                    fallback_heading=0.0,
+                )
+        return heading_from_trajectory_row(
+            road.network,
+            scene,
+            cur,
+            fallback_heading=0.0,
+        )
 
     ego_anchor_positions: list[np.ndarray] = []
     ego_records = trajectory_set.get("ego", {})

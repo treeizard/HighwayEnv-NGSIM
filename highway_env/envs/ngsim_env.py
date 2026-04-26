@@ -1,8 +1,23 @@
 # Developed by: Yide Tao (yide.tao@monash.edu)
+# Reference: @article{huang2021driving,
+#   title={Driving Behavior Modeling Using Naturalistic Human Driving Data With Inverse Reinforcement Learning},
+#   author={Huang, Zhiyu and Wu, Jingda and Lv, Chen},
+#   journal={IEEE Transactions on Intelligent Transportation Systems},
+#   year={2021},
+#   publisher={IEEE}
+# }
+# @misc{highway-env,
+#   author = {Leurent, Edouard},
+#   title = {An Environment for Autonomous Driving Decision-Making},
+#   year = {2018},
+#   publisher = {GitHub},
+#   journal = {GitHub repository},
+#   howpublished = {\url{https://github.com/eleurent/highway-env}},
+# }
+
 from __future__ import annotations
 
 import logging
-import os
 from copy import deepcopy
 from typing import Any
 
@@ -11,37 +26,49 @@ import numpy as np
 from highway_env import utils
 from highway_env.envs.common.abstract import AbstractEnv
 from highway_env.envs.common.action import Action
-from highway_env.ngsim_utils.ngsim_expert_mixin import NGSimExpertMixin
+from highway_env.ngsim_utils.expert.ngsim_expert_mixin import NGSimExpertMixin
 from highway_env.road.road import Road
 
-from highway_env.ngsim_utils.helper_ngsim import (
+from highway_env.ngsim_utils.core.config import (
+    deep_update,
+    normalize_action_mode,
+    resolve_idm_parameters,
+)
+from highway_env.ngsim_utils.vehicles.ego_factory import build_ego_vehicle
+from highway_env.ngsim_utils.data.episode_selection import (
+    build_trajectory_set,
+    select_ego_ids,
+    select_episode_name,
+)
+from highway_env.ngsim_utils.data.ego_trajectory import (
     get_ego_dimensions,
     load_ego_trajectory,
     setup_expert_tracker,
+)
+from highway_env.ngsim_utils.road.lane_mapping import (
+    heading_from_trajectory_row,
     target_lane_index_from_lane_id,
 )
-from highway_env.ngsim_utils.obs_vehicle import (
+from highway_env.ngsim_utils.vehicles.replay import (
     road_entity_conflicts_at_pose,
     road_entity_pose_polygon,
     spawn_surrounding_vehicles,
 )
-from highway_env.ngsim_utils.gen_road import create_ngsim_101_road, create_japanese_road
-from highway_env.ngsim_utils.constants import (
+from highway_env.ngsim_utils.road.gen_road import create_ngsim_101_road, create_japanese_road
+from highway_env.ngsim_utils.core.constants import (
     FEET_PER_METER,
-    IDM_PARAMETER_PRESETS,
     MAX_STEER,
-    SCENE_IDM_PARAMETER_KEY,
 )
-from highway_env.ngsim_utils.trajectory_to_action import (
+from highway_env.ngsim_utils.data.prebuilt import load_prebuilt_data
+from highway_env.ngsim_utils.expert.trajectory_to_action import (
     PurePursuitTracker,
 )
-from highway_env.ngsim_utils.trajectory_gen import (
+from highway_env.ngsim_utils.data.trajectory_gen import (
     common_first_valid_index,
     longest_continuous_active_span_bounds,
-    trajectory_has_min_continuous_occupancy,
     trajectory_row_is_active,
 )
-from highway_env.ngsim_utils.ego_vehicle import EgoVehicle
+from highway_env.ngsim_utils.vehicles.ego import EgoVehicle
 
 
 logger = logging.getLogger(__name__)
@@ -49,19 +76,6 @@ ROAD_BUILDERS = {
     "us-101": create_ngsim_101_road,
     "japanese": create_japanese_road,
 }
-
-
-def _deep_update(base: dict, override: dict) -> dict:
-    """
-    Recursively merge override into base and return the merged dict.
-    """
-    result = deepcopy(base)
-    for k, v in override.items():
-        if isinstance(v, dict) and isinstance(result.get(k), dict):
-            result[k] = _deep_update(result[k], v)
-        else:
-            result[k] = v
-    return result
 
 
 class NGSimEnv(NGSimExpertMixin, AbstractEnv):
@@ -104,6 +118,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                     "lateral_offset_max": 1.50,
                     "target_speeds": list(np.arange(0.0, 35.0 + 1e-6, 2.0)),
                 },
+                # The expert mode planner variables
                 "expert_v": {
                     "planner_horizon": 2,
                     "planner_branching": 5,
@@ -114,23 +129,26 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                     "planner_collision_cost": 1e6,
                     "planner_action_change_weight": 0.05,
                 },
+                # Simulation Parameters
                 "simulation_frequency": 10,
                 "policy_frequency": 10,
                 "max_episode_steps": 300,
+                # Replay parameters
                 "ego_vehicle_ID": None,
                 "simulation_period": None,
+                # Raw data selections
                 "episode_root": "highway_env/data/processed_20s",
                 "prebuilt_split": "train",
+                # Quality of life/ debugging
                 "control_all_vehicles": False,
-                "max_controlled_vehicles": None,
                 "max_surrounding": "all",
                 "show_trajectories": True,
                 "seed": None,
                 "expert_test_mode": False,
                 "discrete_expert_policy": "planner",
-                "controlled_vehicles": 1,
+                "percentage_controlled_vehicles": 0.1,
                 "terminate_when_all_controlled_crashed": True,
-                "truncate_to_trajectory_length": False,
+                "truncate_to_trajectory_length": False, # allow for replay
                 "scene_dataset_collection_mode": False,
                 "disable_controlled_vehicle_collisions": False,
                 "disable_scene_collection_spawn_safety": False,
@@ -144,16 +162,16 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         return config
 
     # -------------------------------------------------------------------------
-    # INIT / DT
+    # Initialize the environment, load prebuilt data, and normalize config options
     # -------------------------------------------------------------------------
     def __init__(self, config: dict | None = None, render_mode: str | None = None) -> None:
         raw_config = config or {}
-        cfg = self.default_config() if config is None else _deep_update(self.default_config(), config)
+        cfg = self.default_config() if config is None else deep_update(self.default_config(), config)
 
         # Normalize control/action mode before AbstractEnv constructs action_type
-        self.control_mode = self._normalize_action_mode(cfg, raw_config)
+        self.control_mode = normalize_action_mode(cfg, raw_config)
         self.scene = str(cfg["scene"])
-        self.idm_parameters = self._resolve_idm_parameters(cfg)
+        self.idm_parameters = resolve_idm_parameters(self.scene, cfg)
         cfg["idm_parameters"] = deepcopy(self.idm_parameters)
 
         self._episodes: list[str] = []
@@ -168,135 +186,20 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         self._replay_xy_pol: list[np.ndarray] = []
         self._frames_per_action: int = 1
 
-        self._load_prebuilt_data(
+        (
+            self._prebuilt_dir,
+            self._valid_ids_by_episode,
+            self._traj_all_by_episode,
+            self._episodes,
+        ) = load_prebuilt_data(
             cfg["episode_root"],
             self.scene,
             str(cfg.get("prebuilt_split", "train")),
             min_occupancy=float(cfg.get("controlled_vehicle_min_occupancy", 0.8)),
+            cache=self._PREBUILT_CACHE,
         )
 
         super().__init__(config=cfg, render_mode=render_mode)
-
-    def _resolve_idm_parameters(self, cfg: dict) -> dict:
-        preset_key = SCENE_IDM_PARAMETER_KEY.get(self.scene, "US")
-        preset = IDM_PARAMETER_PRESETS.get(preset_key, IDM_PARAMETER_PRESETS["US"])
-        configured = cfg.get("idm_parameters")
-        if configured:
-            return _deep_update(deepcopy(preset), configured)
-        return deepcopy(preset)
-
-    def _normalize_action_mode(self, cfg: dict, raw_config: dict | None = None) -> str:
-        raw_config = raw_config or {}
-        raw_action_cfg = raw_config.get("action", {})
-        cfg_action_cfg = cfg.get("action", {})
-        raw_action_type = str(raw_action_cfg.get("type", ""))
-        cfg_action_type = str(cfg_action_cfg.get("type", ""))
-        raw_action_mode = str(raw_config.get("action_mode", "")).lower()
-
-        if raw_action_mode == "teleport":
-            cfg["action_mode"] = "teleport"
-            cfg["action"] = _deep_update(cfg_action_cfg, raw_action_cfg)
-            return "teleport"
-
-        if raw_action_type == "MultiAgentAction" or cfg_action_type == "MultiAgentAction":
-            nested_action = raw_action_cfg.get("action_config", cfg_action_cfg.get("action_config", {}))
-            nested_type = str(nested_action.get("type", ""))
-            if nested_type == "ContinuousAction":
-                control_mode = "continuous"
-            elif nested_type == "DiscreteSteerMetaAction":
-                control_mode = "discrete"
-            else:
-                raise ValueError(
-                    "MultiAgentAction requires action_config.type to be "
-                    "'ContinuousAction' or 'DiscreteSteerMetaAction'."
-                )
-            cfg["action"] = _deep_update(cfg_action_cfg, raw_action_cfg)
-            return control_mode
-
-        if "action_mode" in raw_config:
-            control_mode = str(raw_config["action_mode"]).lower()
-        else:
-            action_type = str(raw_action_cfg.get("type", cfg_action_cfg.get("type", ""))).lower()
-            if action_type == "continuousaction":
-                control_mode = "continuous"
-            elif action_type == "discretesteermetaaction":
-                control_mode = "discrete"
-            else:
-                control_mode = str(cfg.get("action_mode", "continuous")).lower()
-        action_types = {
-            "continuous": "ContinuousAction",
-            "discrete": "DiscreteSteerMetaAction",
-            "teleport": "DiscreteSteerMetaAction",
-        }
-        if control_mode not in action_types:
-            raise ValueError(f"Unknown action_mode={control_mode!r}")
-        cfg["action"] = {"type": action_types[control_mode]}
-        return control_mode
-
-    def _load_prebuilt_data(
-        self,
-        episode_root: str,
-        scene: str,
-        prebuilt_split: str,
-        *,
-        min_occupancy: float | None = None,
-    ) -> None:
-        episode_root_abs = os.path.abspath(episode_root)
-        split = str(prebuilt_split)
-        if min_occupancy is None:
-            min_occupancy = float(getattr(self, "config", {}).get("controlled_vehicle_min_occupancy", 0.8))
-        cache_key = (episode_root_abs, scene, split, min_occupancy)
-        cached = self._PREBUILT_CACHE.get(cache_key)
-        if cached is None:
-            prebuilt_dir = os.path.join(episode_root_abs, scene, "prebuilt")
-            veh_ids_path = os.path.join(prebuilt_dir, f"veh_ids_{split}.npy")
-            traj_path = os.path.join(prebuilt_dir, f"trajectory_{split}.npy")
-            if not os.path.exists(veh_ids_path):
-                raise FileNotFoundError(
-                    f"Missing prebuilt vehicle id file for split={split!r}: {veh_ids_path}"
-                )
-            if not os.path.exists(traj_path):
-                raise FileNotFoundError(
-                    f"Missing prebuilt trajectory file for split={split!r}: {traj_path}"
-                )
-            raw_valid_ids = np.load(veh_ids_path, allow_pickle=True).item()
-            traj_all = np.load(traj_path, allow_pickle=True).item()
-            valid_ids = self._refine_valid_ids_by_episode(
-                raw_valid_ids,
-                traj_all,
-                min_occupancy=min_occupancy,
-            )
-            episodes = sorted(traj_all.keys())
-            cached = (valid_ids, traj_all, episodes)
-            self._PREBUILT_CACHE[cache_key] = cached
-        else:
-            prebuilt_dir = os.path.join(episode_root_abs, scene, "prebuilt")
-        self._prebuilt_dir = prebuilt_dir
-        self._valid_ids_by_episode, self._traj_all_by_episode, self._episodes = cached
-
-    def _refine_valid_ids_by_episode(
-        self,
-        raw_valid_ids: dict[str, np.ndarray],
-        traj_all: dict[str, dict[Any, Any]],
-        *,
-        min_occupancy: float,
-    ) -> dict[str, np.ndarray]:
-        refined: dict[str, np.ndarray] = {}
-        for episode_name, veh_dict in traj_all.items():
-            candidate_ids = raw_valid_ids.get(episode_name, veh_dict.keys())
-            filtered_ids = []
-            for veh_id in candidate_ids:
-                meta = veh_dict.get(int(veh_id))
-                if meta is None:
-                    continue
-                traj = np.asarray(meta.get("trajectory", []), dtype=float)
-                if trajectory_has_min_continuous_occupancy(
-                    traj,
-                    min_presence_ratio=min_occupancy,
-                ):
-                    filtered_ids.append(int(veh_id))
-            refined[episode_name] = np.asarray(filtered_ids, dtype=np.int64)
-        return refined
 
     @property
     def dt(self) -> float:
@@ -411,91 +314,31 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         sim_period = self.config.get("simulation_period", None)
         explicit_ego_id = self.config.get("ego_vehicle_ID", None)
 
-        self.episode_name = self._select_episode_name(sim_period)
+        self.episode_name = select_episode_name(
+            sim_period,
+            self._traj_all_by_episode,
+            self._episodes,
+            self.np_random,
+        )
         valid_ids = self._valid_ids_by_episode[self.episode_name]
-        self.ego_ids = self._select_ego_ids(valid_ids, explicit_ego_id, self.config['controlled_vehicles'])
+        self.ego_ids = select_ego_ids(
+            valid_ids,
+            explicit_ego_id,
+            percentage_controlled_vehicles=self.config[
+                "percentage_controlled_vehicles"
+            ],
+            np_random=self.np_random,
+            episode_name=self.episode_name,
+            control_all_vehicles=bool(self.config.get("control_all_vehicles", False)),
+        )
         self.ego_id = self.ego_ids[0] if self.ego_ids else None
-        self.trajectory_set = self._build_trajectory_set(self.episode_name, self.ego_ids)
+        self.trajectory_set = build_trajectory_set(
+            self._traj_all_by_episode,
+            self.episode_name,
+            self.ego_ids,
+        )
 
         logger.info("Loaded episode=%s ego_ids=%s", self.episode_name, self.ego_ids)
-
-    def _select_episode_name(self, sim_period: Any) -> str:
-        if isinstance(sim_period, dict) and "episode_name" in sim_period:
-            episode_name = sim_period["episode_name"]
-            if episode_name not in self._traj_all_by_episode:
-                raise ValueError(f"Episode {episode_name} not found.")
-            return str(episode_name)
-        return str(self.np_random.choice(self._episodes))
-
-    def _select_ego_ids(
-        self,
-        valid_ids: np.ndarray,
-        explicit_ego_ids: int | list[int] | tuple[int, ...] | np.ndarray | None,
-        num_vehicles: int = 1,
-    ) -> list[int]:
-        if bool(self.config.get("control_all_vehicles", False)):
-            ego_ids = [int(eid) for eid in valid_ids]
-            if not ego_ids:
-                raise ValueError(
-                    "control_all_vehicles selected no viable ego ids for the current "
-                    "episode."
-                )
-            max_controlled = self.config.get("max_controlled_vehicles", None)
-            if max_controlled is not None:
-                max_controlled = int(max_controlled)
-                if max_controlled > 0 and len(ego_ids) > max_controlled:
-                    ego_ids = sorted(
-                        int(eid)
-                        for eid in self.np_random.choice(
-                            ego_ids,
-                            size=max_controlled,
-                            replace=False,
-                        )
-                    )
-            return ego_ids
-
-        if num_vehicles < 1:
-            raise ValueError(f"num_vehicles must be >= 1, got {num_vehicles}")
-
-        if explicit_ego_ids is None:
-            if num_vehicles > len(valid_ids):
-                raise ValueError(
-                    f"Requested {num_vehicles} ego vehicles, but only "
-                    f"{len(valid_ids)} valid ids are available"
-                )
-            return list(
-                map(int, self.np_random.choice(valid_ids, size=num_vehicles, replace=False))
-            )
-
-        if np.isscalar(explicit_ego_ids):
-            explicit_ego_ids = [int(explicit_ego_ids)]
-        else:
-            explicit_ego_ids = [int(eid) for eid in explicit_ego_ids]
-
-        invalid_ids = [eid for eid in explicit_ego_ids if eid not in valid_ids]
-        if invalid_ids:
-            raise ValueError(
-                f"Ego IDs {invalid_ids} not in episode {self.episode_name}"
-            )
-
-        if len(explicit_ego_ids) != num_vehicles:
-            raise ValueError(
-                f"Expected {num_vehicles} explicit ego ids, got {len(explicit_ego_ids)}"
-            )
-
-        return [int(eid) for eid in explicit_ego_ids]
-    def _build_trajectory_set(
-        self,
-        episode_name: str,
-        ego_ids: list[int],
-    ) -> dict[Any, Any]:
-        traj_all = self._traj_all_by_episode[episode_name]
-        ego_id_set = set(ego_ids)
-
-        return {
-            "ego": {eid: traj_all[eid] for eid in ego_ids},
-            **{vid: meta for vid, meta in traj_all.items() if vid not in ego_id_set},
-        }
 
     
     # -------------------------------------------------------------------------
@@ -524,6 +367,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         )
 
     def _create_vehicles(self):
+        # Build ego vehicles first. 
         self.controlled_vehicles = []
         self._ego_start_indices = {}
         self._expert_state_by_vehicle_id = {}
@@ -544,7 +388,15 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 ego_len=ego_len,
                 shared_start_index=shared_start_index,
             )
-            ego = self._build_ego_vehicle(ego_traj, ego_len, ego_wid)
+            ego = build_ego_vehicle(
+                road=self.road,
+                scene=self.scene,
+                ego_traj=ego_traj,
+                ego_len=ego_len,
+                ego_wid=ego_wid,
+                control_mode=self.control_mode,
+                action_cfg=self.action_cfg,
+            )
             ego.vehicle_ID = ego_id
             if self.scene_dataset_collection_mode:
                 self._configure_scene_collection_vehicle(
@@ -599,7 +451,8 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         self._max_traj_policy_steps = min(max_traj_steps) if max_traj_steps else None
         if self.scene_dataset_collection_mode:
             self._sync_scene_collection_controlled_vehicles(step_index=0)
-
+        
+        # Build obstacle vehicles
         self._spawn_surrounding_vehicles()
 
     def _resolve_shared_ego_start_index(
@@ -724,25 +577,13 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         next_row: np.ndarray | None = None,
         fallback_heading: float = 0.0,
     ) -> float:
-        row_arr = np.asarray(row, dtype=float)
-        x, y, _speed, lane_id = row_arr[:4]
-        mapped_lane_index = target_lane_index_from_lane_id(
+        return heading_from_trajectory_row(
             self.road.network,
             self.scene,
-            float(x),
-            int(lane_id),
+            row,
+            next_row=next_row,
+            fallback_heading=fallback_heading,
         )
-        if mapped_lane_index is not None:
-            lane = self.road.network.get_lane(mapped_lane_index)
-            local_s, _local_r = lane.local_coordinates(np.array([x, y], dtype=float))
-            return float(lane.heading_at(local_s))
-        if next_row is not None and trajectory_row_is_active(next_row):
-            next_arr = np.asarray(next_row, dtype=float)
-            dx = float(next_arr[0] - x)
-            dy = float(next_arr[1] - y)
-            if np.hypot(dx, dy) > 1e-3:
-                return float(np.arctan2(dy, dx))
-        return float(fallback_heading)
 
     def _vehicle_has_spawn_conflict(self, vehicle: EgoVehicle) -> bool:
         return road_entity_conflicts_at_pose(
@@ -982,96 +823,6 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             self._tracker = state["tracker"]
             self._expert_actions_policy = state["actions_policy"]
             self._tracker_dbg = state["tracker_dbg"]
-
-    def _build_ego_vehicle(
-        self,
-        ego_traj: np.ndarray,
-        ego_len: float,
-        ego_wid: float,
-    ) -> EgoVehicle:
-        x0, y0, ego_speed, lane0 = ego_traj[0]
-        ego_xy = np.array([x0, y0], dtype=float)
-        heading_raw = self._estimate_initial_heading(ego_traj)
-        target_speeds = self._target_speeds_for_trajectory(ego_traj)
-
-        ego = EgoVehicle(
-            road=self.road,
-            position=ego_xy,
-            speed=ego_speed,
-            heading=heading_raw,
-            control_mode=self.control_mode,
-            target_speeds=target_speeds,
-            lateral_offset_step=float(
-                self.action_cfg.get(
-                    "lateral_offset_step",
-                    EgoVehicle.DEFAULT_LATERAL_OFFSET_STEP,
-                )
-            ),
-            lateral_offset_max=float(
-                self.action_cfg.get(
-                    "lateral_offset_max",
-                    EgoVehicle.DEFAULT_LATERAL_OFFSET_MAX,
-                )
-            ),
-        )
-        ego.set_ego_dimension(width=ego_wid, length=ego_len)
-
-        mapped_lane_index = target_lane_index_from_lane_id(
-            self.road.network, self.scene, x0, int(lane0)
-        )
-        if mapped_lane_index is not None:
-            ego.target_lane_index = mapped_lane_index
-            ego.lane_index = mapped_lane_index
-            ego.lane = self.road.network.get_lane(mapped_lane_index)
-            s0, r0 = ego.lane.local_coordinates(ego.position)
-            if not ego.lane.on_lane(ego.position, s0, r0):
-                lane_margin = max(0.1, 0.5 * ego_wid)
-                r0 = float(
-                    np.clip(
-                        r0,
-                        -ego.lane.width_at(s0) / 2.0 + lane_margin,
-                        ego.lane.width_at(s0) / 2.0 - lane_margin,
-                    )
-                )
-                ego.position = ego.lane.position(s0, r0)
-            ego.heading = float(ego.lane.heading_at(s0))
-
-        return ego
-
-    def _target_speeds_for_trajectory(self, ego_traj: np.ndarray) -> np.ndarray | None:
-        if self.control_mode != "discrete":
-            target_speeds_cfg = self.action_cfg.get("target_speeds", None)
-            return np.array(target_speeds_cfg, dtype=float) if target_speeds_cfg is not None else None
-
-        target_speeds_cfg = self.action_cfg.get("target_speeds", None)
-        if target_speeds_cfg is None:
-            base = np.array(EgoVehicle.DEFAULT_TARGET_SPEEDS, dtype=float)
-        else:
-            base = np.array(target_speeds_cfg, dtype=float)
-
-        if base.ndim != 1 or base.size < 2 or not np.all(np.isfinite(base)):
-            return np.array(EgoVehicle.DEFAULT_TARGET_SPEEDS, dtype=float)
-
-        diffs = np.diff(base)
-        positive_diffs = diffs[diffs > 1e-6]
-        step = float(np.median(positive_diffs)) if positive_diffs.size else 2.0
-        step = max(0.5, step)
-
-        valid_speeds = ego_traj[:, 2]
-        valid_speeds = valid_speeds[np.isfinite(valid_speeds) & (valid_speeds >= 0.0)]
-        if valid_speeds.size == 0:
-            return base
-
-        max_speed = max(float(base[-1]), float(np.max(valid_speeds)) + step)
-        count = int(np.ceil(max_speed / step)) + 1
-        adaptive = np.arange(count, dtype=float) * step
-        return adaptive
-
-    def _estimate_initial_heading(self, ego_traj: np.ndarray) -> float:
-        dx0 = ego_traj[1, 0] - ego_traj[0, 0]
-        dy0 = ego_traj[1, 1] - ego_traj[0, 1]
-        disp = np.hypot(dx0, dy0)
-        return float(np.arctan2(dy0, dx0)) if disp >= 0.1 else 0.0
 
     def _spawn_surrounding_vehicles(self) -> None:
         max_surr_raw = self.config.get("max_surrounding", 0)

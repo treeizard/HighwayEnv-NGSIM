@@ -7,7 +7,7 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-from highway_env.ngsim_utils.trajectory_gen import (
+from highway_env.ngsim_utils.data.trajectory_gen import (
     build_all_trajectories_for_scene,
     trajectory_has_min_continuous_occupancy,
 )

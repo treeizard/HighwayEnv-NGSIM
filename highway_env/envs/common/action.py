@@ -12,7 +12,7 @@ from highway_env.utils import Vector
 from highway_env.vehicle.controller import MDPVehicle
 from highway_env.vehicle.dynamics import BicycleVehicle
 from highway_env.vehicle.kinematics import Vehicle
-from highway_env.ngsim_utils.ego_vehicle import EgoVehicle
+from highway_env.ngsim_utils.vehicles.ego import EgoVehicle
 
 
 if TYPE_CHECKING:

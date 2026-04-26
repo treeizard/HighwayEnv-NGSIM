@@ -45,7 +45,7 @@ if str(RAW_DATA_DIR) not in sys.path:
     sys.path.insert(0, str(RAW_DATA_DIR))
 
 from highway_env.data.curvature_remap import estimate_curvature_remap
-from highway_env.ngsim_utils.trajectory_gen import (
+from highway_env.ngsim_utils.data.trajectory_gen import (
     trajectory_has_min_continuous_occupancy,
     trajectory_smoothing,
 )

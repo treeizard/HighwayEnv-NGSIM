@@ -1,7 +1,22 @@
+# Modified by: Yide Tao (yide.tao@monash.edu)
+# Reference: @article{huang2021driving,
+#   title={Driving Behavior Modeling Using Naturalistic Human Driving Data With Inverse Reinforcement Learning},
+#   author={Huang, Zhiyu and Wu, Jingda and Lv, Chen},
+#   journal={IEEE Transactions on Intelligent Transportation Systems},
+#   year={2021},
+#   publisher={IEEE}
+# }
+# @misc{highway-env,
+#   author = {Leurent, Edouard},
+#   title = {An Environment for Autonomous Driving Decision-Making},
+#   year = {2018},
+#   publisher = {GitHub},
+#   journal = {GitHub repository},
+#   howpublished = {\url{https://github.com/eleurent/highway-env}},
+# }
 import numpy as np
-from highway_env.ngsim_utils.constants import FEET_PER_METER, US101_SECTION_ENDS_M
-from highway_env.ngsim_utils.trajectory_gen import process_raw_trajectory
-from highway_env.ngsim_utils.trajectory_to_action import traj_to_expert_actions
+from highway_env.ngsim_utils.core.constants import FEET_PER_METER, US101_SECTION_ENDS_M
+from highway_env.ngsim_utils.data.trajectory_gen import trajectory_row_is_active
 
 # -------------------------------------------------------------------------
 # ROAD / LANE HELPERS
@@ -138,45 +153,31 @@ def target_lane_index_from_lane_id(
     return None
 
 
-# -------------------------------------------------------------------------
-# EXPERT HELPERS (consistent with create_ngsim_101_road)
-# -------------------------------------------------------------------------
-def load_ego_trajectory(ego_rec, scene = 'us-101'):
-    """Process and return the ego trajectory data."""
-    ego_traj_full = process_raw_trajectory(ego_rec["trajectory"], scene)  # [T,4]: x, y, v, lane_id
-    return ego_traj_full
-
-def get_ego_dimensions(ego_rec, f2m_conv, scene):
-    """Return the ego vehicle's length and width in meters."""
-    if scene == "us-101":
-        ego_len = ego_rec["length"] / f2m_conv
-        ego_wid = ego_rec["width"] / f2m_conv
-    else:
-        ego_len = ego_rec["length"]
-        ego_wid = ego_rec["width"]
-        
-    return ego_len, ego_wid
-
-# highway_env/ngsim_utils/helper_ngsim.py
-
-def setup_expert_tracker(net, ego_traj_full, ego_len, config):
-    """
-    Setup the expert trajectory tracker. 
-    MODIFIED: We do NOT clamp lanes here anymore. We pass raw lanes to the tracker.
-    """
-    expert = traj_to_expert_actions(ego_traj_full, dt=1.0 / config["policy_frequency"], L_forward=ego_len)
-    start_idx = int(expert["start_idx"])
-    end_idx = int(expert["end_idx"])
-
-    if end_idx <= start_idx:
-        raise RuntimeError(f"Invalid expert start/end idx: {start_idx}, {end_idx}")
-
-    ref_slice = ego_traj_full[start_idx: end_idx + 1]
-    ref_xy_pol = ref_slice[:, :2]
-    ref_v_pol = ref_slice[:, 2]
-    
-    # Just grab the raw lane IDs. Do not clamp yet.
-    lane_pol = ref_slice[:, 3].astype(int)
-
-    # Return raw lane_pol
-    return ref_xy_pol, ref_v_pol, lane_pol, start_idx
+def heading_from_trajectory_row(
+    net,
+    scene: str,
+    row: np.ndarray,
+    *,
+    next_row: np.ndarray | None = None,
+    fallback_heading: float = 0.0,
+) -> float:
+    """Infer heading from a trajectory row using lane geometry, then motion delta."""
+    row_arr = np.asarray(row, dtype=float)
+    x, y, _speed, lane_id = row_arr[:4]
+    mapped_lane_index = target_lane_index_from_lane_id(
+        net,
+        scene,
+        float(x),
+        int(lane_id),
+    )
+    if mapped_lane_index is not None:
+        lane = net.get_lane(mapped_lane_index)
+        local_s, _local_r = lane.local_coordinates(np.array([x, y], dtype=float))
+        return float(lane.heading_at(local_s))
+    if next_row is not None and trajectory_row_is_active(next_row):
+        next_arr = np.asarray(next_row, dtype=float)
+        dx = float(next_arr[0] - x)
+        dy = float(next_arr[1] - y)
+        if np.hypot(dx, dy) > 1e-3:
+            return float(np.arctan2(dy, dx))
+    return float(fallback_heading)

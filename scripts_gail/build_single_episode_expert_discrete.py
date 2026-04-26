@@ -111,18 +111,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--controlled-vehicles",
-        type=int,
-        default=1,
+        "--percentage-controlled-vehicles",
+        type=float,
+        default=0.1,
         help=(
-            "Number of controlled vehicles when dataset_mode=per_vehicle. "
+            "Fraction of valid ego vehicles when dataset_mode=per_vehicle. "
             "Ignored when --dataset-mode scene is used with --control-all-vehicles."
         ),
     )
     parser.add_argument(
         "--control-all-vehicles",
         action="store_true",
-        default=True,
+        default=False,
         help=(
             "When enabled with --dataset-mode scene, replay all viable vehicle ids "
             "for the chosen time interval together."
@@ -132,7 +132,7 @@ def parse_args() -> argparse.Namespace:
         "--no-control-all-vehicles",
         dest="control_all_vehicles",
         action="store_false",
-        help="Disable all-vehicle scene replay and use only --controlled-vehicles.",
+        help="Disable all-vehicle scene replay and use only a percentage of valid vehicles.",
     )
     return parser.parse_args()
 
@@ -162,9 +162,6 @@ def main() -> None:
 
     dataset_mode = str(args.dataset_mode)
     control_all_vehicles = bool(args.control_all_vehicles)
-    controlled_vehicles = int(args.controlled_vehicles)
-    if dataset_mode == "scene" and not control_all_vehicles and controlled_vehicles <= 1:
-        controlled_vehicles = 2
 
     build_kwargs = dict(
         scene=args.scene,
@@ -175,7 +172,7 @@ def main() -> None:
         num_episodes=1,
         fixed_episode_name=episode_name,
         max_horizon=args.max_horizon,
-        controlled_vehicles=controlled_vehicles,
+        percentage_controlled_vehicles=float(args.percentage_controlled_vehicles),
         control_all_vehicles=control_all_vehicles,
         dataset_mode=dataset_mode,
         max_surrounding=args.max_surrounding,
@@ -192,8 +189,8 @@ def main() -> None:
     print(f"dataset_mode={metadata['dataset_mode']}")
     print(f"dataset_episodes={metadata['num_dataset_episodes']}")
     print(
-        "controlled_vehicles_per_scenario="
-        f"{metadata['controlled_vehicles_per_scenario']} "
+        "percentage_controlled_vehicles="
+        f"{metadata['percentage_controlled_vehicles']} "
         f"control_all_vehicles={metadata['control_all_vehicles']}"
     )
     print(f"observation_shape={tuple(metadata['observation_shape'])}")

@@ -46,8 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-ratio", type=float, default=1.0 / 3.0)
     parser.add_argument("--action-mode", choices=["discrete", "continuous"], default="discrete")
     parser.add_argument("--dataset-mode", choices=["scene", "per_vehicle"], default="scene")
-    parser.add_argument("--controlled-vehicles", type=int, default=1)
-    parser.add_argument("--control-all-vehicles", action="store_true", default=True)
+    parser.add_argument("--percentage-controlled-vehicles", type=float, default=0.1)
+    parser.add_argument("--control-all-vehicles", action="store_true", default=False)
     parser.add_argument(
         "--no-control-all-vehicles",
         dest="control_all_vehicles",
@@ -171,10 +171,6 @@ def build_scene_expert_dataset(args: argparse.Namespace, scene: str, split: str)
         cells=args.cells,
         maximum_range=args.maximum_range,
     )
-    controlled_vehicles = int(args.controlled_vehicles)
-    if args.dataset_mode == "scene" and not args.control_all_vehicles and controlled_vehicles <= 1:
-        controlled_vehicles = 2
-
     result = build_expert_dataset(
         scene=scene,
         action_mode=args.action_mode,
@@ -182,7 +178,7 @@ def build_scene_expert_dataset(args: argparse.Namespace, scene: str, split: str)
         prebuilt_split=split,
         output_path=str(out_path),
         num_episodes=num_episodes,
-        controlled_vehicles=controlled_vehicles,
+        percentage_controlled_vehicles=float(args.percentage_controlled_vehicles),
         control_all_vehicles=bool(args.control_all_vehicles),
         dataset_mode=args.dataset_mode,
         max_surrounding=args.max_surrounding,

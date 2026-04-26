@@ -1,5 +1,23 @@
+# Modified by: Yide Tao (yide.tao@monash.edu)
+# Reference: @article{huang2021driving,
+#   title={Driving Behavior Modeling Using Naturalistic Human Driving Data With Inverse Reinforcement Learning},
+#   author={Huang, Zhiyu and Wu, Jingda and Lv, Chen},
+#   journal={IEEE Transactions on Intelligent Transportation Systems},
+#   year={2021},
+#   publisher={IEEE}
+# }
+# @misc{highway-env,
+#   author = {Leurent, Edouard},
+#   title = {An Environment for Autonomous Driving Decision-Making},
+#   year = {2018},
+#   publisher = {GitHub},
+#   journal = {GitHub repository},
+#   howpublished = {\url{https://github.com/eleurent/highway-env}},
+# }
+
+
 import numpy as np
-from highway_env.ngsim_utils.constants import MAX_STEER
+from highway_env.ngsim_utils.core.constants import MAX_STEER
 
 try:
     from scipy.interpolate import UnivariateSpline

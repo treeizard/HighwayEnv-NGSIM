@@ -29,6 +29,8 @@ import torch
 from gymnasium.envs.registration import register, registry
 from torch.utils.data import Dataset
 
+from highway_env.ngsim_utils.data.episode_selection import resolve_num_ego_vehicles
+
 
 ENV_ID = "NGSim-US101-v0"
 SCHEMA_VERSION = 1
@@ -94,9 +96,9 @@ def build_env_config(
     action_mode: str,
     episode_root: str,
     prebuilt_split: str = "train",
-    controlled_vehicles: int,
+    percentage_controlled_vehicles: float = 0.1,
     control_all_vehicles: bool = False,
-    max_surrounding: str | int,
+    max_surrounding: str | int = "all",
     observation_config: dict[str, Any] | None = None,
     simulation_frequency: int = 10,
     policy_frequency: int = 10,
@@ -125,7 +127,7 @@ def build_env_config(
         else "DiscreteSteerMetaAction"
     )
 
-    if control_all_vehicles or controlled_vehicles > 1:
+    if control_all_vehicles or float(percentage_controlled_vehicles) > 0.0:
         observation = {
             "type": "MultiAgentObservation",
             "observation_config": obs_cfg,
@@ -151,7 +153,7 @@ def build_env_config(
         "prebuilt_split": str(prebuilt_split),
         "simulation_period": simulation_period,
         "ego_vehicle_ID": ego_vehicle_id,
-        "controlled_vehicles": int(controlled_vehicles),
+        "percentage_controlled_vehicles": float(percentage_controlled_vehicles),
         "control_all_vehicles": bool(control_all_vehicles),
         "max_surrounding": max_surrounding,
         "expert_test_mode": True,
@@ -241,7 +243,7 @@ def _dummy_action(env: gym.Env) -> Any:
 
 def _available_scenarios(
     env: gym.Env,
-    controlled_vehicles: int,
+    percentage_controlled_vehicles: float,
     control_all_vehicles: bool = False,
 ) -> list[tuple[str, tuple[int, ...]]]:
     base = env.unwrapped
@@ -256,15 +258,19 @@ def _available_scenarios(
             if valid_ids:
                 scenarios.append((str(episode_name), tuple(valid_ids)))
             continue
-        if len(valid_ids) < controlled_vehicles:
+        controlled_count = resolve_num_ego_vehicles(
+            percentage_controlled_vehicles,
+            len(valid_ids),
+        )
+        if len(valid_ids) < controlled_count:
             continue
 
-        if controlled_vehicles == 1:
+        if controlled_count == 1:
             ego_groups = [(ego_id,) for ego_id in valid_ids]
         else:
             ego_groups = [
-                tuple(valid_ids[start : start + controlled_vehicles])
-                for start in range(len(valid_ids) - controlled_vehicles + 1)
+                tuple(valid_ids[start : start + controlled_count])
+                for start in range(len(valid_ids) - controlled_count + 1)
             ]
 
         for ego_ids in ego_groups:
@@ -390,7 +396,7 @@ def build_expert_dataset(
     num_episodes: int,
     fixed_episode_name: str | None = None,
     max_horizon: int | None = None,
-    controlled_vehicles: int = 1,
+    percentage_controlled_vehicles: float = 0.1,
     control_all_vehicles: bool = False,
     dataset_mode: str = "per_vehicle",
     max_surrounding: str | int = "all",
@@ -414,9 +420,6 @@ def build_expert_dataset(
     dataset_mode = str(dataset_mode)
     if dataset_mode not in {"per_vehicle", "scene"}:
         raise ValueError("dataset_mode must be 'per_vehicle' or 'scene'.")
-    if dataset_mode == "scene" and not (control_all_vehicles or controlled_vehicles > 1):
-        raise ValueError("scene dataset_mode requires multi-agent replay.")
-
     register_ngsim_env()
     episode_root = os.path.abspath(episode_root)
     output_path = os.path.abspath(output_path)
@@ -426,7 +429,7 @@ def build_expert_dataset(
         action_mode=action_mode,
         episode_root=episode_root,
         prebuilt_split=prebuilt_split,
-        controlled_vehicles=controlled_vehicles,
+        percentage_controlled_vehicles=percentage_controlled_vehicles,
         control_all_vehicles=control_all_vehicles,
         max_surrounding=max_surrounding,
         observation_config=observation_config,
@@ -440,7 +443,7 @@ def build_expert_dataset(
     try:
         scenarios = _available_scenarios(
             probe_env,
-            controlled_vehicles=controlled_vehicles,
+            percentage_controlled_vehicles=percentage_controlled_vehicles,
             control_all_vehicles=control_all_vehicles,
         )
     finally:
@@ -471,7 +474,7 @@ def build_expert_dataset(
             action_mode=action_mode,
             episode_root=episode_root,
             prebuilt_split=prebuilt_split,
-            controlled_vehicles=controlled_vehicles,
+            percentage_controlled_vehicles=percentage_controlled_vehicles,
             control_all_vehicles=control_all_vehicles,
             max_surrounding=max_surrounding,
             observation_config=observation_config,
@@ -487,7 +490,7 @@ def build_expert_dataset(
         env = gym.make(ENV_ID, config=scenario_cfg)
         try:
             obs, _ = env.reset(seed=seed + scenario_index)
-            multi_agent_observations = bool(control_all_vehicles or controlled_vehicles > 1)
+            multi_agent_observations = bool(control_all_vehicles or len(ego_ids) > 1)
             obs_views = _extract_single_agent_views(
                 obs,
                 dtype=np.float32,
@@ -679,7 +682,7 @@ def build_expert_dataset(
         "dataset_mode": dataset_mode,
         "num_dataset_episodes": num_dataset_episodes,
         "num_requested_scenarios": int(num_episodes),
-        "controlled_vehicles_per_scenario": int(controlled_vehicles),
+        "percentage_controlled_vehicles": float(percentage_controlled_vehicles),
         "control_all_vehicles": bool(control_all_vehicles),
         "max_horizon": None if max_horizon is None else int(max_horizon),
         "max_surrounding": max_surrounding,

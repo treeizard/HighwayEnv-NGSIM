@@ -1,3 +1,21 @@
+# Modified by: Yide Tao (yide.tao@monash.edu)
+# Reference: @article{huang2021driving,
+#   title={Driving Behavior Modeling Using Naturalistic Human Driving Data With Inverse Reinforcement Learning},
+#   author={Huang, Zhiyu and Wu, Jingda and Lv, Chen},
+#   journal={IEEE Transactions on Intelligent Transportation Systems},
+#   year={2021},
+#   publisher={IEEE}
+# }
+# @misc{highway-env,
+#   author = {Leurent, Edouard},
+#   title = {An Environment for Autonomous Driving Decision-Making},
+#   year = {2018},
+#   publisher = {GitHub},
+#   journal = {GitHub repository},
+#   howpublished = {\url{https://github.com/eleurent/highway-env}},
+# }
+
+
 from __future__ import annotations
 
 from typing import List, Optional, Tuple, Union
@@ -9,8 +27,8 @@ from highway_env.road.road import LaneIndex, Road, Route
 from highway_env.utils import Vector
 from highway_env.vehicle.kinematics import Vehicle
 
-from highway_env.ngsim_utils.constants import MAX_STEER, US101_LANE_WIDTH_M
-from highway_env.ngsim_utils.helper_ngsim import edge_from_x
+from highway_env.ngsim_utils.core.constants import MAX_STEER, US101_LANE_WIDTH_M
+from highway_env.ngsim_utils.road.lane_mapping import edge_from_x
 
 
 class EgoVehicle(Vehicle):

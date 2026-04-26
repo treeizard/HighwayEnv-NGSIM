@@ -18,12 +18,12 @@ This note describes how [`NGSimEnv`](/home/tao/Documents/Github_Projects/Highway
 ```mermaid
 flowchart TD
     A[NGSimEnv\nhighway_env/envs/ngsim_env.py]
-    B[helper_ngsim.py\nscene helpers, lane mapping,\ntrajectory loading helpers]
-    C[gen_road.py\nroad-network builders]
-    D[ego_vehicle.py\ncontrolled ego vehicle]
-    E[obs_vehicle.py\nsurrounding replay vehicles]
-    F[trajectory_gen.py\nraw trajectory conversion]
-    G[trajectory_to_action.py\nexpert tracker and action mapping]
+    B[road/lane_mapping.py\nscene helpers, lane mapping,\ntrajectory loading helpers]
+    C[road/gen_road.py\nroad-network builders]
+    D[vehicles/ego.py\ncontrolled ego vehicle]
+    E[vehicles/replay.py\nsurrounding replay vehicles]
+    F[data/trajectory_gen.py\nraw trajectory conversion]
+    G[expert/trajectory_to_action.py\nexpert tracker and action mapping]
 
     A --> B
     A --> C
@@ -140,14 +140,14 @@ flowchart LR
 
 Current scene-related responsibilities:
 
-- [`gen_road.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/gen_road.py): builds road topology
-- [`helper_ngsim.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/helper_ngsim.py): maps `x` and dataset `lane_id` to valid road edges/lane indices
+- [`road/gen_road.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/road/road/gen_road.py): builds road topology
+- [`road/lane_mapping.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/road/lane_mapping.py): maps `x` and dataset `lane_id` to valid road edges/lane indices
 
 ## Vehicle Roles
 
 ### EgoVehicle
 
-[`EgoVehicle`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/ego_vehicle.py) is the controlled vehicle used by the environment.
+[`EgoVehicle`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/vehicles/ego.py) is the controlled vehicle used by the environment.
 
 It supports:
 
@@ -158,7 +158,7 @@ It supports:
 
 ### NGSIMVehicle
 
-[`NGSIMVehicle`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/obs_vehicle.py) is used for surrounding vehicles.
+[`NGSIMVehicle`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/vehicles/replay.py) is used for surrounding vehicles.
 
 It supports:
 
@@ -171,9 +171,9 @@ It supports:
 
 In `expert_test_mode`, `NGSimEnv` computes an expert action each step using:
 
-- [`setup_expert_tracker()`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/helper_ngsim.py#L133)
-- [`PurePursuitTracker`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/trajectory_to_action.py)
-- [`map_discrete_expert_action()`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/trajectory_to_action.py)
+- [`setup_expert_tracker()`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/road/lane_mapping.py#L133)
+- [`PurePursuitTracker`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/expert/expert/trajectory_to_action.py)
+- [`map_discrete_expert_action()`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/expert/expert/trajectory_to_action.py)
 
 ```mermaid
 flowchart TD
@@ -220,18 +220,18 @@ flowchart TD
 ## Key Files
 
 - [`ngsim_env.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/envs/ngsim_env.py): main environment orchestration
-- [`helper_ngsim.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/helper_ngsim.py): lane mapping and helper utilities
-- [`gen_road.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/gen_road.py): road builders
-- [`ego_vehicle.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/ego_vehicle.py): ego control logic
-- [`obs_vehicle.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/obs_vehicle.py): surrounding replay vehicles
-- [`trajectory_gen.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/trajectory_gen.py): trajectory conversion
-- [`trajectory_to_action.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/trajectory_to_action.py): expert tracking/action conversion
+- [`road/lane_mapping.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/road/lane_mapping.py): lane mapping and helper utilities
+- [`road/gen_road.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/road/road/gen_road.py): road builders
+- [`vehicles/ego.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/vehicles/ego.py): ego control logic
+- [`vehicles/replay.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/vehicles/replay.py): surrounding replay vehicles
+- [`data/trajectory_gen.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/data/data/trajectory_gen.py): trajectory conversion
+- [`expert/trajectory_to_action.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/expert/expert/trajectory_to_action.py): expert tracking/action conversion
 
 ## Suggested Reading Order
 
 1. [`ngsim_env.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/envs/ngsim_env.py)
-2. [`helper_ngsim.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/helper_ngsim.py)
-3. [`gen_road.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/gen_road.py)
-4. [`ego_vehicle.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/ego_vehicle.py)
-5. [`obs_vehicle.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/obs_vehicle.py)
-6. [`trajectory_to_action.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/trajectory_to_action.py)
+2. [`road/lane_mapping.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/road/lane_mapping.py)
+3. [`road/gen_road.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/road/road/gen_road.py)
+4. [`vehicles/ego.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/vehicles/ego.py)
+5. [`vehicles/replay.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/vehicles/replay.py)
+6. [`expert/trajectory_to_action.py`](/home/tao/Documents/Github_Projects/HighwayEnv-NGSIM/highway_env/ngsim_utils/expert/expert/trajectory_to_action.py)

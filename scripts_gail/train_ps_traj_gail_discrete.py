@@ -130,29 +130,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--control-all-vehicles",
         action="store_true",
-        default=True,
+        default=False,
         help="Apply the shared policy to every viable controlled vehicle in each scene.",
     )
     parser.add_argument(
         "--no-control-all-vehicles",
         dest="control_all_vehicles",
         action="store_false",
-        help="Debug/ablation mode: control only --controlled-vehicles vehicles.",
+        help="Debug/ablation mode: control only a percentage of valid vehicles.",
     )
     parser.add_argument(
-        "--controlled-vehicles",
-        type=int,
-        default=4,
-        help="Number of controlled vehicles when --no-control-all-vehicles is used.",
-    )
-    parser.add_argument(
-        "--max-controlled-vehicles",
-        type=int,
-        default=0,
-        help=(
-            "Optional cap for --control-all-vehicles scenes. "
-            "0 keeps every start-aligned vehicle."
-        ),
+        "--percentage-controlled-vehicles",
+        type=float,
+        default=0.1,
+        help="Fraction of valid ego vehicles when --no-control-all-vehicles is used.",
     )
     parser.add_argument("--cells", type=int, default=128)
     parser.add_argument("--maximum-range", type=float, default=64.0)
@@ -203,7 +194,7 @@ def make_scene_env(args: argparse.Namespace) -> gym.Env:
         action_mode="discrete",
         episode_root=args.episode_root,
         prebuilt_split=args.prebuilt_split,
-        controlled_vehicles=max(1, int(args.controlled_vehicles)),
+        percentage_controlled_vehicles=float(args.percentage_controlled_vehicles),
         control_all_vehicles=bool(args.control_all_vehicles),
         max_surrounding=args.max_surrounding,
         observation_config=observation_config,
@@ -216,8 +207,6 @@ def make_scene_env(args: argparse.Namespace) -> gym.Env:
     cfg["expert_test_mode"] = False
     cfg["disable_controlled_vehicle_collisions"] = True
     cfg["terminate_when_all_controlled_crashed"] = False
-    if int(args.max_controlled_vehicles) > 0:
-        cfg["max_controlled_vehicles"] = int(args.max_controlled_vehicles)
     return gym.make(ENV_ID, config=cfg)
 
 

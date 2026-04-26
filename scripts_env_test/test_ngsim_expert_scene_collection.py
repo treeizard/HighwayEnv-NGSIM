@@ -20,7 +20,7 @@ if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
 from highway_env.imitation.expert_dataset import ENV_ID, build_env_config, register_ngsim_env  # noqa: E402
-from highway_env.ngsim_utils.obs_vehicle import NGSIMVehicle  # noqa: E402
+from highway_env.ngsim_utils.vehicles.replay import NGSIMVehicle  # noqa: E402
 from highway_env.vehicle.behavior import IDMVehicle  # noqa: E402
 
 
@@ -40,12 +40,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--max-surrounding", default="all")
-    parser.add_argument("--controlled-vehicles", type=int, default=4)
-    parser.add_argument("--max-controlled-vehicles", type=int, default=0)
+    parser.add_argument("--percentage-controlled-vehicles", type=float, default=0.1)
     parser.add_argument(
         "--control-all-vehicles",
         action="store_true",
-        default=True,
+        default=False,
         help="Check every viable controlled vehicle in the chosen scene.",
     )
     parser.add_argument(
@@ -154,7 +153,7 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
         action_mode=str(args.expert_control_mode),
         episode_root=str(args.episode_root),
         prebuilt_split=str(args.prebuilt_split),
-        controlled_vehicles=max(1, int(args.controlled_vehicles)),
+        percentage_controlled_vehicles=float(args.percentage_controlled_vehicles),
         control_all_vehicles=bool(args.control_all_vehicles),
         max_surrounding=args.max_surrounding,
         observation_config=light_observation_config(),
@@ -178,8 +177,6 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
         cfg["debug_idm_handover_ids"] = [int(vehicle_id) for vehicle_id in args.print_idm_handover_ids]
     if args.episode_name:
         cfg["simulation_period"] = {"episode_name": str(args.episode_name)}
-    if int(args.max_controlled_vehicles) > 0:
-        cfg["max_controlled_vehicles"] = int(args.max_controlled_vehicles)
     return cfg
 
 

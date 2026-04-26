@@ -1,7 +1,7 @@
 import pytest
 
-from highway_env.ngsim_utils.gen_road import create_ngsim_101_road
-from highway_env.ngsim_utils.helper_ngsim import target_lane_index_from_lane_id
+from highway_env.ngsim_utils.road.gen_road import create_ngsim_101_road
+from highway_env.ngsim_utils.road.lane_mapping import target_lane_index_from_lane_id
 from highway_env.road.road import Road, RoadNetwork
 from highway_env.vehicle.behavior import IDMVehicle
 from highway_env.vehicle.controller import ControlledVehicle

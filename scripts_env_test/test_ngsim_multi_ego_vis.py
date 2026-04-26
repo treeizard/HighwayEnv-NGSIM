@@ -44,10 +44,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--scene", type=str, default="us-101", help="Scene name.")
     parser.add_argument(
-        "--controlled-vehicles",
-        type=int,
-        default=3,
-        help="Number of controlled ego vehicles to spawn.",
+        "--percentage-controlled-vehicles",
+        type=float,
+        default=0.1,
+        help="Fraction of valid ego vehicles to spawn as controlled vehicles.",
     )
     parser.add_argument(
         "--control-all-vehicles",
@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="*",
         default=None,
-        help="Optional explicit ego vehicle IDs. Must match --controlled-vehicles in length.",
+        help="Optional explicit ego vehicle IDs. Must match the resolved controlled-vehicle percentage in length.",
     )
     parser.add_argument(
         "--max-surrounding",
@@ -161,7 +161,7 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
         "observation": hybrid_observation_config(),
         "action": {"type": action_type},
         "action_mode": args.action_mode,
-        "controlled_vehicles": int(args.controlled_vehicles),
+        "percentage_controlled_vehicles": float(args.percentage_controlled_vehicles),
         "control_all_vehicles": bool(args.control_all_vehicles),
         "ego_vehicle_ID": args.ego_ids,
         "simulation_period": simulation_period,

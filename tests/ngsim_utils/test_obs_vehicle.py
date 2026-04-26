@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from highway_env.ngsim_utils.obs_vehicle import NGSIMVehicle
+from highway_env.ngsim_utils.vehicles.replay import NGSIMVehicle
 from highway_env.road.road import Road, RoadNetwork
 from highway_env.vehicle.objects import Obstacle
 

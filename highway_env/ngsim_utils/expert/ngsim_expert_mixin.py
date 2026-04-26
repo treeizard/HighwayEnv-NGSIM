@@ -1,3 +1,21 @@
+# Modified by: Yide Tao (yide.tao@monash.edu)
+# Reference: @article{huang2021driving,
+#   title={Driving Behavior Modeling Using Naturalistic Human Driving Data With Inverse Reinforcement Learning},
+#   author={Huang, Zhiyu and Wu, Jingda and Lv, Chen},
+#   journal={IEEE Transactions on Intelligent Transportation Systems},
+#   year={2021},
+#   publisher={IEEE}
+# }
+# @misc{highway-env,
+#   author = {Leurent, Edouard},
+#   title = {An Environment for Autonomous Driving Decision-Making},
+#   year = {2018},
+#   publisher = {GitHub},
+#   journal = {GitHub repository},
+#   howpublished = {\url{https://github.com/eleurent/highway-env}},
+# }
+
+
 from __future__ import annotations
 
 import copy
@@ -7,9 +25,9 @@ from typing import Any
 import numpy as np
 
 from highway_env.envs.common.action import Action
-from highway_env.ngsim_utils.constants import MAX_ACCEL, MAX_STEER
-from highway_env.ngsim_utils.ego_vehicle import EgoVehicle
-from highway_env.ngsim_utils.trajectory_to_action import map_discrete_expert_action
+from highway_env.ngsim_utils.core.constants import MAX_ACCEL, MAX_STEER
+from highway_env.ngsim_utils.vehicles.ego import EgoVehicle
+from highway_env.ngsim_utils.expert.trajectory_to_action import map_discrete_expert_action
 
 
 logger = logging.getLogger(__name__)
