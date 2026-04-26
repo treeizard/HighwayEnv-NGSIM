@@ -504,7 +504,9 @@ class Road:
             position = getattr(obj, "position", None)
             if position is None or not np.all(np.isfinite(position)):
                 continue
-            self._spatial_index.setdefault(self._cell_key(np.asarray(position, dtype=float)), []).append(obj)
+            self._spatial_index.setdefault(
+                self._cell_key(np.asarray(position, dtype=float)), []
+            ).append(obj)
 
             lane_index = getattr(obj, "lane_index", None)
             if lane_index is None or lane_index is np.nan:
@@ -527,24 +529,42 @@ class Road:
         sort: bool = True,
         vehicles_only: bool = False,
     ) -> object:
-        vehicles = [
-            v
-            for v in self.vehicles
-            if np.linalg.norm(v.position - vehicle.position) < distance
-            and v is not vehicle
-            and (see_behind or -2 * vehicle.LENGTH < vehicle.lane_distance_to(v))
-        ]
-        obstacles = [
-            o
-            for o in self.objects
-            if np.linalg.norm(o.position - vehicle.position) < distance
-            and -2 * vehicle.LENGTH < vehicle.lane_distance_to(o)
-        ]
+        candidates = list(self.vehicles)
+        if not vehicles_only:
+            candidates += list(self.objects)
+        return self._filter_close_candidates(
+            vehicle,
+            candidates,
+            distance,
+            count=count,
+            see_behind=see_behind,
+            sort=sort,
+            vehicles_only=vehicles_only,
+        )
 
-        objects_ = vehicles if vehicles_only else vehicles + obstacles
+    def _filter_close_candidates(
+        self,
+        vehicle: kinematics.Vehicle,
+        candidates: list[objects.RoadObject],
+        distance: float,
+        count: int | None = None,
+        see_behind: bool = True,
+        sort: bool = True,
+        vehicles_only: bool = False,
+    ) -> list[objects.RoadObject]:
+        objects_ = [
+            obj
+            for obj in candidates
+            if obj is not vehicle
+            and (obj in self.vehicles or not vehicles_only)
+            and np.linalg.norm(obj.position - vehicle.position) < distance
+            and (see_behind or -2 * vehicle.LENGTH < vehicle.lane_distance_to(obj))
+        ]
 
         if sort:
-            objects_ = sorted(objects_, key=lambda o: abs(vehicle.lane_distance_to(o)))
+            objects_ = sorted(
+                objects_, key=lambda obj: abs(vehicle.lane_distance_to(obj))
+            )
         if count:
             objects_ = objects_[:count]
         return objects_
@@ -586,9 +606,13 @@ class Road:
         s_front = s_rear = None
         v_front = v_rear = None
         for v in self.vehicles + self.objects:
-            if v is not vehicle and not isinstance(v, Landmark):
+            if (
+                v is not vehicle
+                and not isinstance(v, Landmark)
+                and self._is_neighbour_candidate(v)
+            ):
                 s_v, lat_v = lane.local_coordinates(v.position)
-                if not lane.on_lane(v.position, s_v, lat_v, margin=1):
+                if not lane.on_lane(v.position, s_v, lat_v, margin=0.05):
                     continue
                 if s <= s_v and (s_front is None or s_v <= s_front):
                     s_front = s_v
@@ -597,6 +621,22 @@ class Road:
                     s_rear = s_v
                     v_rear = v
         return v_front, v_rear
+
+    @staticmethod
+    def _is_neighbour_candidate(obj) -> bool:
+        if getattr(obj, "remove_from_road", False):
+            return False
+        if hasattr(obj, "visible") and not bool(getattr(obj, "visible", True)):
+            return False
+        if hasattr(obj, "appear") and not bool(getattr(obj, "appear", True)):
+            return False
+        if hasattr(obj, "scene_collection_is_active") and not bool(
+            getattr(obj, "scene_collection_is_active", True)
+        ):
+            return False
+        if float(getattr(obj, "LENGTH", 0.0)) <= 0.0 or float(getattr(obj, "WIDTH", 0.0)) <= 0.0:
+            return False
+        return True
 
     def _candidate_objects_for_lane(
         self,
@@ -640,7 +680,11 @@ class Road:
         sort: bool = True,
         vehicles_only: bool = False,
     ) -> object:
-        total_objects = len(self.vehicles) if vehicles_only else len(self.vehicles) + len(self.objects)
+        total_objects = (
+            len(self.vehicles)
+            if vehicles_only
+            else len(self.vehicles) + len(self.objects)
+        )
         if (not self.use_query_fast_path) or total_objects < 64:
             return self._close_objects_to_legacy(
                 vehicle,
@@ -665,20 +709,15 @@ class Road:
                 sort=sort,
                 vehicles_only=vehicles_only,
             )
-        objects_ = [
-            obj
-            for obj in candidates
-            if obj is not vehicle
-            and (obj in self.vehicles or not vehicles_only)
-            and np.linalg.norm(obj.position - vehicle.position) < distance
-            and (see_behind or -2 * vehicle.LENGTH < vehicle.lane_distance_to(obj))
-        ]
-
-        if sort:
-            objects_ = sorted(objects_, key=lambda o: abs(vehicle.lane_distance_to(o)))
-        if count:
-            objects_ = objects_[:count]
-        return objects_
+        return self._filter_close_candidates(
+            vehicle,
+            candidates,
+            distance,
+            count=count,
+            see_behind=see_behind,
+            sort=sort,
+            vehicles_only=vehicles_only,
+        )
 
     def close_vehicles_to(
         self,
@@ -744,10 +783,14 @@ class Road:
             return self._neighbour_vehicles_legacy(vehicle, lane_index=lane_index)
 
         for v in candidates:
-            if v is vehicle or isinstance(v, Landmark):
+            if (
+                v is vehicle
+                or isinstance(v, Landmark)
+                or not self._is_neighbour_candidate(v)
+            ):
                 continue
             s_v, lat_v = lane.local_coordinates(v.position)
-            if not lane.on_lane(v.position, s_v, lat_v, margin=1):
+            if not lane.on_lane(v.position, s_v, lat_v, margin=0.05):
                 continue
             if s <= s_v and (s_front is None or s_v <= s_front):
                 s_front = s_v

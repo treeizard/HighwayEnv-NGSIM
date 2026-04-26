@@ -66,6 +66,10 @@ def clamp_lane_id_for_x(net,
     return int(np.clip(int(lane_id), 0, n_lanes - 1))
 
 
+def _last_lane_id(net, edge: tuple[str, str]) -> int:
+    return len(net.graph[edge[0]][edge[1]]) - 1
+
+
 def target_lane_index_from_lane_id(
     net,
     scene: str,
@@ -86,11 +90,14 @@ def target_lane_index_from_lane_id(
             edge = us101_edge_from_x(x)
             return (edge[0], edge[1], lane_id - 1)
         if lane_id == 6:
-            return ("s2", "s3", -1)
+            edge = ("s2", "s3")
+            return (edge[0], edge[1], _last_lane_id(net, edge))
         if lane_id == 7:
-            return ("merge_in", "s2", -1)
+            edge = ("merge_in", "s2")
+            return (edge[0], edge[1], _last_lane_id(net, edge))
         if lane_id == 8:
-            return ("s3", "merge_out", -1)
+            edge = ("s3", "merge_out")
+            return (edge[0], edge[1], _last_lane_id(net, edge))
         return None
 
     if scene == "i-80":
@@ -98,7 +105,8 @@ def target_lane_index_from_lane_id(
             edge = i80_edge_from_x(x)
             return (edge[0], edge[1], lane_id - 1)
         if lane_id == 7:
-            return ("s1", "s2", -1)
+            edge = ("s1", "s2")
+            return (edge[0], edge[1], _last_lane_id(net, edge))
         return None
 
     if scene == "japanese":

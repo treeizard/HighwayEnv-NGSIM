@@ -160,6 +160,9 @@ highway_env/data/processed_10s
 highway_env/data/processed_20s
 logs
 tb_logs
+debug/
+expert_compare_outputs/
+*.tfevents.*
 
 raw_data
 

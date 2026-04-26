@@ -99,12 +99,6 @@ def dump_episode(
     reader: ngsim_data,
     snap_times,
     out_dir: str,
-    *,
-    car_only: bool = False,
-    car_length_min: float = 10.0,
-    car_length_max: float = 22.0,
-    car_width_min: float = 4.0,
-    car_width_max: float = 8.0,
 ):
     """
     Dump one episode (subset of time) in the same format as ngsim_data.dump(),
@@ -124,14 +118,6 @@ def dump_episode(
     for t in snap_times:
         snap = reader.snap_dict[t]
         for vr in snap.vr_list:
-            if car_only:
-                vr_length = float(getattr(vr, "len", 0.0))
-                vr_width = float(getattr(vr, "wid", 0.0))
-                if not (
-                    car_length_min <= vr_length <= car_length_max
-                    and car_width_min <= vr_width <= car_width_max
-                ):
-                    continue
             if vr.ID not in episode_vr_by_id:
                 episode_vr_by_id[vr.ID] = vr
                 episode_vr_ids.append(vr.ID)
@@ -248,36 +234,6 @@ def main():
         default=0.1,
         help="Fraction of episodes assigned to test from the latest time segment.",
     )
-    parser.add_argument(
-        "--car_only",
-        action="store_true",
-        help="Keep only car-sized vehicles when writing episode folders.",
-    )
-    parser.add_argument(
-        "--car_length_min",
-        type=float,
-        default=10.0,
-        help="Minimum vehicle length in feet for the US/NGSIM car filter.",
-    )
-    parser.add_argument(
-        "--car_length_max",
-        type=float,
-        default=22.0,
-        help="Maximum vehicle length in feet for the US/NGSIM car filter.",
-    )
-    parser.add_argument(
-        "--car_width_min",
-        type=float,
-        default=4.0,
-        help="Minimum vehicle width in feet for the US/NGSIM car filter.",
-    )
-    parser.add_argument(
-        "--car_width_max",
-        type=float,
-        default=8.0,
-        help="Maximum vehicle width in feet for the US/NGSIM car filter.",
-    )
-
     args = parser.parse_args()
 
     path = args.path
@@ -330,11 +286,6 @@ def main():
                 reader,
                 snap_times,
                 ep_dir,
-                car_only=args.car_only,
-                car_length_min=args.car_length_min,
-                car_length_max=args.car_length_max,
-                car_width_min=args.car_width_min,
-                car_width_max=args.car_width_max,
             )
             #traj_cont_action(ep_dir)
 

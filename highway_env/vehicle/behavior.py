@@ -1,9 +1,10 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 
 import numpy as np
 
 from highway_env import utils
+from highway_env.ngsim_utils.constants import IDM_PARAMETER_PRESETS, SCENE_IDM_PARAMETER_KEY
 from highway_env.road.road import LaneIndex, Road, Route
 from highway_env.utils import Vector
 from highway_env.vehicle.controller import ControlledVehicle
@@ -26,6 +27,8 @@ class IDMParams:
     b_comf: float = 10.0                     # [m/s^2] comfortable deceleration magnitude (IDM), positive
 
     # IDM headway
+    desired_speed: float = 30.0               # [m/s] free-road desired speed
+    min_gap: float = 2.0                      # [m] standstill bumper-to-bumper gap
     time_headway: float = 1.5                # [s] desired time gap (tau)
     delta: float = 4.0                       # [-] acceleration exponent
 
@@ -41,6 +44,93 @@ class IDMParams:
     lane_change_min_acc_gain: float = 0.2    # [m/s^2]
     lane_change_max_braking_imposed: float = 2.0  # [m/s^2]
     lane_change_delay: float = 1.0           # [s]
+
+    # ACC-style discrete integration safeguards
+    prevent_reverse: bool = True             # clamp speed at zero in discrete updates
+    stop_within_step: bool = True            # use ballistic stop when v + a*dt would become negative
+
+
+def _preset_from_constants(region_key: str, *, fallback: IDMParams) -> IDMParams:
+    cfg = IDM_PARAMETER_PRESETS.get(region_key, {})
+    idm_cfg = cfg.get("idm", {})
+    mobil_cfg = cfg.get("mobil", {})
+    return IDMParams(
+        a_max=fallback.a_max,
+        a_comf=float(idm_cfg.get("acceleration", fallback.a_comf)),
+        b_comf=float(idm_cfg.get("comfortable_deceleration", fallback.b_comf)),
+        desired_speed=float(idm_cfg.get("desired_speed", fallback.desired_speed)),
+        min_gap=float(idm_cfg.get("min_gap", fallback.min_gap)),
+        time_headway=float(idm_cfg.get("time_headway", fallback.time_headway)),
+        delta=float(idm_cfg.get("delta", fallback.delta)),
+        s0_factor_ego=fallback.s0_factor_ego,
+        s0_factor_front=fallback.s0_factor_front,
+        contact_buffer_factor=fallback.contact_buffer_factor,
+        politeness=float(mobil_cfg.get("politeness", fallback.politeness)),
+        lane_change_min_acc_gain=float(
+            mobil_cfg.get("lane_change_min_acc_gain", fallback.lane_change_min_acc_gain)
+        ),
+        lane_change_max_braking_imposed=float(
+            mobil_cfg.get(
+                "lane_change_max_braking_imposed",
+                fallback.lane_change_max_braking_imposed,
+            )
+        ),
+        lane_change_delay=float(mobil_cfg.get("lane_change_delay", fallback.lane_change_delay)),
+        prevent_reverse=fallback.prevent_reverse,
+        stop_within_step=fallback.stop_within_step,
+    )
+
+
+IDM_PRESETS: dict[str, IDMParams] = {
+    "default": IDMParams(),
+    "us": _preset_from_constants(
+        "US",
+        fallback=IDMParams(
+            a_max=8.0,
+            a_comf=1.4,
+            b_comf=2.2,
+            desired_speed=30.0,
+            min_gap=2.0,
+            time_headway=1.2,
+            delta=4.0,
+            s0_factor_ego=0.4,
+            s0_factor_front=0.0,
+            contact_buffer_factor=0.35,
+            politeness=0.05,
+            lane_change_min_acc_gain=0.15,
+            lane_change_max_braking_imposed=2.5,
+            lane_change_delay=0.8,
+        ),
+    ),
+    "japanese": _preset_from_constants(
+        "JAPAN",
+        fallback=IDMParams(
+            a_max=7.0,
+            a_comf=1.1,
+            b_comf=2.4,
+            desired_speed=28.0,
+            min_gap=2.0,
+            time_headway=1.6,
+            delta=4.0,
+            s0_factor_ego=0.45,
+            s0_factor_front=0.0,
+            contact_buffer_factor=0.4,
+            politeness=0.3,
+            lane_change_min_acc_gain=0.1,
+            lane_change_max_braking_imposed=1.8,
+            lane_change_delay=1.2,
+        ),
+    ),
+}
+
+IDM_SCENE_PRESETS: dict[str, str] = {
+    "us": "us",
+    "us-101": "us",
+    "i-80": "us",
+    "lankershim": "us",
+    "japan": "japanese",
+    "japanese": "japanese",
+}
 
 
 class IDMVehicle(ControlledVehicle):
@@ -75,15 +165,50 @@ class IDMVehicle(ControlledVehicle):
         enable_lane_change: bool = True,
         timer: float | None = None,
         params: IDMParams | None = None,
+        params_profile: str | None = None,
+        params_overrides: dict | None = None,
     ):
         super().__init__(road, position, heading, speed, target_lane_index, target_speed, route)
         self.enable_lane_change = enable_lane_change
         self.timer = float(timer) if timer is not None else (np.sum(self.position) * np.pi) % self.PARAMS.lane_change_delay
-        self.params: IDMParams = params if params is not None else self.PARAMS
+        self.params = self.resolve_params(
+            params=params,
+            profile=params_profile,
+            overrides=params_overrides,
+        )
+
+    @classmethod
+    def preset_params(cls, profile: str | None = None) -> IDMParams:
+        if profile:
+            scene_key = str(profile).lower()
+            region_key = SCENE_IDM_PARAMETER_KEY.get(scene_key)
+            if region_key == "US":
+                preset_name = "us"
+            elif region_key == "JAPAN":
+                preset_name = "japanese"
+            else:
+                preset_name = IDM_SCENE_PRESETS.get(scene_key, scene_key)
+        else:
+            preset_name = "default"
+        base = IDM_PRESETS.get(preset_name, cls.PARAMS)
+        return IDMParams(**asdict(base))
+
+    @classmethod
+    def resolve_params(
+        cls,
+        *,
+        params: IDMParams | None = None,
+        profile: str | None = None,
+        overrides: dict | None = None,
+    ) -> IDMParams:
+        resolved = IDMParams(**asdict(params)) if params is not None else cls.preset_params(profile)
+        if overrides:
+            resolved = replace(resolved, **overrides)
+        return resolved
 
     def randomize_behavior(self) -> None:
         """Optionally randomize IDM aggressiveness by sampling delta."""
-        self.params = IDMParams(**{**self.params.__dict__})  # shallow copy
+        self.params = IDMParams(**asdict(self.params))
         self.params.delta = float(self.road.np_random.uniform(self.DELTA_RANGE[0], self.DELTA_RANGE[1]))
 
     @classmethod
@@ -115,13 +240,18 @@ class IDMVehicle(ControlledVehicle):
             return
 
         cmd: dict[str, float] = {}
+        self._last_mobil_decisions = []
 
         # Lateral: follow road and optionally change lane (MOBIL)
         self.follow_road()
+        self._reset_target_lane_if_unsafe()
         if self.enable_lane_change:
             self.change_lane_policy()
+        self._reset_target_lane_if_unsafe()
         steering = float(self.steering_control(self.target_lane_index))
-        cmd["steering"] = float(np.clip(steering, -self.MAX_STEERING_ANGLE, self.MAX_STEERING_ANGLE))
+        cmd["steering"] = float(
+            np.clip(steering, -self.MAX_STEERING_ANGLE, self.MAX_STEERING_ANGLE)
+        )
 
         # Longitudinal: IDM (consider current lane)
         front_vehicle, rear_vehicle = self.road.neighbour_vehicles(self, self.lane_index)
@@ -132,18 +262,80 @@ class IDMVehicle(ControlledVehicle):
             f2, r2 = self.road.neighbour_vehicles(self, self.target_lane_index)
             acc2 = self.acceleration(self, front_vehicle=f2, rear_vehicle=r2)
             acc = min(float(acc), float(acc2))
+        else:
+            f2 = r2 = None
+            acc2 = None
 
         # Actuation clamp
         acc = float(np.clip(acc, -self.params.a_max, self.params.a_max))
         cmd["acceleration"] = acc
+        self._last_idm_decision = {
+            "lane_index": self.lane_index,
+            "target_lane_index": self.target_lane_index,
+            "current_front": front_vehicle,
+            "current_rear": rear_vehicle,
+            "target_front": f2,
+            "target_rear": r2,
+            "current_acceleration": float(self.acceleration(self, front_vehicle=front_vehicle, rear_vehicle=rear_vehicle)),
+            "target_acceleration": None if acc2 is None else float(acc2),
+            "applied_acceleration": float(acc),
+            "applied_steering": float(cmd["steering"]),
+        }
 
         # Skip ControlledVehicle.act(); apply directly to the kinematic model.
         Vehicle.act(self, cmd)
 
     def step(self, dt: float) -> None:
-        """Advance the simulation and update the lane-change timer."""
+        """
+        Advance the simulation and update the lane-change timer.
+
+        Uses the ACC-style ballistic stop rule for discrete integration:
+        if v + a*dt would become negative, stop inside the current interval and
+        keep the vehicle at standstill for the remainder of the step.
+        """
         self.timer += float(dt)
-        super().step(dt)
+        self.clip_actions()
+
+        delta_f = self.action["steering"]
+        acc = float(self.action["acceleration"])
+        beta = np.arctan(0.5 * np.tan(delta_f))
+        direction = np.array(
+            [np.cos(self.heading + beta), np.sin(self.heading + beta)],
+            dtype=float,
+        )
+        speed = float(self.speed)
+
+        if (
+            self.params.prevent_reverse
+            and self.params.stop_within_step
+            and speed >= 0.0
+            and acc < 0.0
+            and speed + acc * dt <= 0.0
+        ):
+            t_stop = -speed / acc
+            stop_distance = -0.5 * speed * speed / acc
+            self.position += direction * stop_distance
+            if self.impact is not None:
+                self.position += self.impact
+                self.crashed = True
+                self.impact = None
+            self.heading += speed * np.sin(beta) / (self.LENGTH / 2) * t_stop
+            self.speed = 0.0
+            self.on_state_update()
+            self._reset_target_lane_if_unsafe()
+            return
+
+        self.position += speed * direction * dt
+        if self.impact is not None:
+            self.position += self.impact
+            self.crashed = True
+            self.impact = None
+        self.heading += speed * np.sin(beta) / (self.LENGTH / 2) * dt
+        self.speed += acc * dt
+        if self.params.prevent_reverse and self.speed < 0.0:
+            self.speed = 0.0
+        self.on_state_update()
+        self._reset_target_lane_if_unsafe()
 
     # ----------------------------
     # Longitudinal model (IDM + guard)
@@ -170,7 +362,10 @@ class IDMVehicle(ControlledVehicle):
         p = self.params
 
         # Target speed
-        v0 = float(getattr(ego_vehicle, "target_speed", 0.0))
+        v0 = max(
+            float(getattr(ego_vehicle, "target_speed", 0.0)),
+            float(p.desired_speed),
+        )
         if ego_vehicle.lane and ego_vehicle.lane.speed_limit is not None:
             v0 = float(np.clip(v0, 0.0, float(ego_vehicle.lane.speed_limit)))
         v0 = abs(utils.not_zero(v0))
@@ -191,8 +386,14 @@ class IDMVehicle(ControlledVehicle):
         a_int = -float(p.a_comf * (s_star / utils.not_zero(d)) ** 2)
         a_idm = a_free + a_int
 
-        # Hard safety guard (geometry-based)
-        return float(min(a_idm, self._required_braking_to_avoid_contact(ego_vehicle, front_vehicle, d)))
+        # Hard safety guard (geometry-based). A non-negative guard means
+        # "no extra braking required", so it must not suppress a legitimate
+        # positive IDM acceleration when a stopped vehicle should start moving
+        # again or when the leader is pulling away.
+        a_safe = float(self._required_braking_to_avoid_contact(ego_vehicle, front_vehicle, d))
+        if a_safe < 0.0:
+            return float(min(a_idm, a_safe))
+        return float(a_idm)
 
     def _required_braking_to_avoid_contact(self, ego: Vehicle, front: Vehicle, lane_distance: float) -> float:
         """
@@ -239,7 +440,7 @@ class IDMVehicle(ControlledVehicle):
         p = self.params
 
         L_ego = float(getattr(ego_vehicle, "length", getattr(ego_vehicle, "LENGTH", self.LENGTH)))
-        s0 = float(p.s0_factor_ego * L_ego)
+        s0 = max(float(p.min_gap), float(p.s0_factor_ego * L_ego))
 
         if front_vehicle is not None and p.s0_factor_front != 0.0:
             L_front = float(getattr(front_vehicle, "length", getattr(front_vehicle, "LENGTH", self.LENGTH)))
@@ -274,6 +475,31 @@ class IDMVehicle(ControlledVehicle):
 
         # Lane change ongoing
         if self.lane_index != self.target_lane_index:
+            # At very low speed, abandon a pending lane change and let MOBIL
+            # re-evaluate from the current lane instead of waiting at near
+            # standstill with large steering demand.
+            if abs(float(self.speed)) < 1.0:
+                self.target_lane_index = self.lane_index
+                return
+
+            # If the target lane is no longer reachable from the current pose,
+            # fall back to the current lane immediately.
+            if not self.road.network.get_lane(self.target_lane_index).is_reachable_from(self.position):
+                self.target_lane_index = self.lane_index
+                return
+
+            # If remaining in the current lane is at least as good
+            # longitudinally while we are already moving slowly, do not keep
+            # forcing the lane-change commitment.
+            if abs(float(self.speed)) < 3.0:
+                current_front, current_rear = self.road.neighbour_vehicles(self, self.lane_index)
+                target_front, target_rear = self.road.neighbour_vehicles(self, self.target_lane_index)
+                current_acc = float(self.acceleration(self, front_vehicle=current_front, rear_vehicle=current_rear))
+                target_acc = float(self.acceleration(self, front_vehicle=target_front, rear_vehicle=target_rear))
+                if current_acc >= target_acc - 0.1:
+                    self.target_lane_index = self.lane_index
+                    return
+
             # Abort conflicting merges into the same lane
             if self.lane_index[:2] == self.target_lane_index[:2]:
                 for v in self.road.vehicles:
@@ -304,43 +530,188 @@ class IDMVehicle(ControlledVehicle):
             if self.mobil(lane_index):
                 self.target_lane_index = lane_index
 
+    def _reset_target_lane_if_unsafe(self) -> None:
+        """
+        Cancel stale same-segment target lanes that no longer satisfy MOBIL safety.
+
+        Replay handover and road-segment updates can change ``lane_index`` after
+        a target was selected. This keeps those stale targets from steering a
+        vehicle into an occupied adjacent lane without a fresh MOBIL approval.
+        """
+        if self.target_lane_index is None:
+            self.target_lane_index = self.lane_index
+            return
+        if self.target_lane_index == self.lane_index:
+            return
+
+        try:
+            target_lane = self.road.network.get_lane(self.target_lane_index)
+        except Exception:
+            self.target_lane_index = self.lane_index
+            return
+        if not target_lane.is_reachable_from(self.position):
+            self.target_lane_index = self.lane_index
+            return
+
+        if self.lane_index[:2] != self.target_lane_index[:2]:
+            return
+
+        target_front, _target_rear = self.road.neighbour_vehicles(
+            self, self.target_lane_index
+        )
+        target_acc = float(self.acceleration(self, front_vehicle=target_front))
+        if not self._target_lane_is_safe_for_ego(
+            self.target_lane_index,
+            target_front,
+            target_acc,
+        ):
+            self.target_lane_index = self.lane_index
+
     def mobil(self, lane_index: LaneIndex) -> bool:
         """MOBIL: decide whether a lane change is beneficial and safe."""
         p = self.params
+        decision = {
+            "candidate_lane_index": lane_index,
+            "accepted": False,
+            "reason": "",
+            "new_preceding": None,
+            "new_following": None,
+            "old_preceding": None,
+            "old_following": None,
+            "self_pred_a": None,
+            "self_current_a": None,
+            "new_following_a": None,
+            "new_following_pred_a": None,
+            "old_following_a": None,
+            "old_following_pred_a": None,
+            "jerk": None,
+        }
 
         # Safety for new follower in target lane
         new_preceding, new_following = self.road.neighbour_vehicles(self, lane_index)
+        decision["new_preceding"] = new_preceding
+        decision["new_following"] = new_following
+        self_pred_a = self.acceleration(self, front_vehicle=new_preceding)
+        decision["self_pred_a"] = float(self_pred_a)
 
-        new_following_a = self.acceleration(new_following, front_vehicle=new_preceding) if new_following else 0.0
-        new_following_pred_a = self.acceleration(new_following, front_vehicle=self) if new_following else 0.0
+        if not self._target_lane_is_safe_for_ego(lane_index, new_preceding, self_pred_a):
+            decision["reason"] = "ego_target_lane_unsafe"
+            self._record_mobil_decision(decision)
+            return False
+
+        new_following_a = (
+            self.acceleration(new_following, front_vehicle=new_preceding)
+            if new_following
+            else 0.0
+        )
+        decision["new_following_a"] = float(new_following_a)
+        new_following_pred_a = (
+            self.acceleration(new_following, front_vehicle=self)
+            if new_following
+            else 0.0
+        )
+        decision["new_following_pred_a"] = float(new_following_pred_a)
 
         if new_following_pred_a < -float(p.lane_change_max_braking_imposed):
+            decision["reason"] = "new_following_hard_brake"
+            self._record_mobil_decision(decision)
             return False
 
         # Route constraint (optional): if route requests a direction, do not go opposite
         old_preceding, old_following = self.road.neighbour_vehicles(self)
-
-        self_pred_a = self.acceleration(self, front_vehicle=new_preceding)
+        decision["old_preceding"] = old_preceding
+        decision["old_following"] = old_following
 
         if self.route and self.route[0][2] is not None:
-            if np.sign(lane_index[2] - self.target_lane_index[2]) != np.sign(self.route[0][2] - self.target_lane_index[2]):
-                return False
-            if self_pred_a < -float(p.lane_change_max_braking_imposed):
+            if np.sign(lane_index[2] - self.target_lane_index[2]) != np.sign(
+                self.route[0][2] - self.target_lane_index[2]
+            ):
+                decision["reason"] = "route_direction"
+                self._record_mobil_decision(decision)
                 return False
         else:
             self_a = self.acceleration(self, front_vehicle=old_preceding)
-            old_following_a = self.acceleration(old_following, front_vehicle=self) if old_following else 0.0
-            old_following_pred_a = self.acceleration(old_following, front_vehicle=old_preceding) if old_following else 0.0
+            decision["self_current_a"] = float(self_a)
+            old_following_a = (
+                self.acceleration(old_following, front_vehicle=self)
+                if old_following
+                else 0.0
+            )
+            decision["old_following_a"] = float(old_following_a)
+            old_following_pred_a = (
+                self.acceleration(old_following, front_vehicle=old_preceding)
+                if old_following
+                else 0.0
+            )
+            decision["old_following_pred_a"] = float(old_following_pred_a)
 
             jerk = (
                 self_pred_a
                 - self_a
                 + float(p.politeness)
-                * ((new_following_pred_a - new_following_a) + (old_following_pred_a - old_following_a))
+                * (
+                    (new_following_pred_a - new_following_a)
+                    + (old_following_pred_a - old_following_a)
+                )
             )
+            decision["jerk"] = float(jerk)
             if jerk < float(p.lane_change_min_acc_gain):
+                decision["reason"] = "insufficient_acc_gain"
+                self._record_mobil_decision(decision)
                 return False
 
+        decision["accepted"] = True
+        decision["reason"] = "accepted"
+        self._record_mobil_decision(decision)
+        return True
+
+    def _record_mobil_decision(self, decision: dict) -> None:
+        if not hasattr(self, "_last_mobil_decisions"):
+            self._last_mobil_decisions = []
+        self._last_mobil_decisions.append(decision)
+
+    def _target_lane_is_safe_for_ego(
+        self,
+        lane_index: LaneIndex,
+        new_preceding: Vehicle | None,
+        predicted_acceleration: float,
+    ) -> bool:
+        """
+        Reject lane changes that would put ego into an unavoidable front conflict.
+
+        MOBIL's follower-safety test alone is not enough: ego may move into a
+        lane with a stopped vehicle or obstacle immediately ahead. In that case
+        IDM will brake after the lane-change commitment, but too late to avoid
+        overlap in dense replay scenes.
+        """
+        p = self.params
+        if new_preceding is None:
+            return True
+
+        if predicted_acceleration < -float(p.lane_change_max_braking_imposed):
+            return False
+
+        target_lane = self.road.network.get_lane(lane_index)
+        ego_s, _ego_lat = target_lane.local_coordinates(self.position)
+        front_s, front_lat = target_lane.local_coordinates(new_preceding.position)
+        if front_s <= ego_s:
+            return True
+        if not target_lane.on_lane(new_preceding.position, front_s, front_lat, margin=0.05):
+            return True
+
+        lane_gap = float(front_s - ego_s)
+        desired_gap = float(self.desired_gap(self, new_preceding, projected=True))
+        required_brake = float(
+            self._required_braking_to_avoid_contact(self, new_preceding, lane_gap)
+        )
+        closing_speed = max(
+            float(self.speed) - max(float(new_preceding.speed), 0.0), 0.0
+        )
+
+        if required_brake < -float(p.lane_change_max_braking_imposed):
+            return False
+        if lane_gap < desired_gap and closing_speed > 0.0:
+            return False
         return True
 
 class LinearVehicle(IDMVehicle):

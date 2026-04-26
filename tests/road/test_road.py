@@ -46,6 +46,21 @@ def test_network_to_from_config(net):
     assert len(net.graph) == len(net_2.graph)
 
 
+def test_neighbour_vehicles_do_not_pick_adjacent_lane_vehicle():
+    road = Road(RoadNetwork.straight_road_network(lanes=3))
+    ego = ControlledVehicle(road, [0, 8], heading=0, target_speed=0)
+    adjacent_front = ControlledVehicle(road, [10, 4], heading=0, target_speed=0)
+    same_lane_front = ControlledVehicle(road, [20, 8], heading=0, target_speed=0)
+    road.vehicles.extend([ego, adjacent_front, same_lane_front])
+    for vehicle in road.vehicles:
+        vehicle.on_state_update()
+
+    front, rear = road.neighbour_vehicles(ego, ("0", "1", 2))
+
+    assert front is same_lane_front
+    assert rear is None
+
+
 def test_polylane():
     lane = CircularLane(
         center=[0, 0],

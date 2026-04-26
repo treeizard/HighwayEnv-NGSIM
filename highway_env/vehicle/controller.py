@@ -158,12 +158,13 @@ class ControlledVehicle(Vehicle):
         lane_coords = target_lane.local_coordinates(self.position)
         lane_next_coords = lane_coords[0] + self.speed * self.TAU_PURSUIT
         lane_future_heading = target_lane.heading_at(lane_next_coords)
+        control_speed = max(abs(float(self.speed)), 1.0)
 
         # Lateral position control
         lateral_speed_command = -self.KP_LATERAL * lane_coords[1]
         # Lateral speed to heading
         heading_command = np.arcsin(
-            np.clip(lateral_speed_command / utils.not_zero(self.speed), -1, 1)
+            np.clip(lateral_speed_command / control_speed, -1, 1)
         )
         heading_ref = lane_future_heading + np.clip(
             heading_command, -np.pi / 4, np.pi / 4
@@ -175,14 +176,21 @@ class ControlledVehicle(Vehicle):
         # Heading rate to steering angle
         slip_angle = np.arcsin(
             np.clip(
-                self.LENGTH / 2 / utils.not_zero(self.speed) * heading_rate_command,
+                self.LENGTH / 2 / control_speed * heading_rate_command,
                 -1,
                 1,
             )
         )
         steering_angle = np.arctan(2 * np.tan(slip_angle))
+        steering_limit = float(
+            np.interp(
+                control_speed,
+                [1.0, 5.0],
+                [0.2, self.MAX_STEERING_ANGLE],
+            )
+        )
         steering_angle = np.clip(
-            steering_angle, -self.MAX_STEERING_ANGLE, self.MAX_STEERING_ANGLE
+            steering_angle, -steering_limit, steering_limit
         )
         return float(steering_angle)
 

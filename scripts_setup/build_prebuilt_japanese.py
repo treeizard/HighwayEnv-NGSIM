@@ -98,42 +98,6 @@ def parse_args() -> argparse.Namespace:
         help="Minimum fraction of expected frames required for a vehicle to be considered valid.",
     )
     parser.add_argument(
-        "--car_only",
-        action="store_true",
-        default=True,
-        help="Keep only car-sized vehicles when building expert replay caches.",
-    )
-    parser.add_argument(
-        "--no-car_only",
-        dest="car_only",
-        action="store_false",
-        help="Disable car-only filtering and keep all vehicle classes.",
-    )
-    parser.add_argument(
-        "--car_length_min",
-        type=float,
-        default=3.0,
-        help="Minimum vehicle length in meters for the Japanese car filter.",
-    )
-    parser.add_argument(
-        "--car_length_max",
-        type=float,
-        default=5.5,
-        help="Maximum vehicle length in meters for the Japanese car filter.",
-    )
-    parser.add_argument(
-        "--car_width_min",
-        type=float,
-        default=1.3,
-        help="Minimum vehicle width in meters for the Japanese car filter.",
-    )
-    parser.add_argument(
-        "--car_width_max",
-        type=float,
-        default=2.2,
-        help="Maximum vehicle width in meters for the Japanese car filter.",
-    )
-    parser.add_argument(
         "--x_m_max",
         type=float,
         default=800.0,
@@ -163,6 +127,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=5.0,
         help="Longitudinal bin size used by the centerline estimator.",
+    )
+    parser.add_argument(
+        "--curved_flatten_bin_size_m",
+        type=float,
+        default=10.0,
+        help="Bin size used to suppress residual end-of-road curvature in y_curved.",
+    )
+    parser.add_argument(
+        "--curved_flatten_sample_step",
+        type=int,
+        default=25,
+        help="Use every Nth remapped row to estimate the residual y_curved drift profile.",
     )
     parser.add_argument(
         "--start_clock",
@@ -397,27 +373,83 @@ def smooth_vehicle_trajectories(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(smoothed_groups, ignore_index=True)
 
 
-def filter_car_like_vehicles(
+def suppress_terminal_curvature(
     df: pd.DataFrame,
     *,
-    length_col: str,
-    width_col: str,
-    length_min: float,
-    length_max: float,
-    width_min: float,
-    width_max: float,
-) -> pd.DataFrame:
+    x_col: str = "x_curved",
+    y_col: str = "y_curved",
+    bin_size_m: float = 10.0,
+    sample_step: int = 25,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Keep only vehicles whose dimensions are consistent with passenger cars.
+    Remove shared residual lateral drift from the curved-road projection.
+
+    The centerline remap is already close to straight, but sparse downstream
+    coverage can leave a small common bend near the road end. We estimate that
+    shared bias profile in x_curved bins and subtract it from all rows so the
+    prebuilt road stays visually and numerically flatter.
     """
     out = df.copy()
-    out[length_col] = pd.to_numeric(out[length_col], errors="coerce")
-    out[width_col] = pd.to_numeric(out[width_col], errors="coerce")
-    mask = (
-        out[length_col].between(float(length_min), float(length_max), inclusive="both")
-        & out[width_col].between(float(width_min), float(width_max), inclusive="both")
+    sample_step = max(1, int(sample_step))
+    sample = out.iloc[::sample_step].copy()
+    sample = sample.dropna(subset=[x_col, y_col]).copy()
+    if sample.empty:
+        empty_profile = pd.DataFrame(columns=["x_center", "y_bias"])
+        out["y_curved_raw"] = out[y_col]
+        return out, empty_profile
+
+    x_vals = pd.to_numeric(sample[x_col], errors="coerce").to_numpy(dtype=float)
+    y_vals = pd.to_numeric(sample[y_col], errors="coerce").to_numpy(dtype=float)
+    finite_mask = np.isfinite(x_vals) & np.isfinite(y_vals)
+    x_vals = x_vals[finite_mask]
+    y_vals = y_vals[finite_mask]
+    if x_vals.size == 0:
+        empty_profile = pd.DataFrame(columns=["x_center", "y_bias"])
+        out["y_curved_raw"] = out[y_col]
+        return out, empty_profile
+
+    bin_size = max(1.0, float(bin_size_m))
+    bins = np.arange(0.0, float(np.nanmax(x_vals)) + bin_size, bin_size, dtype=float)
+    if bins.size < 2:
+        empty_profile = pd.DataFrame(columns=["x_center", "y_bias"])
+        out["y_curved_raw"] = out[y_col]
+        return out, empty_profile
+
+    sample["_bin"] = pd.cut(
+        sample[x_col],
+        bins=bins,
+        labels=False,
+        include_lowest=True,
     )
-    return out.loc[mask].copy()
+    profile = (
+        sample.groupby("_bin", observed=False)[y_col]
+        .median()
+        .dropna()
+        .to_frame("y_median")
+    )
+    if profile.empty:
+        empty_profile = pd.DataFrame(columns=["x_center", "y_bias"])
+        out["y_curved_raw"] = out[y_col]
+        return out, empty_profile
+
+    profile["x_center"] = bins[:-1][profile.index.to_numpy(dtype=int)] + 0.5 * bin_size
+    profile["y_bias"] = (
+        profile["y_median"]
+        .rolling(window=5, center=True, min_periods=1)
+        .median()
+    )
+
+    x_bias = profile["x_center"].to_numpy(dtype=float)
+    y_bias = profile["y_bias"].to_numpy(dtype=float)
+    out["y_curved_raw"] = pd.to_numeric(out[y_col], errors="coerce")
+    out[y_col] = out["y_curved_raw"] - np.interp(
+        pd.to_numeric(out[x_col], errors="coerce").to_numpy(dtype=float),
+        x_bias,
+        y_bias,
+        left=float(y_bias[0]),
+        right=float(y_bias[-1]),
+    )
+    return out, profile.reset_index(drop=True)[["x_center", "y_bias"]]
 
 
 def build_episode_dicts(
@@ -594,10 +626,21 @@ def main() -> None:
     df["x_curved"] = pd.to_numeric(df_curved["x_curved"], errors="coerce")
     df["y_curved"] = pd.to_numeric(df_curved["y_curved"], errors="coerce")
     df = df.dropna(subset=["x_curved", "y_curved"]).copy()
+    df, flatten_profile = suppress_terminal_curvature(
+        df,
+        x_col="x_curved",
+        y_col="y_curved",
+        bin_size_m=args.curved_flatten_bin_size_m,
+        sample_step=args.curved_flatten_sample_step,
+    )
 
     print(
         "Centerline estimated with "
         f"{len(centerline_df)} samples using lanes {list(args.centerline_lanes)}"
+    )
+    print(
+        "Applied residual curved-road flattening with "
+        f"{len(flatten_profile)} bias samples"
     )
 
     df_smooth = smooth_vehicle_trajectories(df)
@@ -610,24 +653,6 @@ def main() -> None:
     episode_keys = sorted(traj_all.keys())
     if not episode_keys:
         raise RuntimeError("No episodes were created from the filtered Japanese dataset.")
-
-    if args.car_only:
-        before_rows = len(df)
-        before_vehicles = df["vehicle_id"].nunique()
-        df = filter_car_like_vehicles(
-            df,
-            length_col="vehicle_length",
-            width_col="vehicle_width",
-            length_min=args.car_length_min,
-            length_max=args.car_length_max,
-            width_min=args.car_width_min,
-            width_max=args.car_width_max,
-        )
-        print(
-            "Applied Japanese car-only filter: "
-            f"{before_rows} -> {len(df)} rows, "
-            f"{before_vehicles} -> {df['vehicle_id'].nunique()} vehicles"
-        )
 
     train_keys, val_keys, test_keys = split_episode_keys(
         episode_keys=episode_keys,

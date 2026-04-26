@@ -1,16 +1,18 @@
 import numpy as np
 import pandas as pd
-from pyproj import Geod
-from matplotlib.patches import Rectangle
-from matplotlib.transforms import Affine2D
-import matplotlib.pyplot as plt
 
-def add_local_xy(df, lat_col="latitude", lon_col="longitude",
-                 basis_lat=34.681580, basis_lon=135.527945):
+
+def add_local_xy(
+    df,
+    lat_col="latitude",
+    lon_col="longitude",
+    basis_lat=34.681580,
+    basis_lon=135.527945,
+):
     """
     Convert lat/lon to local Cartesian coordinates in meters.
     Origin is at (basis_lat, basis_lon).
-    
+
     Returns a copy with:
         x_m: east displacement in meters
         y_m: north displacement in meters
@@ -21,13 +23,16 @@ def add_local_xy(df, lat_col="latitude", lon_col="longitude",
     lat0 = np.deg2rad(basis_lat)
     lon0 = np.deg2rad(basis_lon)
 
-    lat = np.deg2rad(out[lat_col].astype(float).to_numpy())
-    lon = np.deg2rad(out[lon_col].astype(float).to_numpy())
+    lat = np.deg2rad(pd.to_numeric(out[lat_col], errors="coerce").to_numpy())
+    lon = np.deg2rad(pd.to_numeric(out[lon_col], errors="coerce").to_numpy())
 
     out["x_m"] = R * (lon - lon0) * np.cos(lat0)
     out["y_m"] = R * (lat - lat0)
 
     return out
+
+
+add_local_xy_fast = add_local_xy
 
 
 def visualize_trajectories_first_100s(
@@ -40,11 +45,11 @@ def visualize_trajectories_first_100s(
     lon_col="longitude",
     detected_flag_col="detected_flag",
     only_detected=True,
-    time_unit="ms",      # "ms" or "s"
+    time_unit="ms",  # "ms" or "s"
     figsize=(10, 8),
     linewidth=1.0,
     alpha=0.8,
-    show_points=False
+    show_points=False,
 ):
     """
     Visualize all vehicle trajectories during the first 100 seconds.
@@ -54,6 +59,8 @@ def visualize_trajectories_first_100s(
     - if time_unit == 'ms', first 100 seconds = first 100000 ms
     - if time_unit == 's', first 100 seconds = first 100 s
     """
+    import matplotlib.pyplot as plt
+
     data = df.copy()
 
     # Optional filtering
@@ -67,7 +74,7 @@ def visualize_trajectories_first_100s(
             lat_col=lat_col,
             lon_col=lon_col,
             basis_lat=basis_lat,
-            basis_lon=basis_lon
+            basis_lon=basis_lon,
         )
 
     # Normalize time to start from zero
@@ -106,32 +113,13 @@ def visualize_trajectories_first_100s(
     return data
 
 
-def add_local_xy_fast(df, lat_col="latitude", lon_col="longitude",
-                      basis_lat=34.681580, basis_lon=135.527945):
-    """
-    Fast local tangent-plane approximation.
-    x_m: east displacement (m)
-    y_m: north displacement (m)
-    """
-    R = 6378137.0
-
-    out = df.copy()
-    lat0 = np.deg2rad(basis_lat)
-    lon0 = np.deg2rad(basis_lon)
-
-    lat = np.deg2rad(pd.to_numeric(out[lat_col], errors="coerce").to_numpy())
-    lon = np.deg2rad(pd.to_numeric(out[lon_col], errors="coerce").to_numpy())
-
-    out["x_m"] = R * (lon - lon0) * np.cos(lat0)
-    out["y_m"] = R * (lat - lat0)
-    return out
-
-
-def _estimate_heading_for_vehicle(group, target_time, time_col="datetime", window: int = 2):
+def _estimate_heading_for_vehicle(
+    group, target_time, time_col="datetime", window: int = 2
+):
     """
     Estimate heading angle (radians) for one vehicle at target_time
     using nearby points in time.
-    
+
     Returns angle measured from +x axis.
     If not enough information exists, returns 0.0.
     """
@@ -212,6 +200,9 @@ def visualize_vehicle_snapshot(
         If True, chooses the nearest available global timestamp.
         If False, requires exact timestamp match.
     """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    from matplotlib.transforms import Affine2D
 
     data = df.copy()
 
@@ -547,6 +538,8 @@ def plot_same_spawn_time_path_pair(
     If use_shared_horizon=True, both paths are cropped to the shared time range
     so the visual comparison covers the same elapsed duration after spawning.
     """
+    import matplotlib.pyplot as plt
+
     pair = find_same_spawn_time_lane_pair(
         df,
         lane_focus=lane_focus,
@@ -626,6 +619,8 @@ def plot_average_path_length_comparison(
     Compare average total path length for vehicles spawned from lane_focus
     against vehicles spawned from all other lanes.
     """
+    import matplotlib.pyplot as plt
+
     summary = build_lane_path_length_summary(
         df,
         lane_focus=lane_focus,

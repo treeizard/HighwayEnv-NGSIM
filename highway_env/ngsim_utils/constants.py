@@ -10,6 +10,55 @@ METERS_PER_FOOT = 1.0 / FEET_PER_METER
 MAX_ACCEL = 5.0
 MAX_STEER = np.pi / 4
 
+# IDM / MOBIL parameter placeholders by dataset/region.
+# These are configuration placeholders so the environment can cleanly select
+# region-specific settings now and fill in calibrated values later.
+IDM_PARAMETER_PRESETS = {
+    "US": {
+        "profile": "us",
+        "dataset": "US",
+        "idm": {
+            "desired_speed": 19.6268,
+            "time_headway": 1.2408,
+            "min_gap": 4.1301,
+            "acceleration": 1.6354,
+            "comfortable_deceleration": 1.4806,
+            "delta": 4.0,
+        },
+        "mobil": {
+            "politeness": 0.0,
+            "lane_change_min_acc_gain": 0.1841,
+            "lane_change_max_braking_imposed": 0.9366,
+            "lane_change_delay": 2.3499,
+        },
+    },
+    "JAPAN": {
+        "profile": "japanese",
+        "dataset": "JAPAN",
+        "idm": {
+            "desired_speed": 18.8892,
+            "time_headway": 1.1854,
+            "min_gap": 5.2877,
+            "acceleration": 1.2797,
+            "comfortable_deceleration": 0.9570,
+            "delta": 4.0,
+        },
+        "mobil": {
+            "politeness": 0.2597,
+            "lane_change_min_acc_gain": 0.0491,
+            "lane_change_max_braking_imposed": 0.6554,
+            "lane_change_delay": 5.4958,
+        },
+    },
+}
+
+SCENE_IDM_PARAMETER_KEY = {
+    "us-101": "US",
+    "i-80": "US",
+    "lankershim": "US",
+    "japanese": "JAPAN",
+}
+
 # US-101 geometry in dataset-native feet
 US101_MAINLINE_LENGTH_FT = 2150.0
 US101_LANE_WIDTH_FT = 12.0

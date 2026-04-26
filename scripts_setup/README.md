@@ -297,3 +297,18 @@ This repository contains scene-specific logic for at least:
 - `japanese`
 
 Some older helper code also references `i-80`, but support depends on the downstream road-building and environment code you intend to use.
+
+
+```
+python scripts_setup/estimate_idm_parameters.py \
+  --scene us-101 \
+  --split train \
+  --output-json /tmp/idm_us_estimate.json
+```
+
+```
+python scripts_setup/estimate_idm_parameters.py \
+  --scene japanese \
+  --split train \
+  --output-json /tmp/idm_japan_estimate.json
+```

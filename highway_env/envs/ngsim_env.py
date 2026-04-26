@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 
+from highway_env import utils
 from highway_env.envs.common.abstract import AbstractEnv
 from highway_env.envs.common.action import Action
 from highway_env.ngsim_utils.ngsim_expert_mixin import NGSimExpertMixin
@@ -21,10 +22,16 @@ from highway_env.ngsim_utils.helper_ngsim import (
 )
 from highway_env.ngsim_utils.obs_vehicle import (
     road_entity_conflicts_at_pose,
+    road_entity_pose_polygon,
     spawn_surrounding_vehicles,
 )
 from highway_env.ngsim_utils.gen_road import create_ngsim_101_road, create_japanese_road
-from highway_env.ngsim_utils.constants import FEET_PER_METER, MAX_STEER
+from highway_env.ngsim_utils.constants import (
+    FEET_PER_METER,
+    IDM_PARAMETER_PRESETS,
+    MAX_STEER,
+    SCENE_IDM_PARAMETER_KEY,
+)
 from highway_env.ngsim_utils.trajectory_to_action import (
     PurePursuitTracker,
 )
@@ -126,8 +133,12 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 "truncate_to_trajectory_length": False,
                 "scene_dataset_collection_mode": False,
                 "disable_controlled_vehicle_collisions": False,
+                "disable_scene_collection_spawn_safety": False,
                 "allow_idm": True,
                 "controlled_vehicle_min_occupancy": 0.8,
+                "idm_parameters": None,
+                "debug_idm_handover": False,
+                "debug_idm_handover_ids": None,
             }
         )
         return config
@@ -142,6 +153,8 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         # Normalize control/action mode before AbstractEnv constructs action_type
         self.control_mode = self._normalize_action_mode(cfg, raw_config)
         self.scene = str(cfg["scene"])
+        self.idm_parameters = self._resolve_idm_parameters(cfg)
+        cfg["idm_parameters"] = deepcopy(self.idm_parameters)
 
         self._episodes: list[str] = []
         self._valid_ids_by_episode: dict[str, np.ndarray] = {}
@@ -163,6 +176,14 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         )
 
         super().__init__(config=cfg, render_mode=render_mode)
+
+    def _resolve_idm_parameters(self, cfg: dict) -> dict:
+        preset_key = SCENE_IDM_PARAMETER_KEY.get(self.scene, "US")
+        preset = IDM_PARAMETER_PRESETS.get(preset_key, IDM_PARAMETER_PRESETS["US"])
+        configured = cfg.get("idm_parameters")
+        if configured:
+            return _deep_update(deepcopy(preset), configured)
+        return deepcopy(preset)
 
     def _normalize_action_mode(self, cfg: dict, raw_config: dict | None = None) -> str:
         raw_config = raw_config or {}
@@ -494,6 +515,13 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             np_random=self.np_random,
             record_history=self.config["show_trajectories"],
         )
+        self.road.debug_idm_handover = bool(self.config.get("debug_idm_handover", False))
+        debug_ids = self.config.get("debug_idm_handover_ids")
+        self.road.debug_idm_handover_ids = (
+            {int(vehicle_id) for vehicle_id in debug_ids}
+            if debug_ids
+            else None
+        )
 
     def _create_vehicles(self):
         self.controlled_vehicles = []
@@ -503,6 +531,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         ego_records = self.trajectory_set["ego"]
         shared_start_index = self._resolve_shared_ego_start_index(ego_records)
         max_traj_steps = []
+        scene_collection_spawn_records: list[dict[str, Any]] = []
 
         for ego_index, ego_id in enumerate(self.ego_ids):
             ego_rec = ego_records[ego_id]
@@ -522,6 +551,21 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                     ego=ego,
                     ego_traj_full=ego_traj_full,
                 )
+                if not self._scene_collection_spawn_has_min_occupancy(ego):
+                    logger.warning(
+                        "Skipping controlled vehicle %s because its scene-collection active occupancy is below the configured minimum.",
+                        ego_id,
+                    )
+                    continue
+                if self._scene_collection_spawn_has_conflict(
+                    ego,
+                    scene_collection_spawn_records,
+                ):
+                    logger.warning(
+                        "Skipping controlled vehicle %s because its scene-collection spawn pose overlaps an existing controlled vehicle.",
+                        ego_id,
+                    )
+                    continue
             elif self._vehicle_has_spawn_conflict(ego):
                 logger.warning(
                     "Skipping controlled vehicle %s because its spawn pose overlaps an existing road entity.",
@@ -532,6 +576,9 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             self.controlled_vehicles.append(ego)
             self._ego_start_indices[int(ego_id)] = int(ego_start_index)
             if self.scene_dataset_collection_mode:
+                scene_collection_spawn_records.append(
+                    self._scene_collection_spawn_record(ego)
+                )
                 max_traj_steps.append(int(len(ego_traj_full)))
             else:
                 max_traj_steps.append(int(ego_policy_steps))
@@ -724,10 +771,91 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             self.road,
             row_arr[:2],
             heading=heading,
-            length=float(ego.LENGTH),
-            width=float(ego.WIDTH),
+            length=float(getattr(ego, "scene_collection_real_length", ego.LENGTH)),
+            width=float(getattr(ego, "scene_collection_real_width", ego.WIDTH)),
             ignore_entity=ego,
         )
+
+    def _scene_collection_spawn_record(self, ego: EgoVehicle) -> dict[str, Any]:
+        traj = np.asarray(getattr(ego, "scene_collection_full_traj"))
+        start_index = int(getattr(ego, "scene_collection_start_index", 0))
+        row = np.asarray(traj[start_index], dtype=float)
+        next_row = (
+            np.asarray(traj[start_index + 1], dtype=float)
+            if start_index + 1 < len(traj)
+            else None
+        )
+        length = float(getattr(ego, "scene_collection_real_length", ego.LENGTH))
+        width = float(getattr(ego, "scene_collection_real_width", ego.WIDTH))
+        heading = self._heading_for_spawn_row(
+            row,
+            next_row=next_row,
+            fallback_heading=float(getattr(ego, "heading", 0.0)),
+        )
+        position = np.asarray(row[:2], dtype=float)
+        return {
+            "vehicle_id": int(getattr(ego, "vehicle_ID", -1)),
+            "position": position,
+            "diagonal": float(np.hypot(length, width)),
+            "polygon": road_entity_pose_polygon(position, heading, length, width),
+        }
+
+    def _scene_collection_spawn_has_min_occupancy(self, ego: EgoVehicle) -> bool:
+        min_occupancy = float(self.config.get("controlled_vehicle_min_occupancy", 0.0))
+        if min_occupancy <= 0.0:
+            return True
+
+        max_steps = int(self.config.get("max_episode_steps") or 0)
+        if max_steps <= 0:
+            return True
+
+        traj = np.asarray(getattr(ego, "scene_collection_full_traj"))
+        start_index = int(getattr(ego, "scene_collection_start_index", 0))
+        # The acceptance/debug counters are recorded after each simulation step,
+        # so compare against the same post-step trajectory window.
+        window_start = start_index + 1
+        end_index = min(len(traj), window_start + max_steps)
+        active_steps = sum(
+            1 for row in traj[window_start:end_index] if trajectory_row_is_active(row)
+        )
+        return (active_steps / float(max_steps)) >= min_occupancy
+
+    def _scene_collection_spawn_has_conflict(
+        self,
+        ego: EgoVehicle,
+        accepted_spawn_records: list[dict[str, Any]],
+    ) -> bool:
+        if bool(self.config.get("disable_scene_collection_spawn_safety", False)):
+            return False
+
+        traj = np.asarray(getattr(ego, "scene_collection_full_traj"))
+        start_index = int(getattr(ego, "scene_collection_start_index", 0))
+        row = np.asarray(traj[start_index], dtype=float)
+        next_row = (
+            np.asarray(traj[start_index + 1], dtype=float)
+            if start_index + 1 < len(traj)
+            else None
+        )
+        if self._scene_collection_row_has_conflict(ego, row, next_row=next_row):
+            return True
+
+        candidate = self._scene_collection_spawn_record(ego)
+        zero_velocity = np.zeros(2, dtype=float)
+        for accepted in accepted_spawn_records:
+            if (
+                np.linalg.norm(candidate["position"] - accepted["position"])
+                > 0.5 * (candidate["diagonal"] + accepted["diagonal"])
+            ):
+                continue
+            intersecting, _will_intersect, _transition = utils.are_polygons_intersecting(
+                candidate["polygon"],
+                accepted["polygon"],
+                zero_velocity,
+                zero_velocity,
+            )
+            if intersecting:
+                return True
+        return False
 
     def _activate_scene_collection_vehicle(
         self,
@@ -746,7 +874,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             else None
         )
         if (
-            not bool(self.config.get("disable_controlled_vehicle_collisions", False))
+            not bool(self.config.get("disable_scene_collection_spawn_safety", False))
             and self._scene_collection_row_has_conflict(ego, row, next_row=next_row)
         ):
             self._deactivate_scene_collection_vehicle(ego)
