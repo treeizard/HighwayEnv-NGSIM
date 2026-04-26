@@ -292,16 +292,13 @@ def collect_rollouts(
     cfg: PSGAILConfig,
     device: torch.device,
     policy_obs_dim: int,
+    seed_offset: int = 0,
 ) -> RolloutBatch:
     num_workers = max(1, int(cfg.num_rollout_workers))
     total_steps = max(1, int(cfg.rollout_steps))
+    rollout_seed = int(cfg.seed) + int(seed_offset)
     if num_workers == 1:
-        return collect_rollout(env, policy, cfg, device)
-
-    num_workers = min(num_workers, total_steps)
-    base_steps = total_steps // num_workers
-    extra_steps = total_steps % num_workers
-    steps_by_worker = [base_steps + (1 if worker_id < extra_steps else 0) for worker_id in range(num_workers)]
+        return collect_rollout(env, policy, cfg, device, seed=rollout_seed)
 
     cpu_state_dict = {key: value.detach().cpu() for key, value in policy.state_dict().items()}
     context = mp.get_context("spawn")
@@ -312,10 +309,10 @@ def collect_rollouts(
                 cfg,
                 cpu_state_dict,
                 int(policy_obs_dim),
-                worker_id,
-                steps,
+                int(seed_offset) + worker_id,
+                total_steps,
             )
-            for worker_id, steps in enumerate(steps_by_worker)
+            for worker_id in range(num_workers)
         ]
         batches = [future.result() for future in futures]
     return merge_rollout_batches(batches, cfg)

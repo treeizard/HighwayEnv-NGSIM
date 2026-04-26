@@ -93,7 +93,14 @@ def main() -> None:
         )
 
         for round_idx in range(1, int(cfg.total_rounds) + 1):
-            rollout = collect_rollouts(env, policy, cfg, device, policy_obs_dim)
+            rollout = collect_rollouts(
+                env,
+                policy,
+                cfg,
+                device,
+                policy_obs_dim,
+                seed_offset=(round_idx - 1) * max(1, int(cfg.num_rollout_workers)),
+            )
             disc_stats = update_discriminator(
                 discriminator,
                 disc_optimizer,
