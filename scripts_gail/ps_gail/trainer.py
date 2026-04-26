@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from dataclasses import replace
 
 import gymnasium as gym
 import numpy as np
@@ -12,7 +15,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from .config import PSGAILConfig
 from .data import discriminator_features
-from .envs import controlled_vehicle_snapshot
+from .envs import controlled_vehicle_snapshot, make_training_env
 from .models import SharedActorCritic, TrajectoryDiscriminator
 from .observations import flatten_agent_observations, policy_observations_from_flat
 
@@ -126,9 +129,10 @@ def collect_rollout(
     policy: SharedActorCritic,
     cfg: PSGAILConfig,
     device: torch.device,
+    seed: int | None = None,
 ) -> RolloutBatch:
     policy.eval()
-    obs, _ = env.reset(seed=int(cfg.seed))
+    obs, _ = env.reset(seed=int(cfg.seed if seed is None else seed))
     obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
     transitions: list[AgentTransition] = []
     key_to_trajectory_id: dict[tuple[int, int], int] = {}
@@ -202,6 +206,119 @@ def collect_rollout(
         num_env_steps=env_steps,
         num_agent_steps=len(transitions),
     )
+
+
+def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> RolloutBatch:
+    if not batches:
+        raise ValueError("Cannot merge an empty rollout batch list.")
+
+    trajectory_ids: list[np.ndarray] = []
+    trajectory_offset = 0
+    for batch in batches:
+        ids = batch.trajectory_ids.astype(np.int32, copy=True)
+        if ids.size:
+            ids += trajectory_offset
+            trajectory_offset = int(ids.max()) + 1
+        trajectory_ids.append(ids)
+
+    rewards = np.concatenate([batch.rewards for batch in batches], axis=0).astype(np.float32)
+    old_values = np.concatenate([batch.old_values for batch in batches], axis=0).astype(np.float32)
+    dones = np.concatenate([batch.dones for batch in batches], axis=0).astype(bool)
+    merged_trajectory_ids = np.concatenate(trajectory_ids, axis=0).astype(np.int32)
+    returns, advantages = compute_returns_and_advantages(
+        rewards,
+        old_values,
+        dones,
+        merged_trajectory_ids,
+        cfg,
+    )
+    return RolloutBatch(
+        policy_observations=np.concatenate([batch.policy_observations for batch in batches], axis=0).astype(
+            np.float32
+        ),
+        actions=np.concatenate([batch.actions for batch in batches], axis=0).astype(np.int64),
+        old_log_probs=np.concatenate([batch.old_log_probs for batch in batches], axis=0).astype(np.float32),
+        old_values=old_values,
+        trajectory_ids=merged_trajectory_ids,
+        dones=dones,
+        rewards=rewards,
+        returns=returns,
+        advantages=advantages,
+        generator_features=np.concatenate([batch.generator_features for batch in batches], axis=0).astype(
+            np.float32
+        ),
+        num_env_steps=sum(batch.num_env_steps for batch in batches),
+        num_agent_steps=sum(batch.num_agent_steps for batch in batches),
+    )
+
+
+def _rollout_worker(
+    cfg: PSGAILConfig,
+    policy_state_dict: dict[str, torch.Tensor],
+    policy_obs_dim: int,
+    worker_id: int,
+    rollout_steps: int,
+) -> RolloutBatch:
+    threads = max(1, int(cfg.rollout_worker_threads))
+    torch.set_num_threads(threads)
+    np.random.seed(int(cfg.seed) + int(worker_id))
+
+    worker_cfg = replace(
+        cfg,
+        rollout_steps=int(rollout_steps),
+        seed=int(cfg.seed) + int(worker_id),
+        device="cpu",
+    )
+    policy = SharedActorCritic(int(policy_obs_dim), int(cfg.hidden_size))
+    policy.load_state_dict(policy_state_dict)
+    policy.to(torch.device("cpu"))
+
+    env = make_training_env(worker_cfg)
+    try:
+        return collect_rollout(
+            env,
+            policy,
+            worker_cfg,
+            torch.device("cpu"),
+            seed=int(worker_cfg.seed),
+        )
+    finally:
+        env.close()
+
+
+def collect_rollouts(
+    env: gym.Env,
+    policy: SharedActorCritic,
+    cfg: PSGAILConfig,
+    device: torch.device,
+    policy_obs_dim: int,
+) -> RolloutBatch:
+    num_workers = max(1, int(cfg.num_rollout_workers))
+    total_steps = max(1, int(cfg.rollout_steps))
+    if num_workers == 1:
+        return collect_rollout(env, policy, cfg, device)
+
+    num_workers = min(num_workers, total_steps)
+    base_steps = total_steps // num_workers
+    extra_steps = total_steps % num_workers
+    steps_by_worker = [base_steps + (1 if worker_id < extra_steps else 0) for worker_id in range(num_workers)]
+
+    cpu_state_dict = {key: value.detach().cpu() for key, value in policy.state_dict().items()}
+    context = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=num_workers, mp_context=context) as executor:
+        futures = [
+            executor.submit(
+                _rollout_worker,
+                cfg,
+                cpu_state_dict,
+                int(policy_obs_dim),
+                worker_id,
+                steps,
+            )
+            for worker_id, steps in enumerate(steps_by_worker)
+        ]
+        batches = [future.result() for future in futures]
+    return merge_rollout_batches(batches, cfg)
 
 
 def update_discriminator(

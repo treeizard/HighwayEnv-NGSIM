@@ -15,12 +15,19 @@ set -euo pipefail
 export REPODIR=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM
 export PYTHONPATH="${REPODIR}:${PYTHONPATH:-}"
 
-# Keep native thread pools bounded. The env rollout is CPU-heavy, while PyTorch
-# updates use the allocated GPU.
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
-export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
-export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
-export NUMEXPR_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
+# Rollouts run in multiple CPU worker processes while PyTorch updates run on
+# the allocated GPU. Give each rollout worker a small native thread pool so the
+# total CPU use stays near SLURM_CPUS_PER_TASK.
+ROLLOUT_WORKER_THREADS="${ROLLOUT_WORKER_THREADS:-2}"
+ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-$((SLURM_CPUS_PER_TASK / ROLLOUT_WORKER_THREADS))}"
+if [ "${ROLLOUT_WORKERS}" -lt 1 ]; then
+    ROLLOUT_WORKERS=1
+fi
+
+export OMP_NUM_THREADS="${ROLLOUT_WORKER_THREADS}"
+export MKL_NUM_THREADS="${ROLLOUT_WORKER_THREADS}"
+export OPENBLAS_NUM_THREADS="${ROLLOUT_WORKER_THREADS}"
+export NUMEXPR_NUM_THREADS="${ROLLOUT_WORKER_THREADS}"
 export MPLCONFIGDIR="${REPODIR}/logs/matplotlib_${SLURM_JOB_ID}"
 
 cd "${REPODIR}"
@@ -36,6 +43,8 @@ conda activate ngsim_env
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Node: ${SLURMD_NODENAME:-unknown}"
 echo "CPUs per task: ${SLURM_CPUS_PER_TASK}"
+echo "Rollout workers: ${ROLLOUT_WORKERS}"
+echo "Rollout worker threads: ${ROLLOUT_WORKER_THREADS}"
 echo "CUDA devices: ${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi || true
 
@@ -68,6 +77,8 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --device cuda \
     --total-rounds "${TOTAL_ROUNDS}" \
     --rollout-steps "${ROLLOUT_STEPS}" \
+    --num-rollout-workers "${ROLLOUT_WORKERS}" \
+    --rollout-worker-threads "${ROLLOUT_WORKER_THREADS}" \
     --max-expert-samples "${MAX_EXPERT_SAMPLES}" \
     --hidden-size "${HIDDEN_SIZE}" \
     --batch-size "${BATCH_SIZE}" \

@@ -14,6 +14,8 @@ class PSGAILConfig:
 
     total_rounds: int = 10
     rollout_steps: int = 128
+    num_rollout_workers: int = 1
+    rollout_worker_threads: int = 1
     max_expert_samples: int = 100_000
     max_surrounding: str | int = "all"
     control_all_vehicles: bool = True

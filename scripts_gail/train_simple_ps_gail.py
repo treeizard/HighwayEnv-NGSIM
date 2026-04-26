@@ -19,7 +19,7 @@ from scripts_gail.ps_gail.envs import make_training_env
 from scripts_gail.ps_gail.monitoring import WandbMonitor
 from scripts_gail.ps_gail.models import SharedActorCritic, TrajectoryDiscriminator
 from scripts_gail.ps_gail.trainer import (
-    collect_rollout,
+    collect_rollouts,
     infer_policy_obs_dim,
     refresh_rollout_rewards,
     resolve_device,
@@ -87,11 +87,13 @@ def main() -> None:
         )
         print(
             f"collision_enabled={cfg.enable_collision} allow_idm={cfg.allow_idm} "
-            f"policy_obs_dim={policy_obs_dim} disc_feature_dim={feature_dim} device={device}"
+            f"policy_obs_dim={policy_obs_dim} disc_feature_dim={feature_dim} device={device} "
+            f"rollout_workers={cfg.num_rollout_workers} "
+            f"rollout_worker_threads={cfg.rollout_worker_threads}"
         )
 
         for round_idx in range(1, int(cfg.total_rounds) + 1):
-            rollout = collect_rollout(env, policy, cfg, device)
+            rollout = collect_rollouts(env, policy, cfg, device, policy_obs_dim)
             disc_stats = update_discriminator(
                 discriminator,
                 disc_optimizer,
@@ -131,6 +133,8 @@ def main() -> None:
                     "train/policy_obs_dim": policy_obs_dim,
                     "train/disc_feature_dim": feature_dim,
                     "train/expert_samples": int(expert_features.shape[0]),
+                    "train/rollout_workers": int(cfg.num_rollout_workers),
+                    "train/rollout_worker_threads": int(cfg.rollout_worker_threads),
                 },
                 step=round_idx,
             )
