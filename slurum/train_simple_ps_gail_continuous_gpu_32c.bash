@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ps_gail_gpu_32c
+#SBATCH --job-name=ps_gail_cont_gpu_32c
 #SBATCH --account=bt60
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
@@ -7,8 +7,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
-#SBATCH --output=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_gail_gpu_32c_%j.out
-#SBATCH --error=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_gail_gpu_32c_%j.err
+#SBATCH --output=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_gail_cont_gpu_32c_%j.out
+#SBATCH --error=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_gail_cont_gpu_32c_%j.err
 
 set -euo pipefail
 
@@ -56,7 +56,8 @@ if torch.cuda.is_available():
     print("cuda device:", torch.cuda.get_device_name(0))
 PY
 
-RUN_NAME="${RUN_NAME:-ps_gail_gpu_32c_${SLURM_JOB_ID}}"
+RUN_NAME="${RUN_NAME:-ps_gail_continuous_gpu_32c_${SLURM_JOB_ID}}"
+ACTION_MODE="${ACTION_MODE:-continuous}"
 WANDB_MODE="${WANDB_MODE:-online}"
 TOTAL_ROUNDS="${TOTAL_ROUNDS:-200}"
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-200}"
@@ -94,6 +95,7 @@ fi
 python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --expert-data "${REPODIR}/expert_data/ngsim_ps_traj_expert_discrete_54902119" \
     --scene us-101 \
+    --action-mode "${ACTION_MODE}" \
     --episode-root "${REPODIR}/highway_env/data/processed_20s" \
     --prebuilt-split train \
     --no-control-all-vehicles \
@@ -128,5 +130,5 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --checkpoint-video-steps "${CHECKPOINT_VIDEO_STEPS}" \
     --wandb-mode "${WANDB_MODE}" \
     --wandb-project highwayenv-ps-gail \
-    --wandb-tags ps-gail,collision,idm,gpu,32c \
+    --wandb-tags ps-gail,continuous,collision,idm,gpu,32c \
     --run-name "${RUN_NAME}"

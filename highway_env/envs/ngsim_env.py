@@ -955,6 +955,12 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         info["controlled_vehicle_crashes"] = [
             bool(vehicle.crashed) for vehicle in self.controlled_vehicles
         ]
+        info["controlled_vehicle_on_road"] = [
+            bool(getattr(vehicle, "on_road", True)) for vehicle in self.controlled_vehicles
+        ]
+        info["controlled_vehicle_offroad"] = [
+            not bool(getattr(vehicle, "on_road", True)) for vehicle in self.controlled_vehicles
+        ]
         info["scene_dataset_collection_mode"] = self.scene_dataset_collection_mode
         return info
 

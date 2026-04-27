@@ -31,7 +31,7 @@ def make_training_env(cfg: PSGAILConfig) -> gym.Env:
     register_ngsim_env()
     env_cfg = build_env_config(
         scene=cfg.scene,
-        action_mode="discrete",
+        action_mode=str(cfg.action_mode),
         episode_root=cfg.episode_root,
         prebuilt_split=cfg.prebuilt_split,
         percentage_controlled_vehicles=cfg.percentage_controlled_vehicles,
@@ -47,7 +47,9 @@ def make_training_env(cfg: PSGAILConfig) -> gym.Env:
     )
     env_cfg["expert_test_mode"] = False
     env_cfg["disable_controlled_vehicle_collisions"] = not bool(cfg.enable_collision)
-    env_cfg["terminate_when_all_controlled_crashed"] = True
+    env_cfg["terminate_when_all_controlled_crashed"] = bool(
+        cfg.terminate_when_all_controlled_crashed
+    )
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
     return gym.make(ENV_ID, config=env_cfg)
 

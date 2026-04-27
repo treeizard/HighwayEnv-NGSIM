@@ -10,11 +10,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Independent, Normal
 from torch.utils.data import DataLoader, TensorDataset
 
 from .config import PSGAILConfig
-from .data import discriminator_features
+from .data import discriminator_features, normalize_trajectory_frame
 from .envs import controlled_vehicle_snapshot, make_training_env
 from .models import SharedActorCritic, TrajectoryDiscriminator
 from .observations import flatten_agent_observations, policy_observations_from_flat
@@ -23,11 +23,14 @@ from .observations import flatten_agent_observations, policy_observations_from_f
 @dataclass
 class AgentTransition:
     policy_observation: np.ndarray
-    action: int
+    action: object
     log_prob: float
     value: float
     trajectory_id: int
     trajectory_state: np.ndarray
+    env_penalty: float
+    crashed: bool
+    offroad: bool
     done: bool
 
 
@@ -40,11 +43,31 @@ class RolloutBatch:
     trajectory_ids: np.ndarray
     dones: np.ndarray
     rewards: np.ndarray
+    gail_rewards_raw: np.ndarray
+    gail_rewards_normalized: np.ndarray
+    env_penalties: np.ndarray
     returns: np.ndarray
     advantages: np.ndarray
     generator_features: np.ndarray
     num_env_steps: int
     num_agent_steps: int
+    num_episodes: int = 0
+    num_terminated: int = 0
+    num_truncated: int = 0
+    num_crash_events: int = 0
+    num_offroad_events: int = 0
+    crash_agent_fraction: float = 0.0
+    offroad_agent_fraction: float = 0.0
+    mean_env_penalty: float = 0.0
+    mean_raw_gail_reward: float = 0.0
+    mean_normalized_gail_reward: float = 0.0
+    mean_episode_length: float = 0.0
+    min_episode_length: int = 0
+    max_episode_length: int = 0
+    unique_episode_names: int = 0
+    episode_names: tuple[str, ...] = ()
+    mean_controlled_vehicles: float = 0.0
+    mean_road_vehicles: float = 0.0
 
 
 def resolve_device(name: str) -> torch.device:
@@ -56,6 +79,66 @@ def resolve_device(name: str) -> torch.device:
 def infer_policy_obs_dim(env: gym.Env) -> int:
     obs, _ = env.reset()
     return int(policy_observations_from_flat(flatten_agent_observations(obs)).shape[1])
+
+
+def infer_continuous_action_dim(env: gym.Env) -> int:
+    action_space = env.action_space
+    if isinstance(action_space, gym.spaces.Tuple):
+        if not action_space.spaces:
+            raise ValueError("Cannot infer continuous action dim from an empty Tuple action space.")
+        action_space = action_space.spaces[0]
+    if not isinstance(action_space, gym.spaces.Box):
+        raise ValueError(f"Continuous action mode expects a Box action space, got {action_space!r}.")
+    return int(np.prod(action_space.shape))
+
+
+def _is_continuous(cfg: PSGAILConfig) -> bool:
+    return str(cfg.action_mode).lower() == "continuous"
+
+
+def policy_distribution_and_values(
+    policy: SharedActorCritic,
+    obs_tensor: torch.Tensor,
+    cfg: PSGAILConfig,
+) -> tuple[Categorical | Independent, torch.Tensor]:
+    policy_out, values = policy(obs_tensor)
+    if _is_continuous(cfg):
+        if policy.log_std is None:
+            raise RuntimeError("Continuous action mode requires policy.log_std.")
+        std = torch.exp(policy.log_std).expand_as(policy_out)
+        return Independent(Normal(policy_out, std), 1), values
+    return Categorical(logits=policy_out), values
+
+
+def _sample_policy_actions(
+    dist: Categorical | Independent,
+    cfg: PSGAILConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    actions = dist.sample()
+    if _is_continuous(cfg):
+        actions = torch.clamp(actions, -1.0, 1.0)
+    return actions, dist.log_prob(actions)
+
+
+def _actions_to_env_tuple(actions: torch.Tensor, cfg: PSGAILConfig) -> tuple[object, ...]:
+    actions_np = actions.detach().cpu().numpy()
+    if _is_continuous(cfg):
+        actions_np = np.asarray(actions_np, dtype=np.float32).reshape(
+            -1,
+            int(cfg.continuous_action_dim),
+        )
+        actions_np = np.clip(actions_np, -1.0, 1.0)
+        return tuple(action.copy() for action in actions_np)
+    return tuple(int(action) for action in actions_np.tolist())
+
+
+def _actions_to_rollout_array(transitions: list[AgentTransition], cfg: PSGAILConfig) -> np.ndarray:
+    if _is_continuous(cfg):
+        return np.stack(
+            [np.asarray(tr.action, dtype=np.float32) for tr in transitions],
+            axis=0,
+        ).astype(np.float32)
+    return np.asarray([tr.action for tr in transitions], dtype=np.int64)
 
 
 def compute_returns_and_advantages(
@@ -94,13 +177,42 @@ def discriminator_reward(
     return rewards.cpu().numpy().astype(np.float32)
 
 
+def shape_rollout_rewards(
+    raw_gail_rewards: np.ndarray,
+    env_penalties: np.ndarray,
+    cfg: PSGAILConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    raw = np.asarray(raw_gail_rewards, dtype=np.float32)
+    penalties = np.asarray(env_penalties, dtype=np.float32)
+    if raw.shape != penalties.shape:
+        raise ValueError(f"Reward/penalty shape mismatch: {raw.shape} != {penalties.shape}")
+
+    shaped_gail = raw.astype(np.float32, copy=True)
+    if bool(cfg.normalize_gail_reward) and shaped_gail.size > 1:
+        shaped_gail = (shaped_gail - shaped_gail.mean()) / (shaped_gail.std() + 1e-8)
+    if float(cfg.gail_reward_clip) > 0:
+        clip = float(cfg.gail_reward_clip)
+        shaped_gail = np.clip(shaped_gail, -clip, clip)
+
+    rewards = shaped_gail + penalties
+    if float(cfg.final_reward_clip) > 0:
+        clip = float(cfg.final_reward_clip)
+        rewards = np.clip(rewards, -clip, clip)
+    return rewards.astype(np.float32), shaped_gail.astype(np.float32)
+
+
 def refresh_rollout_rewards(
     rollout: RolloutBatch,
     discriminator: TrajectoryDiscriminator,
     cfg: PSGAILConfig,
     device: torch.device,
 ) -> RolloutBatch:
-    rewards = discriminator_reward(discriminator, rollout.generator_features, device)
+    raw_gail_rewards = discriminator_reward(discriminator, rollout.generator_features, device)
+    rewards, normalized_gail_rewards = shape_rollout_rewards(
+        raw_gail_rewards,
+        rollout.env_penalties,
+        cfg,
+    )
     returns, advantages = compute_returns_and_advantages(
         rewards,
         rollout.old_values,
@@ -116,11 +228,31 @@ def refresh_rollout_rewards(
         trajectory_ids=rollout.trajectory_ids,
         dones=rollout.dones,
         rewards=rewards,
+        gail_rewards_raw=raw_gail_rewards,
+        gail_rewards_normalized=normalized_gail_rewards,
+        env_penalties=rollout.env_penalties,
         returns=returns,
         advantages=advantages,
         generator_features=rollout.generator_features,
         num_env_steps=rollout.num_env_steps,
         num_agent_steps=rollout.num_agent_steps,
+        num_episodes=rollout.num_episodes,
+        num_terminated=rollout.num_terminated,
+        num_truncated=rollout.num_truncated,
+        num_crash_events=rollout.num_crash_events,
+        num_offroad_events=rollout.num_offroad_events,
+        crash_agent_fraction=rollout.crash_agent_fraction,
+        offroad_agent_fraction=rollout.offroad_agent_fraction,
+        mean_env_penalty=float(rollout.env_penalties.mean()) if rollout.env_penalties.size else 0.0,
+        mean_raw_gail_reward=float(raw_gail_rewards.mean()) if raw_gail_rewards.size else 0.0,
+        mean_normalized_gail_reward=float(normalized_gail_rewards.mean()) if normalized_gail_rewards.size else 0.0,
+        mean_episode_length=rollout.mean_episode_length,
+        min_episode_length=rollout.min_episode_length,
+        max_episode_length=rollout.max_episode_length,
+        unique_episode_names=rollout.unique_episode_names,
+        episode_names=rollout.episode_names,
+        mean_controlled_vehicles=rollout.mean_controlled_vehicles,
+        mean_road_vehicles=rollout.mean_road_vehicles,
     )
 
 
@@ -138,9 +270,26 @@ def collect_rollout(
     key_to_trajectory_id: dict[tuple[int, int], int] = {}
     episode_counter = 0
     env_steps = 0
+    episode_steps = 0
+    episode_lengths: list[int] = []
+    episode_names = {str(getattr(env.unwrapped, "episode_name", ""))}
+    controlled_counts: list[int] = []
+    road_vehicle_counts: list[int] = []
+    terminated_count = 0
+    truncated_count = 0
+    crash_event_count = 0
+    offroad_event_count = 0
+    episode_had_crash = False
+    episode_had_offroad = False
 
-    while env_steps < int(cfg.rollout_steps):
+    forced_reset_cap = int(cfg.rollout_max_episode_steps)
+    min_episodes = max(1, int(cfg.rollout_min_episodes))
+
+    while env_steps < int(cfg.rollout_steps) or len(episode_lengths) < min_episodes:
         vehicle_ids, trajectory_states = controlled_vehicle_snapshot(env)
+        controlled_counts.append(len(vehicle_ids))
+        road = getattr(env.unwrapped, "road", None)
+        road_vehicle_counts.append(len(getattr(road, "vehicles", ())) if road is not None else 0)
         if len(vehicle_ids) != len(obs_agents):
             raise RuntimeError(
                 f"Observation/vehicle mismatch: obs_agents={len(obs_agents)} vehicles={len(vehicle_ids)}"
@@ -152,44 +301,84 @@ def collect_rollout(
 
         with torch.no_grad():
             obs_tensor = torch.as_tensor(obs_agents, dtype=torch.float32, device=device)
-            logits, values = policy(obs_tensor)
-            dist = Categorical(logits=logits)
-            actions = dist.sample()
-            log_probs = dist.log_prob(actions)
+            dist, values = policy_distribution_and_values(policy, obs_tensor, cfg)
+            actions, log_probs = _sample_policy_actions(dist, cfg)
 
-        action_tuple = tuple(int(action) for action in actions.cpu().numpy().tolist())
-        next_obs, _env_reward, terminated, truncated, _info = env.step(action_tuple)
-        done = bool(terminated or truncated)
+        action_tuple = _actions_to_env_tuple(actions, cfg)
+        next_obs, _env_reward, terminated, truncated, info = env.step(action_tuple)
+        episode_steps += 1
+        force_rollout_reset = forced_reset_cap > 0 and episode_steps >= forced_reset_cap
+        done = bool(terminated or truncated or force_rollout_reset)
+        crash_flags = info.get("controlled_vehicle_crashes", [])
+        offroad_flags = info.get("controlled_vehicle_offroad", [])
+        episode_had_crash = bool(episode_had_crash or any(bool(flag) for flag in crash_flags))
+        episode_had_offroad = bool(episode_had_offroad or any(bool(flag) for flag in offroad_flags))
 
         for i, key in enumerate(keys):
+            crashed = bool(crash_flags[i]) if i < len(crash_flags) else False
+            offroad = bool(offroad_flags[i]) if i < len(offroad_flags) else False
+            env_penalty = 0.0
+            if crashed:
+                env_penalty -= float(cfg.collision_penalty)
+            if offroad:
+                env_penalty -= float(cfg.offroad_penalty)
             transitions.append(
                 AgentTransition(
                     policy_observation=obs_agents[i].copy(),
-                    action=int(action_tuple[i]),
+                    action=(
+                        np.asarray(action_tuple[i], dtype=np.float32).copy()
+                        if _is_continuous(cfg)
+                        else int(action_tuple[i])
+                    ),
                     log_prob=float(log_probs[i].cpu().item()),
                     value=float(values[i].cpu().item()),
                     trajectory_id=int(key_to_trajectory_id[key]),
                     trajectory_state=trajectory_states[i].copy(),
+                    env_penalty=float(env_penalty),
+                    crashed=crashed,
+                    offroad=offroad,
                     done=done,
                 )
             )
 
         env_steps += 1
         if done:
+            episode_lengths.append(int(episode_steps))
+            terminated_count += int(bool(terminated))
+            truncated_count += int(bool(truncated or force_rollout_reset))
+            crash_event_count += int(episode_had_crash)
+            offroad_event_count += int(episode_had_offroad)
             episode_counter += 1
+            episode_steps = 0
+            episode_had_crash = False
+            episode_had_offroad = False
             obs, _ = env.reset()
+            episode_names.add(str(getattr(env.unwrapped, "episode_name", "")))
         else:
             obs = next_obs
         obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
 
+    if episode_steps > 0:
+        episode_lengths.append(int(episode_steps))
+        crash_event_count += int(episode_had_crash)
+        offroad_event_count += int(episode_had_offroad)
+
     policy_obs = np.stack([tr.policy_observation for tr in transitions], axis=0).astype(np.float32)
     trajectory_states = np.stack([tr.trajectory_state for tr in transitions], axis=0).astype(np.float32)
-    gen_features = discriminator_features(policy_obs, trajectory_states)
-    actions = np.asarray([tr.action for tr in transitions], dtype=np.int64)
+    actions = _actions_to_rollout_array(transitions, cfg)
     old_log_probs = np.asarray([tr.log_prob for tr in transitions], dtype=np.float32)
     old_values = np.asarray([tr.value for tr in transitions], dtype=np.float32)
     dones = np.asarray([tr.done for tr in transitions], dtype=bool)
+    env_penalties = np.asarray([tr.env_penalty for tr in transitions], dtype=np.float32)
+    crashed = np.asarray([tr.crashed for tr in transitions], dtype=bool)
+    offroad = np.asarray([tr.offroad for tr in transitions], dtype=bool)
     trajectory_ids = np.asarray([tr.trajectory_id for tr in transitions], dtype=np.int32)
+    trajectory_states = normalize_trajectory_frame(
+        trajectory_states,
+        trajectory_ids,
+        frame=cfg.trajectory_frame,
+    )
+    gen_features = discriminator_features(policy_obs, trajectory_states)
     rewards = np.zeros(len(transitions), dtype=np.float32)
     returns, advantages = compute_returns_and_advantages(rewards, old_values, dones, trajectory_ids, cfg)
     return RolloutBatch(
@@ -200,11 +389,29 @@ def collect_rollout(
         trajectory_ids=trajectory_ids,
         dones=dones,
         rewards=rewards,
+        gail_rewards_raw=np.zeros(len(transitions), dtype=np.float32),
+        gail_rewards_normalized=np.zeros(len(transitions), dtype=np.float32),
+        env_penalties=env_penalties,
         returns=returns,
         advantages=advantages,
         generator_features=gen_features,
         num_env_steps=env_steps,
         num_agent_steps=len(transitions),
+        num_episodes=len(episode_lengths),
+        num_terminated=terminated_count,
+        num_truncated=truncated_count,
+        num_crash_events=crash_event_count,
+        num_offroad_events=offroad_event_count,
+        crash_agent_fraction=float(crashed.mean()) if crashed.size else 0.0,
+        offroad_agent_fraction=float(offroad.mean()) if offroad.size else 0.0,
+        mean_env_penalty=float(env_penalties.mean()) if env_penalties.size else 0.0,
+        mean_episode_length=float(np.mean(episode_lengths)) if episode_lengths else 0.0,
+        min_episode_length=int(np.min(episode_lengths)) if episode_lengths else 0,
+        max_episode_length=int(np.max(episode_lengths)) if episode_lengths else 0,
+        unique_episode_names=len({name for name in episode_names if name}),
+        episode_names=tuple(sorted(name for name in episode_names if name)),
+        mean_controlled_vehicles=float(np.mean(controlled_counts)) if controlled_counts else 0.0,
+        mean_road_vehicles=float(np.mean(road_vehicle_counts)) if road_vehicle_counts else 0.0,
     )
 
 
@@ -222,6 +429,15 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
         trajectory_ids.append(ids)
 
     rewards = np.concatenate([batch.rewards for batch in batches], axis=0).astype(np.float32)
+    gail_rewards_raw = np.concatenate([batch.gail_rewards_raw for batch in batches], axis=0).astype(
+        np.float32
+    )
+    gail_rewards_normalized = np.concatenate(
+        [batch.gail_rewards_normalized for batch in batches], axis=0
+    ).astype(np.float32)
+    env_penalties = np.concatenate([batch.env_penalties for batch in batches], axis=0).astype(
+        np.float32
+    )
     old_values = np.concatenate([batch.old_values for batch in batches], axis=0).astype(np.float32)
     dones = np.concatenate([batch.dones for batch in batches], axis=0).astype(bool)
     merged_trajectory_ids = np.concatenate(trajectory_ids, axis=0).astype(np.int32)
@@ -236,12 +452,17 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
         policy_observations=np.concatenate([batch.policy_observations for batch in batches], axis=0).astype(
             np.float32
         ),
-        actions=np.concatenate([batch.actions for batch in batches], axis=0).astype(np.int64),
+        actions=np.concatenate([batch.actions for batch in batches], axis=0).astype(
+            np.float32 if _is_continuous(cfg) else np.int64
+        ),
         old_log_probs=np.concatenate([batch.old_log_probs for batch in batches], axis=0).astype(np.float32),
         old_values=old_values,
         trajectory_ids=merged_trajectory_ids,
         dones=dones,
         rewards=rewards,
+        gail_rewards_raw=gail_rewards_raw,
+        gail_rewards_normalized=gail_rewards_normalized,
+        env_penalties=env_penalties,
         returns=returns,
         advantages=advantages,
         generator_features=np.concatenate([batch.generator_features for batch in batches], axis=0).astype(
@@ -249,6 +470,59 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
         ),
         num_env_steps=sum(batch.num_env_steps for batch in batches),
         num_agent_steps=sum(batch.num_agent_steps for batch in batches),
+        num_episodes=sum(batch.num_episodes for batch in batches),
+        num_terminated=sum(batch.num_terminated for batch in batches),
+        num_truncated=sum(batch.num_truncated for batch in batches),
+        num_crash_events=sum(batch.num_crash_events for batch in batches),
+        num_offroad_events=sum(batch.num_offroad_events for batch in batches),
+        crash_agent_fraction=float(
+            np.average(
+                [batch.crash_agent_fraction for batch in batches],
+                weights=[max(1, batch.num_agent_steps) for batch in batches],
+            )
+        ),
+        offroad_agent_fraction=float(
+            np.average(
+                [batch.offroad_agent_fraction for batch in batches],
+                weights=[max(1, batch.num_agent_steps) for batch in batches],
+            )
+        ),
+        mean_env_penalty=float(env_penalties.mean()) if env_penalties.size else 0.0,
+        mean_raw_gail_reward=float(gail_rewards_raw.mean()) if gail_rewards_raw.size else 0.0,
+        mean_normalized_gail_reward=float(gail_rewards_normalized.mean())
+        if gail_rewards_normalized.size
+        else 0.0,
+        mean_episode_length=float(
+            np.average(
+                [batch.mean_episode_length for batch in batches],
+                weights=[max(1, batch.num_episodes) for batch in batches],
+            )
+        ),
+        min_episode_length=min(
+            [batch.min_episode_length for batch in batches if batch.min_episode_length > 0],
+            default=0,
+        ),
+        max_episode_length=max(batch.max_episode_length for batch in batches),
+        unique_episode_names=len(
+            {
+                name
+                for batch in batches
+                for name in batch.episode_names
+                if name
+            }
+        ),
+        episode_names=tuple(
+            sorted(
+                {
+                    name
+                    for batch in batches
+                    for name in batch.episode_names
+                    if name
+                }
+            )
+        ),
+        mean_controlled_vehicles=float(np.mean([batch.mean_controlled_vehicles for batch in batches])),
+        mean_road_vehicles=float(np.mean([batch.mean_road_vehicles for batch in batches])),
     )
 
 
@@ -269,7 +543,12 @@ def _rollout_worker(
         seed=int(cfg.seed) + int(worker_id),
         device="cpu",
     )
-    policy = SharedActorCritic(int(policy_obs_dim), int(cfg.hidden_size))
+    policy = SharedActorCritic(
+        int(policy_obs_dim),
+        int(cfg.hidden_size),
+        action_mode=str(cfg.action_mode),
+        continuous_action_dim=int(cfg.continuous_action_dim),
+    )
     policy.load_state_dict(policy_state_dict)
     policy.to(torch.device("cpu"))
 
@@ -333,8 +612,13 @@ def update_discriminator(
     )
     expert = expert_features[expert_idx]
     x = np.concatenate([expert, generator_features], axis=0).astype(np.float32)
+    expert_label = float(cfg.disc_expert_label)
+    generator_label = float(cfg.disc_generator_label)
     y = np.concatenate(
-        [np.ones(len(expert), dtype=np.float32), np.zeros(len(generator_features), dtype=np.float32)],
+        [
+            np.full(len(expert), expert_label, dtype=np.float32),
+            np.full(len(generator_features), generator_label, dtype=np.float32),
+        ],
         axis=0,
     )
     loader = DataLoader(
@@ -357,8 +641,8 @@ def update_discriminator(
             optimizer.step()
             with torch.no_grad():
                 pred = torch.sigmoid(logits) >= 0.5
-                expert_mask = batch_y >= 0.5
-                gen_mask = ~expert_mask
+                expert_mask = batch_y > 0.5
+                gen_mask = batch_y < 0.5
                 if expert_mask.any():
                     expert_accs.append(float((pred[expert_mask] == 1).float().mean().cpu().item()))
                 if gen_mask.any():
@@ -379,10 +663,15 @@ def update_policy(
     device: torch.device,
 ) -> dict[str, float]:
     policy.train()
+    action_tensor = (
+        torch.as_tensor(rollout.actions, dtype=torch.float32)
+        if _is_continuous(cfg)
+        else torch.as_tensor(rollout.actions, dtype=torch.long)
+    )
     loader = DataLoader(
         TensorDataset(
             torch.as_tensor(rollout.policy_observations, dtype=torch.float32),
-            torch.as_tensor(rollout.actions, dtype=torch.long),
+            action_tensor,
             torch.as_tensor(rollout.old_log_probs, dtype=torch.float32),
             torch.as_tensor(rollout.returns, dtype=torch.float32),
             torch.as_tensor(rollout.advantages, dtype=torch.float32),
@@ -400,8 +689,7 @@ def update_policy(
             old_log_probs = old_log_probs.to(device)
             returns = returns.to(device)
             advantages = advantages.to(device)
-            logits, values = policy(obs)
-            dist = Categorical(logits=logits)
+            dist, values = policy_distribution_and_values(policy, obs, cfg)
             log_probs = dist.log_prob(actions)
             ratio = torch.exp(log_probs - old_log_probs)
             policy_loss = -torch.min(

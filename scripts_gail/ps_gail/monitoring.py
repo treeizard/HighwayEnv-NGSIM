@@ -60,6 +60,16 @@ class WandbMonitor:
             return
         self._wandb.save(os.path.abspath(path), base_path=os.path.abspath(self.run_dir))
 
+    def log_video(self, key: str, path: str, *, step: int, fps: int) -> None:
+        if not self.enabled or self._wandb is None:
+            return
+        abs_path = os.path.abspath(path)
+        self._wandb.log(
+            {key: self._wandb.Video(abs_path, fps=max(1, int(fps)), format="mp4")},
+            step=int(step),
+        )
+        self.save(abs_path)
+
     def finish(self) -> None:
         if not self.enabled or self._wandb is None:
             return

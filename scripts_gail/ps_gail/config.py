@@ -8,19 +8,29 @@ class PSGAILConfig:
     expert_data: str = "expert_data/ngsim_ps_traj_expert_discrete_54902119"
     run_name: str = "simple_ps_gail"
     scene: str = "us-101"
+    action_mode: str = "discrete"
+    continuous_action_dim: int = 2
     episode_root: str = "highway_env/data/processed_20s"
     prebuilt_split: str = "train"
     seed: int = 0
 
     total_rounds: int = 10
     rollout_steps: int = 128
+    rollout_min_episodes: int = 1
+    rollout_max_episode_steps: int = 0
     num_rollout_workers: int = 1
     rollout_worker_threads: int = 1
     max_expert_samples: int = 100_000
+    trajectory_frame: str = "relative"
     max_surrounding: str | int = "all"
     control_all_vehicles: bool = True
     percentage_controlled_vehicles: float = 0.1
+    controlled_vehicle_curriculum: bool = False
+    initial_controlled_vehicle_fraction: float = 0.02
+    final_controlled_vehicle_fraction: float = 1.0
+    controlled_vehicle_curriculum_rounds: int = 100
     enable_collision: bool = True
+    terminate_when_all_controlled_crashed: bool = True
     allow_idm: bool = True
 
     cells: int = 128
@@ -39,10 +49,24 @@ class PSGAILConfig:
     batch_size: int = 1024
     disc_batch_size: int = 1024
     disc_updates_per_round: int = 4
+    disc_expert_label: float = 0.9
+    disc_generator_label: float = 0.1
     entropy_coef: float = 0.01
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
+    normalize_gail_reward: bool = True
+    gail_reward_clip: float = 5.0
+    collision_penalty: float = 2.0
+    offroad_penalty: float = 2.0
+    final_reward_clip: float = 10.0
     checkpoint_every: int = 5
+    save_checkpoint_video: bool = True
+    checkpoint_video_steps: int = 120
+    checkpoint_video_dir: str = "videos"
+    checkpoint_video_deterministic: bool = True
+    checkpoint_video_width: int = 1200
+    checkpoint_video_height: int = 608
+    checkpoint_video_scaling: float = 5.5
     device: str = "auto"
 
     wandb_mode: str = "disabled"
