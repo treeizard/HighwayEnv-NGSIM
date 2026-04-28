@@ -51,6 +51,19 @@ def make_training_env(cfg: PSGAILConfig) -> gym.Env:
         cfg.terminate_when_all_controlled_crashed
     )
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
+    env_cfg["crash_controlled_vehicles_offroad"] = True
+    action_cfg = env_cfg.get("action", {})
+    if str(cfg.action_mode).lower() == "discrete":
+        nested_action_cfg = (
+            action_cfg.get("action_config", {})
+            if action_cfg.get("type") == "MultiAgentAction"
+            else action_cfg
+        )
+        if nested_action_cfg.get("type") != "DiscreteSteerMetaAction":
+            raise RuntimeError(
+                "Discrete PS-GAIL must use DiscreteSteerMetaAction, got "
+                f"{nested_action_cfg.get('type')!r}."
+            )
     return gym.make(ENV_ID, config=env_cfg)
 
 

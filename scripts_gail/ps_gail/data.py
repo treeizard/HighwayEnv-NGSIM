@@ -9,6 +9,9 @@ import numpy as np
 from .observations import policy_observations_from_flat
 
 
+SCENE_FEATURE_DIM_PER_VEHICLE = 5
+
+
 def discriminator_features(policy_observations: np.ndarray, trajectory_states: np.ndarray) -> np.ndarray:
     policy_observations = np.asarray(policy_observations, dtype=np.float32)
     trajectory_states = np.asarray(trajectory_states, dtype=np.float32)
@@ -21,6 +24,92 @@ def discriminator_features(policy_observations: np.ndarray, trajectory_states: n
     if trajectory_states.shape[1] != 3:
         raise ValueError(f"Expected trajectory states [x, y, v], got {trajectory_states.shape}.")
     return np.concatenate([policy_observations, trajectory_states], axis=1).astype(np.float32, copy=False)
+
+
+def scene_snapshot_features(
+    vehicles: list[Any] | tuple[Any, ...],
+    *,
+    max_vehicles: int,
+    origin: np.ndarray | None = None,
+) -> np.ndarray:
+    """Encode one road snapshot as fixed top-K [presence, rel_x, rel_y, vx, vy]."""
+    max_vehicles = max(1, int(max_vehicles))
+    rows: list[tuple[float, int, np.ndarray]] = []
+    if origin is None:
+        positions = [
+            np.asarray(getattr(vehicle, "position"), dtype=np.float32)
+            for vehicle in vehicles
+            if getattr(vehicle, "position", None) is not None
+        ]
+        origin = np.mean(np.stack(positions, axis=0), axis=0) if positions else np.zeros(2, dtype=np.float32)
+    origin = np.asarray(origin, dtype=np.float32).reshape(2)
+
+    for index, vehicle in enumerate(vehicles):
+        if hasattr(vehicle, "visible") and not bool(getattr(vehicle, "visible", True)):
+            continue
+        if hasattr(vehicle, "appear") and not bool(getattr(vehicle, "appear", True)):
+            continue
+        if hasattr(vehicle, "scene_collection_is_active") and not bool(
+            getattr(vehicle, "scene_collection_is_active", True)
+        ):
+            continue
+        position = getattr(vehicle, "position", None)
+        if position is None:
+            continue
+        position_arr = np.asarray(position, dtype=np.float32).reshape(2)
+        if not np.all(np.isfinite(position_arr)):
+            continue
+        velocity = np.asarray(getattr(vehicle, "velocity", np.zeros(2, dtype=np.float32)), dtype=np.float32).reshape(2)
+        if not np.all(np.isfinite(velocity)):
+            velocity = np.zeros(2, dtype=np.float32)
+        rel = position_arr - origin
+        vehicle_id = int(getattr(vehicle, "vehicle_ID", index))
+        feature = np.asarray([1.0, rel[0], rel[1], velocity[0], velocity[1]], dtype=np.float32)
+        rows.append((float(np.linalg.norm(rel)), vehicle_id, feature))
+
+    rows.sort(key=lambda item: (item[0], item[1]))
+    out = np.zeros((max_vehicles, SCENE_FEATURE_DIM_PER_VEHICLE), dtype=np.float32)
+    for row_idx, (_dist, _vehicle_id, feature) in enumerate(rows[:max_vehicles]):
+        out[row_idx] = feature
+    return out.reshape(-1).astype(np.float32, copy=False)
+
+
+def build_sequence_windows(
+    features: np.ndarray,
+    trajectory_ids: np.ndarray,
+    *,
+    sequence_length: int,
+    stride: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    features = np.asarray(features, dtype=np.float32)
+    trajectory_ids = np.asarray(trajectory_ids)
+    if features.ndim != 2:
+        raise ValueError(f"Expected rank-2 features, got {features.shape}.")
+    if len(features) != len(trajectory_ids):
+        raise ValueError(
+            f"Feature/trajectory id count mismatch: {len(features)} != {len(trajectory_ids)}."
+        )
+    sequence_length = max(1, int(sequence_length))
+    stride = max(1, int(stride))
+    windows: list[np.ndarray] = []
+    last_indices: list[int] = []
+    for trajectory_id in np.unique(trajectory_ids):
+        indices = np.flatnonzero(trajectory_ids == trajectory_id)
+        if indices.size < sequence_length:
+            continue
+        for start in range(0, indices.size - sequence_length + 1, stride):
+            window_indices = indices[start : start + sequence_length]
+            windows.append(features[window_indices])
+            last_indices.append(int(window_indices[-1]))
+    if not windows:
+        return (
+            np.zeros((0, sequence_length, features.shape[1]), dtype=np.float32),
+            np.zeros((0,), dtype=np.int64),
+        )
+    return (
+        np.stack(windows, axis=0).astype(np.float32, copy=False),
+        np.asarray(last_indices, dtype=np.int64),
+    )
 
 
 def normalize_trajectory_frame(
@@ -211,3 +300,101 @@ def load_expert_policy_and_disc_data(
         "episodes": metadata_items,
     }
     return policy_obs, features, metadata
+
+
+def load_expert_scene_data(
+    path: str,
+    *,
+    max_samples: int = 100_000,
+    seed: int = 0,
+    scene_max_vehicles: int = 64,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    rng = np.random.default_rng(seed)
+    files = _dataset_files(path)
+    parts: list[np.ndarray] = []
+    for file_path in files:
+        with np.load(file_path, allow_pickle=True) as data:
+            if "scene_features" not in data.files:
+                raise KeyError(
+                    f"{file_path} is missing scene_features. Rebuild the expert data with the updated "
+                    "scripts_gail/build_ps_traj_expert_discrete.py before enabling the scene discriminator."
+                )
+            scene = np.asarray(data["scene_features"], dtype=np.float32)
+            if scene.ndim != 2:
+                raise ValueError(f"{file_path} scene_features must be rank-2, got {scene.shape}.")
+            expected_dim = int(scene_max_vehicles) * SCENE_FEATURE_DIM_PER_VEHICLE
+            if scene.shape[1] != expected_dim:
+                raise ValueError(
+                    f"{file_path} scene feature dim {scene.shape[1]} does not match configured "
+                    f"scene_max_vehicles={scene_max_vehicles} ({expected_dim})."
+                )
+            if len(scene):
+                parts.append(scene)
+    if not parts:
+        raise RuntimeError(f"No expert scene features were loaded from {path}.")
+    features = np.concatenate(parts, axis=0).astype(np.float32, copy=False)
+    source_samples = int(len(features))
+    if 0 < int(max_samples) < source_samples:
+        idx = np.sort(rng.choice(source_samples, size=int(max_samples), replace=False))
+        features = features[idx]
+    return features, {
+        "num_scene_samples": int(len(features)),
+        "num_source_scene_samples": source_samples,
+        "scene_feature_dim": int(features.shape[1]),
+    }
+
+
+def load_expert_sequence_data(
+    path: str,
+    *,
+    max_samples: int = 100_000,
+    seed: int = 0,
+    trajectory_frame: str = "relative",
+    sequence_length: int = 8,
+    sequence_stride: int = 1,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    rng = np.random.default_rng(seed)
+    files = _dataset_files(path)
+    windows: list[np.ndarray] = []
+    source_windows = 0
+    for file_idx, file_path in enumerate(files):
+        with np.load(file_path, allow_pickle=True) as data:
+            required = {"observations", "trajectory_states", "vehicle_ids"}
+            missing = sorted(required.difference(data.files))
+            if missing:
+                raise KeyError(f"{file_path} is missing arrays for sequence discriminator: {missing}")
+            obs = policy_observations_from_flat(np.asarray(data["observations"], dtype=np.float32))
+            traj = normalize_trajectory_frame(
+                np.asarray(data["trajectory_states"], dtype=np.float32),
+                np.asarray(data["vehicle_ids"]),
+                frame=trajectory_frame,
+            )
+            features = discriminator_features(obs, traj)
+            vehicle_ids = np.asarray(data["vehicle_ids"], dtype=np.int64)
+            trajectory_ids = np.asarray(
+                [f"{file_idx}:{int(vehicle_id)}" for vehicle_id in vehicle_ids],
+                dtype=object,
+            )
+            file_windows, _last_indices = build_sequence_windows(
+                features,
+                trajectory_ids,
+                sequence_length=sequence_length,
+                stride=sequence_stride,
+            )
+            source_windows += int(len(file_windows))
+            if len(file_windows):
+                windows.append(file_windows)
+    if not windows:
+        raise RuntimeError(
+            f"No expert sequence windows of length {sequence_length} were built from {path}."
+        )
+    sequences = np.concatenate(windows, axis=0).astype(np.float32, copy=False)
+    if 0 < int(max_samples) < len(sequences):
+        idx = np.sort(rng.choice(len(sequences), size=int(max_samples), replace=False))
+        sequences = sequences[idx]
+    return sequences, {
+        "num_sequence_samples": int(len(sequences)),
+        "num_source_sequence_samples": int(source_windows),
+        "sequence_length": int(sequence_length),
+        "sequence_feature_dim": int(sequences.shape[-1]),
+    }

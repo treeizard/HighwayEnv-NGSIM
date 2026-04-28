@@ -57,3 +57,28 @@ class TrajectoryDiscriminator(nn.Module):
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.net(features).squeeze(-1)
+
+
+class SceneDiscriminator(TrajectoryDiscriminator):
+    """MLP discriminator for one full-road traffic snapshot."""
+
+
+class SequenceTrajectoryDiscriminator(nn.Module):
+    """Autoregressive discriminator over fixed-length trajectory feature windows."""
+
+    def __init__(self, input_dim: int, hidden_size: int) -> None:
+        super().__init__()
+        self.encoder = nn.GRU(
+            input_size=int(input_dim),
+            hidden_size=int(hidden_size),
+            batch_first=True,
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        _sequence, hidden = self.encoder(features)
+        return self.head(hidden[-1]).squeeze(-1)

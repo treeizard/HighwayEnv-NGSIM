@@ -36,6 +36,7 @@ from highway_env.imitation.expert_dataset import (  # noqa: E402
 from highway_env.ngsim_utils.data.trajectory_gen import (  # noqa: E402
     trajectory_row_is_active,
 )
+from scripts_gail.ps_gail.data import scene_snapshot_features  # noqa: E402
 
 
 SCHEMA_VERSION = 2
@@ -77,6 +78,12 @@ def parse_args() -> argparse.Namespace:
         help="Cap per-step samples per vehicle. Use 0 for no per-vehicle cap.",
     )
     parser.add_argument("--max-surrounding", default="all")
+    parser.add_argument(
+        "--scene-max-vehicles",
+        type=int,
+        default=64,
+        help="Maximum number of road vehicles encoded in each full-scene discriminator snapshot.",
+    )
     parser.add_argument(
         "--control-all-vehicles",
         action="store_true",
@@ -422,6 +429,8 @@ def collect_expert_episode(
     timesteps: list[int] = []
     dones: list[bool] = []
     rewards: list[float] = []
+    scene_features: list[np.ndarray] = []
+    scene_timesteps: list[int] = []
     frames: list[np.ndarray] = []
 
     max_per_vehicle = int(args.max_samples_per_vehicle)
@@ -454,6 +463,26 @@ def collect_expert_episode(
             step_index = int(base.steps)
             obs_agents = flatten_agent_observations(current_obs)
             vehicles = getattr(base, "controlled_vehicles", ())
+            active_controlled_positions = [
+                np.asarray(vehicle.position, dtype=np.float32)
+                for vehicle in vehicles
+                if bool(getattr(vehicle, "scene_collection_is_active", True))
+                and getattr(vehicle, "position", None) is not None
+            ]
+            scene_origin = (
+                np.mean(np.stack(active_controlled_positions, axis=0), axis=0)
+                if active_controlled_positions
+                else None
+            )
+            road = getattr(base, "road", None)
+            scene_features.append(
+                scene_snapshot_features(
+                    list(getattr(road, "vehicles", ())) if road is not None else [],
+                    max_vehicles=int(args.scene_max_vehicles),
+                    origin=scene_origin,
+                )
+            )
+            scene_timesteps.append(step_index)
             if len(obs_agents) != len(vehicles):
                 raise RuntimeError(
                     "Expert collection observation/vehicle mismatch: "
@@ -549,6 +578,8 @@ def collect_expert_episode(
         "timesteps": np.asarray(timesteps, dtype=np.int64),
         "dones": np.asarray(dones, dtype=bool),
         "rewards": np.asarray(rewards, dtype=np.float32),
+        "scene_features": np.stack(scene_features, axis=0).astype(np.float32, copy=False),
+        "scene_timesteps": np.asarray(scene_timesteps, dtype=np.int64),
     }
     metadata = {
         "episode_name": episode_name,
@@ -558,6 +589,8 @@ def collect_expert_episode(
         "trajectory_state_shape": list(traj_arr.shape[1:]),
         "trajectory_state_dim": int(traj_arr.shape[1]),
         "feature_dim": int(feature_arr.shape[1]),
+        "scene_feature_dim": int(arrays["scene_features"].shape[1]),
+        "scene_max_vehicles": int(args.scene_max_vehicles),
         "controlled_vehicle_ids": sorted({int(v) for v in vehicle_ids}),
         "video_requested": bool(args.save_video),
     }
@@ -602,13 +635,13 @@ def _aggregate_saved_episode_datasets(paths: list[str]) -> tuple[np.ndarray, dic
     for name, parts in arrays_per_key.items():
         if name == "features":
             arrays[name] = np.concatenate([np.asarray(part, dtype=np.float32) for part in parts], axis=0)
-        elif name in {"observations", "next_observations", "trajectory_states"}:
+        elif name in {"observations", "next_observations", "trajectory_states", "scene_features"}:
             arrays[name] = np.concatenate([np.asarray(part, dtype=np.float32) for part in parts], axis=0)
         elif name == "rewards":
             arrays[name] = np.concatenate([np.asarray(part, dtype=np.float32) for part in parts], axis=0)
         elif name == "dones":
             arrays[name] = np.concatenate([np.asarray(part, dtype=bool) for part in parts], axis=0)
-        elif name in {"vehicle_ids", "timesteps"}:
+        elif name in {"vehicle_ids", "timesteps", "scene_timesteps"}:
             arrays[name] = np.concatenate([np.asarray(part, dtype=np.int64) for part in parts], axis=0)
         else:
             arrays[name] = np.concatenate(parts, axis=0)
@@ -627,6 +660,9 @@ def _aggregate_saved_episode_datasets(paths: list[str]) -> tuple[np.ndarray, dic
         "trajectory_state_shape": list(trajectory_states.shape[1:]),
         "trajectory_state_dim": int(trajectory_states.shape[1]),
         "feature_dim": int(features.shape[1]),
+        "scene_feature_dim": int(np.asarray(arrays["scene_features"]).shape[1])
+        if "scene_features" in arrays
+        else None,
         "episodes": metadata_items,
     }
     return features, metadata, arrays
@@ -762,6 +798,7 @@ def main() -> None:
                 "observation_dim": int(arrays["observations"].shape[1]),
                 "trajectory_state_dim": int(arrays["trajectory_states"].shape[1]),
                 "feature_dim": int(arrays["features"].shape[1]),
+                "scene_feature_dim": int(arrays["scene_features"].shape[1]),
             }
         )
         print(f"Saved episode dataset to: {output_path}")
@@ -779,6 +816,7 @@ def main() -> None:
         "allow_idm": bool(args.allow_idm),
         "control_all_vehicles": bool(args.control_all_vehicles),
         "percentage_controlled_vehicles": float(args.percentage_controlled_vehicles),
+        "scene_max_vehicles": int(args.scene_max_vehicles),
         "num_episodes": len(manifest_entries),
         "num_samples": int(total_samples),
         "episodes": manifest_entries,

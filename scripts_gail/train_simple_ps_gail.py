@@ -17,10 +17,19 @@ if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
 from scripts_gail.ps_gail.config import PSGAILConfig
-from scripts_gail.ps_gail.data import load_expert_policy_and_disc_data
+from scripts_gail.ps_gail.data import (
+    load_expert_policy_and_disc_data,
+    load_expert_scene_data,
+    load_expert_sequence_data,
+)
 from scripts_gail.ps_gail.envs import make_training_env
 from scripts_gail.ps_gail.monitoring import WandbMonitor
-from scripts_gail.ps_gail.models import SharedActorCritic, TrajectoryDiscriminator
+from scripts_gail.ps_gail.models import (
+    SceneDiscriminator,
+    SequenceTrajectoryDiscriminator,
+    SharedActorCritic,
+    TrajectoryDiscriminator,
+)
 from scripts_gail.ps_gail.observations import flatten_agent_observations, policy_observations_from_flat
 from scripts_gail.ps_gail.trainer import (
     collect_rollouts,
@@ -198,6 +207,26 @@ def main() -> None:
             seed=cfg.seed,
             trajectory_frame=cfg.trajectory_frame,
         )
+        expert_scene_features = None
+        expert_scene_metadata = {}
+        if bool(cfg.enable_scene_discriminator):
+            expert_scene_features, expert_scene_metadata = load_expert_scene_data(
+                cfg.expert_data,
+                max_samples=cfg.max_expert_samples,
+                seed=cfg.seed,
+                scene_max_vehicles=cfg.scene_max_vehicles,
+            )
+        expert_sequence_features = None
+        expert_sequence_metadata = {}
+        if bool(cfg.enable_sequence_discriminator):
+            expert_sequence_features, expert_sequence_metadata = load_expert_sequence_data(
+                cfg.expert_data,
+                max_samples=cfg.max_expert_samples,
+                seed=cfg.seed,
+                trajectory_frame=cfg.trajectory_frame,
+                sequence_length=cfg.sequence_length,
+                sequence_stride=cfg.sequence_stride,
+            )
         env_cfg = config_for_round(cfg, 1)
         env = make_training_env(env_cfg)
         if str(env_cfg.action_mode).lower() == "continuous":
@@ -219,8 +248,31 @@ def main() -> None:
             continuous_action_dim=int(cfg.continuous_action_dim),
         ).to(device)
         discriminator = TrajectoryDiscriminator(feature_dim, cfg.hidden_size).to(device)
+        scene_discriminator = (
+            SceneDiscriminator(int(expert_scene_features.shape[1]), cfg.hidden_size).to(device)
+            if expert_scene_features is not None
+            else None
+        )
+        sequence_discriminator = (
+            SequenceTrajectoryDiscriminator(
+                int(expert_sequence_features.shape[-1]),
+                cfg.hidden_size,
+            ).to(device)
+            if expert_sequence_features is not None
+            else None
+        )
         policy_optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.learning_rate)
         disc_optimizer = torch.optim.Adam(discriminator.parameters(), lr=cfg.disc_learning_rate)
+        scene_disc_optimizer = (
+            torch.optim.Adam(scene_discriminator.parameters(), lr=cfg.disc_learning_rate)
+            if scene_discriminator is not None
+            else None
+        )
+        sequence_disc_optimizer = (
+            torch.optim.Adam(sequence_discriminator.parameters(), lr=cfg.disc_learning_rate)
+            if sequence_discriminator is not None
+            else None
+        )
         monitor.watch(policy, discriminator)
 
         print(f"Loaded expert folder: {os.path.abspath(cfg.expert_data)}")
@@ -242,6 +294,20 @@ def main() -> None:
             f"rollout_workers={cfg.num_rollout_workers} "
             f"rollout_worker_threads={cfg.rollout_worker_threads}"
         )
+        if expert_scene_features is not None:
+            print(
+                "scene_discriminator="
+                f"samples={expert_scene_metadata.get('num_scene_samples')} "
+                f"feature_dim={expert_scene_metadata.get('scene_feature_dim')} "
+                f"max_vehicles={cfg.scene_max_vehicles}"
+            )
+        if expert_sequence_features is not None:
+            print(
+                "sequence_discriminator="
+                f"samples={expert_sequence_metadata.get('num_sequence_samples')} "
+                f"length={expert_sequence_metadata.get('sequence_length')} "
+                f"feature_dim={expert_sequence_metadata.get('sequence_feature_dim')}"
+            )
         if cfg.controlled_vehicle_curriculum:
             print(
                 "controlled_vehicle_curriculum="
@@ -275,7 +341,45 @@ def main() -> None:
                 round_cfg,
                 device,
             )
-            rollout = refresh_rollout_rewards(rollout, discriminator, round_cfg, device)
+            scene_disc_stats = {}
+            if scene_discriminator is not None:
+                if scene_disc_optimizer is None or expert_scene_features is None:
+                    raise RuntimeError("Scene discriminator was enabled without optimizer/expert features.")
+                if not rollout.scene_features.size:
+                    raise RuntimeError("Scene discriminator was enabled but rollout produced no scene features.")
+                scene_disc_stats = update_discriminator(
+                    scene_discriminator,
+                    scene_disc_optimizer,
+                    expert_scene_features,
+                    rollout.scene_features,
+                    round_cfg,
+                    device,
+                )
+            sequence_disc_stats = {}
+            if sequence_discriminator is not None:
+                if sequence_disc_optimizer is None or expert_sequence_features is None:
+                    raise RuntimeError("Sequence discriminator was enabled without optimizer/expert features.")
+                if not rollout.sequence_features.size:
+                    raise RuntimeError(
+                        "Sequence discriminator was enabled but rollout produced no sequence windows. "
+                        "Lower --sequence-length or collect longer rollout episodes."
+                    )
+                sequence_disc_stats = update_discriminator(
+                    sequence_discriminator,
+                    sequence_disc_optimizer,
+                    expert_sequence_features,
+                    rollout.sequence_features,
+                    round_cfg,
+                    device,
+                )
+            rollout = refresh_rollout_rewards(
+                rollout,
+                discriminator,
+                round_cfg,
+                device,
+                scene_discriminator=scene_discriminator,
+                sequence_discriminator=sequence_discriminator,
+            )
             policy_stats = update_policy(policy, policy_optimizer, rollout, round_cfg, device)
 
             print(
@@ -290,6 +394,27 @@ def main() -> None:
                 f"ctrl_frac={round_cfg.percentage_controlled_vehicles:.4f} "
                 f"veh={rollout.mean_controlled_vehicles:.1f}/{rollout.mean_road_vehicles:.1f} "
                 f"disc_loss={disc_stats['disc_loss']:.4f} "
+                + (
+                    f"scene_disc_loss={scene_disc_stats['disc_loss']:.4f} "
+                    if scene_disc_stats
+                    else ""
+                )
+                + (
+                    f"seq_disc_loss={sequence_disc_stats['disc_loss']:.4f} "
+                    if sequence_disc_stats
+                    else ""
+                )
+                + (
+                    f"scene_n={len(rollout.scene_features)} "
+                    if scene_discriminator is not None
+                    else ""
+                )
+                + (
+                    f"seq_n={len(rollout.sequence_features)} "
+                    if sequence_discriminator is not None
+                    else ""
+                )
+                + (
                 f"expert_acc={disc_stats['expert_acc']:.3f} gen_acc={disc_stats['gen_acc']:.3f} "
                 f"policy_loss={policy_stats['policy_loss']:.4f} "
                 f"value_loss={policy_stats['value_loss']:.4f} "
@@ -298,47 +423,67 @@ def main() -> None:
                 f"norm_gail={rollout.mean_normalized_gail_reward:.4f} "
                 f"env_penalty={rollout.mean_env_penalty:.4f} "
                 f"reward={float(rollout.rewards.mean()):.4f}"
+                )
             )
+            metrics = {
+                "round": round_idx,
+                "rollout/env_steps": rollout.num_env_steps,
+                "rollout/agent_steps": rollout.num_agent_steps,
+                "rollout/episodes": rollout.num_episodes,
+                "rollout/terminated": rollout.num_terminated,
+                "rollout/truncated": rollout.num_truncated,
+                "rollout/crash_episodes": rollout.num_crash_events,
+                "rollout/offroad_episodes": rollout.num_offroad_events,
+                "rollout/crash_agent_fraction": rollout.crash_agent_fraction,
+                "rollout/offroad_agent_fraction": rollout.offroad_agent_fraction,
+                "rollout/mean_episode_length": rollout.mean_episode_length,
+                "rollout/min_episode_length": rollout.min_episode_length,
+                "rollout/max_episode_length": rollout.max_episode_length,
+                "rollout/unique_episode_names": rollout.unique_episode_names,
+                "rollout/controlled_vehicle_fraction": float(round_cfg.percentage_controlled_vehicles),
+                "rollout/mean_controlled_vehicles": rollout.mean_controlled_vehicles,
+                "rollout/mean_road_vehicles": rollout.mean_road_vehicles,
+                "rollout/scene_samples": int(len(rollout.scene_features)),
+                "rollout/sequence_samples": int(len(rollout.sequence_features)),
+                "rollout/mean_gail_reward": float(rollout.rewards.mean()),
+                "rollout/mean_raw_gail_reward": rollout.mean_raw_gail_reward,
+                "rollout/mean_normalized_gail_reward": rollout.mean_normalized_gail_reward,
+                "rollout/mean_env_penalty": rollout.mean_env_penalty,
+                "rollout/reward_std": float(rollout.rewards.std()),
+                "rollout/raw_gail_reward_std": float(rollout.gail_rewards_raw.std()),
+                "rollout/normalized_gail_reward_std": float(rollout.gail_rewards_normalized.std()),
+                "rollout/action_mean": float(rollout.actions.mean()),
+                "rollout/action_std": float(rollout.actions.std()),
+                "discriminator/loss": disc_stats["disc_loss"],
+                "discriminator/expert_acc": disc_stats["expert_acc"],
+                "discriminator/gen_acc": disc_stats["gen_acc"],
+                "policy/loss": policy_stats["policy_loss"],
+                "policy/value_loss": policy_stats["value_loss"],
+                "policy/entropy": policy_stats["entropy"],
+                "train/policy_obs_dim": policy_obs_dim,
+                "train/disc_feature_dim": feature_dim,
+                "train/expert_samples": int(expert_features.shape[0]),
+                "train/rollout_workers": int(cfg.num_rollout_workers),
+                "train/rollout_worker_threads": int(cfg.rollout_worker_threads),
+            }
+            if scene_disc_stats:
+                metrics.update(
+                    {
+                        "scene_discriminator/loss": scene_disc_stats["disc_loss"],
+                        "scene_discriminator/expert_acc": scene_disc_stats["expert_acc"],
+                        "scene_discriminator/gen_acc": scene_disc_stats["gen_acc"],
+                    }
+                )
+            if sequence_disc_stats:
+                metrics.update(
+                    {
+                        "sequence_discriminator/loss": sequence_disc_stats["disc_loss"],
+                        "sequence_discriminator/expert_acc": sequence_disc_stats["expert_acc"],
+                        "sequence_discriminator/gen_acc": sequence_disc_stats["gen_acc"],
+                    }
+                )
             monitor.log(
-                {
-                    "round": round_idx,
-                    "rollout/env_steps": rollout.num_env_steps,
-                    "rollout/agent_steps": rollout.num_agent_steps,
-                    "rollout/episodes": rollout.num_episodes,
-                    "rollout/terminated": rollout.num_terminated,
-                    "rollout/truncated": rollout.num_truncated,
-                    "rollout/crash_episodes": rollout.num_crash_events,
-                    "rollout/offroad_episodes": rollout.num_offroad_events,
-                    "rollout/crash_agent_fraction": rollout.crash_agent_fraction,
-                    "rollout/offroad_agent_fraction": rollout.offroad_agent_fraction,
-                    "rollout/mean_episode_length": rollout.mean_episode_length,
-                    "rollout/min_episode_length": rollout.min_episode_length,
-                    "rollout/max_episode_length": rollout.max_episode_length,
-                    "rollout/unique_episode_names": rollout.unique_episode_names,
-                    "rollout/controlled_vehicle_fraction": float(round_cfg.percentage_controlled_vehicles),
-                    "rollout/mean_controlled_vehicles": rollout.mean_controlled_vehicles,
-                    "rollout/mean_road_vehicles": rollout.mean_road_vehicles,
-                    "rollout/mean_gail_reward": float(rollout.rewards.mean()),
-                    "rollout/mean_raw_gail_reward": rollout.mean_raw_gail_reward,
-                    "rollout/mean_normalized_gail_reward": rollout.mean_normalized_gail_reward,
-                    "rollout/mean_env_penalty": rollout.mean_env_penalty,
-                    "rollout/reward_std": float(rollout.rewards.std()),
-                    "rollout/raw_gail_reward_std": float(rollout.gail_rewards_raw.std()),
-                    "rollout/normalized_gail_reward_std": float(rollout.gail_rewards_normalized.std()),
-                    "rollout/action_mean": float(rollout.actions.mean()),
-                    "rollout/action_std": float(rollout.actions.std()),
-                    "discriminator/loss": disc_stats["disc_loss"],
-                    "discriminator/expert_acc": disc_stats["expert_acc"],
-                    "discriminator/gen_acc": disc_stats["gen_acc"],
-                    "policy/loss": policy_stats["policy_loss"],
-                    "policy/value_loss": policy_stats["value_loss"],
-                    "policy/entropy": policy_stats["entropy"],
-                    "train/policy_obs_dim": policy_obs_dim,
-                    "train/disc_feature_dim": feature_dim,
-                    "train/expert_samples": int(expert_features.shape[0]),
-                    "train/rollout_workers": int(cfg.num_rollout_workers),
-                    "train/rollout_worker_threads": int(cfg.rollout_worker_threads),
-                },
+                metrics,
                 step=round_idx,
             )
 
@@ -349,6 +494,12 @@ def main() -> None:
                         "round": round_idx,
                         "policy_state_dict": policy.state_dict(),
                         "discriminator_state_dict": discriminator.state_dict(),
+                        "scene_discriminator_state_dict": scene_discriminator.state_dict()
+                        if scene_discriminator is not None
+                        else None,
+                        "sequence_discriminator_state_dict": sequence_discriminator.state_dict()
+                        if sequence_discriminator is not None
+                        else None,
                         "config": vars(cfg),
                         "round_config": vars(round_cfg),
                     },
@@ -376,6 +527,12 @@ def main() -> None:
                 "round": int(cfg.total_rounds),
                 "policy_state_dict": policy.state_dict(),
                 "discriminator_state_dict": discriminator.state_dict(),
+                "scene_discriminator_state_dict": scene_discriminator.state_dict()
+                if scene_discriminator is not None
+                else None,
+                "sequence_discriminator_state_dict": sequence_discriminator.state_dict()
+                if sequence_discriminator is not None
+                else None,
                 "config": vars(cfg),
                 "round_config": vars(config_for_round(cfg, int(cfg.total_rounds))),
             },

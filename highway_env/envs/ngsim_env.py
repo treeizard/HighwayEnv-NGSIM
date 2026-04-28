@@ -151,6 +151,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 "truncate_to_trajectory_length": False, # allow for replay
                 "scene_dataset_collection_mode": False,
                 "disable_controlled_vehicle_collisions": False,
+                "crash_controlled_vehicles_offroad": True,
                 "disable_scene_collection_spawn_safety": False,
                 "allow_idm": True,
                 "controlled_vehicle_min_occupancy": 0.8,
@@ -299,6 +300,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
 
             self.road.act()
             self.road.step(dt)
+            self._crash_offroad_controlled_vehicles()
             self._prune_removed_vehicles()
             self.steps += 1
 
@@ -306,6 +308,23 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 self._automatic_rendering()
 
         self.enable_auto_render = False
+
+    def _crash_offroad_controlled_vehicles(self) -> None:
+        if (
+            not bool(self.config.get("crash_controlled_vehicles_offroad", True))
+            or self.scene_dataset_collection_mode
+            or self.expert_test_mode
+        ):
+            return
+        for vehicle in list(getattr(self, "controlled_vehicles", ())):
+            if vehicle is None or bool(getattr(vehicle, "crashed", False)):
+                continue
+            try:
+                is_on_road = bool(getattr(vehicle, "on_road", True))
+            except Exception:
+                is_on_road = False
+            if not is_on_road:
+                vehicle.crashed = True
 
     # -------------------------------------------------------------------------
     # LOAD TRAJECTORY

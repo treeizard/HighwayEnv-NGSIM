@@ -7,6 +7,17 @@ This package is a small modular trainer for the NGSIM discrete meta-action setup
 - Discriminator input: policy observation + trajectory state `[x, y, v]`.
 - Discriminator does not receive the discrete meta action.
 - Generator environment defaults to `enable_collision=True` and `allow_idm=True`.
+- Optional scene discriminator: fixed-size full-road snapshots encoded as
+  top-K `[presence, rel_x, rel_y, vx, vy]` road-vehicle rows. Rebuild expert
+  data with the current `build_ps_traj_expert_discrete.py` so `scene_features`
+  are present before enabling this.
+- Optional sequence discriminator: GRU over fixed-length windows of the normal
+  discriminator feature, grouped by vehicle trajectory id.
+- Generator rollouts collect complete random NGSIM episodes by default. With the
+  default `max_episode_steps=200`, `--rollout-min-episodes 4` means four full
+  200-step episodes per training round, split across rollout workers.
+- Training starts from 20% controlled vehicles by default, and the curriculum
+  default initial fraction is also 20%.
 
 Run a quick demonstration:
 
@@ -14,7 +25,8 @@ Run a quick demonstration:
 MPLCONFIGDIR=/tmp python scripts_gail/train_simple_ps_gail.py \
   --expert-data expert_data/ngsim_ps_traj_expert_discrete_54902119 \
   --total-rounds 10 \
-  --rollout-steps 128 \
+  --rollout-steps 200 \
+  --rollout-min-episodes 4 \
   --max-expert-samples 100000 \
   --run-name ps_gail_collision_idm
 ```
@@ -45,4 +57,11 @@ MPLCONFIGDIR=/tmp python scripts_gail/train_simple_ps_gail.py \
   --disc-updates-per-round 1 \
   --ppo-epochs 1 \
   --run-name smoke
+```
+
+Check the dual-discriminator setup on SLURM:
+
+```bash
+sbatch slurum/check_build_ps_gail_dual_disc_expert.bash
+sbatch slurum/check_train_simple_ps_gail_dual_disc_gpu_32c.bash
 ```

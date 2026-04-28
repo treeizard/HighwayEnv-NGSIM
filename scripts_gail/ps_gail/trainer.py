@@ -14,7 +14,7 @@ from torch.distributions import Categorical, Independent, Normal
 from torch.utils.data import DataLoader, TensorDataset
 
 from .config import PSGAILConfig
-from .data import discriminator_features, normalize_trajectory_frame
+from .data import build_sequence_windows, discriminator_features, normalize_trajectory_frame, scene_snapshot_features
 from .envs import controlled_vehicle_snapshot, make_training_env
 from .models import SharedActorCritic, TrajectoryDiscriminator
 from .observations import flatten_agent_observations, policy_observations_from_flat
@@ -28,6 +28,7 @@ class AgentTransition:
     value: float
     trajectory_id: int
     trajectory_state: np.ndarray
+    scene_index: int
     env_penalty: float
     crashed: bool
     offroad: bool
@@ -49,6 +50,10 @@ class RolloutBatch:
     returns: np.ndarray
     advantages: np.ndarray
     generator_features: np.ndarray
+    scene_features: np.ndarray
+    transition_scene_indices: np.ndarray
+    sequence_features: np.ndarray
+    sequence_last_indices: np.ndarray
     num_env_steps: int
     num_agent_steps: int
     num_episodes: int = 0
@@ -167,7 +172,7 @@ def compute_returns_and_advantages(
 
 
 def discriminator_reward(
-    discriminator: TrajectoryDiscriminator,
+    discriminator: nn.Module,
     generator_features: np.ndarray,
     device: torch.device,
 ) -> np.ndarray:
@@ -201,15 +206,49 @@ def shape_rollout_rewards(
     return rewards.astype(np.float32), shaped_gail.astype(np.float32)
 
 
+def _target_rollout_episodes(cfg: PSGAILConfig) -> int:
+    target = max(1, int(cfg.rollout_min_episodes))
+    if bool(getattr(cfg, "rollout_full_episodes", True)):
+        max_episode_steps = int(cfg.max_episode_steps)
+        if max_episode_steps > 0:
+            target = max(target, int(np.ceil(max(1, int(cfg.rollout_steps)) / max_episode_steps)))
+    return target
+
+
 def refresh_rollout_rewards(
     rollout: RolloutBatch,
     discriminator: TrajectoryDiscriminator,
     cfg: PSGAILConfig,
     device: torch.device,
+    *,
+    scene_discriminator: nn.Module | None = None,
+    sequence_discriminator: nn.Module | None = None,
 ) -> RolloutBatch:
     raw_gail_rewards = discriminator_reward(discriminator, rollout.generator_features, device)
+    combined_raw_gail_rewards = raw_gail_rewards.astype(np.float32, copy=True)
+    if scene_discriminator is not None and rollout.scene_features.size:
+        scene_rewards = discriminator_reward(scene_discriminator, rollout.scene_features, device)
+        scene_rewards = scene_rewards * float(cfg.scene_reward_coef)
+        valid = (
+            (rollout.transition_scene_indices >= 0)
+            & (rollout.transition_scene_indices < len(scene_rewards))
+        )
+        combined_raw_gail_rewards[valid] += scene_rewards[rollout.transition_scene_indices[valid]]
+    if sequence_discriminator is not None and rollout.sequence_features.size:
+        sequence_rewards = discriminator_reward(sequence_discriminator, rollout.sequence_features, device)
+        sequence_rewards = sequence_rewards * float(cfg.sequence_reward_coef)
+        per_transition = np.zeros_like(combined_raw_gail_rewards, dtype=np.float32)
+        counts = np.zeros_like(combined_raw_gail_rewards, dtype=np.float32)
+        for reward, last_idx in zip(sequence_rewards, rollout.sequence_last_indices):
+            last_idx = int(last_idx)
+            if 0 <= last_idx < len(per_transition):
+                per_transition[last_idx] += float(reward)
+                counts[last_idx] += 1.0
+        mask = counts > 0
+        per_transition[mask] /= counts[mask]
+        combined_raw_gail_rewards += per_transition
     rewards, normalized_gail_rewards = shape_rollout_rewards(
-        raw_gail_rewards,
+        combined_raw_gail_rewards,
         rollout.env_penalties,
         cfg,
     )
@@ -228,12 +267,16 @@ def refresh_rollout_rewards(
         trajectory_ids=rollout.trajectory_ids,
         dones=rollout.dones,
         rewards=rewards,
-        gail_rewards_raw=raw_gail_rewards,
+        gail_rewards_raw=combined_raw_gail_rewards,
         gail_rewards_normalized=normalized_gail_rewards,
         env_penalties=rollout.env_penalties,
         returns=returns,
         advantages=advantages,
         generator_features=rollout.generator_features,
+        scene_features=rollout.scene_features,
+        transition_scene_indices=rollout.transition_scene_indices,
+        sequence_features=rollout.sequence_features,
+        sequence_last_indices=rollout.sequence_last_indices,
         num_env_steps=rollout.num_env_steps,
         num_agent_steps=rollout.num_agent_steps,
         num_episodes=rollout.num_episodes,
@@ -244,7 +287,7 @@ def refresh_rollout_rewards(
         crash_agent_fraction=rollout.crash_agent_fraction,
         offroad_agent_fraction=rollout.offroad_agent_fraction,
         mean_env_penalty=float(rollout.env_penalties.mean()) if rollout.env_penalties.size else 0.0,
-        mean_raw_gail_reward=float(raw_gail_rewards.mean()) if raw_gail_rewards.size else 0.0,
+        mean_raw_gail_reward=float(combined_raw_gail_rewards.mean()) if combined_raw_gail_rewards.size else 0.0,
         mean_normalized_gail_reward=float(normalized_gail_rewards.mean()) if normalized_gail_rewards.size else 0.0,
         mean_episode_length=rollout.mean_episode_length,
         min_episode_length=rollout.min_episode_length,
@@ -267,6 +310,7 @@ def collect_rollout(
     obs, _ = env.reset(seed=int(cfg.seed if seed is None else seed))
     obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
     transitions: list[AgentTransition] = []
+    scene_features: list[np.ndarray] = []
     key_to_trajectory_id: dict[tuple[int, int], int] = {}
     episode_counter = 0
     env_steps = 0
@@ -282,14 +326,38 @@ def collect_rollout(
     episode_had_crash = False
     episode_had_offroad = False
 
-    forced_reset_cap = int(cfg.rollout_max_episode_steps)
-    min_episodes = max(1, int(cfg.rollout_min_episodes))
+    collect_full_episodes = bool(getattr(cfg, "rollout_full_episodes", True))
+    forced_reset_cap = 0 if collect_full_episodes else int(cfg.rollout_max_episode_steps)
+    target_episodes = _target_rollout_episodes(cfg)
 
-    while env_steps < int(cfg.rollout_steps) or len(episode_lengths) < min_episodes:
+    while (
+        len(episode_lengths) < target_episodes
+        if collect_full_episodes
+        else env_steps < int(cfg.rollout_steps) or len(episode_lengths) < target_episodes
+    ):
         vehicle_ids, trajectory_states = controlled_vehicle_snapshot(env)
         controlled_counts.append(len(vehicle_ids))
         road = getattr(env.unwrapped, "road", None)
-        road_vehicle_counts.append(len(getattr(road, "vehicles", ())) if road is not None else 0)
+        road_vehicles = list(getattr(road, "vehicles", ())) if road is not None else []
+        road_vehicle_counts.append(len(road_vehicles))
+        scene_index = len(scene_features)
+        controlled_positions = [
+            np.asarray(vehicle.position, dtype=np.float32)
+            for vehicle in getattr(env.unwrapped, "controlled_vehicles", ())
+            if getattr(vehicle, "position", None) is not None
+        ]
+        scene_origin = (
+            np.mean(np.stack(controlled_positions, axis=0), axis=0)
+            if controlled_positions
+            else None
+        )
+        scene_features.append(
+            scene_snapshot_features(
+                road_vehicles,
+                max_vehicles=int(cfg.scene_max_vehicles),
+                origin=scene_origin,
+            )
+        )
         if len(vehicle_ids) != len(obs_agents):
             raise RuntimeError(
                 f"Observation/vehicle mismatch: obs_agents={len(obs_agents)} vehicles={len(vehicle_ids)}"
@@ -334,6 +402,7 @@ def collect_rollout(
                     value=float(values[i].cpu().item()),
                     trajectory_id=int(key_to_trajectory_id[key]),
                     trajectory_state=trajectory_states[i].copy(),
+                    scene_index=int(scene_index),
                     env_penalty=float(env_penalty),
                     crashed=crashed,
                     offroad=offroad,
@@ -358,7 +427,7 @@ def collect_rollout(
             obs = next_obs
         obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
 
-    if episode_steps > 0:
+    if episode_steps > 0 and not collect_full_episodes:
         episode_lengths.append(int(episode_steps))
         crash_event_count += int(episode_had_crash)
         offroad_event_count += int(episode_had_offroad)
@@ -370,6 +439,7 @@ def collect_rollout(
     old_values = np.asarray([tr.value for tr in transitions], dtype=np.float32)
     dones = np.asarray([tr.done for tr in transitions], dtype=bool)
     env_penalties = np.asarray([tr.env_penalty for tr in transitions], dtype=np.float32)
+    transition_scene_indices = np.asarray([tr.scene_index for tr in transitions], dtype=np.int64)
     crashed = np.asarray([tr.crashed for tr in transitions], dtype=bool)
     offroad = np.asarray([tr.offroad for tr in transitions], dtype=bool)
     trajectory_ids = np.asarray([tr.trajectory_id for tr in transitions], dtype=np.int32)
@@ -379,6 +449,12 @@ def collect_rollout(
         frame=cfg.trajectory_frame,
     )
     gen_features = discriminator_features(policy_obs, trajectory_states)
+    sequence_features, sequence_last_indices = build_sequence_windows(
+        gen_features,
+        trajectory_ids,
+        sequence_length=int(cfg.sequence_length),
+        stride=int(cfg.sequence_stride),
+    )
     rewards = np.zeros(len(transitions), dtype=np.float32)
     returns, advantages = compute_returns_and_advantages(rewards, old_values, dones, trajectory_ids, cfg)
     return RolloutBatch(
@@ -395,6 +471,15 @@ def collect_rollout(
         returns=returns,
         advantages=advantages,
         generator_features=gen_features,
+        scene_features=np.stack(scene_features, axis=0).astype(np.float32, copy=False)
+        if scene_features
+        else np.zeros(
+            (0, int(cfg.scene_max_vehicles) * int(cfg.scene_feature_dim_per_vehicle)),
+            dtype=np.float32,
+        ),
+        transition_scene_indices=transition_scene_indices,
+        sequence_features=sequence_features,
+        sequence_last_indices=sequence_last_indices,
         num_env_steps=env_steps,
         num_agent_steps=len(transitions),
         num_episodes=len(episode_lengths),
@@ -421,12 +506,27 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
 
     trajectory_ids: list[np.ndarray] = []
     trajectory_offset = 0
+    transition_offset = 0
+    scene_offset = 0
+    transition_scene_indices: list[np.ndarray] = []
+    sequence_last_indices: list[np.ndarray] = []
     for batch in batches:
         ids = batch.trajectory_ids.astype(np.int32, copy=True)
         if ids.size:
             ids += trajectory_offset
             trajectory_offset = int(ids.max()) + 1
         trajectory_ids.append(ids)
+        scene_ids = batch.transition_scene_indices.astype(np.int64, copy=True)
+        if scene_ids.size:
+            valid = scene_ids >= 0
+            scene_ids[valid] += scene_offset
+        transition_scene_indices.append(scene_ids)
+        last_ids = batch.sequence_last_indices.astype(np.int64, copy=True)
+        if last_ids.size:
+            last_ids += transition_offset
+        sequence_last_indices.append(last_ids)
+        transition_offset += int(batch.num_agent_steps)
+        scene_offset += int(len(batch.scene_features))
 
     rewards = np.concatenate([batch.rewards for batch in batches], axis=0).astype(np.float32)
     gail_rewards_raw = np.concatenate([batch.gail_rewards_raw for batch in batches], axis=0).astype(
@@ -468,6 +568,10 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
         generator_features=np.concatenate([batch.generator_features for batch in batches], axis=0).astype(
             np.float32
         ),
+        scene_features=np.concatenate([batch.scene_features for batch in batches], axis=0).astype(np.float32),
+        transition_scene_indices=np.concatenate(transition_scene_indices, axis=0).astype(np.int64),
+        sequence_features=np.concatenate([batch.sequence_features for batch in batches], axis=0).astype(np.float32),
+        sequence_last_indices=np.concatenate(sequence_last_indices, axis=0).astype(np.int64),
         num_env_steps=sum(batch.num_env_steps for batch in batches),
         num_agent_steps=sum(batch.num_agent_steps for batch in batches),
         num_episodes=sum(batch.num_episodes for batch in batches),
@@ -532,6 +636,7 @@ def _rollout_worker(
     policy_obs_dim: int,
     worker_id: int,
     rollout_steps: int,
+    rollout_min_episodes: int,
 ) -> RolloutBatch:
     threads = max(1, int(cfg.rollout_worker_threads))
     torch.set_num_threads(threads)
@@ -540,6 +645,7 @@ def _rollout_worker(
     worker_cfg = replace(
         cfg,
         rollout_steps=int(rollout_steps),
+        rollout_min_episodes=int(rollout_min_episodes),
         seed=int(cfg.seed) + int(worker_id),
         device="cpu",
     )
@@ -579,9 +685,34 @@ def collect_rollouts(
     if num_workers == 1:
         return collect_rollout(env, policy, cfg, device, seed=rollout_seed)
 
+    if bool(getattr(cfg, "rollout_full_episodes", True)):
+        total_episodes = _target_rollout_episodes(cfg)
+        active_workers = min(num_workers, total_episodes)
+        worker_episodes = [
+            total_episodes // active_workers
+            + (1 if worker_id < total_episodes % active_workers else 0)
+            for worker_id in range(active_workers)
+        ]
+        max_episode_steps = max(1, int(cfg.max_episode_steps))
+        worker_steps = [episodes * max_episode_steps for episodes in worker_episodes]
+    else:
+        active_workers = num_workers
+        worker_steps = [
+            total_steps // active_workers
+            + (1 if worker_id < total_steps % active_workers else 0)
+            for worker_id in range(active_workers)
+        ]
+        min_episodes = max(1, int(cfg.rollout_min_episodes))
+        worker_episodes = [
+            min_episodes // active_workers
+            + (1 if worker_id < min_episodes % active_workers else 0)
+            for worker_id in range(active_workers)
+        ]
+        worker_episodes = [max(1, episodes) for episodes in worker_episodes]
+
     cpu_state_dict = {key: value.detach().cpu() for key, value in policy.state_dict().items()}
     context = mp.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=num_workers, mp_context=context) as executor:
+    with ProcessPoolExecutor(max_workers=active_workers, mp_context=context) as executor:
         futures = [
             executor.submit(
                 _rollout_worker,
@@ -589,16 +720,17 @@ def collect_rollouts(
                 cpu_state_dict,
                 int(policy_obs_dim),
                 int(seed_offset) + worker_id,
-                total_steps,
+                int(worker_steps[worker_id]),
+                int(worker_episodes[worker_id]),
             )
-            for worker_id in range(num_workers)
+            for worker_id in range(active_workers)
         ]
         batches = [future.result() for future in futures]
     return merge_rollout_batches(batches, cfg)
 
 
 def update_discriminator(
-    discriminator: TrajectoryDiscriminator,
+    discriminator: nn.Module,
     optimizer: torch.optim.Optimizer,
     expert_features: np.ndarray,
     generator_features: np.ndarray,
