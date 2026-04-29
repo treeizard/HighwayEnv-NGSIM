@@ -29,12 +29,14 @@ from scripts_gail.ps_gail.models import (
     SequenceTrajectoryDiscriminator,
     SharedActorCritic,
     TrajectoryDiscriminator,
+    make_actor_critic,
 )
 from scripts_gail.ps_gail.observations import flatten_agent_observations, policy_observations_from_flat
 from scripts_gail.ps_gail.trainer import (
     collect_rollouts,
     infer_continuous_action_dim,
     infer_policy_obs_dim,
+    make_rollout_executor,
     refresh_rollout_rewards,
     resolve_device,
     update_discriminator,
@@ -126,13 +128,12 @@ def save_checkpoint_video(
     os.makedirs(video_dir, exist_ok=True)
     path = os.path.join(video_dir, f"round_{int(round_idx):04d}.mp4")
 
-    video_env = make_training_env(cfg)
+    video_env = make_training_env(cfg, render_mode="rgb_array")
     frames: list[np.ndarray] = []
     was_training = policy.training
     policy.eval()
     try:
         base = video_env.unwrapped
-        base.render_mode = "rgb_array"
         base.config["offscreen_rendering"] = True
         base.config["screen_width"] = int(cfg.checkpoint_video_width)
         base.config["screen_height"] = int(cfg.checkpoint_video_height)
@@ -189,6 +190,11 @@ def parse_args() -> PSGAILConfig:
 
 def main() -> None:
     cfg = parse_args()
+    if bool(cfg.enable_sequence_discriminator) and bool(cfg.enable_scene_discriminator):
+        raise ValueError(
+            "Sequence-discriminator training now uses a single sequential discriminator. "
+            "Disable --enable-scene-discriminator for sequential GAIL."
+        )
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     device = resolve_device(cfg.device)
@@ -200,6 +206,7 @@ def main() -> None:
     monitor.start()
 
     env = None
+    rollout_executor = None
     try:
         expert_policy_obs, expert_features, expert_metadata = load_expert_policy_and_disc_data(
             cfg.expert_data,
@@ -207,6 +214,7 @@ def main() -> None:
             seed=cfg.seed,
             trajectory_frame=cfg.trajectory_frame,
         )
+        sequence_only_discriminator = bool(cfg.enable_sequence_discriminator)
         expert_scene_features = None
         expert_scene_metadata = {}
         if bool(cfg.enable_scene_discriminator):
@@ -241,36 +249,40 @@ def main() -> None:
                 f"{expert_metadata['policy_observation_dim']} != {policy_obs_dim}."
             )
         feature_dim = int(expert_features.shape[1])
-        policy = SharedActorCritic(
+        policy = make_actor_critic(
+            cfg.policy_model,
             policy_obs_dim,
             cfg.hidden_size,
             action_mode=str(cfg.action_mode),
             continuous_action_dim=int(cfg.continuous_action_dim),
+            transformer_layers=int(cfg.transformer_layers),
+            transformer_heads=int(cfg.transformer_heads),
+            transformer_dropout=float(cfg.transformer_dropout),
         ).to(device)
-        discriminator = TrajectoryDiscriminator(feature_dim, cfg.hidden_size).to(device)
+        if sequence_only_discriminator:
+            if expert_sequence_features is None:
+                raise RuntimeError("Sequence discriminator was enabled but no expert sequence features were loaded.")
+            discriminator = SequenceTrajectoryDiscriminator(
+                int(expert_sequence_features.shape[-1]),
+                cfg.hidden_size,
+            ).to(device)
+            discriminator_expert_features = expert_sequence_features
+            discriminator_name = "sequence"
+        else:
+            discriminator = TrajectoryDiscriminator(feature_dim, cfg.hidden_size).to(device)
+            discriminator_expert_features = expert_features
+            discriminator_name = "trajectory"
         scene_discriminator = (
             SceneDiscriminator(int(expert_scene_features.shape[1]), cfg.hidden_size).to(device)
             if expert_scene_features is not None
             else None
         )
-        sequence_discriminator = (
-            SequenceTrajectoryDiscriminator(
-                int(expert_sequence_features.shape[-1]),
-                cfg.hidden_size,
-            ).to(device)
-            if expert_sequence_features is not None
-            else None
-        )
+        sequence_discriminator = discriminator if sequence_only_discriminator else None
         policy_optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.learning_rate)
         disc_optimizer = torch.optim.Adam(discriminator.parameters(), lr=cfg.disc_learning_rate)
         scene_disc_optimizer = (
             torch.optim.Adam(scene_discriminator.parameters(), lr=cfg.disc_learning_rate)
             if scene_discriminator is not None
-            else None
-        )
-        sequence_disc_optimizer = (
-            torch.optim.Adam(sequence_discriminator.parameters(), lr=cfg.disc_learning_rate)
-            if sequence_discriminator is not None
             else None
         )
         monitor.watch(policy, discriminator)
@@ -290,7 +302,10 @@ def main() -> None:
         print(
             f"collision_enabled={cfg.enable_collision} allow_idm={cfg.allow_idm} "
             f"action_mode={cfg.action_mode} "
+            f"policy_model={cfg.policy_model} "
             f"policy_obs_dim={policy_obs_dim} disc_feature_dim={feature_dim} device={device} "
+            f"discriminator={discriminator_name} "
+            f"cgail_k={cfg.cgail_k} "
             f"rollout_workers={cfg.num_rollout_workers} "
             f"rollout_worker_threads={cfg.rollout_worker_threads}"
         )
@@ -306,7 +321,8 @@ def main() -> None:
                 "sequence_discriminator="
                 f"samples={expert_sequence_metadata.get('num_sequence_samples')} "
                 f"length={expert_sequence_metadata.get('sequence_length')} "
-                f"feature_dim={expert_sequence_metadata.get('sequence_feature_dim')}"
+                f"feature_dim={expert_sequence_metadata.get('sequence_feature_dim')} "
+                f"trajectory_frame={cfg.trajectory_frame}"
             )
         if cfg.controlled_vehicle_curriculum:
             print(
@@ -315,6 +331,7 @@ def main() -> None:
                 f"final={cfg.final_controlled_vehicle_fraction:.4f} "
                 f"rounds={cfg.controlled_vehicle_curriculum_rounds}"
             )
+        rollout_executor = make_rollout_executor(cfg)
 
         for round_idx in range(1, int(cfg.total_rounds) + 1):
             round_cfg = config_for_round(cfg, round_idx)
@@ -332,12 +349,18 @@ def main() -> None:
                 device,
                 policy_obs_dim,
                 seed_offset=(round_idx - 1) * max(1, int(cfg.num_rollout_workers)),
+                executor=rollout_executor,
             )
+            if sequence_only_discriminator and not rollout.sequence_features.size:
+                raise RuntimeError(
+                    "Sequence discriminator was enabled but rollout produced no sequence windows. "
+                    "Lower --sequence-length or collect longer rollout episodes."
+                )
             disc_stats = update_discriminator(
                 discriminator,
                 disc_optimizer,
-                expert_features,
-                rollout.generator_features,
+                discriminator_expert_features,
+                rollout.sequence_features if sequence_only_discriminator else rollout.generator_features,
                 round_cfg,
                 device,
             )
@@ -355,26 +378,10 @@ def main() -> None:
                     round_cfg,
                     device,
                 )
-            sequence_disc_stats = {}
-            if sequence_discriminator is not None:
-                if sequence_disc_optimizer is None or expert_sequence_features is None:
-                    raise RuntimeError("Sequence discriminator was enabled without optimizer/expert features.")
-                if not rollout.sequence_features.size:
-                    raise RuntimeError(
-                        "Sequence discriminator was enabled but rollout produced no sequence windows. "
-                        "Lower --sequence-length or collect longer rollout episodes."
-                    )
-                sequence_disc_stats = update_discriminator(
-                    sequence_discriminator,
-                    sequence_disc_optimizer,
-                    expert_sequence_features,
-                    rollout.sequence_features,
-                    round_cfg,
-                    device,
-                )
+            sequence_disc_stats = disc_stats if sequence_only_discriminator else {}
             rollout = refresh_rollout_rewards(
                 rollout,
-                discriminator,
+                None if sequence_only_discriminator else discriminator,
                 round_cfg,
                 device,
                 scene_discriminator=scene_discriminator,
@@ -394,6 +401,11 @@ def main() -> None:
                 f"ctrl_frac={round_cfg.percentage_controlled_vehicles:.4f} "
                 f"veh={rollout.mean_controlled_vehicles:.1f}/{rollout.mean_road_vehicles:.1f} "
                 f"disc_loss={disc_stats['disc_loss']:.4f} "
+                + (
+                    f"cgail_penalty={disc_stats['cgail_penalty']:.6f} "
+                    if float(round_cfg.cgail_k) > 0.0
+                    else ""
+                )
                 + (
                     f"scene_disc_loss={scene_disc_stats['disc_loss']:.4f} "
                     if scene_disc_stats
@@ -455,6 +467,12 @@ def main() -> None:
                 "rollout/action_mean": float(rollout.actions.mean()),
                 "rollout/action_std": float(rollout.actions.std()),
                 "discriminator/loss": disc_stats["disc_loss"],
+                "discriminator/bce_loss": disc_stats["disc_bce_loss"],
+                "discriminator/cgail_penalty": disc_stats["cgail_penalty"],
+                "discriminator/prob_mean": disc_stats["disc_prob_mean"],
+                "discriminator/prob_std": disc_stats["disc_prob_std"],
+                "discriminator/expert_prob_mean": disc_stats["expert_prob_mean"],
+                "discriminator/gen_prob_mean": disc_stats["gen_prob_mean"],
                 "discriminator/expert_acc": disc_stats["expert_acc"],
                 "discriminator/gen_acc": disc_stats["gen_acc"],
                 "policy/loss": policy_stats["policy_loss"],
@@ -470,6 +488,12 @@ def main() -> None:
                 metrics.update(
                     {
                         "scene_discriminator/loss": scene_disc_stats["disc_loss"],
+                        "scene_discriminator/bce_loss": scene_disc_stats["disc_bce_loss"],
+                        "scene_discriminator/cgail_penalty": scene_disc_stats["cgail_penalty"],
+                        "scene_discriminator/prob_mean": scene_disc_stats["disc_prob_mean"],
+                        "scene_discriminator/prob_std": scene_disc_stats["disc_prob_std"],
+                        "scene_discriminator/expert_prob_mean": scene_disc_stats["expert_prob_mean"],
+                        "scene_discriminator/gen_prob_mean": scene_disc_stats["gen_prob_mean"],
                         "scene_discriminator/expert_acc": scene_disc_stats["expert_acc"],
                         "scene_discriminator/gen_acc": scene_disc_stats["gen_acc"],
                     }
@@ -478,6 +502,12 @@ def main() -> None:
                 metrics.update(
                     {
                         "sequence_discriminator/loss": sequence_disc_stats["disc_loss"],
+                        "sequence_discriminator/bce_loss": sequence_disc_stats["disc_bce_loss"],
+                        "sequence_discriminator/cgail_penalty": sequence_disc_stats["cgail_penalty"],
+                        "sequence_discriminator/prob_mean": sequence_disc_stats["disc_prob_mean"],
+                        "sequence_discriminator/prob_std": sequence_disc_stats["disc_prob_std"],
+                        "sequence_discriminator/expert_prob_mean": sequence_disc_stats["expert_prob_mean"],
+                        "sequence_discriminator/gen_prob_mean": sequence_disc_stats["gen_prob_mean"],
                         "sequence_discriminator/expert_acc": sequence_disc_stats["expert_acc"],
                         "sequence_discriminator/gen_acc": sequence_disc_stats["gen_acc"],
                     }
@@ -497,9 +527,10 @@ def main() -> None:
                         "scene_discriminator_state_dict": scene_discriminator.state_dict()
                         if scene_discriminator is not None
                         else None,
-                        "sequence_discriminator_state_dict": sequence_discriminator.state_dict()
-                        if sequence_discriminator is not None
+                        "sequence_discriminator_state_dict": discriminator.state_dict()
+                        if sequence_only_discriminator
                         else None,
+                        "discriminator_type": discriminator_name,
                         "config": vars(cfg),
                         "round_config": vars(round_cfg),
                     },
@@ -530,9 +561,10 @@ def main() -> None:
                 "scene_discriminator_state_dict": scene_discriminator.state_dict()
                 if scene_discriminator is not None
                 else None,
-                "sequence_discriminator_state_dict": sequence_discriminator.state_dict()
-                if sequence_discriminator is not None
+                "sequence_discriminator_state_dict": discriminator.state_dict()
+                if sequence_only_discriminator
                 else None,
+                "discriminator_type": discriminator_name,
                 "config": vars(cfg),
                 "round_config": vars(config_for_round(cfg, int(cfg.total_rounds))),
             },
@@ -554,6 +586,8 @@ def main() -> None:
                 fps=int(cfg.policy_frequency),
             )
     finally:
+        if rollout_executor is not None:
+            rollout_executor.shutdown(wait=True, cancel_futures=True)
         if env is not None:
             env.close()
         monitor.finish()

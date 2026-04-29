@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from dataclasses import replace
 
@@ -11,12 +12,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical, Independent, Normal
-from torch.utils.data import DataLoader, TensorDataset
 
 from .config import PSGAILConfig
 from .data import build_sequence_windows, discriminator_features, normalize_trajectory_frame, scene_snapshot_features
 from .envs import controlled_vehicle_snapshot, make_training_env
-from .models import SharedActorCritic, TrajectoryDiscriminator
+from .models import make_actor_critic
 from .observations import flatten_agent_observations, policy_observations_from_flat
 
 
@@ -101,8 +101,17 @@ def _is_continuous(cfg: PSGAILConfig) -> bool:
     return str(cfg.action_mode).lower() == "continuous"
 
 
+def _as_device_tensor(array: np.ndarray, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    tensor = torch.as_tensor(array, dtype=dtype)
+    if device.type == "cuda":
+        tensor = tensor.pin_memory().to(device=device, non_blocking=True)
+    else:
+        tensor = tensor.to(device=device)
+    return tensor
+
+
 def policy_distribution_and_values(
-    policy: SharedActorCritic,
+    policy: nn.Module,
     obs_tensor: torch.Tensor,
     cfg: PSGAILConfig,
 ) -> tuple[Categorical | Independent, torch.Tensor]:
@@ -177,7 +186,7 @@ def discriminator_reward(
     device: torch.device,
 ) -> np.ndarray:
     with torch.no_grad():
-        logits = discriminator(torch.as_tensor(generator_features, dtype=torch.float32, device=device))
+        logits = discriminator(_as_device_tensor(generator_features, dtype=torch.float32, device=device))
         rewards = F.softplus(logits)
     return rewards.cpu().numpy().astype(np.float32)
 
@@ -217,15 +226,18 @@ def _target_rollout_episodes(cfg: PSGAILConfig) -> int:
 
 def refresh_rollout_rewards(
     rollout: RolloutBatch,
-    discriminator: TrajectoryDiscriminator,
+    discriminator: nn.Module | None,
     cfg: PSGAILConfig,
     device: torch.device,
     *,
     scene_discriminator: nn.Module | None = None,
     sequence_discriminator: nn.Module | None = None,
 ) -> RolloutBatch:
-    raw_gail_rewards = discriminator_reward(discriminator, rollout.generator_features, device)
-    combined_raw_gail_rewards = raw_gail_rewards.astype(np.float32, copy=True)
+    if discriminator is None:
+        combined_raw_gail_rewards = np.zeros(int(rollout.num_agent_steps), dtype=np.float32)
+    else:
+        raw_gail_rewards = discriminator_reward(discriminator, rollout.generator_features, device)
+        combined_raw_gail_rewards = raw_gail_rewards.astype(np.float32, copy=True)
     if scene_discriminator is not None and rollout.scene_features.size:
         scene_rewards = discriminator_reward(scene_discriminator, rollout.scene_features, device)
         scene_rewards = scene_rewards * float(cfg.scene_reward_coef)
@@ -301,7 +313,7 @@ def refresh_rollout_rewards(
 
 def collect_rollout(
     env: gym.Env,
-    policy: SharedActorCritic,
+    policy: nn.Module,
     cfg: PSGAILConfig,
     device: torch.device,
     seed: int | None = None,
@@ -311,6 +323,7 @@ def collect_rollout(
     obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
     transitions: list[AgentTransition] = []
     scene_features: list[np.ndarray] = []
+    collect_scene_features = bool(getattr(cfg, "enable_scene_discriminator", False))
     key_to_trajectory_id: dict[tuple[int, int], int] = {}
     episode_counter = 0
     env_steps = 0
@@ -340,24 +353,26 @@ def collect_rollout(
         road = getattr(env.unwrapped, "road", None)
         road_vehicles = list(getattr(road, "vehicles", ())) if road is not None else []
         road_vehicle_counts.append(len(road_vehicles))
-        scene_index = len(scene_features)
-        controlled_positions = [
-            np.asarray(vehicle.position, dtype=np.float32)
-            for vehicle in getattr(env.unwrapped, "controlled_vehicles", ())
-            if getattr(vehicle, "position", None) is not None
-        ]
-        scene_origin = (
-            np.mean(np.stack(controlled_positions, axis=0), axis=0)
-            if controlled_positions
-            else None
-        )
-        scene_features.append(
-            scene_snapshot_features(
-                road_vehicles,
-                max_vehicles=int(cfg.scene_max_vehicles),
-                origin=scene_origin,
+        scene_index = -1
+        if collect_scene_features:
+            scene_index = len(scene_features)
+            controlled_positions = [
+                np.asarray(vehicle.position, dtype=np.float32)
+                for vehicle in getattr(env.unwrapped, "controlled_vehicles", ())
+                if getattr(vehicle, "position", None) is not None
+            ]
+            scene_origin = (
+                np.mean(np.stack(controlled_positions, axis=0), axis=0)
+                if controlled_positions
+                else None
             )
-        )
+            scene_features.append(
+                scene_snapshot_features(
+                    road_vehicles,
+                    max_vehicles=int(cfg.scene_max_vehicles),
+                    origin=scene_origin,
+                )
+            )
         if len(vehicle_ids) != len(obs_agents):
             raise RuntimeError(
                 f"Observation/vehicle mismatch: obs_agents={len(obs_agents)} vehicles={len(vehicle_ids)}"
@@ -649,11 +664,15 @@ def _rollout_worker(
         seed=int(cfg.seed) + int(worker_id),
         device="cpu",
     )
-    policy = SharedActorCritic(
+    policy = make_actor_critic(
+        cfg.policy_model,
         int(policy_obs_dim),
         int(cfg.hidden_size),
         action_mode=str(cfg.action_mode),
         continuous_action_dim=int(cfg.continuous_action_dim),
+        transformer_layers=int(cfg.transformer_layers),
+        transformer_heads=int(cfg.transformer_heads),
+        transformer_dropout=float(cfg.transformer_dropout),
     )
     policy.load_state_dict(policy_state_dict)
     policy.to(torch.device("cpu"))
@@ -673,11 +692,12 @@ def _rollout_worker(
 
 def collect_rollouts(
     env: gym.Env,
-    policy: SharedActorCritic,
+    policy: nn.Module,
     cfg: PSGAILConfig,
     device: torch.device,
     policy_obs_dim: int,
     seed_offset: int = 0,
+    executor: ProcessPoolExecutor | None = None,
 ) -> RolloutBatch:
     num_workers = max(1, int(cfg.num_rollout_workers))
     total_steps = max(1, int(cfg.rollout_steps))
@@ -711,10 +731,14 @@ def collect_rollouts(
         worker_episodes = [max(1, episodes) for episodes in worker_episodes]
 
     cpu_state_dict = {key: value.detach().cpu() for key, value in policy.state_dict().items()}
-    context = mp.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=active_workers, mp_context=context) as executor:
+    executor_context = (
+        nullcontext(executor)
+        if executor is not None
+        else ProcessPoolExecutor(max_workers=active_workers, mp_context=mp.get_context("spawn"))
+    )
+    with executor_context as pool:
         futures = [
-            executor.submit(
+            pool.submit(
                 _rollout_worker,
                 cfg,
                 cpu_state_dict,
@@ -727,6 +751,13 @@ def collect_rollouts(
         ]
         batches = [future.result() for future in futures]
     return merge_rollout_batches(batches, cfg)
+
+
+def make_rollout_executor(cfg: PSGAILConfig) -> ProcessPoolExecutor | None:
+    num_workers = max(1, int(cfg.num_rollout_workers))
+    if num_workers == 1:
+        return None
+    return ProcessPoolExecutor(max_workers=num_workers, mp_context=mp.get_context("spawn"))
 
 
 def update_discriminator(
@@ -753,42 +784,68 @@ def update_discriminator(
         ],
         axis=0,
     )
-    loader = DataLoader(
-        TensorDataset(torch.as_tensor(x), torch.as_tensor(y)),
-        batch_size=int(cfg.disc_batch_size),
-        shuffle=True,
-    )
+    x_tensor = _as_device_tensor(x, dtype=torch.float32, device=device)
+    y_tensor = _as_device_tensor(y, dtype=torch.float32, device=device)
     discriminator.train()
-    losses: list[float] = []
-    expert_accs: list[float] = []
-    gen_accs: list[float] = []
+    losses: list[torch.Tensor] = []
+    bce_losses: list[torch.Tensor] = []
+    cgail_penalties: list[torch.Tensor] = []
+    prob_means: list[torch.Tensor] = []
+    prob_stds: list[torch.Tensor] = []
+    expert_prob_means: list[torch.Tensor] = []
+    gen_prob_means: list[torch.Tensor] = []
+    expert_accs: list[torch.Tensor] = []
+    gen_accs: list[torch.Tensor] = []
+    cgail_k = max(0.0, float(getattr(cfg, "cgail_k", 0.0)))
+    batch_size = max(1, int(cfg.disc_batch_size))
+    num_samples = int(x_tensor.shape[0])
     for _ in range(int(cfg.disc_updates_per_round)):
-        for batch_x, batch_y in loader:
-            batch_x = batch_x.to(device=device, dtype=torch.float32)
-            batch_y = batch_y.to(device=device, dtype=torch.float32)
+        permutation = torch.randperm(num_samples, device=device)
+        for start in range(0, num_samples, batch_size):
+            batch_idx = permutation[start : start + batch_size]
+            batch_x = x_tensor[batch_idx]
+            batch_y = y_tensor[batch_idx]
             logits = discriminator(batch_x)
-            loss = F.binary_cross_entropy_with_logits(logits, batch_y)
+            bce_loss = F.binary_cross_entropy_with_logits(logits, batch_y)
+            probs = torch.sigmoid(logits)
+            cgail_penalty = 0.5 * cgail_k * torch.square(probs - 0.5).mean()
+            loss = bce_loss + cgail_penalty
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             with torch.no_grad():
-                pred = torch.sigmoid(logits) >= 0.5
+                pred = probs >= 0.5
                 expert_mask = batch_y > 0.5
                 gen_mask = batch_y < 0.5
+                prob_means.append(probs.mean().detach())
+                prob_stds.append(probs.std(unbiased=False).detach())
                 if expert_mask.any():
-                    expert_accs.append(float((pred[expert_mask] == 1).float().mean().cpu().item()))
+                    expert_accs.append((pred[expert_mask] == 1).float().mean().detach())
+                    expert_prob_means.append(probs[expert_mask].mean().detach())
                 if gen_mask.any():
-                    gen_accs.append(float((pred[gen_mask] == 0).float().mean().cpu().item()))
-            losses.append(float(loss.detach().cpu().item()))
+                    gen_accs.append((pred[gen_mask] == 0).float().mean().detach())
+                    gen_prob_means.append(probs[gen_mask].mean().detach())
+            losses.append(loss.detach())
+            bce_losses.append(bce_loss.detach())
+            cgail_penalties.append(cgail_penalty.detach())
+    def mean_or_nan(values: list[torch.Tensor]) -> float:
+        return float(torch.stack(values).mean().cpu().item()) if values else float("nan")
+
     return {
-        "disc_loss": float(np.mean(losses)),
-        "expert_acc": float(np.mean(expert_accs)) if expert_accs else float("nan"),
-        "gen_acc": float(np.mean(gen_accs)) if gen_accs else float("nan"),
+        "disc_loss": mean_or_nan(losses),
+        "disc_bce_loss": mean_or_nan(bce_losses),
+        "cgail_penalty": mean_or_nan(cgail_penalties),
+        "disc_prob_mean": mean_or_nan(prob_means),
+        "disc_prob_std": mean_or_nan(prob_stds),
+        "expert_prob_mean": mean_or_nan(expert_prob_means),
+        "gen_prob_mean": mean_or_nan(gen_prob_means),
+        "expert_acc": mean_or_nan(expert_accs),
+        "gen_acc": mean_or_nan(gen_accs),
     }
 
 
 def update_policy(
-    policy: SharedActorCritic,
+    policy: nn.Module,
     optimizer: torch.optim.Optimizer,
     rollout: RolloutBatch,
     cfg: PSGAILConfig,
@@ -796,31 +853,28 @@ def update_policy(
 ) -> dict[str, float]:
     policy.train()
     action_tensor = (
-        torch.as_tensor(rollout.actions, dtype=torch.float32)
+        _as_device_tensor(rollout.actions, dtype=torch.float32, device=device)
         if _is_continuous(cfg)
-        else torch.as_tensor(rollout.actions, dtype=torch.long)
+        else _as_device_tensor(rollout.actions, dtype=torch.long, device=device)
     )
-    loader = DataLoader(
-        TensorDataset(
-            torch.as_tensor(rollout.policy_observations, dtype=torch.float32),
-            action_tensor,
-            torch.as_tensor(rollout.old_log_probs, dtype=torch.float32),
-            torch.as_tensor(rollout.returns, dtype=torch.float32),
-            torch.as_tensor(rollout.advantages, dtype=torch.float32),
-        ),
-        batch_size=int(cfg.batch_size),
-        shuffle=True,
-    )
-    policy_losses: list[float] = []
-    value_losses: list[float] = []
-    entropies: list[float] = []
+    obs_tensor = _as_device_tensor(rollout.policy_observations, dtype=torch.float32, device=device)
+    old_log_probs_tensor = _as_device_tensor(rollout.old_log_probs, dtype=torch.float32, device=device)
+    returns_tensor = _as_device_tensor(rollout.returns, dtype=torch.float32, device=device)
+    advantages_tensor = _as_device_tensor(rollout.advantages, dtype=torch.float32, device=device)
+    policy_losses: list[torch.Tensor] = []
+    value_losses: list[torch.Tensor] = []
+    entropies: list[torch.Tensor] = []
+    batch_size = max(1, int(cfg.batch_size))
+    num_samples = int(obs_tensor.shape[0])
     for _ in range(int(cfg.ppo_epochs)):
-        for obs, actions, old_log_probs, returns, advantages in loader:
-            obs = obs.to(device)
-            actions = actions.to(device)
-            old_log_probs = old_log_probs.to(device)
-            returns = returns.to(device)
-            advantages = advantages.to(device)
+        permutation = torch.randperm(num_samples, device=device)
+        for start in range(0, num_samples, batch_size):
+            batch_idx = permutation[start : start + batch_size]
+            obs = obs_tensor[batch_idx]
+            actions = action_tensor[batch_idx]
+            old_log_probs = old_log_probs_tensor[batch_idx]
+            returns = returns_tensor[batch_idx]
+            advantages = advantages_tensor[batch_idx]
             dist, values = policy_distribution_and_values(policy, obs, cfg)
             log_probs = dist.log_prob(actions)
             ratio = torch.exp(log_probs - old_log_probs)
@@ -835,11 +889,11 @@ def update_policy(
             loss.backward()
             nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
             optimizer.step()
-            policy_losses.append(float(policy_loss.detach().cpu().item()))
-            value_losses.append(float(value_loss.detach().cpu().item()))
-            entropies.append(float(entropy.detach().cpu().item()))
+            policy_losses.append(policy_loss.detach())
+            value_losses.append(value_loss.detach())
+            entropies.append(entropy.detach())
     return {
-        "policy_loss": float(np.mean(policy_losses)),
-        "value_loss": float(np.mean(value_losses)),
-        "entropy": float(np.mean(entropies)),
+        "policy_loss": float(torch.stack(policy_losses).mean().cpu().item()),
+        "value_loss": float(torch.stack(value_losses).mean().cpu().item()),
+        "entropy": float(torch.stack(entropies).mean().cpu().item()),
     }

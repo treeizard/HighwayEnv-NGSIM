@@ -27,7 +27,7 @@ def observation_config(cfg: PSGAILConfig) -> dict[str, Any]:
     }
 
 
-def make_training_env(cfg: PSGAILConfig) -> gym.Env:
+def make_training_env(cfg: PSGAILConfig, *, render_mode: str | None = None) -> gym.Env:
     register_ngsim_env()
     env_cfg = build_env_config(
         scene=cfg.scene,
@@ -64,7 +64,7 @@ def make_training_env(cfg: PSGAILConfig) -> gym.Env:
                 "Discrete PS-GAIL must use DiscreteSteerMetaAction, got "
                 f"{nested_action_cfg.get('type')!r}."
             )
-    return gym.make(ENV_ID, config=env_cfg)
+    return gym.make(ENV_ID, render_mode=render_mode, config=env_cfg)
 
 
 def controlled_vehicle_snapshot(env: gym.Env) -> tuple[list[int], np.ndarray]:

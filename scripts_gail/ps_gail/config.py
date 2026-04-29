@@ -40,7 +40,11 @@ class PSGAILConfig:
     policy_frequency: int = 10
     max_episode_steps: int = 200
 
+    policy_model: str = "mlp"
     hidden_size: int = 256
+    transformer_layers: int = 2
+    transformer_heads: int = 4
+    transformer_dropout: float = 0.1
     learning_rate: float = 3e-4
     disc_learning_rate: float = 3e-4
     gamma: float = 0.99
@@ -52,6 +56,7 @@ class PSGAILConfig:
     disc_updates_per_round: int = 4
     disc_expert_label: float = 0.9
     disc_generator_label: float = 0.1
+    cgail_k: float = 0.0
     enable_scene_discriminator: bool = False
     enable_sequence_discriminator: bool = False
     scene_max_vehicles: int = 64
