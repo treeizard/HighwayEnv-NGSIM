@@ -52,7 +52,7 @@ nvidia-smi || true
 # ---------------------------------------------------------------------------
 # This mode only requires the standard per-vehicle expert arrays:
 # observations, trajectory_states, vehicle_ids, and timesteps.
-EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_traj_expert_discrete_54902119}"
+export EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_traj_expert_discrete_54902119}"
 RUN_NAME="${RUN_NAME:-ps_gail_sequence_disc_cgail_k${CGAIL_K}_32c_${SLURM_JOB_ID}}"
 WANDB_MODE="${WANDB_MODE:-online}"
 TOTAL_ROUNDS="${TOTAL_ROUNDS:-200}"
