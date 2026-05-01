@@ -492,6 +492,7 @@ def main() -> None:
                     f"expert_score={disc_stats['expert_score_mean']:.4f} "
                     f"gen_score={disc_stats['gen_score_mean']:.4f} "
                     f"gp={disc_stats['gradient_penalty']:.4f} "
+                    f"center_acc={disc_stats['expert_centered_acc']:.3f}/{disc_stats['gen_centered_acc']:.3f} "
                     if str(round_cfg.discriminator_loss).lower() == "wgan_gp"
                     else ""
                 )
@@ -595,6 +596,8 @@ def main() -> None:
                 "discriminator/gen_prob_mean": disc_stats["gen_prob_mean"],
                 "discriminator/expert_acc": disc_stats["expert_acc"],
                 "discriminator/gen_acc": disc_stats["gen_acc"],
+                "discriminator/expert_centered_acc": disc_stats["expert_centered_acc"],
+                "discriminator/gen_centered_acc": disc_stats["gen_centered_acc"],
                 "policy/loss": policy_stats["policy_loss"],
                 "policy/value_loss": policy_stats["value_loss"],
                 "policy/entropy": policy_stats["entropy"],
@@ -633,6 +636,12 @@ def main() -> None:
                         "scene_discriminator/gen_prob_mean": scene_disc_stats["gen_prob_mean"],
                         "scene_discriminator/expert_acc": scene_disc_stats["expert_acc"],
                         "scene_discriminator/gen_acc": scene_disc_stats["gen_acc"],
+                        "scene_discriminator/expert_centered_acc": scene_disc_stats[
+                            "expert_centered_acc"
+                        ],
+                        "scene_discriminator/gen_centered_acc": scene_disc_stats[
+                            "gen_centered_acc"
+                        ],
                     }
                 )
             if sequence_disc_stats:
@@ -652,6 +661,12 @@ def main() -> None:
                         "sequence_discriminator/gen_prob_mean": sequence_disc_stats["gen_prob_mean"],
                         "sequence_discriminator/expert_acc": sequence_disc_stats["expert_acc"],
                         "sequence_discriminator/gen_acc": sequence_disc_stats["gen_acc"],
+                        "sequence_discriminator/expert_centered_acc": sequence_disc_stats[
+                            "expert_centered_acc"
+                        ],
+                        "sequence_discriminator/gen_centered_acc": sequence_disc_stats[
+                            "gen_centered_acc"
+                        ],
                     }
                 )
             monitor.log(
