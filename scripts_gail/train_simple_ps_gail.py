@@ -489,6 +489,8 @@ def main() -> None:
                 f"disc_loss={disc_stats['disc_loss']:.4f} "
                 + (
                     f"gap={disc_stats['critic_gap']:.4f} "
+                    f"expert_score={disc_stats['expert_score_mean']:.4f} "
+                    f"gen_score={disc_stats['gen_score_mean']:.4f} "
                     f"gp={disc_stats['gradient_penalty']:.4f} "
                     if str(round_cfg.discriminator_loss).lower() == "wgan_gp"
                     else ""
@@ -527,8 +529,11 @@ def main() -> None:
                 f"entropy={policy_stats['entropy']:.4f} "
                 f"raw_gail={rollout.mean_raw_gail_reward:.4f} "
                 f"norm_gail={rollout.mean_normalized_gail_reward:.4f} "
+                f"raw_gail_std={float(rollout.gail_rewards_raw.std()):.4f} "
+                f"norm_gail_std={float(rollout.gail_rewards_normalized.std()):.4f} "
                 f"env_penalty={rollout.mean_env_penalty:.4f} "
-                f"reward={float(rollout.rewards.mean()):.4f}"
+                f"reward={float(rollout.rewards.mean()):.4f} "
+                f"reward_std={float(rollout.rewards.std()):.4f}"
                 )
             )
             selected_action_valid = float("nan")

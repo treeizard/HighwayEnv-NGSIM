@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ps_gail_seq_tf_32c
+#SBATCH --job-name=ps_gail_seq_tf_64c
 #SBATCH --account=bt60
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
@@ -7,15 +7,15 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
-#SBATCH --output=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_gail_seq_tf_32c_%j.out
-#SBATCH --error=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_gail_seq_tf_32c_%j.err
+#SBATCH --output=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_gail_seq_tf_64c_%j.out
+#SBATCH --error=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_gail_seq_tf_64c_%j.err
 
 set -euo pipefail
 
 export REPODIR="${REPODIR:-/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM}"
 export PYTHONPATH="${REPODIR}:${PYTHONPATH:-}"
 
-ROLLOUT_WORKER_THREADS="${ROLLOUT_WORKER_THREADS:-1}"
+ROLLOUT_WORKER_THREADS="${ROLLOUT_WORKER_THREADS:-2}"
 ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-$((SLURM_CPUS_PER_TASK / ROLLOUT_WORKER_THREADS))}"
 CGAIL_K="${CGAIL_K:-0.0}"
 if [ "${ROLLOUT_WORKERS}" -lt 1 ]; then
@@ -47,7 +47,7 @@ NORMALIZE_DISCRIMINATOR_FEATURES="${NORMALIZE_DISCRIMINATOR_FEATURES:-true}"
 DISCRIMINATOR_FEATURE_CLIP="${DISCRIMINATOR_FEATURE_CLIP:-10.0}"
 ENABLE_ACTION_MASKING="${ENABLE_ACTION_MASKING:-true}"
 ALLOW_IDM="${ALLOW_IDM:-true}"
-RUN_NAME="${RUN_NAME:-ps_gail_seq_tf_${DISCRIMINATOR_LOSS}_${SEQUENCE_FEATURE_MODE}_mask${ENABLE_ACTION_MASKING}_300r_200h_32c_${SLURM_JOB_ID}}"
+RUN_NAME="${RUN_NAME:-ps_gail_seq_tf_${DISCRIMINATOR_LOSS}_${SEQUENCE_FEATURE_MODE}_mask${ENABLE_ACTION_MASKING}_300r_200h_64c_${SLURM_JOB_ID}}"
 WANDB_MODE="${WANDB_MODE:-online}"
 TOTAL_ROUNDS="${TOTAL_ROUNDS:-300}"
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-200}"
@@ -55,7 +55,7 @@ ROLLOUT_MIN_EPISODES="${ROLLOUT_MIN_EPISODES:-${ROLLOUT_WORKERS}}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
 MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-100000}"
 TRAJECTORY_FRAME="${TRAJECTORY_FRAME:-relative}"
-INITIAL_CONTROLLED_VEHICLE_FRACTION="${INITIAL_CONTROLLED_VEHICLE_FRACTION:-0.20}"
+INITIAL_CONTROLLED_VEHICLE_FRACTION="${INITIAL_CONTROLLED_VEHICLE_FRACTION:-0.15}"
 FINAL_CONTROLLED_VEHICLE_FRACTION="${FINAL_CONTROLLED_VEHICLE_FRACTION:-1.0}"
 CONTROLLED_VEHICLE_CURRICULUM_ROUNDS="${CONTROLLED_VEHICLE_CURRICULUM_ROUNDS:-${TOTAL_ROUNDS}}"
 SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-8}"
@@ -71,7 +71,7 @@ SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-true}"
 CHECKPOINT_VIDEO_STEPS="${CHECKPOINT_VIDEO_STEPS:-120}"
 BATCH_SIZE="${BATCH_SIZE:-2048}"
 DISC_BATCH_SIZE="${DISC_BATCH_SIZE:-8192}"
-DISC_UPDATES_PER_ROUND="${DISC_UPDATES_PER_ROUND:-8}"
+DISC_UPDATES_PER_ROUND="${DISC_UPDATES_PER_ROUND:-2}"
 PPO_EPOCHS="${PPO_EPOCHS:-6}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10}"
@@ -87,6 +87,7 @@ echo "Transformer layers/heads/dropout: ${TRANSFORMER_LAYERS}/${TRANSFORMER_HEAD
 echo "C-GAIL discriminator k (BCE only): ${CGAIL_K}"
 echo "Discriminator loss: ${DISCRIMINATOR_LOSS}"
 echo "WGAN-GP lambda: ${WGAN_GP_LAMBDA}"
+echo "Discriminator updates per round: ${DISC_UPDATES_PER_ROUND}"
 echo "Sequence feature mode: ${SEQUENCE_FEATURE_MODE}"
 echo "Normalize discriminator features: ${NORMALIZE_DISCRIMINATOR_FEATURES}"
 echo "Discriminator feature clip: ${DISCRIMINATOR_FEATURE_CLIP}"
@@ -145,7 +146,7 @@ else
     ALLOW_IDM_ARG="--no-allow-idm"
 fi
 
-python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
+python -u "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --expert-data "${EXPERT_DATA}" \
     --scene us-101 \
     --episode-root "${REPODIR}/highway_env/data/processed_20s" \
@@ -201,5 +202,5 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --checkpoint-video-steps "${CHECKPOINT_VIDEO_STEPS}" \
     --wandb-mode "${WANDB_MODE}" \
     --wandb-project highwayenv-ps-gail \
-    --wandb-tags ps-gail,sequence-discriminator,transformer-policy,wgan-gp,action-masking,local-deltas,collision,allow-idm-${ALLOW_IDM},gpu,32c,long-run \
+    --wandb-tags ps-gail,sequence-discriminator,transformer-policy,wgan-gp,action-masking,local-deltas,collision,allow-idm-${ALLOW_IDM},gpu,64c,long-run \
     --run-name "${RUN_NAME}"
