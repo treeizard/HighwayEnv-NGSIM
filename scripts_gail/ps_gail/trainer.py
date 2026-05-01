@@ -937,6 +937,8 @@ def update_discriminator(
     critic_gaps: list[torch.Tensor] = []
     expert_accs: list[torch.Tensor] = []
     gen_accs: list[torch.Tensor] = []
+    expert_centered_accs: list[torch.Tensor] = []
+    gen_centered_accs: list[torch.Tensor] = []
     cgail_k = max(0.0, float(getattr(cfg, "cgail_k", 0.0)))
     loss_type = str(getattr(cfg, "discriminator_loss", "bce")).lower()
     batch_size = max(1, int(cfg.disc_batch_size))
@@ -968,6 +970,7 @@ def update_discriminator(
                 with torch.no_grad():
                     scores = torch.cat([expert_scores, gen_scores], dim=0)
                     probs = torch.sigmoid(scores)
+                    centered_threshold = 0.5 * (expert_scores.mean() + gen_scores.mean())
                     prob_means.append(probs.mean().detach())
                     prob_stds.append(probs.std(unbiased=False).detach())
                     expert_prob_means.append(torch.sigmoid(expert_scores).mean().detach())
@@ -977,6 +980,12 @@ def update_discriminator(
                     critic_gaps.append((expert_scores.mean() - gen_scores.mean()).detach())
                     expert_accs.append((expert_scores > 0.0).float().mean().detach())
                     gen_accs.append((gen_scores < 0.0).float().mean().detach())
+                    expert_centered_accs.append(
+                        (expert_scores > centered_threshold).float().mean().detach()
+                    )
+                    gen_centered_accs.append(
+                        (gen_scores < centered_threshold).float().mean().detach()
+                    )
                 losses.append(loss.detach())
                 wgan_losses.append(wgan_loss.detach())
                 gradient_penalties.append(gradient_penalty.detach())
@@ -1014,10 +1023,12 @@ def update_discriminator(
                     prob_stds.append(probs.std(unbiased=False).detach())
                     if expert_mask.any():
                         expert_accs.append((pred[expert_mask] == 1).float().mean().detach())
+                        expert_centered_accs.append((pred[expert_mask] == 1).float().mean().detach())
                         expert_prob_means.append(probs[expert_mask].mean().detach())
                         expert_score_means.append(logits[expert_mask].mean().detach())
                     if gen_mask.any():
                         gen_accs.append((pred[gen_mask] == 0).float().mean().detach())
+                        gen_centered_accs.append((pred[gen_mask] == 0).float().mean().detach())
                         gen_prob_means.append(probs[gen_mask].mean().detach())
                         gen_score_means.append(logits[gen_mask].mean().detach())
                     if expert_mask.any() and gen_mask.any():
@@ -1046,6 +1057,8 @@ def update_discriminator(
         "gen_prob_mean": mean_or_nan(gen_prob_means),
         "expert_acc": mean_or_nan(expert_accs),
         "gen_acc": mean_or_nan(gen_accs),
+        "expert_centered_acc": mean_or_nan(expert_centered_accs),
+        "gen_centered_acc": mean_or_nan(gen_centered_accs),
     }
 
 
