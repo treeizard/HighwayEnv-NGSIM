@@ -178,6 +178,9 @@ class SequenceTrajectoryDiscriminator(nn.Module):
         # WGAN-GP differentiates through the discriminator input gradients.
         # CuDNN RNN kernels do not support that double-backward path, so use
         # PyTorch's differentiable GRU implementation for this discriminator.
-        with torch.backends.cudnn.flags(enabled=False):
+        if features.requires_grad:
+            with torch.backends.cudnn.flags(enabled=False):
+                _sequence, hidden = self.encoder(features)
+        else:
             _sequence, hidden = self.encoder(features)
         return self.head(hidden[-1]).squeeze(-1)
