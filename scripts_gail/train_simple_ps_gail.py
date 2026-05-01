@@ -18,9 +18,11 @@ if PARENT_DIR not in sys.path:
 
 from scripts_gail.ps_gail.config import PSGAILConfig
 from scripts_gail.ps_gail.data import (
+    fit_feature_standardizer,
     load_expert_policy_and_disc_data,
     load_expert_scene_data,
     load_expert_sequence_data,
+    standardize_features,
 )
 from scripts_gail.ps_gail.envs import make_training_env
 from scripts_gail.ps_gail.monitoring import WandbMonitor
@@ -34,9 +36,11 @@ from scripts_gail.ps_gail.models import (
 from scripts_gail.ps_gail.observations import flatten_agent_observations, policy_observations_from_flat
 from scripts_gail.ps_gail.trainer import (
     collect_rollouts,
+    discrete_action_masks_from_env,
     infer_continuous_action_dim,
     infer_policy_obs_dim,
     make_rollout_executor,
+    policy_action_dim,
     refresh_rollout_rewards,
     resolve_device,
     update_discriminator,
@@ -80,12 +84,39 @@ def env_signature(cfg: PSGAILConfig) -> tuple[object, ...]:
     )
 
 
+def fit_optional_discriminator_normalizer(
+    features: np.ndarray,
+    cfg: PSGAILConfig,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if not bool(getattr(cfg, "normalize_discriminator_features", True)):
+        return None
+    return fit_feature_standardizer(features)
+
+
+def apply_optional_discriminator_normalizer(
+    features: np.ndarray,
+    normalizer: tuple[np.ndarray, np.ndarray] | None,
+    cfg: PSGAILConfig,
+) -> np.ndarray:
+    if normalizer is None:
+        return features.astype(np.float32, copy=False)
+    mean, std = normalizer
+    return standardize_features(
+        features,
+        mean,
+        std,
+        clip=float(getattr(cfg, "discriminator_feature_clip", 0.0)),
+    )
+
+
 def _policy_action_tuple(
     policy: SharedActorCritic,
     obs,
+    env,
     *,
     device: torch.device,
     deterministic: bool,
+    cfg: PSGAILConfig,
 ) -> tuple[object, ...]:
     obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
     with torch.no_grad():
@@ -101,6 +132,15 @@ def _policy_action_tuple(
                 actions = Independent(Normal(policy_out, std), 1).sample()
             actions_np = torch.clamp(actions, -1.0, 1.0).detach().cpu().numpy().astype(np.float32)
             return tuple(action.copy() for action in actions_np)
+        if bool(getattr(cfg, "enable_action_masking", True)):
+            masks = discrete_action_masks_from_env(
+                env,
+                num_agents=len(obs_agents),
+                num_actions=policy_action_dim(policy),
+                enabled=True,
+            )
+            mask_tensor = torch.as_tensor(masks, dtype=torch.bool, device=device)
+            policy_out = policy_out.masked_fill(~mask_tensor, -1.0e9)
         if deterministic:
             actions = torch.argmax(policy_out, dim=-1)
         else:
@@ -146,8 +186,10 @@ def save_checkpoint_video(
             action = _policy_action_tuple(
                 policy,
                 obs,
+                video_env,
                 device=device,
                 deterministic=bool(cfg.checkpoint_video_deterministic),
+                cfg=cfg,
             )
             obs, _reward, terminated, truncated, _info = video_env.step(action)
             frame = video_env.render()
@@ -234,6 +276,7 @@ def main() -> None:
                 trajectory_frame=cfg.trajectory_frame,
                 sequence_length=cfg.sequence_length,
                 sequence_stride=cfg.sequence_stride,
+                sequence_feature_mode=cfg.sequence_feature_mode,
             )
         env_cfg = config_for_round(cfg, 1)
         env = make_training_env(env_cfg)
@@ -278,6 +321,29 @@ def main() -> None:
             else None
         )
         sequence_discriminator = discriminator if sequence_only_discriminator else None
+        primary_discriminator_normalizer = fit_optional_discriminator_normalizer(
+            discriminator_expert_features,
+            cfg,
+        )
+        discriminator_expert_features_train = apply_optional_discriminator_normalizer(
+            discriminator_expert_features,
+            primary_discriminator_normalizer,
+            cfg,
+        )
+        scene_discriminator_normalizer = (
+            fit_optional_discriminator_normalizer(expert_scene_features, cfg)
+            if expert_scene_features is not None
+            else None
+        )
+        expert_scene_features_train = (
+            apply_optional_discriminator_normalizer(
+                expert_scene_features,
+                scene_discriminator_normalizer,
+                cfg,
+            )
+            if expert_scene_features is not None
+            else None
+        )
         policy_optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.learning_rate)
         disc_optimizer = torch.optim.Adam(discriminator.parameters(), lr=cfg.disc_learning_rate)
         scene_disc_optimizer = (
@@ -305,6 +371,11 @@ def main() -> None:
             f"policy_model={cfg.policy_model} "
             f"policy_obs_dim={policy_obs_dim} disc_feature_dim={feature_dim} device={device} "
             f"discriminator={discriminator_name} "
+            f"disc_loss={cfg.discriminator_loss} "
+            f"disc_feature_norm={cfg.normalize_discriminator_features} "
+            f"disc_feature_clip={cfg.discriminator_feature_clip} "
+            f"action_masking={cfg.enable_action_masking} "
+            f"sequence_feature_mode={cfg.sequence_feature_mode} "
             f"cgail_k={cfg.cgail_k} "
             f"rollout_workers={cfg.num_rollout_workers} "
             f"rollout_worker_threads={cfg.rollout_worker_threads}"
@@ -359,8 +430,12 @@ def main() -> None:
             disc_stats = update_discriminator(
                 discriminator,
                 disc_optimizer,
-                discriminator_expert_features,
-                rollout.sequence_features if sequence_only_discriminator else rollout.generator_features,
+                discriminator_expert_features_train,
+                apply_optional_discriminator_normalizer(
+                    rollout.sequence_features if sequence_only_discriminator else rollout.generator_features,
+                    primary_discriminator_normalizer,
+                    round_cfg,
+                ),
                 round_cfg,
                 device,
             )
@@ -373,8 +448,12 @@ def main() -> None:
                 scene_disc_stats = update_discriminator(
                     scene_discriminator,
                     scene_disc_optimizer,
-                    expert_scene_features,
-                    rollout.scene_features,
+                    expert_scene_features_train,
+                    apply_optional_discriminator_normalizer(
+                        rollout.scene_features,
+                        scene_discriminator_normalizer,
+                        round_cfg,
+                    ),
                     round_cfg,
                     device,
                 )
@@ -386,6 +465,13 @@ def main() -> None:
                 device,
                 scene_discriminator=scene_discriminator,
                 sequence_discriminator=sequence_discriminator,
+                discriminator_normalizer=(
+                    None if sequence_only_discriminator else primary_discriminator_normalizer
+                ),
+                scene_discriminator_normalizer=scene_discriminator_normalizer,
+                sequence_discriminator_normalizer=(
+                    primary_discriminator_normalizer if sequence_only_discriminator else None
+                ),
             )
             policy_stats = update_policy(policy, policy_optimizer, rollout, round_cfg, device)
 
@@ -401,6 +487,12 @@ def main() -> None:
                 f"ctrl_frac={round_cfg.percentage_controlled_vehicles:.4f} "
                 f"veh={rollout.mean_controlled_vehicles:.1f}/{rollout.mean_road_vehicles:.1f} "
                 f"disc_loss={disc_stats['disc_loss']:.4f} "
+                + (
+                    f"gap={disc_stats['critic_gap']:.4f} "
+                    f"gp={disc_stats['gradient_penalty']:.4f} "
+                    if str(round_cfg.discriminator_loss).lower() == "wgan_gp"
+                    else ""
+                )
                 + (
                     f"cgail_penalty={disc_stats['cgail_penalty']:.6f} "
                     if float(round_cfg.cgail_k) > 0.0
@@ -430,6 +522,8 @@ def main() -> None:
                 f"expert_acc={disc_stats['expert_acc']:.3f} gen_acc={disc_stats['gen_acc']:.3f} "
                 f"policy_loss={policy_stats['policy_loss']:.4f} "
                 f"value_loss={policy_stats['value_loss']:.4f} "
+                f"kl={policy_stats['approx_kl']:.5f} "
+                f"clip_frac={policy_stats['clip_fraction']:.3f} "
                 f"entropy={policy_stats['entropy']:.4f} "
                 f"raw_gail={rollout.mean_raw_gail_reward:.4f} "
                 f"norm_gail={rollout.mean_normalized_gail_reward:.4f} "
@@ -437,6 +531,20 @@ def main() -> None:
                 f"reward={float(rollout.rewards.mean()):.4f}"
                 )
             )
+            selected_action_valid = float("nan")
+            mean_available_actions = float("nan")
+            if (
+                str(round_cfg.action_mode).lower() != "continuous"
+                and rollout.action_masks.size
+                and rollout.actions.ndim == 1
+            ):
+                action_indices = rollout.actions.astype(np.int64, copy=False)
+                row_indices = np.arange(len(action_indices), dtype=np.int64)
+                in_range = (action_indices >= 0) & (action_indices < rollout.action_masks.shape[1])
+                selected_valid = np.zeros(len(action_indices), dtype=bool)
+                selected_valid[in_range] = rollout.action_masks[row_indices[in_range], action_indices[in_range]]
+                selected_action_valid = float(selected_valid.mean()) if selected_valid.size else float("nan")
+                mean_available_actions = float(rollout.action_masks.sum(axis=1).mean())
             metrics = {
                 "round": round_idx,
                 "rollout/env_steps": rollout.num_env_steps,
@@ -466,9 +574,16 @@ def main() -> None:
                 "rollout/normalized_gail_reward_std": float(rollout.gail_rewards_normalized.std()),
                 "rollout/action_mean": float(rollout.actions.mean()),
                 "rollout/action_std": float(rollout.actions.std()),
+                "rollout/selected_action_valid_fraction": selected_action_valid,
+                "rollout/mean_available_actions": mean_available_actions,
                 "discriminator/loss": disc_stats["disc_loss"],
                 "discriminator/bce_loss": disc_stats["disc_bce_loss"],
                 "discriminator/cgail_penalty": disc_stats["cgail_penalty"],
+                "discriminator/wgan_loss": disc_stats["wgan_loss"],
+                "discriminator/gradient_penalty": disc_stats["gradient_penalty"],
+                "discriminator/expert_score_mean": disc_stats["expert_score_mean"],
+                "discriminator/gen_score_mean": disc_stats["gen_score_mean"],
+                "discriminator/critic_gap": disc_stats["critic_gap"],
                 "discriminator/prob_mean": disc_stats["disc_prob_mean"],
                 "discriminator/prob_std": disc_stats["disc_prob_std"],
                 "discriminator/expert_prob_mean": disc_stats["expert_prob_mean"],
@@ -478,9 +593,21 @@ def main() -> None:
                 "policy/loss": policy_stats["policy_loss"],
                 "policy/value_loss": policy_stats["value_loss"],
                 "policy/entropy": policy_stats["entropy"],
+                "policy/approx_kl": policy_stats["approx_kl"],
+                "policy/clip_fraction": policy_stats["clip_fraction"],
+                "policy/ratio_mean": policy_stats["ratio_mean"],
+                "policy/ratio_std": policy_stats["ratio_std"],
                 "train/policy_obs_dim": policy_obs_dim,
                 "train/disc_feature_dim": feature_dim,
                 "train/expert_samples": int(expert_features.shape[0]),
+                "train/disc_feature_norm": int(bool(cfg.normalize_discriminator_features)),
+                "train/disc_feature_clip": float(cfg.discriminator_feature_clip),
+                "train/action_masking": int(bool(cfg.enable_action_masking)),
+                "train/discriminator_loss_type_wgan_gp": int(str(cfg.discriminator_loss).lower() == "wgan_gp"),
+                "train/wgan_gp_lambda": float(cfg.wgan_gp_lambda),
+                "train/sequence_feature_mode_local_deltas": int(
+                    str(cfg.sequence_feature_mode).lower() == "local_deltas"
+                ),
                 "train/rollout_workers": int(cfg.num_rollout_workers),
                 "train/rollout_worker_threads": int(cfg.rollout_worker_threads),
             }
@@ -490,6 +617,11 @@ def main() -> None:
                         "scene_discriminator/loss": scene_disc_stats["disc_loss"],
                         "scene_discriminator/bce_loss": scene_disc_stats["disc_bce_loss"],
                         "scene_discriminator/cgail_penalty": scene_disc_stats["cgail_penalty"],
+                        "scene_discriminator/wgan_loss": scene_disc_stats["wgan_loss"],
+                        "scene_discriminator/gradient_penalty": scene_disc_stats["gradient_penalty"],
+                        "scene_discriminator/expert_score_mean": scene_disc_stats["expert_score_mean"],
+                        "scene_discriminator/gen_score_mean": scene_disc_stats["gen_score_mean"],
+                        "scene_discriminator/critic_gap": scene_disc_stats["critic_gap"],
                         "scene_discriminator/prob_mean": scene_disc_stats["disc_prob_mean"],
                         "scene_discriminator/prob_std": scene_disc_stats["disc_prob_std"],
                         "scene_discriminator/expert_prob_mean": scene_disc_stats["expert_prob_mean"],
@@ -504,6 +636,11 @@ def main() -> None:
                         "sequence_discriminator/loss": sequence_disc_stats["disc_loss"],
                         "sequence_discriminator/bce_loss": sequence_disc_stats["disc_bce_loss"],
                         "sequence_discriminator/cgail_penalty": sequence_disc_stats["cgail_penalty"],
+                        "sequence_discriminator/wgan_loss": sequence_disc_stats["wgan_loss"],
+                        "sequence_discriminator/gradient_penalty": sequence_disc_stats["gradient_penalty"],
+                        "sequence_discriminator/expert_score_mean": sequence_disc_stats["expert_score_mean"],
+                        "sequence_discriminator/gen_score_mean": sequence_disc_stats["gen_score_mean"],
+                        "sequence_discriminator/critic_gap": sequence_disc_stats["critic_gap"],
                         "sequence_discriminator/prob_mean": sequence_disc_stats["disc_prob_mean"],
                         "sequence_discriminator/prob_std": sequence_disc_stats["disc_prob_std"],
                         "sequence_discriminator/expert_prob_mean": sequence_disc_stats["expert_prob_mean"],
@@ -530,6 +667,8 @@ def main() -> None:
                         "sequence_discriminator_state_dict": discriminator.state_dict()
                         if sequence_only_discriminator
                         else None,
+                        "discriminator_feature_normalizer": primary_discriminator_normalizer,
+                        "scene_discriminator_feature_normalizer": scene_discriminator_normalizer,
                         "discriminator_type": discriminator_name,
                         "config": vars(cfg),
                         "round_config": vars(round_cfg),
@@ -564,6 +703,8 @@ def main() -> None:
                 "sequence_discriminator_state_dict": discriminator.state_dict()
                 if sequence_only_discriminator
                 else None,
+                "discriminator_feature_normalizer": primary_discriminator_normalizer,
+                "scene_discriminator_feature_normalizer": scene_discriminator_normalizer,
                 "discriminator_type": discriminator_name,
                 "config": vars(cfg),
                 "round_config": vars(config_for_round(cfg, int(cfg.total_rounds))),

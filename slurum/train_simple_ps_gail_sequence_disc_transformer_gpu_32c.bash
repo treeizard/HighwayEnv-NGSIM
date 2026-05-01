@@ -3,7 +3,7 @@
 #SBATCH --account=bt60
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
@@ -17,7 +17,7 @@ export PYTHONPATH="${REPODIR}:${PYTHONPATH:-}"
 
 ROLLOUT_WORKER_THREADS="${ROLLOUT_WORKER_THREADS:-1}"
 ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-$((SLURM_CPUS_PER_TASK / ROLLOUT_WORKER_THREADS))}"
-CGAIL_K="${CGAIL_K:-0.1}"
+CGAIL_K="${CGAIL_K:-0.0}"
 if [ "${ROLLOUT_WORKERS}" -lt 1 ]; then
     ROLLOUT_WORKERS=1
 fi
@@ -40,9 +40,16 @@ POLICY_MODEL="${POLICY_MODEL:-transformer}"
 TRANSFORMER_LAYERS="${TRANSFORMER_LAYERS:-2}"
 TRANSFORMER_HEADS="${TRANSFORMER_HEADS:-4}"
 TRANSFORMER_DROPOUT="${TRANSFORMER_DROPOUT:-0.1}"
-RUN_NAME="${RUN_NAME:-ps_gail_sequence_disc_transformer_cgail_k${CGAIL_K}_32c_${SLURM_JOB_ID}}"
+DISCRIMINATOR_LOSS="${DISCRIMINATOR_LOSS:-wgan_gp}"
+WGAN_GP_LAMBDA="${WGAN_GP_LAMBDA:-2.0}"
+SEQUENCE_FEATURE_MODE="${SEQUENCE_FEATURE_MODE:-local_deltas}"
+NORMALIZE_DISCRIMINATOR_FEATURES="${NORMALIZE_DISCRIMINATOR_FEATURES:-true}"
+DISCRIMINATOR_FEATURE_CLIP="${DISCRIMINATOR_FEATURE_CLIP:-10.0}"
+ENABLE_ACTION_MASKING="${ENABLE_ACTION_MASKING:-true}"
+ALLOW_IDM="${ALLOW_IDM:-true}"
+RUN_NAME="${RUN_NAME:-ps_gail_seq_tf_${DISCRIMINATOR_LOSS}_${SEQUENCE_FEATURE_MODE}_mask${ENABLE_ACTION_MASKING}_300r_200h_32c_${SLURM_JOB_ID}}"
 WANDB_MODE="${WANDB_MODE:-online}"
-TOTAL_ROUNDS="${TOTAL_ROUNDS:-200}"
+TOTAL_ROUNDS="${TOTAL_ROUNDS:-300}"
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-200}"
 ROLLOUT_MIN_EPISODES="${ROLLOUT_MIN_EPISODES:-${ROLLOUT_WORKERS}}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
@@ -77,7 +84,16 @@ echo "Rollout workers: ${ROLLOUT_WORKERS}"
 echo "Rollout worker threads: ${ROLLOUT_WORKER_THREADS}"
 echo "Policy model: ${POLICY_MODEL}"
 echo "Transformer layers/heads/dropout: ${TRANSFORMER_LAYERS}/${TRANSFORMER_HEADS}/${TRANSFORMER_DROPOUT}"
-echo "C-GAIL discriminator k: ${CGAIL_K}"
+echo "C-GAIL discriminator k (BCE only): ${CGAIL_K}"
+echo "Discriminator loss: ${DISCRIMINATOR_LOSS}"
+echo "WGAN-GP lambda: ${WGAN_GP_LAMBDA}"
+echo "Sequence feature mode: ${SEQUENCE_FEATURE_MODE}"
+echo "Normalize discriminator features: ${NORMALIZE_DISCRIMINATOR_FEATURES}"
+echo "Discriminator feature clip: ${DISCRIMINATOR_FEATURE_CLIP}"
+echo "Action masking: ${ENABLE_ACTION_MASKING}"
+echo "Allow IDM: ${ALLOW_IDM}"
+echo "Total rounds: ${TOTAL_ROUNDS}"
+echo "Rollout steps: ${ROLLOUT_STEPS}"
 echo "Rollout min episodes: ${ROLLOUT_MIN_EPISODES}"
 echo "Policy batch size: ${BATCH_SIZE}"
 echo "Discriminator batch size: ${DISC_BATCH_SIZE}"
@@ -113,6 +129,21 @@ if [ "${SAVE_CHECKPOINT_VIDEO}" = "true" ]; then
 else
     CHECKPOINT_VIDEO_ARG="--no-save-checkpoint-video"
 fi
+if [ "${NORMALIZE_DISCRIMINATOR_FEATURES}" = "true" ]; then
+    DISC_FEATURE_NORM_ARG="--normalize-discriminator-features"
+else
+    DISC_FEATURE_NORM_ARG="--no-normalize-discriminator-features"
+fi
+if [ "${ENABLE_ACTION_MASKING}" = "true" ]; then
+    ACTION_MASKING_ARG="--enable-action-masking"
+else
+    ACTION_MASKING_ARG="--no-enable-action-masking"
+fi
+if [ "${ALLOW_IDM}" = "true" ]; then
+    ALLOW_IDM_ARG="--allow-idm"
+else
+    ALLOW_IDM_ARG="--no-allow-idm"
+fi
 
 python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --expert-data "${EXPERT_DATA}" \
@@ -132,9 +163,14 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --final-reward-clip "${FINAL_REWARD_CLIP}" \
     --disc-expert-label "${DISC_EXPERT_LABEL}" \
     --disc-generator-label "${DISC_GENERATOR_LABEL}" \
+    --discriminator-loss "${DISCRIMINATOR_LOSS}" \
+    --wgan-gp-lambda "${WGAN_GP_LAMBDA}" \
+    "${DISC_FEATURE_NORM_ARG}" \
+    --discriminator-feature-clip "${DISCRIMINATOR_FEATURE_CLIP}" \
+    "${ACTION_MASKING_ARG}" \
     --cgail-k "${CGAIL_K}" \
     "${TERMINATION_ARG}" \
-    --allow-idm \
+    "${ALLOW_IDM_ARG}" \
     --device cuda \
     --total-rounds "${TOTAL_ROUNDS}" \
     --rollout-steps "${ROLLOUT_STEPS}" \
@@ -151,6 +187,7 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --transformer-heads "${TRANSFORMER_HEADS}" \
     --transformer-dropout "${TRANSFORMER_DROPOUT}" \
     --enable-sequence-discriminator \
+    --sequence-feature-mode "${SEQUENCE_FEATURE_MODE}" \
     --sequence-length "${SEQUENCE_LENGTH}" \
     --sequence-stride "${SEQUENCE_STRIDE}" \
     --sequence-reward-coef "${SEQUENCE_REWARD_COEF}" \
@@ -164,5 +201,5 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --checkpoint-video-steps "${CHECKPOINT_VIDEO_STEPS}" \
     --wandb-mode "${WANDB_MODE}" \
     --wandb-project highwayenv-ps-gail \
-    --wandb-tags ps-gail,sequence-discriminator,transformer-policy,c-gail,collision,idm,gpu,32c \
+    --wandb-tags ps-gail,sequence-discriminator,transformer-policy,wgan-gp,action-masking,local-deltas,collision,allow-idm-${ALLOW_IDM},gpu,32c,long-run \
     --run-name "${RUN_NAME}"

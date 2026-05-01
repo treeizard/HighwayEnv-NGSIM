@@ -1,0 +1,315 @@
+import sys
+import types
+
+import numpy as np
+import torch
+from torch.distributions import Categorical
+
+try:
+    import gymnasium  # noqa: F401
+except ModuleNotFoundError:
+    gymnasium = types.ModuleType("gymnasium")
+
+    class _Env:
+        pass
+
+    class _Wrapper:
+        pass
+
+    class _RecordConstructorArgs:
+        pass
+
+    gymnasium.Env = _Env
+    gymnasium.Wrapper = _Wrapper
+
+    class _Space:
+        def __init__(self, *args, **kwargs):
+            self.shape = tuple(kwargs.get("shape", ()))
+            self.spaces = tuple(kwargs.get("spaces", ()))
+
+        def contains(self, _value):
+            return True
+
+        def sample(self):
+            return 0
+
+    class _Tuple:
+        def __init__(self, spaces=()):
+            self.spaces = tuple(spaces)
+
+    class _Box:
+        def __init__(self, shape=()):
+            self.shape = tuple(shape)
+
+    class _Discrete:
+        def __init__(self, n):
+            self.n = int(n)
+
+    class _Dict(dict):
+        pass
+
+    gymnasium.spaces = types.SimpleNamespace(
+        Space=_Space,
+        Tuple=_Tuple,
+        Box=_Box,
+        Discrete=_Discrete,
+        Dict=_Dict,
+    )
+    gymnasium.make = lambda *args, **kwargs: None
+    envs = types.ModuleType("gymnasium.envs")
+    registration = types.ModuleType("gymnasium.envs.registration")
+    registration.register = lambda *args, **kwargs: None
+    registration.registry = {}
+    utils = types.ModuleType("gymnasium.utils")
+    utils.RecordConstructorArgs = _RecordConstructorArgs
+    wrappers = types.ModuleType("gymnasium.wrappers")
+    wrappers.RecordVideo = object
+    sys.modules["gymnasium"] = gymnasium
+    sys.modules["gymnasium.envs"] = envs
+    sys.modules["gymnasium.envs.registration"] = registration
+    sys.modules["gymnasium.utils"] = utils
+    sys.modules["gymnasium.wrappers"] = wrappers
+
+fake_envs = types.ModuleType("scripts_gail.ps_gail.envs")
+fake_envs.controlled_vehicle_snapshot = lambda _env: ([], np.zeros((0, 3), dtype=np.float32))
+fake_envs.make_training_env = lambda *args, **kwargs: None
+sys.modules.setdefault("scripts_gail.ps_gail.envs", fake_envs)
+
+from scripts_gail.ps_gail.config import PSGAILConfig
+from scripts_gail.ps_gail.data import (
+    fit_feature_standardizer,
+    standardize_features,
+    transform_sequence_features,
+)
+from scripts_gail.ps_gail.models import SequenceTrajectoryDiscriminator, make_actor_critic
+from scripts_gail.ps_gail.trainer import (
+    RolloutBatch,
+    policy_distribution_and_values,
+    refresh_rollout_rewards,
+    update_discriminator,
+    update_policy,
+)
+
+
+def _minimal_rollout(
+    *,
+    observations: np.ndarray,
+    actions: np.ndarray,
+    old_log_probs: np.ndarray,
+    old_values: np.ndarray,
+    returns: np.ndarray,
+    advantages: np.ndarray,
+    generator_features: np.ndarray | None = None,
+) -> RolloutBatch:
+    n = int(len(observations))
+    return RolloutBatch(
+        policy_observations=observations.astype(np.float32),
+        actions=actions,
+        action_masks=np.ones((n, 5), dtype=bool),
+        old_log_probs=old_log_probs.astype(np.float32),
+        old_values=old_values.astype(np.float32),
+        trajectory_ids=np.arange(n, dtype=np.int32),
+        dones=np.ones(n, dtype=bool),
+        rewards=np.zeros(n, dtype=np.float32),
+        gail_rewards_raw=np.zeros(n, dtype=np.float32),
+        gail_rewards_normalized=np.zeros(n, dtype=np.float32),
+        env_penalties=np.zeros(n, dtype=np.float32),
+        returns=returns.astype(np.float32),
+        advantages=advantages.astype(np.float32),
+        generator_features=(
+            generator_features.astype(np.float32)
+            if generator_features is not None
+            else np.zeros((n, 2), dtype=np.float32)
+        ),
+        scene_features=np.zeros((0, 2), dtype=np.float32),
+        transition_scene_indices=np.full(n, -1, dtype=np.int64),
+        sequence_features=np.zeros((0, 1, 2), dtype=np.float32),
+        sequence_last_indices=np.zeros((0,), dtype=np.int64),
+        num_env_steps=n,
+        num_agent_steps=n,
+    )
+
+
+def test_feature_standardizer_supports_sequence_features_and_clipping():
+    features = np.asarray(
+        [
+            [[1.0, 10.0], [3.0, 14.0]],
+            [[5.0, 18.0], [7.0, 22.0]],
+        ],
+        dtype=np.float32,
+    )
+
+    mean, std = fit_feature_standardizer(features)
+    normalized = standardize_features(features, mean, std, clip=1.0)
+
+    assert mean.shape == (2,)
+    assert std.shape == (2,)
+    assert normalized.shape == features.shape
+    assert np.max(np.abs(normalized)) <= 1.0
+
+
+def test_transformer_policy_update_uses_rollout_consistent_eval_mode():
+    torch.manual_seed(0)
+    cfg = PSGAILConfig(
+        policy_model="transformer",
+        hidden_size=32,
+        transformer_heads=4,
+        transformer_dropout=0.5,
+        batch_size=16,
+        ppo_epochs=1,
+        entropy_coef=0.0,
+        value_coef=0.0,
+    )
+    policy = make_actor_critic(
+        "transformer",
+        obs_dim=12,
+        hidden_size=32,
+        transformer_heads=4,
+        transformer_dropout=0.5,
+    )
+    observations = torch.randn(32, 12)
+    policy.eval()
+    with torch.no_grad():
+        logits, values = policy(observations)
+        dist = Categorical(logits=logits)
+        actions = dist.sample()
+        old_log_probs = dist.log_prob(actions)
+
+    rollout = _minimal_rollout(
+        observations=observations.numpy(),
+        actions=actions.numpy().astype(np.int64),
+        old_log_probs=old_log_probs.numpy(),
+        old_values=values.numpy(),
+        returns=values.numpy(),
+        advantages=np.ones(32, dtype=np.float32),
+    )
+    policy.train()
+    optimizer = torch.optim.Adam(policy.parameters(), lr=0.0)
+
+    stats = update_policy(policy, optimizer, rollout, cfg, torch.device("cpu"))
+
+    assert policy.training
+    assert abs(stats["approx_kl"]) < 1e-7
+    assert stats["clip_fraction"] == 0.0
+    assert abs(stats["ratio_mean"] - 1.0) < 1e-7
+
+
+def test_discrete_policy_distribution_respects_action_masks():
+    torch.manual_seed(0)
+    cfg = PSGAILConfig(action_mode="discrete")
+    policy = make_actor_critic("mlp", obs_dim=3, hidden_size=8)
+    obs = torch.randn(2, 3)
+    masks = torch.tensor(
+        [
+            [False, True, False, False, False],
+            [False, False, True, False, False],
+        ],
+        dtype=torch.bool,
+    )
+
+    dist, _values = policy_distribution_and_values(policy, obs, cfg, masks)
+
+    assert torch.equal(dist.sample(), torch.tensor([1, 2]))
+    assert torch.isneginf(dist.logits[0, 0]) or dist.logits[0, 0] < -1.0e8
+
+
+def test_sequence_feature_local_deltas_remove_cumulative_progress():
+    sequence = np.zeros((1, 4, 5), dtype=np.float32)
+    sequence[0, :, -3:] = np.asarray(
+        [
+            [100.0, 2.0, 10.0],
+            [103.0, 3.0, 12.0],
+            [107.0, 2.5, 11.0],
+            [110.0, 2.0, 11.5],
+        ],
+        dtype=np.float32,
+    )
+
+    transformed = transform_sequence_features(sequence, mode="local_deltas")
+
+    np.testing.assert_allclose(transformed[0, 0, -3:], [0.0, 0.0, 0.0])
+    np.testing.assert_allclose(transformed[0, 1:, -3:], [[3.0, 1.0, 2.0], [4.0, -0.5, -1.0], [3.0, -0.5, 0.5]])
+
+
+def test_refresh_rollout_rewards_applies_discriminator_feature_normalizer():
+    class FirstFeatureDiscriminator(torch.nn.Module):
+        def forward(self, features: torch.Tensor) -> torch.Tensor:
+            return features[:, 0]
+
+    cfg = PSGAILConfig(
+        discriminator_loss="bce",
+        normalize_gail_reward=False,
+        gail_reward_clip=0.0,
+        final_reward_clip=0.0,
+        discriminator_feature_clip=0.0,
+    )
+    rollout = _minimal_rollout(
+        observations=np.zeros((1, 1), dtype=np.float32),
+        actions=np.zeros((1,), dtype=np.int64),
+        old_log_probs=np.zeros((1,), dtype=np.float32),
+        old_values=np.zeros((1,), dtype=np.float32),
+        returns=np.zeros((1,), dtype=np.float32),
+        advantages=np.zeros((1,), dtype=np.float32),
+        generator_features=np.asarray([[11.0, 0.0]], dtype=np.float32),
+    )
+
+    refreshed = refresh_rollout_rewards(
+        rollout,
+        FirstFeatureDiscriminator(),
+        cfg,
+        torch.device("cpu"),
+        discriminator_normalizer=(
+            np.asarray([10.0, 0.0], dtype=np.float32),
+            np.asarray([1.0, 1.0], dtype=np.float32),
+        ),
+    )
+
+    expected = torch.nn.functional.softplus(torch.tensor([1.0])).numpy()
+    np.testing.assert_allclose(refreshed.gail_rewards_raw, expected, rtol=1e-6)
+
+
+def test_wgan_gp_discriminator_update_returns_critic_metrics():
+    torch.manual_seed(0)
+    np.random.seed(0)
+    cfg = PSGAILConfig(
+        discriminator_loss="wgan_gp",
+        disc_updates_per_round=1,
+        disc_batch_size=4,
+        wgan_gp_lambda=2.0,
+    )
+    discriminator = torch.nn.Sequential(
+        torch.nn.Linear(2, 8),
+        torch.nn.Tanh(),
+        torch.nn.Linear(8, 1),
+        torch.nn.Flatten(0),
+    )
+    expert = np.ones((8, 2), dtype=np.float32)
+    generator = -np.ones((8, 2), dtype=np.float32)
+    optimizer = torch.optim.Adam(discriminator.parameters(), lr=1e-3)
+
+    stats = update_discriminator(discriminator, optimizer, expert, generator, cfg, torch.device("cpu"))
+
+    assert np.isfinite(stats["disc_loss"])
+    assert np.isfinite(stats["wgan_loss"])
+    assert np.isfinite(stats["gradient_penalty"])
+    assert "critic_gap" in stats
+
+
+def test_wgan_gp_supports_sequence_discriminator_inputs():
+    torch.manual_seed(0)
+    np.random.seed(0)
+    cfg = PSGAILConfig(
+        discriminator_loss="wgan_gp",
+        disc_updates_per_round=1,
+        disc_batch_size=4,
+        wgan_gp_lambda=2.0,
+    )
+    discriminator = SequenceTrajectoryDiscriminator(input_dim=3, hidden_size=8)
+    expert = np.ones((8, 4, 3), dtype=np.float32)
+    generator = -np.ones((8, 4, 3), dtype=np.float32)
+    optimizer = torch.optim.Adam(discriminator.parameters(), lr=1e-3)
+
+    stats = update_discriminator(discriminator, optimizer, expert, generator, cfg, torch.device("cpu"))
+
+    assert np.isfinite(stats["disc_loss"])
+    assert np.isfinite(stats["gradient_penalty"])

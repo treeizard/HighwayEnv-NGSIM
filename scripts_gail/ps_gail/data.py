@@ -12,6 +12,40 @@ from .observations import policy_observations_from_flat
 SCENE_FEATURE_DIM_PER_VEHICLE = 5
 
 
+def fit_feature_standardizer(features: np.ndarray, *, eps: float = 1e-6) -> tuple[np.ndarray, np.ndarray]:
+    features = np.asarray(features, dtype=np.float32)
+    if features.ndim < 2:
+        raise ValueError(f"Expected at least rank-2 features, got {features.shape}.")
+    axes = tuple(range(features.ndim - 1))
+    mean = features.mean(axis=axes, dtype=np.float64).astype(np.float32)
+    std = features.std(axis=axes, dtype=np.float64).astype(np.float32)
+    std = np.where(std < float(eps), 1.0, std).astype(np.float32, copy=False)
+    return mean, std
+
+
+def standardize_features(
+    features: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray,
+    *,
+    clip: float = 0.0,
+) -> np.ndarray:
+    features = np.asarray(features, dtype=np.float32)
+    mean = np.asarray(mean, dtype=np.float32)
+    std = np.asarray(std, dtype=np.float32)
+    if features.ndim < 2:
+        raise ValueError(f"Expected at least rank-2 features, got {features.shape}.")
+    if mean.shape != (features.shape[-1],) or std.shape != (features.shape[-1],):
+        raise ValueError(
+            "Feature normalizer shape mismatch: "
+            f"features last dim={features.shape[-1]} mean={mean.shape} std={std.shape}."
+        )
+    normalized = (features - mean) / std
+    if float(clip) > 0.0:
+        normalized = np.clip(normalized, -float(clip), float(clip))
+    return normalized.astype(np.float32, copy=False)
+
+
 def discriminator_features(policy_observations: np.ndarray, trajectory_states: np.ndarray) -> np.ndarray:
     policy_observations = np.asarray(policy_observations, dtype=np.float32)
     trajectory_states = np.asarray(trajectory_states, dtype=np.float32)
@@ -109,6 +143,43 @@ def build_sequence_windows(
     return (
         np.stack(windows, axis=0).astype(np.float32, copy=False),
         np.asarray(last_indices, dtype=np.int64),
+    )
+
+
+def transform_sequence_features(
+    sequence_features: np.ndarray,
+    *,
+    mode: str = "raw",
+) -> np.ndarray:
+    """Transform only the trajectory tail of sequence windows.
+
+    Expert files remain unchanged. This is a training-time view that prevents
+    autoregressive discriminators from using cumulative trajectory progress as
+    an easy shortcut.
+    """
+    sequence_features = np.asarray(sequence_features, dtype=np.float32)
+    if sequence_features.ndim != 3:
+        raise ValueError(f"Expected rank-3 sequence features, got {sequence_features.shape}.")
+    mode = str(mode).lower()
+    if mode in {"raw", "none", ""}:
+        return sequence_features.astype(np.float32, copy=True)
+    if sequence_features.shape[-1] < 3:
+        raise ValueError(
+            f"Sequence features need a final [x, y, v] tail, got {sequence_features.shape}."
+        )
+
+    transformed = sequence_features.astype(np.float32, copy=True)
+    trajectory = transformed[:, :, -3:]
+    if mode == "local":
+        trajectory[:, :, :2] -= trajectory[:, 0:1, :2]
+        return transformed
+    if mode == "local_deltas":
+        deltas = np.zeros_like(trajectory, dtype=np.float32)
+        deltas[:, 1:, :] = trajectory[:, 1:, :] - trajectory[:, :-1, :]
+        transformed[:, :, -3:] = deltas
+        return transformed
+    raise ValueError(
+        f"Unsupported sequence_feature_mode={mode!r}. Expected 'raw', 'local', or 'local_deltas'."
     )
 
 
@@ -352,6 +423,7 @@ def load_expert_sequence_data(
     trajectory_frame: str = "relative",
     sequence_length: int = 8,
     sequence_stride: int = 1,
+    sequence_feature_mode: str = "raw",
 ) -> tuple[np.ndarray, dict[str, Any]]:
     rng = np.random.default_rng(seed)
     files = _dataset_files(path)
@@ -389,6 +461,7 @@ def load_expert_sequence_data(
             f"No expert sequence windows of length {sequence_length} were built from {path}."
         )
     sequences = np.concatenate(windows, axis=0).astype(np.float32, copy=False)
+    sequences = transform_sequence_features(sequences, mode=sequence_feature_mode)
     if 0 < int(max_samples) < len(sequences):
         idx = np.sort(rng.choice(len(sequences), size=int(max_samples), replace=False))
         sequences = sequences[idx]
@@ -396,5 +469,6 @@ def load_expert_sequence_data(
         "num_sequence_samples": int(len(sequences)),
         "num_source_sequence_samples": int(source_windows),
         "sequence_length": int(sequence_length),
+        "sequence_feature_mode": str(sequence_feature_mode),
         "sequence_feature_dim": int(sequences.shape[-1]),
     }
