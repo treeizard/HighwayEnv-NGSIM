@@ -51,7 +51,7 @@ nvidia-smi || true
 # This mode requires expert files rebuilt by the updated
 # scripts_gail/build_ps_traj_expert_discrete.py so each .npz contains
 # scene_features and scene_timesteps.
-EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_traj_expert_dual_disc_check}"
+export EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_traj_expert_dual_disc_check}"
 RUN_NAME="${RUN_NAME:-ps_gail_scene_disc_32c_${SLURM_JOB_ID}}"
 WANDB_MODE="${WANDB_MODE:-online}"
 TOTAL_ROUNDS="${TOTAL_ROUNDS:-200}"

@@ -35,7 +35,7 @@ module load miniforge3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate ngsim_env
 
-EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_traj_expert_discrete_54902119}"
+export EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_traj_expert_discrete_54902119}"
 POLICY_MODEL="${POLICY_MODEL:-transformer}"
 TRANSFORMER_LAYERS="${TRANSFORMER_LAYERS:-2}"
 TRANSFORMER_HEADS="${TRANSFORMER_HEADS:-4}"
