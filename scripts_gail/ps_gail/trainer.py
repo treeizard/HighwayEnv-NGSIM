@@ -247,7 +247,6 @@ def discriminator_reward(
     feature_normalizer: tuple[np.ndarray, np.ndarray] | None = None,
     feature_clip: float = 0.0,
     loss_type: str = "bce",
-    wgan_reward_clip: float = 0.0,
 ) -> np.ndarray:
     features = generator_features
     if feature_normalizer is not None:
@@ -255,12 +254,7 @@ def discriminator_reward(
         features = standardize_features(features, mean, std, clip=feature_clip)
     with torch.no_grad():
         logits = discriminator(_as_device_tensor(features, dtype=torch.float32, device=device))
-        if str(loss_type).lower() == "wgan_gp":
-            rewards = logits
-            if float(wgan_reward_clip) > 0:
-                rewards = torch.clamp(rewards, -float(wgan_reward_clip), float(wgan_reward_clip))
-        else:
-            rewards = F.softplus(logits)
+        rewards = logits if str(loss_type).lower() == "wgan_gp" else F.softplus(logits)
     return rewards.cpu().numpy().astype(np.float32)
 
 
@@ -320,7 +314,6 @@ def refresh_rollout_rewards(
             feature_normalizer=discriminator_normalizer,
             feature_clip=feature_clip,
             loss_type=str(getattr(cfg, "discriminator_loss", "bce")),
-            wgan_reward_clip=float(getattr(cfg, "wgan_reward_clip", 0.0)),
         )
         combined_raw_gail_rewards = raw_gail_rewards.astype(np.float32, copy=True)
     if scene_discriminator is not None and rollout.scene_features.size:
@@ -331,7 +324,6 @@ def refresh_rollout_rewards(
             feature_normalizer=scene_discriminator_normalizer,
             feature_clip=feature_clip,
             loss_type=str(getattr(cfg, "discriminator_loss", "bce")),
-            wgan_reward_clip=float(getattr(cfg, "wgan_reward_clip", 0.0)),
         )
         scene_rewards = scene_rewards * float(cfg.scene_reward_coef)
         valid = (
@@ -347,7 +339,6 @@ def refresh_rollout_rewards(
             feature_normalizer=sequence_discriminator_normalizer,
             feature_clip=feature_clip,
             loss_type=str(getattr(cfg, "discriminator_loss", "bce")),
-            wgan_reward_clip=float(getattr(cfg, "wgan_reward_clip", 0.0)),
         )
         sequence_rewards = sequence_rewards * float(cfg.sequence_reward_coef)
         per_transition = np.zeros_like(combined_raw_gail_rewards, dtype=np.float32)

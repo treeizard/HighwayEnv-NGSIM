@@ -84,7 +84,6 @@ from scripts_gail.ps_gail.data import (
 from scripts_gail.ps_gail.models import SequenceTrajectoryDiscriminator, make_actor_critic
 from scripts_gail.ps_gail.trainer import (
     RolloutBatch,
-    discriminator_reward,
     policy_distribution_and_values,
     refresh_rollout_rewards,
     update_discriminator,
@@ -267,22 +266,6 @@ def test_refresh_rollout_rewards_applies_discriminator_feature_normalizer():
 
     expected = torch.nn.functional.softplus(torch.tensor([1.0])).numpy()
     np.testing.assert_allclose(refreshed.gail_rewards_raw, expected, rtol=1e-6)
-
-
-def test_wgan_discriminator_reward_is_clipped_when_configured():
-    class WideRangeDiscriminator(torch.nn.Module):
-        def forward(self, features: torch.Tensor) -> torch.Tensor:
-            return features[:, 0] * 10.0
-
-    rewards = discriminator_reward(
-        WideRangeDiscriminator(),
-        np.asarray([[-2.0], [0.5], [2.0]], dtype=np.float32),
-        torch.device("cpu"),
-        loss_type="wgan_gp",
-        wgan_reward_clip=3.0,
-    )
-
-    np.testing.assert_allclose(rewards, [-3.0, 3.0, 3.0], rtol=1e-6)
 
 
 def test_wgan_gp_discriminator_update_returns_critic_metrics():
