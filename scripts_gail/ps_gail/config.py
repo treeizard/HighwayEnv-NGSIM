@@ -58,6 +58,7 @@ class PSGAILConfig:
     disc_generator_label: float = 0.1
     discriminator_loss: str = "wgan_gp"
     wgan_gp_lambda: float = 2.0
+    wgan_reward_clip: float = 10.0
     normalize_discriminator_features: bool = True
     discriminator_feature_clip: float = 10.0
     cgail_k: float = 0.0
