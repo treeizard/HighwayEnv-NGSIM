@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ps_unified_expert
 #SBATCH --account=bt60
-#SBATCH --time=02:00:00
+#SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
@@ -40,10 +40,10 @@ conda activate ngsim_env
 
 OUT="${OUT:-${REPODIR}/expert_data/ngsim_ps_unified_expert_continuous_${SLURM_JOB_ID}}"
 VIDEO_DIR="${VIDEO_DIR:-${REPODIR}/expert_data/videos/${SLURM_JOB_ID}}"
-MAX_EPISODES="${MAX_EPISODES:-10}"
+MAX_EPISODES="${MAX_EPISODES:-0}"
 MAX_STEPS_PER_EPISODE="${MAX_STEPS_PER_EPISODE:-200}"
 MAX_SAMPLES_PER_VEHICLE="${MAX_SAMPLES_PER_VEHICLE:-200}"
-SAVE_VIDEO="${SAVE_VIDEO:-true}"
+SAVE_VIDEO="${SAVE_VIDEO:-false}"
 
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "CPUs per task: ${SLURM_CPUS_PER_TASK:-unknown}"
@@ -60,6 +60,7 @@ python "${REPODIR}/scripts_gail/build_ps_traj_expert_discrete.py" \
     --scene us-101 \
     --prebuilt-split train \
     --max-episodes "${MAX_EPISODES}" \
+    --collect-all-split-episodes \
     --max-steps-per-episode "${MAX_STEPS_PER_EPISODE}" \
     --max-samples-per-vehicle "${MAX_SAMPLES_PER_VEHICLE}" \
     --num-collection-workers "${COLLECTION_WORKERS}" \

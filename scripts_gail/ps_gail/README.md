@@ -21,6 +21,9 @@ This package is a small modular trainer for the NGSIM discrete meta-action setup
 - Expert collection can run episodes in parallel with
   `--num-collection-workers N --collection-worker-threads 2`; each worker owns
   one environment at a time and caps native CPU thread pools.
+- Use `--collect-all-split-episodes` or `--max-episodes 0` to collect every
+  available fixed episode in the configured prebuilt split without duplicate
+  random resets.
 - Generator rollouts collect complete random NGSIM episodes by default. With the
   default `max_episode_steps=200`, `--rollout-min-episodes 4` means four full
   200-step episodes per training round, split across rollout workers.

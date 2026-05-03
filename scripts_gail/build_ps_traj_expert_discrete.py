@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
         "--max-episodes",
         type=int,
         default=1,
-        help="Number of expert replay episodes to collect from.",
+        help="Number of expert replay episodes to collect from. Use 0 to collect every available episode in the split.",
     )
     parser.add_argument(
         "--max-steps-per-episode",
@@ -217,6 +217,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable per-episode tqdm progress bars. Parallel collection uses one parent progress bar.",
     )
+    parser.add_argument(
+        "--collect-all-split-episodes",
+        action="store_true",
+        help="Collect every available episode in the configured prebuilt split. Equivalent to --max-episodes 0.",
+    )
     return parser.parse_args()
 
 
@@ -243,7 +248,13 @@ def observation_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def make_expert_scene_env(args: argparse.Namespace, *, render_mode: str | None = None) -> gym.Env:
+def make_expert_scene_env(
+    args: argparse.Namespace,
+    *,
+    render_mode: str | None = None,
+    episode_name: str | None = None,
+    ego_ids: list[int] | tuple[int, ...] | None = None,
+) -> gym.Env:
     cfg = build_env_config(
         scene=args.scene,
         action_mode=str(args.expert_control_mode),
@@ -257,6 +268,8 @@ def make_expert_scene_env(args: argparse.Namespace, *, render_mode: str | None =
         policy_frequency=args.policy_frequency,
         max_episode_steps=args.max_episode_steps,
         seed=None,
+        simulation_period={"episode_name": str(episode_name)} if episode_name is not None else None,
+        ego_vehicle_id=list(ego_ids) if ego_ids is not None else None,
         scene_dataset_collection_mode=True,
         allow_idm=bool(args.allow_idm),
     )
@@ -927,10 +940,49 @@ def render_mode_from_args(args: argparse.Namespace) -> str | None:
     return "rgb_array" if args.save_video else ("human" if args.visualize_episode else None)
 
 
+def available_collection_scenarios(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Return deterministic fixed episodes/ego ids for expert collection."""
+    register_ngsim_env()
+    probe_env = make_expert_scene_env(args)
+    try:
+        base = probe_env.unwrapped
+        if not hasattr(base, "_episodes") or not hasattr(base, "_valid_ids_by_episode"):
+            raise AttributeError("NGSimEnv does not expose prebuilt episode metadata.")
+        scenarios: list[dict[str, Any]] = []
+        for episode_name in base._episodes:
+            valid_ids = sorted(
+                int(vehicle_id)
+                for vehicle_id in base._valid_ids_by_episode.get(episode_name, [])
+            )
+            if valid_ids:
+                scenarios.append({"episode_name": str(episode_name), "ego_ids": valid_ids})
+    finally:
+        probe_env.close()
+    if not scenarios:
+        raise RuntimeError(
+            f"No available expert collection episodes found for split {args.prebuilt_split!r}."
+        )
+    return scenarios
+
+
+def selected_collection_scenarios(args: argparse.Namespace) -> list[dict[str, Any]]:
+    scenarios = available_collection_scenarios(args)
+    if bool(getattr(args, "collect_all_split_episodes", False)) or int(args.max_episodes) <= 0:
+        return scenarios
+
+    max_episodes = max(1, int(args.max_episodes))
+    rng = np.random.default_rng(int(args.seed))
+    order = rng.permutation(len(scenarios))
+    selected = [scenarios[int(idx)] for idx in order[: min(max_episodes, len(scenarios))]]
+    selected.sort(key=lambda item: str(item["episode_name"]))
+    return selected
+
+
 def enriched_episode_metadata(
     args: argparse.Namespace,
     *,
     episode_index: int,
+    scenario: dict[str, Any],
     episode_metadata: dict[str, Any],
     video_path: str | None,
 ) -> dict[str, Any]:
@@ -950,6 +1002,8 @@ def enriched_episode_metadata(
         "max_samples_per_vehicle": int(args.max_samples_per_vehicle),
         "percentage_controlled_vehicles": float(args.percentage_controlled_vehicles),
         "control_all_vehicles": bool(args.control_all_vehicles),
+        "collection_episode_name": str(scenario["episode_name"]),
+        "collection_ego_vehicle_ids": [int(vehicle_id) for vehicle_id in scenario["ego_ids"]],
         "max_surrounding": args.max_surrounding,
         "simulation_frequency": int(args.simulation_frequency),
         "policy_frequency": int(args.policy_frequency),
@@ -992,9 +1046,15 @@ def collect_and_save_expert_episode(
     args: argparse.Namespace,
     *,
     episode_index: int,
+    scenario: dict[str, Any],
     render_mode: str | None,
 ) -> dict[str, Any]:
-    expert_env = make_expert_scene_env(args, render_mode=render_mode)
+    expert_env = make_expert_scene_env(
+        args,
+        render_mode=render_mode,
+        episode_name=str(scenario["episode_name"]),
+        ego_ids=[int(vehicle_id) for vehicle_id in scenario["ego_ids"]],
+    )
     try:
         arrays, episode_metadata, video_path = collect_expert_episode(
             expert_env,
@@ -1007,6 +1067,7 @@ def collect_and_save_expert_episode(
     episode_metadata = enriched_episode_metadata(
         args,
         episode_index=episode_index,
+        scenario=scenario,
         episode_metadata=episode_metadata,
         video_path=video_path,
     )
@@ -1034,19 +1095,20 @@ def collect_and_save_expert_episode(
     }
 
 
-def _collection_worker(args_dict: dict[str, Any], episode_index: int) -> dict[str, Any]:
+def _collection_worker(args_dict: dict[str, Any], episode_index: int, scenario: dict[str, Any]) -> dict[str, Any]:
     args = argparse.Namespace(**args_dict)
     configure_native_threads(int(args.collection_worker_threads))
     register_ngsim_env()
     return collect_and_save_expert_episode(
         args,
         episode_index=int(episode_index),
+        scenario=scenario,
         render_mode=render_mode_from_args(args),
     )
 
 
-def collect_expert_episodes(args: argparse.Namespace) -> list[dict[str, Any]]:
-    max_episodes = max(1, int(args.max_episodes))
+def collect_expert_episodes(args: argparse.Namespace, scenarios: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    max_episodes = max(1, len(scenarios))
     num_workers = max(1, int(args.num_collection_workers))
     if bool(args.visualize_episode) and num_workers > 1:
         warnings.warn(
@@ -1063,6 +1125,7 @@ def collect_expert_episodes(args: argparse.Namespace) -> list[dict[str, Any]]:
             collect_and_save_expert_episode(
                 args,
                 episode_index=episode_index,
+                scenario=scenarios[episode_index],
                 render_mode=render_mode,
             )
             for episode_index in range(max_episodes)
@@ -1077,8 +1140,8 @@ def collect_expert_episodes(args: argparse.Namespace) -> list[dict[str, Any]]:
         mp_context=mp.get_context("spawn"),
     ) as pool:
         futures = {
-            pool.submit(_collection_worker, args_dict, episode_index): episode_index
-            for episode_index in range(max_episodes)
+            pool.submit(_collection_worker, args_dict, episode_index, scenario): episode_index
+            for episode_index, scenario in enumerate(scenarios)
         }
         for future in tqdm(
             as_completed(futures),
@@ -1105,7 +1168,12 @@ def main() -> None:
         f"{max(1, int(args.num_collection_workers))} "
         f"worker_threads={max(1, int(args.collection_worker_threads))}"
     )
-    results = collect_expert_episodes(args)
+    scenarios = selected_collection_scenarios(args)
+    print(
+        f"Collecting {len(scenarios)} fixed {args.prebuilt_split} episodes "
+        f"from {args.scene}."
+    )
+    results = collect_expert_episodes(args, scenarios)
     manifest_entries = [dict(result["manifest_entry"]) for result in results]
     total_samples = int(sum(int(result["num_samples"]) for result in results))
     for result in results:
@@ -1130,6 +1198,9 @@ def main() -> None:
         "scene_max_vehicles": int(args.scene_max_vehicles),
         "num_collection_workers": max(1, int(args.num_collection_workers)),
         "collection_worker_threads": max(1, int(args.collection_worker_threads)),
+        "collect_all_split_episodes": bool(getattr(args, "collect_all_split_episodes", False))
+        or int(args.max_episodes) <= 0,
+        "available_split_episodes": int(len(scenarios)),
         "continuous_action_dim": 2 if has_continuous_actions else None,
         "actions_continuous_env_key": ACTION_CONTINUOUS_ENV_KEY if has_continuous_actions else None,
         "actions_continuous_env_columns": list(ACTION_CONTINUOUS_ENV_COLUMNS)
