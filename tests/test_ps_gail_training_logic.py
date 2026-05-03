@@ -86,6 +86,7 @@ from scripts_gail.ps_gail.trainer import (
     RolloutBatch,
     policy_distribution_and_values,
     refresh_rollout_rewards,
+    shape_rollout_rewards,
     update_discriminator,
     update_policy,
 )
@@ -266,6 +267,25 @@ def test_refresh_rollout_rewards_applies_discriminator_feature_normalizer():
 
     expected = torch.nn.functional.softplus(torch.tensor([1.0])).numpy()
     np.testing.assert_allclose(refreshed.gail_rewards_raw, expected, rtol=1e-6)
+
+
+def test_wgan_reward_center_and_clip_are_applied_before_env_penalty():
+    cfg = PSGAILConfig(
+        discriminator_loss="wgan_gp",
+        wgan_reward_center=True,
+        wgan_reward_clip=2.0,
+        normalize_gail_reward=False,
+        gail_reward_clip=0.0,
+        final_reward_clip=0.0,
+    )
+    rewards, shaped_gail = shape_rollout_rewards(
+        np.asarray([10.0, 12.0, 50.0], dtype=np.float32),
+        np.asarray([0.0, -5.0, 0.0], dtype=np.float32),
+        cfg,
+    )
+
+    np.testing.assert_allclose(shaped_gail, [-2.0, -2.0, 2.0], rtol=1e-6)
+    np.testing.assert_allclose(rewards, [-2.0, -7.0, 2.0], rtol=1e-6)
 
 
 def test_wgan_gp_discriminator_update_returns_critic_metrics():

@@ -372,6 +372,9 @@ def main() -> None:
             f"policy_obs_dim={policy_obs_dim} disc_feature_dim={feature_dim} device={device} "
             f"discriminator={discriminator_name} "
             f"disc_loss={cfg.discriminator_loss} "
+            f"wgan_reward_center={cfg.wgan_reward_center} "
+            f"wgan_reward_clip={cfg.wgan_reward_clip} "
+            f"wgan_reward_scale={cfg.wgan_reward_scale} "
             f"disc_feature_norm={cfg.normalize_discriminator_features} "
             f"disc_feature_clip={cfg.discriminator_feature_clip} "
             f"action_masking={cfg.enable_action_masking} "
@@ -613,6 +616,9 @@ def main() -> None:
                 "train/action_masking": int(bool(cfg.enable_action_masking)),
                 "train/discriminator_loss_type_wgan_gp": int(str(cfg.discriminator_loss).lower() == "wgan_gp"),
                 "train/wgan_gp_lambda": float(cfg.wgan_gp_lambda),
+                "train/wgan_reward_center": int(bool(cfg.wgan_reward_center)),
+                "train/wgan_reward_clip": float(cfg.wgan_reward_clip),
+                "train/wgan_reward_scale": float(cfg.wgan_reward_scale),
                 "train/sequence_feature_mode_local_deltas": int(
                     str(cfg.sequence_feature_mode).lower() == "local_deltas"
                 ),

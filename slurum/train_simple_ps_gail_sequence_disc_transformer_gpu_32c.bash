@@ -42,6 +42,9 @@ TRANSFORMER_HEADS="${TRANSFORMER_HEADS:-4}"
 TRANSFORMER_DROPOUT="${TRANSFORMER_DROPOUT:-0.1}"
 DISCRIMINATOR_LOSS="${DISCRIMINATOR_LOSS:-wgan_gp}"
 WGAN_GP_LAMBDA="${WGAN_GP_LAMBDA:-2.0}"
+WGAN_REWARD_CENTER="${WGAN_REWARD_CENTER:-true}"
+WGAN_REWARD_CLIP="${WGAN_REWARD_CLIP:-2.0}"
+WGAN_REWARD_SCALE="${WGAN_REWARD_SCALE:-1.0}"
 SEQUENCE_FEATURE_MODE="${SEQUENCE_FEATURE_MODE:-local_deltas}"
 NORMALIZE_DISCRIMINATOR_FEATURES="${NORMALIZE_DISCRIMINATOR_FEATURES:-true}"
 DISCRIMINATOR_FEATURE_CLIP="${DISCRIMINATOR_FEATURE_CLIP:-10.0}"
@@ -87,6 +90,9 @@ echo "Transformer layers/heads/dropout: ${TRANSFORMER_LAYERS}/${TRANSFORMER_HEAD
 echo "C-GAIL discriminator k (BCE only): ${CGAIL_K}"
 echo "Discriminator loss: ${DISCRIMINATOR_LOSS}"
 echo "WGAN-GP lambda: ${WGAN_GP_LAMBDA}"
+echo "WGAN reward center: ${WGAN_REWARD_CENTER}"
+echo "WGAN reward clip: ${WGAN_REWARD_CLIP}"
+echo "WGAN reward scale: ${WGAN_REWARD_SCALE}"
 echo "Discriminator updates per round: ${DISC_UPDATES_PER_ROUND}"
 echo "Sequence feature mode: ${SEQUENCE_FEATURE_MODE}"
 echo "Normalize discriminator features: ${NORMALIZE_DISCRIMINATOR_FEATURES}"
@@ -145,6 +151,11 @@ if [ "${ALLOW_IDM}" = "true" ]; then
 else
     ALLOW_IDM_ARG="--no-allow-idm"
 fi
+if [ "${WGAN_REWARD_CENTER}" = "true" ]; then
+    WGAN_REWARD_CENTER_ARG="--wgan-reward-center"
+else
+    WGAN_REWARD_CENTER_ARG="--no-wgan-reward-center"
+fi
 
 python -u "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --expert-data "${EXPERT_DATA}" \
@@ -166,6 +177,9 @@ python -u "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --disc-generator-label "${DISC_GENERATOR_LABEL}" \
     --discriminator-loss "${DISCRIMINATOR_LOSS}" \
     --wgan-gp-lambda "${WGAN_GP_LAMBDA}" \
+    "${WGAN_REWARD_CENTER_ARG}" \
+    --wgan-reward-clip "${WGAN_REWARD_CLIP}" \
+    --wgan-reward-scale "${WGAN_REWARD_SCALE}" \
     "${DISC_FEATURE_NORM_ARG}" \
     --discriminator-feature-clip "${DISCRIMINATOR_FEATURE_CLIP}" \
     "${ACTION_MASKING_ARG}" \

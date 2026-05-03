@@ -269,6 +269,15 @@ def shape_rollout_rewards(
         raise ValueError(f"Reward/penalty shape mismatch: {raw.shape} != {penalties.shape}")
 
     shaped_gail = raw.astype(np.float32, copy=True)
+    if str(getattr(cfg, "discriminator_loss", "bce")).lower() == "wgan_gp":
+        if bool(getattr(cfg, "wgan_reward_center", False)) and shaped_gail.size > 1:
+            shaped_gail = shaped_gail - shaped_gail.mean()
+        reward_scale = float(getattr(cfg, "wgan_reward_scale", 1.0))
+        if reward_scale != 1.0:
+            shaped_gail = shaped_gail * reward_scale
+        wgan_clip = float(getattr(cfg, "wgan_reward_clip", 0.0))
+        if wgan_clip > 0:
+            shaped_gail = np.clip(shaped_gail, -wgan_clip, wgan_clip)
     if bool(cfg.normalize_gail_reward) and shaped_gail.size > 1:
         shaped_gail = (shaped_gail - shaped_gail.mean()) / (shaped_gail.std() + 1e-8)
     if float(cfg.gail_reward_clip) > 0:
