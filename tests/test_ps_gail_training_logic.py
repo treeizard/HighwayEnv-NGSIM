@@ -1,7 +1,9 @@
+import json
 import sys
 import types
 
 import numpy as np
+import pytest
 import torch
 from torch.distributions import Categorical
 
@@ -77,7 +79,13 @@ sys.modules.setdefault("scripts_gail.ps_gail.envs", fake_envs)
 
 from scripts_gail.ps_gail.config import PSGAILConfig
 from scripts_gail.ps_gail.data import (
+    ACTION_CONTINUOUS_ENV_COLUMNS,
+    ACTION_CONTINUOUS_ENV_KEY,
+    ACTION_STEERING_ACCELERATION_COLUMNS,
+    ACTION_STEERING_ACCELERATION_KEY,
     fit_feature_standardizer,
+    load_expert_policy_and_disc_data,
+    load_expert_transition_data,
     standardize_features,
     transform_sequence_features,
 )
@@ -129,6 +137,89 @@ def _minimal_rollout(
         num_env_steps=n,
         num_agent_steps=n,
     )
+
+
+def _write_action_conditioned_expert_file(path, *, include_actions: bool = True) -> None:
+    observations = np.asarray(
+        [
+            [0.0, 1.0, 2.0, 10.0, 0.10, 2.0, 4.5],
+            [0.5, 1.5, 2.5, 11.0, 0.20, 2.0, 4.5],
+            [1.0, 2.0, 3.0, 12.0, 0.30, 2.0, 4.5],
+        ],
+        dtype=np.float32,
+    )
+    next_observations = observations + 0.25
+    trajectory_states = np.asarray(
+        [[100.0, 20.0, 10.0], [101.0, 20.5, 10.2], [102.0, 21.0, 10.4]],
+        dtype=np.float32,
+    )
+    arrays = {
+        "observations": observations,
+        "next_observations": next_observations,
+        "trajectory_states": trajectory_states,
+        "features": np.concatenate([observations, trajectory_states], axis=1).astype(np.float32),
+        "vehicle_ids": np.asarray([7, 7, 7], dtype=np.int64),
+        "timesteps": np.asarray([0, 1, 2], dtype=np.int64),
+        "dones": np.asarray([False, False, True], dtype=bool),
+        "rewards": np.asarray([0.0, 0.5, 1.0], dtype=np.float32),
+        "metadata_json": np.asarray(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "actions_continuous_env_columns": list(ACTION_CONTINUOUS_ENV_COLUMNS),
+                    "actions_steering_acceleration_columns": list(
+                        ACTION_STEERING_ACCELERATION_COLUMNS
+                    ),
+                }
+            )
+        ),
+    }
+    if include_actions:
+        arrays[ACTION_CONTINUOUS_ENV_KEY] = np.asarray(
+            [[0.1, -0.2], [0.0, 0.3], [-0.4, 0.5]],
+            dtype=np.float32,
+        )
+        arrays[ACTION_STEERING_ACCELERATION_KEY] = np.asarray(
+            [[-0.157, 0.5], [0.236, 0.0], [0.393, -2.0]],
+            dtype=np.float32,
+        )
+    np.savez_compressed(path, **arrays)
+
+
+def test_gail_loader_accepts_unified_action_conditioned_dataset(tmp_path):
+    path = tmp_path / "expert_unified.npz"
+    _write_action_conditioned_expert_file(path)
+
+    policy_obs, features, metadata = load_expert_policy_and_disc_data(str(path))
+
+    assert policy_obs.shape == (3, 6)
+    assert features.shape == (3, 9)
+    assert metadata["schema_version"] == 3
+    assert metadata["actions_continuous_env_columns"] == list(ACTION_CONTINUOUS_ENV_COLUMNS)
+
+
+def test_action_conditioned_loader_requires_continuous_actions(tmp_path):
+    path = tmp_path / "legacy_expert.npz"
+    _write_action_conditioned_expert_file(path, include_actions=False)
+
+    with pytest.raises(KeyError, match=ACTION_CONTINUOUS_ENV_KEY):
+        load_expert_transition_data(str(path))
+
+
+def test_action_conditioned_loader_returns_valid_continuous_transition_data(tmp_path):
+    path = tmp_path / "expert_unified.npz"
+    _write_action_conditioned_expert_file(path)
+
+    data = load_expert_transition_data(str(path), max_samples=2, seed=0)
+
+    assert data.policy_observations.shape == (2, 6)
+    assert data.next_policy_observations.shape == (2, 6)
+    assert data.actions_continuous_env.shape == (2, 2)
+    assert data.actions_steering_acceleration is not None
+    assert data.actions_steering_acceleration.shape == (2, 2)
+    assert np.all(np.isfinite(data.actions_continuous_env))
+    assert data.metadata["continuous_action_dim"] == 2
+    assert data.metadata["actions_continuous_env_columns"] == list(ACTION_CONTINUOUS_ENV_COLUMNS)
 
 
 def test_feature_standardizer_supports_sequence_features_and_clipping():

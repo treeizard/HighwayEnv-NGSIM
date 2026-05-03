@@ -13,6 +13,14 @@ This package is a small modular trainer for the NGSIM discrete meta-action setup
   are present before enabling this.
 - Optional sequence discriminator: GRU over fixed-length windows of the normal
   discriminator feature, grouped by vehicle trajectory id.
+- Unified expert datasets collected with `build_ps_traj_expert_discrete.py`
+  preserve the existing GAIL fields and, when collected with continuous expert
+  control, add `actions_continuous_env` with columns
+  `[acceleration_norm, steering_norm]` plus `actions_steering_acceleration`
+  with columns `[steering_rad, acceleration_mps2]`.
+- Expert collection can run episodes in parallel with
+  `--num-collection-workers N --collection-worker-threads 2`; each worker owns
+  one environment at a time and caps native CPU thread pools.
 - Generator rollouts collect complete random NGSIM episodes by default. With the
   default `max_episode_steps=200`, `--rollout-min-episodes 4` means four full
   200-step episodes per training round, split across rollout workers.

@@ -10,11 +10,13 @@ an inferred expert action label.
 """
 
 import argparse
+import multiprocessing as mp
 import json
 import os
 import re
 import sys
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
@@ -33,13 +35,20 @@ from highway_env.imitation.expert_dataset import (  # noqa: E402
     build_env_config,
     register_ngsim_env,
 )
+from highway_env.ngsim_utils.core.constants import MAX_ACCEL, MAX_STEER  # noqa: E402
 from highway_env.ngsim_utils.data.trajectory_gen import (  # noqa: E402
     trajectory_row_is_active,
 )
-from scripts_gail.ps_gail.data import scene_snapshot_features  # noqa: E402
+from scripts_gail.ps_gail.data import (  # noqa: E402
+    ACTION_CONTINUOUS_ENV_COLUMNS,
+    ACTION_CONTINUOUS_ENV_KEY,
+    ACTION_STEERING_ACCELERATION_COLUMNS,
+    ACTION_STEERING_ACCELERATION_KEY,
+    scene_snapshot_features,
+)
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,6 +85,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=200,
         help="Cap per-step samples per vehicle. Use 0 for no per-vehicle cap.",
+    )
+    parser.add_argument(
+        "--num-collection-workers",
+        type=int,
+        default=1,
+        help="Number of parallel episode-collection worker processes. Use 1 for serial collection.",
+    )
+    parser.add_argument(
+        "--collection-worker-threads",
+        type=int,
+        default=2,
+        help="Native CPU threads allowed inside each collection worker process.",
     )
     parser.add_argument("--max-surrounding", default="all")
     parser.add_argument(
@@ -191,7 +212,18 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="How often to refresh tqdm postfix text. Higher values reduce logging overhead.",
     )
+    parser.add_argument(
+        "--disable-progress",
+        action="store_true",
+        help="Disable per-episode tqdm progress bars. Parallel collection uses one parent progress bar.",
+    )
     return parser.parse_args()
+
+
+def configure_native_threads(num_threads: int) -> None:
+    threads = str(max(1, int(num_threads)))
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[name] = threads
 
 
 def observation_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -302,6 +334,91 @@ def idle_action_for_env(env: gym.Env, num_agents: int) -> int | tuple[int, ...]:
     if hasattr(env.action_space, "spaces"):
         return tuple(idle for _ in range(num_agents))
     return idle
+
+
+def _coerce_continuous_env_action(action: Any) -> np.ndarray:
+    """Return normalized env-native [acceleration, steering] action."""
+    if action is None:
+        raise ValueError("Continuous expert action is missing for an active controlled vehicle.")
+    if isinstance(action, dict):
+        accel_norm = float(action.get("acceleration", 0.0)) / float(MAX_ACCEL)
+        steer_norm = float(action.get("steering", 0.0)) / float(MAX_STEER)
+        arr = np.asarray([accel_norm, steer_norm], dtype=np.float32)
+    else:
+        arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        if arr.shape[0] < 2:
+            raise ValueError(
+                f"Continuous expert action must contain [acceleration, steering], got shape {arr.shape}."
+            )
+        arr = arr[:2].astype(np.float32, copy=False)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"Continuous expert action contains non-finite values: {arr}.")
+    return np.clip(arr, -1.0, 1.0).astype(np.float32, copy=False)
+
+
+def continuous_env_action_to_steering_acceleration(action: np.ndarray) -> np.ndarray:
+    """Convert normalized [acceleration, steering] to physical [steering, acceleration]."""
+    action = _coerce_continuous_env_action(action)
+    accel_norm, steer_norm = float(action[0]), float(action[1])
+    return np.asarray(
+        [steer_norm * float(MAX_STEER), accel_norm * float(MAX_ACCEL)],
+        dtype=np.float32,
+    )
+
+
+def continuous_expert_actions_from_info(
+    info: dict[str, Any],
+    *,
+    num_agents: int,
+    require: bool,
+) -> list[np.ndarray] | None:
+    """Extract normalized continuous expert actions from one env step."""
+    action_views = None
+    if "expert_action_continuous_all" in info:
+        action_views = info["expert_action_continuous_all"]
+    elif "applied_actions" in info:
+        action_views = info["applied_actions"]
+    elif int(num_agents) == 1 and "expert_action_continuous" in info:
+        action_views = [info["expert_action_continuous"]]
+    elif int(num_agents) == 1 and "applied_action" in info:
+        action_views = [info["applied_action"]]
+
+    if action_views is None:
+        if require:
+            raise RuntimeError(
+                "Unified expert collection expected continuous expert actions, but the environment "
+                "did not expose expert_action_continuous_all/applied_actions. Use "
+                "--expert-control-mode continuous."
+            )
+        return None
+    action_list = list(action_views)
+    if len(action_list) != int(num_agents):
+        raise RuntimeError(
+            "Continuous expert action count mismatch: "
+            f"actions={len(action_list)} controlled_agents={int(num_agents)}."
+        )
+    return [_coerce_continuous_env_action(action) for action in action_list]
+
+
+def validate_transition_array_lengths(arrays: dict[str, np.ndarray]) -> None:
+    expected = int(arrays["observations"].shape[0])
+    per_transition_keys = {
+        "next_observations",
+        "trajectory_states",
+        "features",
+        "vehicle_ids",
+        "timesteps",
+        "dones",
+        "rewards",
+        ACTION_CONTINUOUS_ENV_KEY,
+        ACTION_STEERING_ACCELERATION_KEY,
+    }
+    for key in sorted(per_transition_keys.intersection(arrays)):
+        actual = int(np.asarray(arrays[key]).shape[0])
+        if actual != expected:
+            raise ValueError(
+                f"Array {key!r} has length {actual}, expected {expected} to match observations."
+            )
 
 
 def raw_trajectory_state_from_row(row: np.ndarray) -> np.ndarray:
@@ -429,12 +546,15 @@ def collect_expert_episode(
     timesteps: list[int] = []
     dones: list[bool] = []
     rewards: list[float] = []
+    actions_continuous_env: list[np.ndarray] = []
+    actions_steering_acceleration: list[np.ndarray] = []
     scene_features: list[np.ndarray] = []
     scene_timesteps: list[int] = []
     frames: list[np.ndarray] = []
 
     max_per_vehicle = int(args.max_samples_per_vehicle)
     trajectory_state_source = str(args.trajectory_state_source).lower()
+    require_continuous_actions = str(args.expert_control_mode).lower() == "continuous"
     progress_update_interval = max(1, int(args.progress_update_interval))
     render_this_episode = (
         bool(args.visualize_episode)
@@ -455,6 +575,7 @@ def collect_expert_episode(
         desc=f"episode {episode_index + 1}/{int(args.max_episodes)}",
         unit="step",
         leave=True,
+        disable=bool(getattr(args, "disable_progress", False)),
     )
     episode_name = str(getattr(base, "episode_name", episode_index))
 
@@ -500,7 +621,13 @@ def collect_expert_episode(
                     current_states.append(None)
 
             action = idle_action_for_env(env, len(vehicles))
-            next_obs, reward, terminated, truncated, _info = env.step(action)
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            info = info or {}
+            step_continuous_actions = continuous_expert_actions_from_info(
+                info,
+                num_agents=len(vehicles),
+                require=require_continuous_actions,
+            )
             if render_this_episode or capture_video:
                 frame = env.render()
                 if capture_video and frame is not None:
@@ -539,6 +666,12 @@ def collect_expert_episode(
                 timesteps.append(step_index)
                 dones.append(step_done)
                 rewards.append(reward_scalar(reward))
+                if step_continuous_actions is not None:
+                    continuous_action = step_continuous_actions[agent_idx]
+                    actions_continuous_env.append(continuous_action.copy())
+                    actions_steering_acceleration.append(
+                        continuous_env_action_to_steering_acceleration(continuous_action)
+                    )
                 per_vehicle_counts[key] = per_vehicle_counts.get(key, 0) + 1
                 episode_sample_count += 1
 
@@ -581,6 +714,16 @@ def collect_expert_episode(
         "scene_features": np.stack(scene_features, axis=0).astype(np.float32, copy=False),
         "scene_timesteps": np.asarray(scene_timesteps, dtype=np.int64),
     }
+    if actions_continuous_env:
+        arrays[ACTION_CONTINUOUS_ENV_KEY] = np.stack(actions_continuous_env, axis=0).astype(
+            np.float32,
+            copy=False,
+        )
+        arrays[ACTION_STEERING_ACCELERATION_KEY] = np.stack(
+            actions_steering_acceleration,
+            axis=0,
+        ).astype(np.float32, copy=False)
+    validate_transition_array_lengths(arrays)
     metadata = {
         "episode_name": episode_name,
         "num_samples": int(obs_arr.shape[0]),
@@ -591,6 +734,15 @@ def collect_expert_episode(
         "feature_dim": int(feature_arr.shape[1]),
         "scene_feature_dim": int(arrays["scene_features"].shape[1]),
         "scene_max_vehicles": int(args.scene_max_vehicles),
+        "continuous_action_dim": int(arrays[ACTION_CONTINUOUS_ENV_KEY].shape[1])
+        if ACTION_CONTINUOUS_ENV_KEY in arrays
+        else None,
+        "actions_continuous_env_columns": list(ACTION_CONTINUOUS_ENV_COLUMNS)
+        if ACTION_CONTINUOUS_ENV_KEY in arrays
+        else None,
+        "actions_steering_acceleration_columns": list(ACTION_STEERING_ACCELERATION_COLUMNS)
+        if ACTION_STEERING_ACCELERATION_KEY in arrays
+        else None,
         "controlled_vehicle_ids": sorted({int(v) for v in vehicle_ids}),
         "video_requested": bool(args.save_video),
     }
@@ -635,7 +787,14 @@ def _aggregate_saved_episode_datasets(paths: list[str]) -> tuple[np.ndarray, dic
     for name, parts in arrays_per_key.items():
         if name == "features":
             arrays[name] = np.concatenate([np.asarray(part, dtype=np.float32) for part in parts], axis=0)
-        elif name in {"observations", "next_observations", "trajectory_states", "scene_features"}:
+        elif name in {
+            "observations",
+            "next_observations",
+            "trajectory_states",
+            "scene_features",
+            ACTION_CONTINUOUS_ENV_KEY,
+            ACTION_STEERING_ACCELERATION_KEY,
+        }:
             arrays[name] = np.concatenate([np.asarray(part, dtype=np.float32) for part in parts], axis=0)
         elif name == "rewards":
             arrays[name] = np.concatenate([np.asarray(part, dtype=np.float32) for part in parts], axis=0)
@@ -650,9 +809,18 @@ def _aggregate_saved_episode_datasets(paths: list[str]) -> tuple[np.ndarray, dic
     trajectory_states = np.asarray(arrays["trajectory_states"], dtype=np.float32)
     features = np.asarray(arrays.get("features", discriminator_features(observations, trajectory_states)), dtype=np.float32)
     arrays["features"] = features
+    validate_transition_array_lengths(arrays)
+    schema_versions = sorted(
+        {
+            int(item["schema_version"])
+            for item in metadata_items
+            if "schema_version" in item
+        }
+    )
 
     metadata = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": schema_versions[0] if len(schema_versions) == 1 else SCHEMA_VERSION,
+        "schema_versions": schema_versions,
         "dataset_kind": "ps_traj_observation_per_episode_collection",
         "num_files": len(paths),
         "num_samples": int(observations.shape[0]),
@@ -662,6 +830,15 @@ def _aggregate_saved_episode_datasets(paths: list[str]) -> tuple[np.ndarray, dic
         "feature_dim": int(features.shape[1]),
         "scene_feature_dim": int(np.asarray(arrays["scene_features"]).shape[1])
         if "scene_features" in arrays
+        else None,
+        "continuous_action_dim": int(np.asarray(arrays[ACTION_CONTINUOUS_ENV_KEY]).shape[1])
+        if ACTION_CONTINUOUS_ENV_KEY in arrays
+        else None,
+        "actions_continuous_env_columns": list(ACTION_CONTINUOUS_ENV_COLUMNS)
+        if ACTION_CONTINUOUS_ENV_KEY in arrays
+        else None,
+        "actions_steering_acceleration_columns": list(ACTION_STEERING_ACCELERATION_COLUMNS)
+        if ACTION_STEERING_ACCELERATION_KEY in arrays
         else None,
         "episodes": metadata_items,
     }
@@ -724,87 +901,221 @@ def load_ps_traj_expert_dataset(path: str) -> tuple[np.ndarray, dict[str, Any], 
             )
 
         arrays = {name: np.asarray(data[name]) for name in data.files if name != "metadata_json"}
+        validate_transition_array_lengths(arrays)
+        if ACTION_CONTINUOUS_ENV_KEY in arrays:
+            actions_continuous_env = np.asarray(arrays[ACTION_CONTINUOUS_ENV_KEY], dtype=np.float32)
+            if actions_continuous_env.ndim != 2 or actions_continuous_env.shape[1] != 2:
+                raise ValueError(
+                    f"{ACTION_CONTINUOUS_ENV_KEY} must have shape [N, 2] with columns "
+                    f"{ACTION_CONTINUOUS_ENV_COLUMNS}, got {actions_continuous_env.shape}."
+                )
+            if not np.all(np.isfinite(actions_continuous_env)):
+                raise ValueError(f"{ACTION_CONTINUOUS_ENV_KEY} contains non-finite values.")
+        if ACTION_STEERING_ACCELERATION_KEY in arrays:
+            steering_accel = np.asarray(arrays[ACTION_STEERING_ACCELERATION_KEY], dtype=np.float32)
+            if steering_accel.ndim != 2 or steering_accel.shape[1] != 2:
+                raise ValueError(
+                    f"{ACTION_STEERING_ACCELERATION_KEY} must have shape [N, 2] with columns "
+                    f"{ACTION_STEERING_ACCELERATION_COLUMNS}, got {steering_accel.shape}."
+                )
+            if not np.all(np.isfinite(steering_accel)):
+                raise ValueError(f"{ACTION_STEERING_ACCELERATION_KEY} contains non-finite values.")
     return features.astype(np.float32, copy=False), metadata, arrays
+
+
+def render_mode_from_args(args: argparse.Namespace) -> str | None:
+    return "rgb_array" if args.save_video else ("human" if args.visualize_episode else None)
+
+
+def enriched_episode_metadata(
+    args: argparse.Namespace,
+    *,
+    episode_index: int,
+    episode_metadata: dict[str, Any],
+    video_path: str | None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "dataset_kind": "ps_traj_observation_episode",
+        "built_at_utc": datetime.now(timezone.utc).isoformat(),
+        "env_id": ENV_ID,
+        "scene": str(args.scene),
+        "action_mode": str(args.expert_control_mode),
+        "expert_test_mode": bool(str(args.expert_control_mode) != "teleport"),
+        "episode_root": os.path.abspath(args.episode_root),
+        "prebuilt_split": str(args.prebuilt_split),
+        "max_episodes": int(args.max_episodes),
+        "episode_index": int(episode_index),
+        "max_steps_per_episode": int(args.max_steps_per_episode),
+        "max_samples_per_vehicle": int(args.max_samples_per_vehicle),
+        "percentage_controlled_vehicles": float(args.percentage_controlled_vehicles),
+        "control_all_vehicles": bool(args.control_all_vehicles),
+        "max_surrounding": args.max_surrounding,
+        "simulation_frequency": int(args.simulation_frequency),
+        "policy_frequency": int(args.policy_frequency),
+        "trajectory_state_source": str(args.trajectory_state_source),
+        "observation_config": observation_config_from_args(args),
+        "allow_idm": bool(args.allow_idm),
+        "save_video": bool(args.save_video),
+        "video_dir": os.path.abspath(str(args.video_dir)) if args.save_video else None,
+        "video_path": video_path,
+        "collection_worker_threads": int(args.collection_worker_threads),
+        **episode_metadata,
+    }
+
+
+def manifest_entry_from_episode(
+    *,
+    episode_index: int,
+    episode_metadata: dict[str, Any],
+    arrays: dict[str, np.ndarray],
+    output_path: str,
+    video_path: str | None,
+) -> dict[str, Any]:
+    return {
+        "episode_index": int(episode_index),
+        "episode_name": str(episode_metadata["episode_name"]),
+        "dataset_file": os.path.basename(output_path),
+        "video_file": os.path.basename(video_path) if video_path else None,
+        "num_samples": int(arrays["observations"].shape[0]),
+        "observation_dim": int(arrays["observations"].shape[1]),
+        "trajectory_state_dim": int(arrays["trajectory_states"].shape[1]),
+        "feature_dim": int(arrays["features"].shape[1]),
+        "scene_feature_dim": int(arrays["scene_features"].shape[1]),
+        "continuous_action_dim": int(arrays[ACTION_CONTINUOUS_ENV_KEY].shape[1])
+        if ACTION_CONTINUOUS_ENV_KEY in arrays
+        else None,
+    }
+
+
+def collect_and_save_expert_episode(
+    args: argparse.Namespace,
+    *,
+    episode_index: int,
+    render_mode: str | None,
+) -> dict[str, Any]:
+    expert_env = make_expert_scene_env(args, render_mode=render_mode)
+    try:
+        arrays, episode_metadata, video_path = collect_expert_episode(
+            expert_env,
+            args,
+            episode_index=episode_index,
+        )
+    finally:
+        expert_env.close()
+
+    episode_metadata = enriched_episode_metadata(
+        args,
+        episode_index=episode_index,
+        episode_metadata=episode_metadata,
+        video_path=video_path,
+    )
+    output_path = save_expert_dataset(
+        _episode_dataset_path(
+            args=args,
+            episode_index=episode_index,
+            episode_name=str(episode_metadata["episode_name"]),
+        ),
+        arrays,
+        episode_metadata,
+    )
+    return {
+        "episode_index": int(episode_index),
+        "manifest_entry": manifest_entry_from_episode(
+            episode_index=episode_index,
+            episode_metadata=episode_metadata,
+            arrays=arrays,
+            output_path=output_path,
+            video_path=video_path,
+        ),
+        "num_samples": int(arrays["observations"].shape[0]),
+        "output_path": output_path,
+        "video_path": video_path,
+    }
+
+
+def _collection_worker(args_dict: dict[str, Any], episode_index: int) -> dict[str, Any]:
+    args = argparse.Namespace(**args_dict)
+    configure_native_threads(int(args.collection_worker_threads))
+    register_ngsim_env()
+    return collect_and_save_expert_episode(
+        args,
+        episode_index=int(episode_index),
+        render_mode=render_mode_from_args(args),
+    )
+
+
+def collect_expert_episodes(args: argparse.Namespace) -> list[dict[str, Any]]:
+    max_episodes = max(1, int(args.max_episodes))
+    num_workers = max(1, int(args.num_collection_workers))
+    if bool(args.visualize_episode) and num_workers > 1:
+        warnings.warn(
+            "--visualize-episode requires serial collection; forcing --num-collection-workers 1.",
+            stacklevel=2,
+        )
+        num_workers = 1
+    num_workers = min(num_workers, max_episodes)
+
+    if num_workers == 1:
+        register_ngsim_env()
+        render_mode = render_mode_from_args(args)
+        return [
+            collect_and_save_expert_episode(
+                args,
+                episode_index=episode_index,
+                render_mode=render_mode,
+            )
+            for episode_index in range(max_episodes)
+        ]
+
+    worker_args = argparse.Namespace(**vars(args))
+    worker_args.disable_progress = True
+    args_dict = vars(worker_args)
+    results: list[dict[str, Any]] = []
+    with ProcessPoolExecutor(
+        max_workers=num_workers,
+        mp_context=mp.get_context("spawn"),
+    ) as pool:
+        futures = {
+            pool.submit(_collection_worker, args_dict, episode_index): episode_index
+            for episode_index in range(max_episodes)
+        }
+        for future in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="episodes",
+            unit="episode",
+        ):
+            results.append(future.result())
+    results.sort(key=lambda item: int(item["episode_index"]))
+    return results
 
 
 def main() -> None:
     args = parse_args()
-    register_ngsim_env()
+    configure_native_threads(int(args.collection_worker_threads))
 
-    render_mode = "rgb_array" if args.save_video else ("human" if args.visualize_episode else None)
     collection_root = _episode_output_root(args.out)
     os.makedirs(collection_root, exist_ok=True)
     if args.save_video:
         os.makedirs(os.path.abspath(str(args.video_dir)), exist_ok=True)
 
-    manifest_entries: list[dict[str, Any]] = []
-    total_samples = 0
+    print(
+        "Expert collection workers="
+        f"{max(1, int(args.num_collection_workers))} "
+        f"worker_threads={max(1, int(args.collection_worker_threads))}"
+    )
+    results = collect_expert_episodes(args)
+    manifest_entries = [dict(result["manifest_entry"]) for result in results]
+    total_samples = int(sum(int(result["num_samples"]) for result in results))
+    for result in results:
+        print(f"Saved episode dataset to: {result['output_path']}")
+        if result.get("video_path"):
+            print(f"Saved episode video to: {result['video_path']}")
 
-    for episode_index in range(max(1, int(args.max_episodes))):
-        expert_env = make_expert_scene_env(args, render_mode=render_mode)
-        try:
-            arrays, episode_metadata, video_path = collect_expert_episode(
-                expert_env,
-                args,
-                episode_index=episode_index,
-            )
-        finally:
-            expert_env.close()
-
-        episode_metadata = {
-            "schema_version": SCHEMA_VERSION,
-            "dataset_kind": "ps_traj_observation_episode",
-            "built_at_utc": datetime.now(timezone.utc).isoformat(),
-            "env_id": ENV_ID,
-            "scene": str(args.scene),
-            "action_mode": str(args.expert_control_mode),
-            "expert_test_mode": bool(str(args.expert_control_mode) != "teleport"),
-            "episode_root": os.path.abspath(args.episode_root),
-            "prebuilt_split": str(args.prebuilt_split),
-            "max_episodes": int(args.max_episodes),
-            "episode_index": int(episode_index),
-            "max_steps_per_episode": int(args.max_steps_per_episode),
-            "max_samples_per_vehicle": int(args.max_samples_per_vehicle),
-            "percentage_controlled_vehicles": float(args.percentage_controlled_vehicles),
-            "control_all_vehicles": bool(args.control_all_vehicles),
-            "max_surrounding": args.max_surrounding,
-            "simulation_frequency": int(args.simulation_frequency),
-            "policy_frequency": int(args.policy_frequency),
-            "trajectory_state_source": str(args.trajectory_state_source),
-            "observation_config": observation_config_from_args(args),
-            "allow_idm": bool(args.allow_idm),
-            "save_video": bool(args.save_video),
-            "video_dir": os.path.abspath(str(args.video_dir)) if args.save_video else None,
-            "video_path": video_path,
-            **episode_metadata,
-        }
-        output_path = save_expert_dataset(
-            _episode_dataset_path(
-                args=args,
-                episode_index=episode_index,
-                episode_name=str(episode_metadata["episode_name"]),
-            ),
-            arrays,
-            episode_metadata,
-        )
-        total_samples += int(arrays["observations"].shape[0])
-        manifest_entries.append(
-            {
-                "episode_index": int(episode_index),
-                "episode_name": str(episode_metadata["episode_name"]),
-                "dataset_file": os.path.basename(output_path),
-                "video_file": os.path.basename(video_path) if video_path else None,
-                "num_samples": int(arrays["observations"].shape[0]),
-                "observation_dim": int(arrays["observations"].shape[1]),
-                "trajectory_state_dim": int(arrays["trajectory_states"].shape[1]),
-                "feature_dim": int(arrays["features"].shape[1]),
-                "scene_feature_dim": int(arrays["scene_features"].shape[1]),
-            }
-        )
-        print(f"Saved episode dataset to: {output_path}")
-        if video_path:
-            print(f"Saved episode video to: {video_path}")
-
+    has_continuous_actions = any(
+        entry.get("continuous_action_dim") is not None for entry in manifest_entries
+    )
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "dataset_kind": "ps_traj_observation_per_episode_collection",
@@ -817,6 +1128,19 @@ def main() -> None:
         "control_all_vehicles": bool(args.control_all_vehicles),
         "percentage_controlled_vehicles": float(args.percentage_controlled_vehicles),
         "scene_max_vehicles": int(args.scene_max_vehicles),
+        "num_collection_workers": max(1, int(args.num_collection_workers)),
+        "collection_worker_threads": max(1, int(args.collection_worker_threads)),
+        "continuous_action_dim": 2 if has_continuous_actions else None,
+        "actions_continuous_env_key": ACTION_CONTINUOUS_ENV_KEY if has_continuous_actions else None,
+        "actions_continuous_env_columns": list(ACTION_CONTINUOUS_ENV_COLUMNS)
+        if has_continuous_actions
+        else None,
+        "actions_steering_acceleration_key": ACTION_STEERING_ACCELERATION_KEY
+        if has_continuous_actions
+        else None,
+        "actions_steering_acceleration_columns": list(ACTION_STEERING_ACCELERATION_COLUMNS)
+        if has_continuous_actions
+        else None,
         "num_episodes": len(manifest_entries),
         "num_samples": int(total_samples),
         "episodes": manifest_entries,

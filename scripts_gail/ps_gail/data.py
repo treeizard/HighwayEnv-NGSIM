@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 from typing import Any
@@ -10,6 +11,25 @@ from .observations import policy_observations_from_flat
 
 
 SCENE_FEATURE_DIM_PER_VEHICLE = 5
+ACTION_CONTINUOUS_ENV_KEY = "actions_continuous_env"
+ACTION_STEERING_ACCELERATION_KEY = "actions_steering_acceleration"
+ACTION_CONTINUOUS_ENV_COLUMNS = ("acceleration_norm", "steering_norm")
+ACTION_STEERING_ACCELERATION_COLUMNS = ("steering_rad", "acceleration_mps2")
+
+
+@dataclass(frozen=True)
+class ExpertTransitionData:
+    policy_observations: np.ndarray
+    next_policy_observations: np.ndarray
+    actions_continuous_env: np.ndarray
+    actions_steering_acceleration: np.ndarray | None
+    dones: np.ndarray
+    rewards: np.ndarray
+    trajectory_states: np.ndarray
+    features: np.ndarray
+    vehicle_ids: np.ndarray
+    timesteps: np.ndarray
+    metadata: dict[str, Any]
 
 
 def fit_feature_standardizer(features: np.ndarray, *, eps: float = 1e-6) -> tuple[np.ndarray, np.ndarray]:
@@ -259,6 +279,85 @@ def _dataset_file_counts(path: str, files: list[str]) -> dict[str, int]:
     return counts
 
 
+def _require_arrays(file_path: str, available: list[str], required: set[str]) -> None:
+    missing = sorted(required.difference(available))
+    if not missing:
+        return
+    action_hint = (
+        " Rebuild the expert data with unified continuous-action fields before using "
+        "AIRL/IQ-Learn loaders."
+        if ACTION_CONTINUOUS_ENV_KEY in missing
+        else ""
+    )
+    raise KeyError(f"{file_path} is missing arrays: {missing}.{action_hint}")
+
+
+def _metadata_values(metadata_items: list[dict[str, Any]], key: str) -> list[Any]:
+    values: list[Any] = []
+    for item in metadata_items:
+        value = item.get(key)
+        if value is not None and value not in values:
+            values.append(value)
+    return values
+
+
+def _validate_action_conditioned_arrays(
+    file_path: str,
+    *,
+    observations: np.ndarray,
+    next_observations: np.ndarray,
+    trajectory_states: np.ndarray,
+    actions_continuous_env: np.ndarray,
+    actions_steering_acceleration: np.ndarray | None,
+    dones: np.ndarray,
+    rewards: np.ndarray,
+    vehicle_ids: np.ndarray,
+    timesteps: np.ndarray,
+) -> None:
+    n = int(observations.shape[0])
+    length_fields = {
+        "next_observations": next_observations,
+        "trajectory_states": trajectory_states,
+        ACTION_CONTINUOUS_ENV_KEY: actions_continuous_env,
+        "dones": dones,
+        "rewards": rewards,
+        "vehicle_ids": vehicle_ids,
+        "timesteps": timesteps,
+    }
+    if actions_steering_acceleration is not None:
+        length_fields[ACTION_STEERING_ACCELERATION_KEY] = actions_steering_acceleration
+    for name, value in length_fields.items():
+        if int(value.shape[0]) != n:
+            raise ValueError(
+                f"{file_path} array {name!r} length {value.shape[0]} does not match observations {n}."
+            )
+    if observations.ndim != 2 or next_observations.ndim != 2:
+        raise ValueError(f"{file_path} observations and next_observations must be rank-2 arrays.")
+    if observations.shape != next_observations.shape:
+        raise ValueError(
+            f"{file_path} next_observations shape {next_observations.shape} does not match "
+            f"observations {observations.shape}."
+        )
+    if trajectory_states.ndim != 2 or trajectory_states.shape[1] != 3:
+        raise ValueError(f"{file_path} trajectory_states must have shape [N, 3], got {trajectory_states.shape}.")
+    if actions_continuous_env.ndim != 2 or actions_continuous_env.shape[1] != 2:
+        raise ValueError(
+            f"{file_path} {ACTION_CONTINUOUS_ENV_KEY} must have shape [N, 2] "
+            f"with columns {ACTION_CONTINUOUS_ENV_COLUMNS}, got {actions_continuous_env.shape}."
+        )
+    if not np.all(np.isfinite(actions_continuous_env)):
+        raise ValueError(f"{file_path} {ACTION_CONTINUOUS_ENV_KEY} contains non-finite values.")
+    if actions_steering_acceleration is not None:
+        if actions_steering_acceleration.ndim != 2 or actions_steering_acceleration.shape[1] != 2:
+            raise ValueError(
+                f"{file_path} {ACTION_STEERING_ACCELERATION_KEY} must have shape [N, 2] "
+                f"with columns {ACTION_STEERING_ACCELERATION_COLUMNS}, got "
+                f"{actions_steering_acceleration.shape}."
+            )
+        if not np.all(np.isfinite(actions_steering_acceleration)):
+            raise ValueError(f"{file_path} {ACTION_STEERING_ACCELERATION_KEY} contains non-finite values.")
+
+
 def _uniform_file_sample_plan(
     files: list[str],
     counts: dict[str, int],
@@ -355,8 +454,11 @@ def load_expert_policy_and_disc_data(
     policy_obs = np.concatenate(obs_parts, axis=0).astype(np.float32, copy=False)
     trajectory_states = np.concatenate(traj_parts, axis=0).astype(np.float32, copy=False)
     features = discriminator_features(policy_obs, trajectory_states)
+    schema_versions = _metadata_values(metadata_items, "schema_version")
     metadata = {
         "source_path": os.path.abspath(path),
+        "schema_version": schema_versions[0] if len(schema_versions) == 1 else None,
+        "schema_versions": schema_versions,
         "num_files_seen": len(metadata_items) or len(files),
         "num_files_loaded": len(samples_by_file),
         "num_source_samples": int(sum(counts[file_path] for file_path in files)),
@@ -365,12 +467,190 @@ def load_expert_policy_and_disc_data(
         "trajectory_state_dim": int(trajectory_states.shape[1]),
         "feature_dim": int(features.shape[1]),
         "trajectory_frame": str(trajectory_frame).lower(),
+        "actions_continuous_env_columns": (
+            _metadata_values(metadata_items, "actions_continuous_env_columns") or [None]
+        )[0],
+        "actions_steering_acceleration_columns": (
+            _metadata_values(metadata_items, "actions_steering_acceleration_columns") or [None]
+        )[0],
         "sampling": "uniform_without_replacement",
         "max_samples": int(max_samples),
         "samples_by_file": samples_by_file,
         "episodes": metadata_items,
     }
     return policy_obs, features, metadata
+
+
+def load_expert_transition_data(
+    path: str,
+    *,
+    max_samples: int = 100_000,
+    seed: int = 0,
+    trajectory_frame: str = "relative",
+) -> ExpertTransitionData:
+    """Load action-conditioned expert transitions for AIRL/IQ-Learn-style trainers.
+
+    This loader intentionally requires ``actions_continuous_env`` so callers do
+    not accidentally train action-conditioned baselines on legacy PS-GAIL data
+    that only contains observation/trajectory features.
+    """
+    rng = np.random.default_rng(seed)
+    files = _dataset_files(path)
+    counts = _dataset_file_counts(path, files)
+    sample_plan = _uniform_file_sample_plan(
+        files,
+        counts,
+        max_samples=int(max_samples),
+        rng=rng,
+    )
+
+    obs_parts: list[np.ndarray] = []
+    next_obs_parts: list[np.ndarray] = []
+    traj_parts: list[np.ndarray] = []
+    action_parts: list[np.ndarray] = []
+    steering_accel_parts: list[np.ndarray] = []
+    done_parts: list[np.ndarray] = []
+    reward_parts: list[np.ndarray] = []
+    vehicle_id_parts: list[np.ndarray] = []
+    timestep_parts: list[np.ndarray] = []
+    metadata_items: list[dict[str, Any]] = []
+    samples_by_file: list[dict[str, Any]] = []
+
+    for file_path in files:
+        idx = sample_plan.get(file_path)
+        if file_path not in sample_plan:
+            continue
+        with np.load(file_path, allow_pickle=True) as data:
+            required = {
+                "observations",
+                "next_observations",
+                "trajectory_states",
+                ACTION_CONTINUOUS_ENV_KEY,
+                "dones",
+                "rewards",
+                "vehicle_ids",
+                "timesteps",
+            }
+            _require_arrays(file_path, list(data.files), required)
+            obs = np.asarray(data["observations"], dtype=np.float32)
+            next_obs = np.asarray(data["next_observations"], dtype=np.float32)
+            traj = np.asarray(data["trajectory_states"], dtype=np.float32)
+            actions = np.asarray(data[ACTION_CONTINUOUS_ENV_KEY], dtype=np.float32)
+            steering_accel = (
+                np.asarray(data[ACTION_STEERING_ACCELERATION_KEY], dtype=np.float32)
+                if ACTION_STEERING_ACCELERATION_KEY in data.files
+                else None
+            )
+            dones = np.asarray(data["dones"], dtype=bool)
+            rewards = np.asarray(data["rewards"], dtype=np.float32)
+            vehicle_ids = np.asarray(data["vehicle_ids"], dtype=np.int64)
+            timesteps = np.asarray(data["timesteps"], dtype=np.int64)
+            _validate_action_conditioned_arrays(
+                file_path,
+                observations=obs,
+                next_observations=next_obs,
+                trajectory_states=traj,
+                actions_continuous_env=actions,
+                actions_steering_acceleration=steering_accel,
+                dones=dones,
+                rewards=rewards,
+                vehicle_ids=vehicle_ids,
+                timesteps=timesteps,
+            )
+            if "metadata_json" in data.files:
+                metadata_items.append(json.loads(str(data["metadata_json"].item())))
+
+            traj = normalize_trajectory_frame(traj, vehicle_ids, frame=trajectory_frame)
+            if idx is not None:
+                obs = obs[idx]
+                next_obs = next_obs[idx]
+                traj = traj[idx]
+                actions = actions[idx]
+                steering_accel = steering_accel[idx] if steering_accel is not None else None
+                dones = dones[idx]
+                rewards = rewards[idx]
+                vehicle_ids = vehicle_ids[idx]
+                timesteps = timesteps[idx]
+            take = int(len(obs))
+            if take <= 0:
+                continue
+            obs_parts.append(policy_observations_from_flat(obs))
+            next_obs_parts.append(policy_observations_from_flat(next_obs))
+            traj_parts.append(traj.astype(np.float32, copy=False))
+            action_parts.append(actions.astype(np.float32, copy=False))
+            if steering_accel is not None:
+                steering_accel_parts.append(steering_accel.astype(np.float32, copy=False))
+            done_parts.append(dones.astype(bool, copy=False))
+            reward_parts.append(rewards.astype(np.float32, copy=False))
+            vehicle_id_parts.append(vehicle_ids.astype(np.int64, copy=False))
+            timestep_parts.append(timesteps.astype(np.int64, copy=False))
+            samples_by_file.append(
+                {
+                    "file": os.path.basename(file_path),
+                    "source_samples": int(counts[file_path]),
+                    "loaded_samples": take,
+                }
+            )
+
+    if not obs_parts:
+        raise RuntimeError(f"No action-conditioned expert samples were loaded from {path}.")
+
+    policy_obs = np.concatenate(obs_parts, axis=0).astype(np.float32, copy=False)
+    next_policy_obs = np.concatenate(next_obs_parts, axis=0).astype(np.float32, copy=False)
+    trajectory_states = np.concatenate(traj_parts, axis=0).astype(np.float32, copy=False)
+    actions_continuous_env = np.concatenate(action_parts, axis=0).astype(np.float32, copy=False)
+    if steering_accel_parts and len(steering_accel_parts) != len(action_parts):
+        raise RuntimeError(
+            f"Only {len(steering_accel_parts)} of {len(action_parts)} loaded files contain "
+            f"{ACTION_STEERING_ACCELERATION_KEY}; rebuild a consistent unified expert dataset."
+        )
+    actions_steering_acceleration = (
+        np.concatenate(steering_accel_parts, axis=0).astype(np.float32, copy=False)
+        if steering_accel_parts
+        else None
+    )
+    dones = np.concatenate(done_parts, axis=0).astype(bool, copy=False)
+    rewards = np.concatenate(reward_parts, axis=0).astype(np.float32, copy=False)
+    vehicle_ids = np.concatenate(vehicle_id_parts, axis=0).astype(np.int64, copy=False)
+    timesteps = np.concatenate(timestep_parts, axis=0).astype(np.int64, copy=False)
+    features = discriminator_features(policy_obs, trajectory_states)
+    schema_versions = _metadata_values(metadata_items, "schema_version")
+    metadata = {
+        "source_path": os.path.abspath(path),
+        "schema_version": schema_versions[0] if len(schema_versions) == 1 else None,
+        "schema_versions": schema_versions,
+        "num_files_seen": len(metadata_items) or len(files),
+        "num_files_loaded": len(samples_by_file),
+        "num_source_samples": int(sum(counts[file_path] for file_path in files)),
+        "num_samples": int(policy_obs.shape[0]),
+        "policy_observation_dim": int(policy_obs.shape[1]),
+        "next_policy_observation_dim": int(next_policy_obs.shape[1]),
+        "trajectory_state_dim": int(trajectory_states.shape[1]),
+        "feature_dim": int(features.shape[1]),
+        "continuous_action_dim": int(actions_continuous_env.shape[1]),
+        "actions_continuous_env_columns": list(ACTION_CONTINUOUS_ENV_COLUMNS),
+        "actions_steering_acceleration_columns": list(ACTION_STEERING_ACCELERATION_COLUMNS)
+        if actions_steering_acceleration is not None
+        else None,
+        "trajectory_frame": str(trajectory_frame).lower(),
+        "sampling": "uniform_without_replacement",
+        "max_samples": int(max_samples),
+        "samples_by_file": samples_by_file,
+        "episodes": metadata_items,
+    }
+    return ExpertTransitionData(
+        policy_observations=policy_obs,
+        next_policy_observations=next_policy_obs,
+        actions_continuous_env=actions_continuous_env,
+        actions_steering_acceleration=actions_steering_acceleration,
+        dones=dones,
+        rewards=rewards,
+        trajectory_states=trajectory_states,
+        features=features,
+        vehicle_ids=vehicle_ids,
+        timesteps=timesteps,
+        metadata=metadata,
+    )
 
 
 def load_expert_scene_data(

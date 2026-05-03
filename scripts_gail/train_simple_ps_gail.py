@@ -109,6 +109,24 @@ def apply_optional_discriminator_normalizer(
     )
 
 
+def checkpoint_expert_metadata(metadata: dict[str, object]) -> dict[str, object]:
+    return {
+        "source_path": metadata.get("source_path"),
+        "schema_version": metadata.get("schema_version"),
+        "schema_versions": metadata.get("schema_versions"),
+        "num_files_loaded": metadata.get("num_files_loaded"),
+        "num_source_samples": metadata.get("num_source_samples"),
+        "num_samples": metadata.get("num_samples"),
+        "policy_observation_dim": metadata.get("policy_observation_dim"),
+        "feature_dim": metadata.get("feature_dim"),
+        "trajectory_frame": metadata.get("trajectory_frame"),
+        "actions_continuous_env_columns": metadata.get("actions_continuous_env_columns"),
+        "actions_steering_acceleration_columns": metadata.get(
+            "actions_steering_acceleration_columns"
+        ),
+    }
+
+
 def _policy_action_tuple(
     policy: SharedActorCritic,
     obs,
@@ -696,6 +714,7 @@ def main() -> None:
                         "discriminator_feature_normalizer": primary_discriminator_normalizer,
                         "scene_discriminator_feature_normalizer": scene_discriminator_normalizer,
                         "discriminator_type": discriminator_name,
+                        "expert_metadata": checkpoint_expert_metadata(expert_metadata),
                         "config": vars(cfg),
                         "round_config": vars(round_cfg),
                     },
@@ -732,6 +751,7 @@ def main() -> None:
                 "discriminator_feature_normalizer": primary_discriminator_normalizer,
                 "scene_discriminator_feature_normalizer": scene_discriminator_normalizer,
                 "discriminator_type": discriminator_name,
+                "expert_metadata": checkpoint_expert_metadata(expert_metadata),
                 "config": vars(cfg),
                 "round_config": vars(config_for_round(cfg, int(cfg.total_rounds))),
             },

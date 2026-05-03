@@ -13,10 +13,20 @@ set -euo pipefail
 
 export REPODIR="${REPODIR:-/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM}"
 export PYTHONPATH="${REPODIR}:${PYTHONPATH:-}"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
-export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-2}"
-export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-2}"
+COLLECTION_WORKER_THREADS="${COLLECTION_WORKER_THREADS:-2}"
+if [ "${COLLECTION_WORKER_THREADS}" -lt 1 ]; then
+    COLLECTION_WORKER_THREADS=1
+fi
+SLURM_CPUS="${SLURM_CPUS_PER_TASK:-4}"
+COLLECTION_WORKERS="${COLLECTION_WORKERS:-$((SLURM_CPUS / COLLECTION_WORKER_THREADS))}"
+if [ "${COLLECTION_WORKERS}" -lt 1 ]; then
+    COLLECTION_WORKERS=1
+fi
+
+export OMP_NUM_THREADS="${COLLECTION_WORKER_THREADS}"
+export MKL_NUM_THREADS="${COLLECTION_WORKER_THREADS}"
+export OPENBLAS_NUM_THREADS="${COLLECTION_WORKER_THREADS}"
+export NUMEXPR_NUM_THREADS="${COLLECTION_WORKER_THREADS}"
 export MPLCONFIGDIR="${REPODIR}/logs/matplotlib_${SLURM_JOB_ID}"
 
 cd "${REPODIR}"
@@ -32,6 +42,9 @@ MAX_EPISODES="${MAX_EPISODES:-2}"
 MAX_STEPS_PER_EPISODE="${MAX_STEPS_PER_EPISODE:-200}"
 SCENE_MAX_VEHICLES="${SCENE_MAX_VEHICLES:-64}"
 
+echo "Collection workers: ${COLLECTION_WORKERS}"
+echo "Collection worker threads: ${COLLECTION_WORKER_THREADS}"
+
 python "${REPODIR}/scripts_gail/build_ps_traj_expert_discrete.py" \
     --out "${OUT}" \
     --scene us-101 \
@@ -41,6 +54,8 @@ python "${REPODIR}/scripts_gail/build_ps_traj_expert_discrete.py" \
     --max-episodes "${MAX_EPISODES}" \
     --max-steps-per-episode "${MAX_STEPS_PER_EPISODE}" \
     --max-samples-per-vehicle "${MAX_STEPS_PER_EPISODE}" \
+    --num-collection-workers "${COLLECTION_WORKERS}" \
+    --collection-worker-threads "${COLLECTION_WORKER_THREADS}" \
     --max-episode-steps "${MAX_STEPS_PER_EPISODE}" \
     --scene-max-vehicles "${SCENE_MAX_VEHICLES}" \
     --expert-control-mode continuous \
