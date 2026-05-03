@@ -47,15 +47,6 @@ def select_ego_ids(
     episode_name: str,
     control_all_vehicles: bool = False,
 ) -> list[int]:
-    if control_all_vehicles:
-        ego_ids = [int(eid) for eid in valid_ids]
-        if not ego_ids:
-            raise ValueError(
-                "control_all_vehicles selected no viable ego ids for the current "
-                "episode."
-            )
-        return ego_ids
-
     resolved_num_vehicles = resolve_num_ego_vehicles(
         percentage_controlled_vehicles,
         len(valid_ids),
@@ -67,6 +58,14 @@ def select_ego_ids(
                 f"Requested {resolved_num_vehicles} ego vehicles, but only "
                 f"{len(valid_ids)} valid ids are available"
             )
+        if control_all_vehicles:
+            ego_ids = [int(eid) for eid in valid_ids]
+            if not ego_ids:
+                raise ValueError(
+                    "control_all_vehicles selected no viable ego ids for the current "
+                    "episode."
+                )
+            return ego_ids
         return list(
             map(
                 int,
@@ -87,7 +86,7 @@ def select_ego_ids(
     if invalid_ids:
         raise ValueError(f"Ego IDs {invalid_ids} not in episode {episode_name}")
 
-    if len(selected_ego_ids) != resolved_num_vehicles:
+    if not control_all_vehicles and len(selected_ego_ids) != resolved_num_vehicles:
         raise ValueError(
             f"Expected {resolved_num_vehicles} explicit ego ids, got {len(selected_ego_ids)}"
         )

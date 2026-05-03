@@ -36,7 +36,11 @@ from highway_env.imitation.expert_dataset import (  # noqa: E402
     register_ngsim_env,
 )
 from highway_env.ngsim_utils.core.constants import MAX_ACCEL, MAX_STEER  # noqa: E402
+from highway_env.ngsim_utils.data.ego_trajectory import load_ego_trajectory  # noqa: E402
+from highway_env.ngsim_utils.data.prebuilt import load_prebuilt_data  # noqa: E402
+from highway_env.ngsim_utils.data.episode_selection import resolve_num_ego_vehicles  # noqa: E402
 from highway_env.ngsim_utils.data.trajectory_gen import (  # noqa: E402
+    longest_continuous_active_span_bounds,
     trajectory_row_is_active,
 )
 from scripts_gail.ps_gail.data import (  # noqa: E402
@@ -139,6 +143,12 @@ def parse_args() -> argparse.Namespace:
         dest="allow_idm",
         action="store_false",
         help="Keep surrounding vehicles on pure replay only; no IDM intervention.",
+    )
+    parser.add_argument(
+        "--controlled-min-occupancy",
+        type=float,
+        default=0.8,
+        help="Minimum active ratio required for controlled vehicles during scene collection.",
     )
     parser.add_argument(
         "--expert-control-mode",
@@ -248,6 +258,15 @@ def observation_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _collection_requested_steps(args: argparse.Namespace) -> int:
+    candidates = []
+    for attr in ("max_steps_per_episode", "max_episode_steps"):
+        value = int(getattr(args, attr, 0) or 0)
+        if value > 0:
+            candidates.append(value)
+    return min(candidates) if candidates else 0
+
+
 def make_expert_scene_env(
     args: argparse.Namespace,
     *,
@@ -285,6 +304,10 @@ def make_expert_scene_env(
     cfg["disable_controlled_vehicle_collisions"] = True
     cfg["terminate_when_all_controlled_crashed"] = False
     cfg["offscreen_rendering"] = render_mode == "rgb_array"
+    cfg["controlled_vehicle_min_occupancy"] = float(
+        getattr(args, "controlled_min_occupancy", 0.8)
+    )
+    cfg["scene_collection_min_occupancy_steps"] = _collection_requested_steps(args)
     cfg["screen_width"] = int(args.screen_width)
     cfg["screen_height"] = int(args.screen_height)
     cfg["scaling"] = float(args.scaling)
@@ -940,27 +963,111 @@ def render_mode_from_args(args: argparse.Namespace) -> str | None:
     return "rgb_array" if args.save_video else ("human" if args.visualize_episode else None)
 
 
+def _collection_occupancy_horizon(args: argparse.Namespace, traj_len: int) -> int:
+    max_steps = _collection_requested_steps(args)
+    if max_steps <= 0:
+        return int(traj_len)
+    return min(int(max_steps), int(traj_len))
+
+
+def _collection_active_occupancy(
+    traj: np.ndarray,
+    args: argparse.Namespace,
+    *,
+    start_index: int = 0,
+    end_index: int | None = None,
+) -> float:
+    traj_arr = np.asarray(traj, dtype=float)
+    if traj_arr.ndim != 2 or traj_arr.shape[0] <= 0:
+        return 0.0
+    horizon_steps = _collection_occupancy_horizon(args, int(traj_arr.shape[0]))
+    if horizon_steps <= 0:
+        return 0.0
+    if end_index is None:
+        end_index = int(traj_arr.shape[0] - 1)
+    window_start = max(0, min(int(start_index), horizon_steps))
+    window_end = max(window_start, min(int(end_index) + 1, horizon_steps, len(traj_arr)))
+    active_steps = sum(
+        1 for row in traj_arr[window_start:window_end] if trajectory_row_is_active(row)
+    )
+    return float(active_steps) / float(horizon_steps)
+
+
+def _collection_active_occupancy_from_meta(
+    meta: dict[str, Any],
+    args: argparse.Namespace,
+) -> float:
+    try:
+        traj = load_ego_trajectory(meta, str(args.scene))
+    except Exception:
+        traj = np.asarray(meta.get("trajectory", []), dtype=float)
+    start_index, end_index, span_len = longest_continuous_active_span_bounds(traj)
+    if start_index is None or end_index is None or span_len <= 0:
+        return 0.0
+    return _collection_active_occupancy(
+        traj,
+        args,
+        start_index=int(start_index),
+        end_index=int(end_index),
+    )
+
+
 def available_collection_scenarios(args: argparse.Namespace) -> list[dict[str, Any]]:
     """Return deterministic fixed episodes/ego ids for expert collection."""
     register_ngsim_env()
-    probe_env = make_expert_scene_env(args)
-    try:
-        base = probe_env.unwrapped
-        if not hasattr(base, "_episodes") or not hasattr(base, "_valid_ids_by_episode"):
-            raise AttributeError("NGSimEnv does not expose prebuilt episode metadata.")
-        scenarios: list[dict[str, Any]] = []
-        for episode_name in base._episodes:
-            valid_ids = sorted(
-                int(vehicle_id)
-                for vehicle_id in base._valid_ids_by_episode.get(episode_name, [])
+    _prebuilt_dir, valid_ids_by_episode, traj_all_by_episode, episodes = load_prebuilt_data(
+        args.episode_root,
+        str(args.scene),
+        str(args.prebuilt_split),
+        min_occupancy=float(getattr(args, "controlled_min_occupancy", 0.8)),
+        cache={},
+    )
+    min_occupancy = float(getattr(args, "controlled_min_occupancy", 0.8))
+    scenarios: list[dict[str, Any]] = []
+    for episode_name in episodes:
+        veh_dict = traj_all_by_episode.get(episode_name, {})
+        valid_ids = []
+        for vehicle_id in sorted(
+            int(vehicle_id)
+            for vehicle_id in valid_ids_by_episode.get(episode_name, [])
+        ):
+            meta = veh_dict.get(int(vehicle_id))
+            if meta is None:
+                continue
+            active_occupancy = _collection_active_occupancy_from_meta(meta, args)
+            if active_occupancy >= min_occupancy:
+                valid_ids.append(int(vehicle_id))
+
+        if not valid_ids:
+            continue
+        if bool(getattr(args, "control_all_vehicles", False)):
+            scenarios.append({"episode_name": str(episode_name), "ego_ids": valid_ids})
+            continue
+
+        controlled_count = resolve_num_ego_vehicles(
+            getattr(args, "percentage_controlled_vehicles", 0.1),
+            len(valid_ids),
+        )
+        if len(valid_ids) < controlled_count:
+            continue
+        if controlled_count == 1:
+            ego_groups = [(vehicle_id,) for vehicle_id in valid_ids]
+        else:
+            ego_groups = [
+                tuple(valid_ids[start : start + controlled_count])
+                for start in range(len(valid_ids) - controlled_count + 1)
+            ]
+        for ego_ids in ego_groups:
+            scenarios.append(
+                {
+                    "episode_name": str(episode_name),
+                    "ego_ids": [int(vehicle_id) for vehicle_id in ego_ids],
+                }
             )
-            if valid_ids:
-                scenarios.append({"episode_name": str(episode_name), "ego_ids": valid_ids})
-    finally:
-        probe_env.close()
     if not scenarios:
         raise RuntimeError(
-            f"No available expert collection episodes found for split {args.prebuilt_split!r}."
+            f"No available expert collection episodes found for split {args.prebuilt_split!r} "
+            f"with controlled active occupancy >= {min_occupancy:.3f}."
         )
     return scenarios
 
@@ -1002,6 +1109,8 @@ def enriched_episode_metadata(
         "max_samples_per_vehicle": int(args.max_samples_per_vehicle),
         "percentage_controlled_vehicles": float(args.percentage_controlled_vehicles),
         "control_all_vehicles": bool(args.control_all_vehicles),
+        "controlled_vehicle_min_occupancy": float(args.controlled_min_occupancy),
+        "scene_collection_min_occupancy_steps": _collection_requested_steps(args),
         "collection_episode_name": str(scenario["episode_name"]),
         "collection_ego_vehicle_ids": [int(vehicle_id) for vehicle_id in scenario["ego_ids"]],
         "max_surrounding": args.max_surrounding,
@@ -1195,6 +1304,8 @@ def main() -> None:
         "allow_idm": bool(args.allow_idm),
         "control_all_vehicles": bool(args.control_all_vehicles),
         "percentage_controlled_vehicles": float(args.percentage_controlled_vehicles),
+        "controlled_vehicle_min_occupancy": float(args.controlled_min_occupancy),
+        "scene_collection_min_occupancy_steps": _collection_requested_steps(args),
         "scene_max_vehicles": int(args.scene_max_vehicles),
         "num_collection_workers": max(1, int(args.num_collection_workers)),
         "collection_worker_threads": max(1, int(args.collection_worker_threads)),

@@ -155,6 +155,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 "disable_scene_collection_spawn_safety": False,
                 "allow_idm": True,
                 "controlled_vehicle_min_occupancy": 0.8,
+                "scene_collection_min_occupancy_steps": None,
                 "idm_parameters": None,
                 "debug_idm_handover": False,
                 "debug_idm_handover_ids": None,
@@ -422,10 +423,16 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                     ego=ego,
                     ego_traj_full=ego_traj_full,
                 )
-                if not self._scene_collection_spawn_has_min_occupancy(ego):
+                active_occupancy = self._scene_collection_spawn_active_occupancy(ego)
+                min_occupancy = float(
+                    self.config.get("controlled_vehicle_min_occupancy", 0.0)
+                )
+                if active_occupancy < min_occupancy:
                     logger.warning(
-                        "Skipping controlled vehicle %s because its scene-collection active occupancy is below the configured minimum.",
+                        "Skipping controlled vehicle %s because its scene-collection active occupancy %.3f is below the configured minimum %.3f.",
                         ego_id,
+                        active_occupancy,
+                        min_occupancy,
                     )
                     continue
                 if self._scene_collection_spawn_has_conflict(
@@ -660,25 +667,37 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             "polygon": road_entity_pose_polygon(position, heading, length, width),
         }
 
+    def _scene_collection_min_occupancy_horizon_steps(self, traj_len: int) -> int:
+        configured_steps = self.config.get("scene_collection_min_occupancy_steps")
+        if configured_steps is None:
+            configured_steps = self.config.get("max_episode_steps")
+        max_steps = int(configured_steps or 0)
+        if max_steps <= 0:
+            return int(traj_len)
+        return min(int(max_steps), int(traj_len))
+
+    def _scene_collection_spawn_active_occupancy(self, ego: EgoVehicle) -> float:
+        traj = np.asarray(getattr(ego, "scene_collection_full_traj"))
+        if traj.ndim != 2 or traj.shape[0] <= 0:
+            return 0.0
+        horizon_steps = self._scene_collection_min_occupancy_horizon_steps(len(traj))
+        if horizon_steps <= 0:
+            return 0.0
+
+        start_index = int(getattr(ego, "scene_collection_start_index", 0))
+        end_index = int(getattr(ego, "scene_collection_end_index", len(traj) - 1))
+        window_start = max(0, min(start_index, horizon_steps))
+        window_end = max(window_start, min(end_index + 1, horizon_steps, len(traj)))
+        active_steps = sum(
+            1 for row in traj[window_start:window_end] if trajectory_row_is_active(row)
+        )
+        return float(active_steps) / float(horizon_steps)
+
     def _scene_collection_spawn_has_min_occupancy(self, ego: EgoVehicle) -> bool:
         min_occupancy = float(self.config.get("controlled_vehicle_min_occupancy", 0.0))
         if min_occupancy <= 0.0:
             return True
-
-        max_steps = int(self.config.get("max_episode_steps") or 0)
-        if max_steps <= 0:
-            return True
-
-        traj = np.asarray(getattr(ego, "scene_collection_full_traj"))
-        start_index = int(getattr(ego, "scene_collection_start_index", 0))
-        # The acceptance/debug counters are recorded after each simulation step,
-        # so compare against the same post-step trajectory window.
-        window_start = start_index + 1
-        end_index = min(len(traj), window_start + max_steps)
-        active_steps = sum(
-            1 for row in traj[window_start:end_index] if trajectory_row_is_active(row)
-        )
-        return (active_steps / float(max_steps)) >= min_occupancy
+        return self._scene_collection_spawn_active_occupancy(ego) >= min_occupancy
 
     def _scene_collection_spawn_has_conflict(
         self,
