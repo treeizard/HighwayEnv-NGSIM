@@ -113,6 +113,7 @@ def _minimal_rollout(
     n = int(len(observations))
     return RolloutBatch(
         policy_observations=observations.astype(np.float32),
+        next_policy_observations=observations.astype(np.float32),
         actions=actions,
         action_masks=np.ones((n, 5), dtype=bool),
         old_log_probs=old_log_probs.astype(np.float32),

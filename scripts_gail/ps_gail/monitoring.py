@@ -19,7 +19,27 @@ class WandbMonitor:
     def start(self) -> None:
         if not self.enabled:
             return
+        wandb_root = os.path.abspath(os.path.join(self.run_dir, "wandb"))
+        for name, relative in {
+            "WANDB_DIR": ".",
+            "WANDB_CONFIG_DIR": "config",
+            "WANDB_CACHE_DIR": "cache",
+            "WANDB_DATA_DIR": "data",
+            "WANDB_ARTIFACT_DIR": "artifacts",
+            "TMPDIR": "tmp",
+            "TEMP": "tmp",
+            "TMP": "tmp",
+        }.items():
+            path = os.path.abspath(os.path.join(wandb_root, relative))
+            os.makedirs(path, exist_ok=True)
+            os.environ.setdefault(name, path)
         try:
+            import numpy as np
+
+            if not hasattr(np, "float_"):
+                np.float_ = np.float64  # type: ignore[attr-defined]
+            if not hasattr(np, "complex_"):
+                np.complex_ = np.complex128  # type: ignore[attr-defined]
             import wandb
         except ModuleNotFoundError as exc:
             raise SystemExit(
@@ -30,6 +50,7 @@ class WandbMonitor:
         self._wandb = wandb
         mode = str(self.cfg.wandb_mode).lower()
         tags = [tag.strip() for tag in str(self.cfg.wandb_tags).split(",") if tag.strip()]
+        settings = wandb.Settings(start_method="thread", _service_wait=120)
         self._run = wandb.init(
             project=self.cfg.wandb_project,
             entity=self.cfg.wandb_entity or None,
@@ -39,6 +60,7 @@ class WandbMonitor:
             mode=mode,
             tags=tags or None,
             config=vars(self.cfg),
+            settings=settings,
         )
 
     def watch(self, policy: nn.Module, discriminator: nn.Module) -> None:

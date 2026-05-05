@@ -30,6 +30,7 @@ from .observations import flatten_agent_observations, policy_observations_from_f
 @dataclass
 class AgentTransition:
     policy_observation: np.ndarray
+    next_policy_observation: np.ndarray
     action: object
     action_mask: np.ndarray
     log_prob: float
@@ -46,6 +47,7 @@ class AgentTransition:
 @dataclass
 class RolloutBatch:
     policy_observations: np.ndarray
+    next_policy_observations: np.ndarray
     actions: np.ndarray
     action_masks: np.ndarray
     old_log_probs: np.ndarray
@@ -258,6 +260,31 @@ def discriminator_reward(
     return rewards.cpu().numpy().astype(np.float32)
 
 
+def discriminator_input_mode(cfg: PSGAILConfig) -> str:
+    mode = str(getattr(cfg, "discriminator_input", "auto")).lower()
+    if mode == "auto":
+        return "action" if _is_continuous(cfg) else "trajectory"
+    if mode not in {"trajectory", "action"}:
+        raise ValueError(
+            f"Unsupported discriminator_input={mode!r}. Expected 'auto', 'trajectory', or 'action'."
+        )
+    if mode == "action" and not _is_continuous(cfg):
+        raise ValueError("discriminator_input='action' currently requires continuous action mode.")
+    return mode
+
+
+def action_conditioned_features(policy_observations: np.ndarray, actions: np.ndarray) -> np.ndarray:
+    policy_observations = np.asarray(policy_observations, dtype=np.float32)
+    actions = np.asarray(actions, dtype=np.float32)
+    if policy_observations.ndim != 2 or actions.ndim != 2:
+        raise ValueError(
+            f"Action-conditioned features require rank-2 obs/actions, got {policy_observations.shape} and {actions.shape}."
+        )
+    if len(policy_observations) != len(actions):
+        raise ValueError(f"Observation/action count mismatch: {len(policy_observations)} != {len(actions)}.")
+    return np.concatenate([policy_observations, actions], axis=1).astype(np.float32, copy=False)
+
+
 def shape_rollout_rewards(
     raw_gail_rewards: np.ndarray,
     env_penalties: np.ndarray,
@@ -374,6 +401,7 @@ def refresh_rollout_rewards(
     )
     return RolloutBatch(
         policy_observations=rollout.policy_observations,
+        next_policy_observations=rollout.next_policy_observations,
         actions=rollout.actions,
         action_masks=rollout.action_masks,
         old_log_probs=rollout.old_log_probs,
@@ -506,6 +534,9 @@ def collect_rollout(
 
         action_tuple = _actions_to_env_tuple(actions, cfg)
         next_obs, _env_reward, terminated, truncated, info = env.step(action_tuple)
+        next_obs_agents = policy_observations_from_flat(flatten_agent_observations(next_obs))
+        if len(next_obs_agents) != len(obs_agents):
+            next_obs_agents = obs_agents.copy()
         episode_steps += 1
         force_rollout_reset = forced_reset_cap > 0 and episode_steps >= forced_reset_cap
         done = bool(terminated or truncated or force_rollout_reset)
@@ -525,6 +556,7 @@ def collect_rollout(
             transitions.append(
                 AgentTransition(
                     policy_observation=obs_agents[i].copy(),
+                    next_policy_observation=next_obs_agents[i].copy(),
                     action=(
                         np.asarray(action_tuple[i], dtype=np.float32).copy()
                         if _is_continuous(cfg)
@@ -566,6 +598,7 @@ def collect_rollout(
         offroad_event_count += int(episode_had_offroad)
 
     policy_obs = np.stack([tr.policy_observation for tr in transitions], axis=0).astype(np.float32)
+    next_policy_obs = np.stack([tr.next_policy_observation for tr in transitions], axis=0).astype(np.float32)
     trajectory_states = np.stack([tr.trajectory_state for tr in transitions], axis=0).astype(np.float32)
     actions = _actions_to_rollout_array(transitions, cfg)
     action_masks = np.stack([tr.action_mask for tr in transitions], axis=0).astype(bool)
@@ -582,7 +615,10 @@ def collect_rollout(
         trajectory_ids,
         frame=cfg.trajectory_frame,
     )
-    gen_features = discriminator_features(policy_obs, trajectory_states)
+    if discriminator_input_mode(cfg) == "action":
+        gen_features = action_conditioned_features(policy_obs, actions)
+    else:
+        gen_features = discriminator_features(policy_obs, trajectory_states)
     sequence_features, sequence_last_indices = build_sequence_windows(
         gen_features,
         trajectory_ids,
@@ -597,6 +633,7 @@ def collect_rollout(
     returns, advantages = compute_returns_and_advantages(rewards, old_values, dones, trajectory_ids, cfg)
     return RolloutBatch(
         policy_observations=policy_obs,
+        next_policy_observations=next_policy_obs,
         actions=actions,
         action_masks=action_masks,
         old_log_probs=old_log_probs,
@@ -691,6 +728,10 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
         policy_observations=np.concatenate([batch.policy_observations for batch in batches], axis=0).astype(
             np.float32
         ),
+        next_policy_observations=np.concatenate(
+            [batch.next_policy_observations for batch in batches],
+            axis=0,
+        ).astype(np.float32),
         actions=np.concatenate([batch.actions for batch in batches], axis=0).astype(
             np.float32 if _is_continuous(cfg) else np.int64
         ),

@@ -56,6 +56,7 @@ class PSGAILConfig:
     disc_updates_per_round: int = 4
     disc_expert_label: float = 0.9
     disc_generator_label: float = 0.1
+    discriminator_input: str = "auto"
     discriminator_loss: str = "wgan_gp"
     wgan_gp_lambda: float = 2.0
     wgan_reward_center: bool = False

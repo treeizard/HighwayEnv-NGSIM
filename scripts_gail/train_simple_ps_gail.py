@@ -22,6 +22,7 @@ from scripts_gail.ps_gail.data import (
     load_expert_policy_and_disc_data,
     load_expert_scene_data,
     load_expert_sequence_data,
+    load_expert_transition_data,
     standardize_features,
 )
 from scripts_gail.ps_gail.envs import make_training_env
@@ -36,7 +37,9 @@ from scripts_gail.ps_gail.models import (
 from scripts_gail.ps_gail.observations import flatten_agent_observations, policy_observations_from_flat
 from scripts_gail.ps_gail.trainer import (
     collect_rollouts,
+    action_conditioned_features,
     discrete_action_masks_from_env,
+    discriminator_input_mode,
     infer_continuous_action_dim,
     infer_policy_obs_dim,
     make_rollout_executor,
@@ -234,7 +237,8 @@ def parse_args() -> PSGAILConfig:
         description=(
             "Demonstration PS-GAIL trainer for NGSIM discrete or continuous actions. "
             "Policy input is lidar + lane + [length, velocity, heading]. "
-            "The discriminator compares policy observation + trajectory [x, y, v], not DMA."
+            "Continuous action mode defaults to matching policy observation + continuous action; "
+            "discrete mode defaults to policy observation + trajectory [x, y, v]."
         )
     )
     for field in fields(PSGAILConfig):
@@ -268,13 +272,32 @@ def main() -> None:
     env = None
     rollout_executor = None
     try:
-        expert_policy_obs, expert_features, expert_metadata = load_expert_policy_and_disc_data(
-            cfg.expert_data,
-            max_samples=cfg.max_expert_samples,
-            seed=cfg.seed,
-            trajectory_frame=cfg.trajectory_frame,
-        )
         sequence_only_discriminator = bool(cfg.enable_sequence_discriminator)
+        if discriminator_input_mode(cfg) == "action":
+            if sequence_only_discriminator or bool(cfg.enable_scene_discriminator):
+                raise ValueError(
+                    "Action-conditioned continuous GAIL currently supports the simple discriminator only. "
+                    "Disable scene/sequence discriminators or use --discriminator-input trajectory."
+                )
+            expert_transitions = load_expert_transition_data(
+                cfg.expert_data,
+                max_samples=cfg.max_expert_samples,
+                seed=cfg.seed,
+                trajectory_frame=cfg.trajectory_frame,
+            )
+            expert_policy_obs = expert_transitions.policy_observations
+            expert_features = action_conditioned_features(
+                expert_transitions.policy_observations,
+                expert_transitions.actions_continuous_env,
+            )
+            expert_metadata = expert_transitions.metadata
+        else:
+            expert_policy_obs, expert_features, expert_metadata = load_expert_policy_and_disc_data(
+                cfg.expert_data,
+                max_samples=cfg.max_expert_samples,
+                seed=cfg.seed,
+                trajectory_frame=cfg.trajectory_frame,
+            )
         expert_scene_features = None
         expert_scene_metadata = {}
         if bool(cfg.enable_scene_discriminator):
@@ -389,6 +412,7 @@ def main() -> None:
             f"policy_model={cfg.policy_model} "
             f"policy_obs_dim={policy_obs_dim} disc_feature_dim={feature_dim} device={device} "
             f"discriminator={discriminator_name} "
+            f"discriminator_input={discriminator_input_mode(cfg)} "
             f"disc_loss={cfg.discriminator_loss} "
             f"wgan_reward_center={cfg.wgan_reward_center} "
             f"wgan_reward_clip={cfg.wgan_reward_clip} "
