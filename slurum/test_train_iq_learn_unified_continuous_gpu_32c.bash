@@ -19,7 +19,7 @@ export PYTHONPATH="${REPODIR}:${PYTHONPATH:-}"
 # rollout workers than PS-GAIL/AIRL for a first test. Keep one GPU for batched
 # critic/policy updates.
 WORKER_THREADS="${WORKER_THREADS:-2}"
-SLURM_CPUS="${SLURM_CPUS_PER_TASK:-8}"
+SLURM_CPUS="${SLURM_CPUS_PER_TASK:-32}"
 ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-2}"
 if [ "${ROLLOUT_WORKERS}" -gt "$((SLURM_CPUS / WORKER_THREADS))" ]; then
     ROLLOUT_WORKERS="$((SLURM_CPUS / WORKER_THREADS))"
@@ -32,6 +32,7 @@ export OMP_NUM_THREADS="${WORKER_THREADS}"
 export MKL_NUM_THREADS="${WORKER_THREADS}"
 export OPENBLAS_NUM_THREADS="${WORKER_THREADS}"
 export NUMEXPR_NUM_THREADS="${WORKER_THREADS}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export MPLCONFIGDIR="${REPODIR}/logs/matplotlib_${SLURM_JOB_ID}"
 
 cd "${REPODIR}"
@@ -50,19 +51,43 @@ RUN_NAME="${RUN_NAME:-iqlearn_unified_continuous_test_${SLURM_JOB_ID}}"
 WANDB_MODE="${WANDB_MODE:-online}"
 
 TOTAL_UPDATES="${TOTAL_UPDATES:-20000}"
-EVAL_EVERY="${EVAL_EVERY:-1000}"
+EVAL_EVERY="${EVAL_EVERY:-2000}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
 MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-100000}"
-BATCH_SIZE="${BATCH_SIZE:-2048}"
+BATCH_SIZE="${BATCH_SIZE:-8192}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
 REPLAY_SIZE="${REPLAY_SIZE:-200000}"
-CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5000}"
-SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-true}"
+REPLAY_DEVICE="${REPLAY_DEVICE:-cuda}"
+PIN_CPU_REPLAY="${PIN_CPU_REPLAY:-true}"
+TORCH_MATMUL_PRECISION="${TORCH_MATMUL_PRECISION:-high}"
+LEARNING_RATE="${LEARNING_RATE:-1e-4}"
+DISC_LEARNING_RATE="${DISC_LEARNING_RATE:-1e-4}"
+GAMMA="${GAMMA:-0.95}"
+IQ_ALPHA="${IQ_ALPHA:-0.05}"
+TARGET_TAU="${TARGET_TAU:-0.002}"
+BC_COEF="${BC_COEF:-0.5}"
+BC_WARMUP_COEF="${BC_WARMUP_COEF:-2.0}"
+BC_WARMUP_UPDATES="${BC_WARMUP_UPDATES:-5000}"
+POLICY_BC_ONLY_UPDATES="${POLICY_BC_ONLY_UPDATES:-1000}"
+Q_L2_COEF="${Q_L2_COEF:-0.001}"
+Q_POLICY_REG_COEF="${Q_POLICY_REG_COEF:-0.001}"
+CONSERVATIVE_Q_COEF="${CONSERVATIVE_Q_COEF:-0.05}"
+TARGET_VALUE_CLIP="${TARGET_VALUE_CLIP:-20.0}"
+POLICY_Q_CLIP="${POLICY_Q_CLIP:-20.0}"
+LOG_STD_MIN="${LOG_STD_MIN:--5.0}"
+LOG_STD_MAX="${LOG_STD_MAX:-0.5}"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10000}"
+SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-false}"
 CHECKPOINT_VIDEO_STEPS="${CHECKPOINT_VIDEO_STEPS:-120}"
 if [ "${SAVE_CHECKPOINT_VIDEO}" = "true" ]; then
     CHECKPOINT_VIDEO_ARG="--save-checkpoint-video"
 else
     CHECKPOINT_VIDEO_ARG="--no-save-checkpoint-video"
+fi
+if [ "${PIN_CPU_REPLAY}" = "true" ]; then
+    PIN_CPU_REPLAY_ARG="--pin-cpu-replay"
+else
+    PIN_CPU_REPLAY_ARG="--no-pin-cpu-replay"
 fi
 
 echo "Job ID: ${SLURM_JOB_ID}"
@@ -71,6 +96,10 @@ echo "IQ-Learn trainer: ${IQ_TRAIN_SCRIPT}"
 echo "CPUs per task: ${SLURM_CPUS}"
 echo "Eval rollout workers: ${ROLLOUT_WORKERS}"
 echo "Worker threads: ${WORKER_THREADS}"
+echo "GPU throughput: batch_size=${BATCH_SIZE} replay_device=${REPLAY_DEVICE} matmul_precision=${TORCH_MATMUL_PRECISION}"
+echo "Learning rates: policy=${LEARNING_RATE} q=${DISC_LEARNING_RATE}"
+echo "IQ stability: gamma=${GAMMA} alpha=${IQ_ALPHA} tau=${TARGET_TAU} bc=${BC_COEF} warmup_bc=${BC_WARMUP_COEF}"
+echo "Q stability: q_l2=${Q_L2_COEF} policy_q_reg=${Q_POLICY_REG_COEF} conservative=${CONSERVATIVE_Q_COEF} target_clip=${TARGET_VALUE_CLIP} policy_q_clip=${POLICY_Q_CLIP}"
 echo "CUDA devices: ${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi || true
 
@@ -116,6 +145,25 @@ python "${IQ_TRAIN_SCRIPT}" \
     --device cuda \
     --total-updates "${TOTAL_UPDATES}" \
     --eval-every "${EVAL_EVERY}" \
+    --replay-device "${REPLAY_DEVICE}" \
+    "${PIN_CPU_REPLAY_ARG}" \
+    --torch-matmul-precision "${TORCH_MATMUL_PRECISION}" \
+    --learning-rate "${LEARNING_RATE}" \
+    --disc-learning-rate "${DISC_LEARNING_RATE}" \
+    --gamma "${GAMMA}" \
+    --iq-alpha "${IQ_ALPHA}" \
+    --target-tau "${TARGET_TAU}" \
+    --bc-coef "${BC_COEF}" \
+    --bc-warmup-coef "${BC_WARMUP_COEF}" \
+    --bc-warmup-updates "${BC_WARMUP_UPDATES}" \
+    --policy-bc-only-updates "${POLICY_BC_ONLY_UPDATES}" \
+    --q-l2-coef "${Q_L2_COEF}" \
+    --q-policy-reg-coef "${Q_POLICY_REG_COEF}" \
+    --conservative-q-coef "${CONSERVATIVE_Q_COEF}" \
+    --target-value-clip "${TARGET_VALUE_CLIP}" \
+    --policy-q-clip "${POLICY_Q_CLIP}" \
+    --log-std-min "${LOG_STD_MIN}" \
+    --log-std-max "${LOG_STD_MAX}" \
     --max-episode-steps "${MAX_EPISODE_STEPS}" \
     --num-rollout-workers "${ROLLOUT_WORKERS}" \
     --rollout-worker-threads "${WORKER_THREADS}" \
@@ -128,5 +176,5 @@ python "${IQ_TRAIN_SCRIPT}" \
     --checkpoint-video-steps "${CHECKPOINT_VIDEO_STEPS}" \
     --wandb-mode "${WANDB_MODE}" \
     --wandb-project highwayenv-ps-gail \
-    --wandb-tags iq-learn,continuous,unified-expert,test,gpu,8c \
+    --wandb-tags iq-learn,continuous,unified-expert,stable-test,gpu,32c \
     --run-name "${RUN_NAME}"
