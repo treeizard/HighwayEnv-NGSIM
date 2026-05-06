@@ -8,6 +8,8 @@ import torch.nn as nn
 
 from .config import PSGAILConfig
 
+WANDB_PROJECT = "highwayenv-ps-gail"
+
 
 class WandbMonitor:
     def __init__(self, cfg: PSGAILConfig, run_dir: str) -> None:
@@ -50,13 +52,14 @@ class WandbMonitor:
 
         self._wandb = wandb
         mode = str(self.cfg.wandb_mode).lower()
+        self.cfg.wandb_project = WANDB_PROJECT
         tags = [tag.strip() for tag in str(self.cfg.wandb_tags).split(",") if tag.strip()]
         settings = wandb.Settings(
             _service_wait=120,
             init_timeout=int(os.environ.get("WANDB_INIT_TIMEOUT", "30")),
         )
         init_kwargs = {
-            "project": self.cfg.wandb_project,
+            "project": WANDB_PROJECT,
             "entity": self.cfg.wandb_entity or None,
             "group": self.cfg.wandb_group or None,
             "name": self.cfg.run_name,

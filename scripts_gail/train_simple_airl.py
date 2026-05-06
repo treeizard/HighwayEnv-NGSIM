@@ -371,6 +371,13 @@ def main() -> None:
         print(f"Loaded expert folder: {os.path.abspath(cfg.expert_data)}")
         print(f"expert_obs={expert.policy_observations.shape} expert_actions={expert.actions_continuous_env.shape}")
         print(f"policy_obs_dim={policy_obs_dim} action_dim={cfg.continuous_action_dim} device={device}")
+        if cfg.controlled_vehicle_curriculum:
+            print(
+                "controlled_vehicle_curriculum="
+                f"initial={cfg.initial_controlled_vehicle_fraction:.4f} "
+                f"final={cfg.final_controlled_vehicle_fraction:.4f} "
+                f"rounds={cfg.controlled_vehicle_curriculum_rounds}"
+            )
 
         for round_idx in range(1, int(cfg.total_rounds) + 1):
             round_cfg = config_for_round(cfg, round_idx)
@@ -409,6 +416,8 @@ def main() -> None:
             print(
                 f"[round {round_idx:04d}] env_steps={rollout.num_env_steps} "
                 f"agent_steps={rollout.num_agent_steps} episodes={rollout.num_episodes} "
+                f"ctrl_frac={round_cfg.percentage_controlled_vehicles:.4f} "
+                f"veh={rollout.mean_controlled_vehicles:.1f}/{rollout.mean_road_vehicles:.1f} "
                 f"reward_loss={reward_stats['reward_loss']:.4f} "
                 f"expert_acc={reward_stats['expert_acc']:.3f} gen_acc={reward_stats['gen_acc']:.3f} "
                 f"policy_loss={policy_stats['policy_loss']:.4f} value_loss={policy_stats['value_loss']:.4f} "
@@ -419,6 +428,9 @@ def main() -> None:
                 "rollout/env_steps": rollout.num_env_steps,
                 "rollout/agent_steps": rollout.num_agent_steps,
                 "rollout/episodes": rollout.num_episodes,
+                "rollout/controlled_vehicle_fraction": float(round_cfg.percentage_controlled_vehicles),
+                "rollout/mean_controlled_vehicles": rollout.mean_controlled_vehicles,
+                "rollout/mean_road_vehicles": rollout.mean_road_vehicles,
                 "rollout/mean_reward": float(rollout.rewards.mean()),
                 "airl/reward_loss": reward_stats["reward_loss"],
                 "airl/expert_acc": reward_stats["expert_acc"],
@@ -440,6 +452,7 @@ def main() -> None:
                         "reward_state_dict": reward_model.state_dict(),
                         "expert_metadata": expert.metadata,
                         "config": vars(cfg),
+                        "round_config": vars(round_cfg),
                     },
                     checkpoint_path,
                 )
@@ -456,6 +469,7 @@ def main() -> None:
                 "reward_state_dict": reward_model.state_dict(),
                 "expert_metadata": expert.metadata,
                 "config": vars(cfg),
+                "round_config": vars(config_for_round(cfg, int(cfg.total_rounds))),
             },
             final_path,
         )

@@ -98,6 +98,7 @@ from scripts_gail.ps_gail.trainer import (
     update_discriminator,
     update_policy,
 )
+from scripts_gail.train_simple_airl import config_for_round as airl_config_for_round
 
 
 def _minimal_rollout(
@@ -425,3 +426,22 @@ def test_wgan_gp_supports_sequence_discriminator_inputs():
 
     assert np.isfinite(stats["disc_loss"])
     assert np.isfinite(stats["gradient_penalty"])
+
+
+def test_airl_controlled_vehicle_curriculum_matches_ps_gail_schedule():
+    cfg = PSGAILConfig(
+        controlled_vehicle_curriculum=True,
+        control_all_vehicles=True,
+        percentage_controlled_vehicles=1.0,
+        initial_controlled_vehicle_fraction=0.2,
+        final_controlled_vehicle_fraction=0.8,
+        controlled_vehicle_curriculum_rounds=4,
+    )
+
+    fractions = [
+        airl_config_for_round(cfg, round_idx).percentage_controlled_vehicles
+        for round_idx in range(1, 6)
+    ]
+
+    np.testing.assert_allclose(fractions, [0.2, 0.4, 0.6, 0.8, 0.8], rtol=1e-6)
+    assert airl_config_for_round(cfg, 1).control_all_vehicles is False

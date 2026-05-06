@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=airl_unified_test
+#SBATCH --job-name=ps_airl_gpu_32c
 #SBATCH --account=bt60
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
@@ -7,19 +7,18 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
-#SBATCH --output=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/airl_unified_test_%j.out
-#SBATCH --error=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/airl_unified_test_%j.err
+#SBATCH --output=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_airl_gpu_32c_%j.out
+#SBATCH --error=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_airl_gpu_32c_%j.err
 
 set -euo pipefail
 
 export REPODIR="${REPODIR:-/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM}"
 export PYTHONPATH="${REPODIR}:${PYTHONPATH:-}"
 
-# AIRL has the same on-policy rollout pressure as GAIL, but the reward model is
-# usually cheaper than the PS-GAIL discriminator setup here, so 24 CPUs/96G is a
-# balanced test allocation.
+# PS-AIRL uses the AIRL reward model with the same progressive controlled-vehicle
+# curriculum as PS-GAIL. Rollouts run in CPU workers while PyTorch updates use GPU.
 ROLLOUT_WORKER_THREADS="${ROLLOUT_WORKER_THREADS:-2}"
-SLURM_CPUS="${SLURM_CPUS_PER_TASK:-24}"
+SLURM_CPUS="${SLURM_CPUS_PER_TASK:-32}"
 ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-$((SLURM_CPUS / ROLLOUT_WORKER_THREADS))}"
 if [ "${ROLLOUT_WORKERS}" -lt 1 ]; then
     ROLLOUT_WORKERS=1
@@ -43,19 +42,24 @@ conda activate ngsim_env
 
 EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_unified_expert_continuous_55145982}"
 AIRL_TRAIN_SCRIPT="${AIRL_TRAIN_SCRIPT:-${REPODIR}/scripts_gail/train_simple_airl.py}"
-RUN_NAME="${RUN_NAME:-airl_unified_continuous_test_${SLURM_JOB_ID}}"
+RUN_NAME="${RUN_NAME:-ps_airl_unified_continuous_gpu_32c_${SLURM_JOB_ID}}"
 WANDB_MODE="${WANDB_MODE:-online}"
 
-TOTAL_ROUNDS="${TOTAL_ROUNDS:-20}"
+# Training defaults: 200 AIRL update rounds, each collecting 200 rollout steps.
+TOTAL_ROUNDS="${TOTAL_ROUNDS:-200}"
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-200}"
 ROLLOUT_MIN_EPISODES="${ROLLOUT_MIN_EPISODES:-4}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
 MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-100000}"
+TRAJECTORY_FRAME="${TRAJECTORY_FRAME:-relative}"
+INITIAL_CONTROLLED_VEHICLE_FRACTION="${INITIAL_CONTROLLED_VEHICLE_FRACTION:-0.20}"
+FINAL_CONTROLLED_VEHICLE_FRACTION="${FINAL_CONTROLLED_VEHICLE_FRACTION:-1.0}"
+CONTROLLED_VEHICLE_CURRICULUM_ROUNDS="${CONTROLLED_VEHICLE_CURRICULUM_ROUNDS:-${TOTAL_ROUNDS}}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
 REWARD_BATCH_SIZE="${REWARD_BATCH_SIZE:-4096}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
-CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
-SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-true}"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10}"
+SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-false}"
 CHECKPOINT_VIDEO_STEPS="${CHECKPOINT_VIDEO_STEPS:-120}"
 if [ "${SAVE_CHECKPOINT_VIDEO}" = "true" ]; then
     CHECKPOINT_VIDEO_ARG="--save-checkpoint-video"
@@ -66,6 +70,8 @@ fi
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Expert data: ${EXPERT_DATA}"
 echo "AIRL trainer: ${AIRL_TRAIN_SCRIPT}"
+echo "Total rounds: ${TOTAL_ROUNDS}"
+echo "Rollout steps: ${ROLLOUT_STEPS}"
 echo "CPUs per task: ${SLURM_CPUS}"
 echo "Rollout workers: ${ROLLOUT_WORKERS}"
 echo "Rollout worker threads: ${ROLLOUT_WORKER_THREADS}"
@@ -111,9 +117,9 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --prebuilt-split train \
     --no-control-all-vehicles \
     --controlled-vehicle-curriculum \
-    --initial-controlled-vehicle-fraction 0.20 \
-    --final-controlled-vehicle-fraction 1.0 \
-    --controlled-vehicle-curriculum-rounds "${TOTAL_ROUNDS}" \
+    --initial-controlled-vehicle-fraction "${INITIAL_CONTROLLED_VEHICLE_FRACTION}" \
+    --final-controlled-vehicle-fraction "${FINAL_CONTROLLED_VEHICLE_FRACTION}" \
+    --controlled-vehicle-curriculum-rounds "${CONTROLLED_VEHICLE_CURRICULUM_ROUNDS}" \
     --enable-collision \
     --allow-idm \
     --device cuda \
@@ -122,6 +128,7 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --rollout-min-episodes "${ROLLOUT_MIN_EPISODES}" \
     --rollout-full-episodes \
     --max-episode-steps "${MAX_EPISODE_STEPS}" \
+    --trajectory-frame "${TRAJECTORY_FRAME}" \
     --num-rollout-workers "${ROLLOUT_WORKERS}" \
     --rollout-worker-threads "${ROLLOUT_WORKER_THREADS}" \
     --max-expert-samples "${MAX_EXPERT_SAMPLES}" \
@@ -132,6 +139,6 @@ python "${AIRL_TRAIN_SCRIPT}" \
     "${CHECKPOINT_VIDEO_ARG}" \
     --checkpoint-video-steps "${CHECKPOINT_VIDEO_STEPS}" \
     --wandb-mode "${WANDB_MODE}" \
-    --wandb-project highwayenv-airl \
-    --wandb-tags airl,continuous,unified-expert,test,gpu,24c \
+    --wandb-project highwayenv-ps-gail \
+    --wandb-tags ps-airl,airl,continuous,unified-expert,curriculum,gpu,32c \
     --run-name "${RUN_NAME}"

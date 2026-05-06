@@ -127,6 +127,6 @@ python "${IQ_TRAIN_SCRIPT}" \
     "${CHECKPOINT_VIDEO_ARG}" \
     --checkpoint-video-steps "${CHECKPOINT_VIDEO_STEPS}" \
     --wandb-mode "${WANDB_MODE}" \
-    --wandb-project highwayenv-iq-learn \
+    --wandb-project highwayenv-ps-gail \
     --wandb-tags iq-learn,continuous,unified-expert,test,gpu,8c \
     --run-name "${RUN_NAME}"
