@@ -3,10 +3,10 @@
 #SBATCH --account=bt60
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --time=06:00:00
+#SBATCH --time=24:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=24
-#SBATCH --mem=96G
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=128G
 #SBATCH --output=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/airl_unified_test_%j.out
 #SBATCH --error=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/airl_unified_test_%j.err
 

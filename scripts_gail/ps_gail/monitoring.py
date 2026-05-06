@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from typing import Any
 
 import torch.nn as nn
@@ -50,18 +51,39 @@ class WandbMonitor:
         self._wandb = wandb
         mode = str(self.cfg.wandb_mode).lower()
         tags = [tag.strip() for tag in str(self.cfg.wandb_tags).split(",") if tag.strip()]
-        settings = wandb.Settings(start_method="thread", _service_wait=120)
-        self._run = wandb.init(
-            project=self.cfg.wandb_project,
-            entity=self.cfg.wandb_entity or None,
-            group=self.cfg.wandb_group or None,
-            name=self.cfg.run_name,
-            dir=os.path.abspath(self.run_dir),
-            mode=mode,
-            tags=tags or None,
-            config=vars(self.cfg),
-            settings=settings,
+        settings = wandb.Settings(
+            _service_wait=120,
+            init_timeout=int(os.environ.get("WANDB_INIT_TIMEOUT", "30")),
         )
+        init_kwargs = {
+            "project": self.cfg.wandb_project,
+            "entity": self.cfg.wandb_entity or None,
+            "group": self.cfg.wandb_group or None,
+            "name": self.cfg.run_name,
+            "dir": os.path.abspath(self.run_dir),
+            "tags": tags or None,
+            "config": vars(self.cfg),
+            "settings": settings,
+        }
+        try:
+            self._run = wandb.init(mode=mode, **init_kwargs)
+        except Exception as exc:
+            comm_error = getattr(getattr(wandb, "errors", None), "CommError", None)
+            is_comm_error = (
+                isinstance(exc, comm_error)
+                if comm_error is not None
+                else exc.__class__.__name__ == "CommError"
+            )
+            if not is_comm_error or mode in {"offline", "disabled"}:
+                raise
+            print(
+                "wandb online initialization failed; falling back to local offline W&B logging "
+                f"under {os.path.abspath(self.run_dir)!r}. "
+                "Sync later with `wandb sync` if needed.",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._run = wandb.init(mode="offline", **init_kwargs)
 
     def watch(self, policy: nn.Module, discriminator: nn.Module) -> None:
         if not self.enabled or not self.cfg.wandb_watch or self._wandb is None:
