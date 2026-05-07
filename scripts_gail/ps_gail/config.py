@@ -75,6 +75,7 @@ class PSGAILConfig:
     sequence_length: int = 8
     sequence_stride: int = 1
     sequence_reward_coef: float = 1.0
+    sequence_reward_assignment: str = "last"
     entropy_coef: float = 0.01
     value_coef: float = 0.5
     max_grad_norm: float = 0.5

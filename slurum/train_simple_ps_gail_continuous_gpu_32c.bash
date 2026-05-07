@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-export REPODIR=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM
+export REPODIR="${REPODIR:-/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM}"
 export PYTHONPATH="${REPODIR}:${PYTHONPATH:-}"
 
 # Rollouts run in multiple CPU worker processes while PyTorch updates run on
@@ -58,6 +58,7 @@ PY
 
 RUN_NAME="${RUN_NAME:-ps_gail_continuous_gpu_32c_${SLURM_JOB_ID}}"
 ACTION_MODE="${ACTION_MODE:-continuous}"
+EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_unified_expert_continuous_55145982}"
 WANDB_MODE="${WANDB_MODE:-online}"
 TOTAL_ROUNDS="${TOTAL_ROUNDS:-200}"
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-200}"
@@ -66,11 +67,13 @@ ROLLOUT_MAX_EPISODE_STEPS="${ROLLOUT_MAX_EPISODE_STEPS:-0}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
 MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-100000}"
 TRAJECTORY_FRAME="${TRAJECTORY_FRAME:-relative}"
-INITIAL_CONTROLLED_VEHICLE_FRACTION="${INITIAL_CONTROLLED_VEHICLE_FRACTION:-0.20}"
+INITIAL_CONTROLLED_VEHICLE_FRACTION="${INITIAL_CONTROLLED_VEHICLE_FRACTION:-0.05}"
 FINAL_CONTROLLED_VEHICLE_FRACTION="${FINAL_CONTROLLED_VEHICLE_FRACTION:-1.0}"
 CONTROLLED_VEHICLE_CURRICULUM_ROUNDS="${CONTROLLED_VEHICLE_CURRICULUM_ROUNDS:-${TOTAL_ROUNDS}}"
-DISC_EXPERT_LABEL="${DISC_EXPERT_LABEL:-0.9}"
-DISC_GENERATOR_LABEL="${DISC_GENERATOR_LABEL:-0.1}"
+DISC_EXPERT_LABEL="${DISC_EXPERT_LABEL:-0.8}"
+DISC_GENERATOR_LABEL="${DISC_GENERATOR_LABEL:-0.2}"
+DISC_LEARNING_RATE="${DISC_LEARNING_RATE:-5e-5}"
+DISC_UPDATES_PER_ROUND="${DISC_UPDATES_PER_ROUND:-2}"
 COLLISION_PENALTY="${COLLISION_PENALTY:-2.0}"
 OFFROAD_PENALTY="${OFFROAD_PENALTY:-2.0}"
 GAIL_REWARD_CLIP="${GAIL_REWARD_CLIP:-5.0}"
@@ -93,10 +96,41 @@ else
     CHECKPOINT_VIDEO_ARG="--no-save-checkpoint-video"
 fi
 
+echo "Expert data: ${EXPERT_DATA}"
+echo "Discriminator learning rate: ${DISC_LEARNING_RATE}"
+echo "Discriminator updates per round: ${DISC_UPDATES_PER_ROUND}"
+
+python - <<'PY'
+import os
+import numpy as np
+
+root = os.environ["EXPERT_DATA"]
+if not os.path.exists(root):
+    raise SystemExit(f"EXPERT_DATA does not exist: {root}")
+files = sorted(
+    os.path.join(root, name) for name in os.listdir(root) if name.endswith(".npz")
+) if os.path.isdir(root) else [root]
+if not files:
+    raise SystemExit(f"No expert .npz files found under {root}")
+with np.load(files[0], allow_pickle=True) as data:
+    if "actions_continuous_env" not in data.files:
+        raise SystemExit(
+            f"{files[0]} is missing actions_continuous_env. "
+            "Continuous action-conditioned PS-GAIL requires unified continuous expert data."
+        )
+    actions = np.asarray(data["actions_continuous_env"])
+    if actions.ndim != 2 or actions.shape[1] != 2:
+        raise SystemExit(
+            f"{files[0]} actions_continuous_env must have shape [N, 2], got {actions.shape}."
+        )
+    print("continuous expert preflight ok:", files[0], "samples", len(actions))
+PY
+
 python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
-    --expert-data "${REPODIR}/expert_data/ngsim_ps_traj_expert_discrete_54902119" \
+    --expert-data "${EXPERT_DATA}" \
     --scene us-101 \
     --action-mode "${ACTION_MODE}" \
+    --discriminator-input action \
     --episode-root "${REPODIR}/highway_env/data/processed_20s" \
     --prebuilt-split train \
     --no-control-all-vehicles \
@@ -112,6 +146,7 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --final-reward-clip "${FINAL_REWARD_CLIP}" \
     --disc-expert-label "${DISC_EXPERT_LABEL}" \
     --disc-generator-label "${DISC_GENERATOR_LABEL}" \
+    --disc-learning-rate "${DISC_LEARNING_RATE}" \
     "${TERMINATION_ARG}" \
     --allow-idm \
     --device cuda \
@@ -128,6 +163,7 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --hidden-size "${HIDDEN_SIZE}" \
     --batch-size "${BATCH_SIZE}" \
     --disc-batch-size "${DISC_BATCH_SIZE}" \
+    --disc-updates-per-round "${DISC_UPDATES_PER_ROUND}" \
     --checkpoint-every "${CHECKPOINT_EVERY}" \
     "${CHECKPOINT_VIDEO_ARG}" \
     --checkpoint-video-steps "${CHECKPOINT_VIDEO_STEPS}" \

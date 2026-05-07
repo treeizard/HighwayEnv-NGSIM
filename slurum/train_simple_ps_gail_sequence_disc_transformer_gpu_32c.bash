@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ps_gail_seq_tf_64c
+#SBATCH --job-name=ps_gail_seq_tf_32c
 #SBATCH --account=bt60
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
@@ -7,13 +7,24 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
-#SBATCH --output=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_gail_seq_tf_64c_%j.out
-#SBATCH --error=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_gail_seq_tf_64c_%j.err
+#SBATCH --output=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_gail_seq_tf_32c_%j.out
+#SBATCH --error=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_gail_seq_tf_32c_%j.err
 
 set -euo pipefail
 
 export REPODIR="${REPODIR:-/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM}"
 export PYTHONPATH="${REPODIR}:${PYTHONPATH:-}"
+
+bool_arg() {
+    local value="${1}"
+    local positive="${2}"
+    local negative="${3}"
+    if [ "${value}" = "true" ]; then
+        printf '%s\n' "${positive}"
+    else
+        printf '%s\n' "${negative}"
+    fi
+}
 
 ROLLOUT_WORKER_THREADS="${ROLLOUT_WORKER_THREADS:-2}"
 ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-$((SLURM_CPUS_PER_TASK / ROLLOUT_WORKER_THREADS))}"
@@ -50,7 +61,7 @@ NORMALIZE_DISCRIMINATOR_FEATURES="${NORMALIZE_DISCRIMINATOR_FEATURES:-true}"
 DISCRIMINATOR_FEATURE_CLIP="${DISCRIMINATOR_FEATURE_CLIP:-10.0}"
 ENABLE_ACTION_MASKING="${ENABLE_ACTION_MASKING:-true}"
 ALLOW_IDM="${ALLOW_IDM:-true}"
-RUN_NAME="${RUN_NAME:-ps_gail_seq_tf_${DISCRIMINATOR_LOSS}_${SEQUENCE_FEATURE_MODE}_mask${ENABLE_ACTION_MASKING}_300r_200h_64c_${SLURM_JOB_ID}}"
+RUN_NAME="${RUN_NAME:-ps_gail_seq_tf_${DISCRIMINATOR_LOSS}_${SEQUENCE_FEATURE_MODE}_mask${ENABLE_ACTION_MASKING}_300r_200h_32c_${SLURM_JOB_ID}}"
 WANDB_MODE="${WANDB_MODE:-online}"
 TOTAL_ROUNDS="${TOTAL_ROUNDS:-300}"
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-200}"
@@ -64,6 +75,7 @@ CONTROLLED_VEHICLE_CURRICULUM_ROUNDS="${CONTROLLED_VEHICLE_CURRICULUM_ROUNDS:-${
 SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-8}"
 SEQUENCE_STRIDE="${SEQUENCE_STRIDE:-1}"
 SEQUENCE_REWARD_COEF="${SEQUENCE_REWARD_COEF:-1.0}"
+SEQUENCE_REWARD_ASSIGNMENT="${SEQUENCE_REWARD_ASSIGNMENT:-last}"
 DISC_EXPERT_LABEL="${DISC_EXPERT_LABEL:-0.9}"
 DISC_GENERATOR_LABEL="${DISC_GENERATOR_LABEL:-0.1}"
 COLLISION_PENALTY="${COLLISION_PENALTY:-2.0}"
@@ -74,6 +86,7 @@ SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-true}"
 CHECKPOINT_VIDEO_STEPS="${CHECKPOINT_VIDEO_STEPS:-120}"
 BATCH_SIZE="${BATCH_SIZE:-2048}"
 DISC_BATCH_SIZE="${DISC_BATCH_SIZE:-8192}"
+DISC_LEARNING_RATE="${DISC_LEARNING_RATE:-3e-4}"
 DISC_UPDATES_PER_ROUND="${DISC_UPDATES_PER_ROUND:-4}"
 PPO_EPOCHS="${PPO_EPOCHS:-6}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
@@ -94,7 +107,9 @@ echo "WGAN reward center: ${WGAN_REWARD_CENTER}"
 echo "WGAN reward clip: ${WGAN_REWARD_CLIP}"
 echo "WGAN reward scale: ${WGAN_REWARD_SCALE}"
 echo "Discriminator updates per round: ${DISC_UPDATES_PER_ROUND}"
+echo "Discriminator learning rate: ${DISC_LEARNING_RATE}"
 echo "Sequence feature mode: ${SEQUENCE_FEATURE_MODE}"
+echo "Sequence reward assignment: ${SEQUENCE_REWARD_ASSIGNMENT}"
 echo "Normalize discriminator features: ${NORMALIZE_DISCRIMINATOR_FEATURES}"
 echo "Discriminator feature clip: ${DISCRIMINATOR_FEATURE_CLIP}"
 echo "Action masking: ${ENABLE_ACTION_MASKING}"
@@ -126,36 +141,12 @@ with np.load(files[0], allow_pickle=True) as data:
     print("sequence expert preflight ok:", files[0], "samples", len(data["observations"]))
 PY
 
-if [ "${TERMINATE_WHEN_ALL_CONTROLLED_CRASHED}" = "true" ]; then
-    TERMINATION_ARG="--terminate-when-all-controlled-crashed"
-else
-    TERMINATION_ARG="--no-terminate-when-all-controlled-crashed"
-fi
-if [ "${SAVE_CHECKPOINT_VIDEO}" = "true" ]; then
-    CHECKPOINT_VIDEO_ARG="--save-checkpoint-video"
-else
-    CHECKPOINT_VIDEO_ARG="--no-save-checkpoint-video"
-fi
-if [ "${NORMALIZE_DISCRIMINATOR_FEATURES}" = "true" ]; then
-    DISC_FEATURE_NORM_ARG="--normalize-discriminator-features"
-else
-    DISC_FEATURE_NORM_ARG="--no-normalize-discriminator-features"
-fi
-if [ "${ENABLE_ACTION_MASKING}" = "true" ]; then
-    ACTION_MASKING_ARG="--enable-action-masking"
-else
-    ACTION_MASKING_ARG="--no-enable-action-masking"
-fi
-if [ "${ALLOW_IDM}" = "true" ]; then
-    ALLOW_IDM_ARG="--allow-idm"
-else
-    ALLOW_IDM_ARG="--no-allow-idm"
-fi
-if [ "${WGAN_REWARD_CENTER}" = "true" ]; then
-    WGAN_REWARD_CENTER_ARG="--wgan-reward-center"
-else
-    WGAN_REWARD_CENTER_ARG="--no-wgan-reward-center"
-fi
+TERMINATION_ARG="$(bool_arg "${TERMINATE_WHEN_ALL_CONTROLLED_CRASHED}" "--terminate-when-all-controlled-crashed" "--no-terminate-when-all-controlled-crashed")"
+CHECKPOINT_VIDEO_ARG="$(bool_arg "${SAVE_CHECKPOINT_VIDEO}" "--save-checkpoint-video" "--no-save-checkpoint-video")"
+DISC_FEATURE_NORM_ARG="$(bool_arg "${NORMALIZE_DISCRIMINATOR_FEATURES}" "--normalize-discriminator-features" "--no-normalize-discriminator-features")"
+ACTION_MASKING_ARG="$(bool_arg "${ENABLE_ACTION_MASKING}" "--enable-action-masking" "--no-enable-action-masking")"
+ALLOW_IDM_ARG="$(bool_arg "${ALLOW_IDM}" "--allow-idm" "--no-allow-idm")"
+WGAN_REWARD_CENTER_ARG="$(bool_arg "${WGAN_REWARD_CENTER}" "--wgan-reward-center" "--no-wgan-reward-center")"
 
 python -u "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --expert-data "${EXPERT_DATA}" \
@@ -206,7 +197,9 @@ python -u "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --sequence-length "${SEQUENCE_LENGTH}" \
     --sequence-stride "${SEQUENCE_STRIDE}" \
     --sequence-reward-coef "${SEQUENCE_REWARD_COEF}" \
+    --sequence-reward-assignment "${SEQUENCE_REWARD_ASSIGNMENT}" \
     --hidden-size "${HIDDEN_SIZE}" \
+    --disc-learning-rate "${DISC_LEARNING_RATE}" \
     --batch-size "${BATCH_SIZE}" \
     --disc-batch-size "${DISC_BATCH_SIZE}" \
     --disc-updates-per-round "${DISC_UPDATES_PER_ROUND}" \
@@ -216,5 +209,5 @@ python -u "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --checkpoint-video-steps "${CHECKPOINT_VIDEO_STEPS}" \
     --wandb-mode "${WANDB_MODE}" \
     --wandb-project highwayenv-ps-gail \
-    --wandb-tags ps-gail,sequence-discriminator,transformer-policy,wgan-gp,action-masking,local-deltas,collision,allow-idm-${ALLOW_IDM},gpu,64c,long-run \
+    --wandb-tags ps-gail,sequence-discriminator,transformer-policy,wgan-gp,action-masking,local-deltas,seq-reward-${SEQUENCE_REWARD_ASSIGNMENT},collision,allow-idm-${ALLOW_IDM},gpu,32c,long-run \
     --run-name "${RUN_NAME}"

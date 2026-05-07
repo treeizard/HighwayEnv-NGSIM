@@ -12,7 +12,10 @@ This package is a small modular trainer for the NGSIM discrete meta-action setup
   data with the current `build_ps_traj_expert_discrete.py` so `scene_features`
   are present before enabling this.
 - Optional sequence discriminator: GRU over fixed-length windows of the normal
-  discriminator feature, grouped by vehicle trajectory id.
+  discriminator feature, grouped by vehicle trajectory id. By default, each
+  sequence reward is assigned to the final transition of its window; set
+  `--sequence-reward-assignment mean` or `sum` to run denser credit-assignment
+  ablations without changing the discriminator itself.
 - Unified expert datasets collected with `build_ps_traj_expert_discrete.py`
   preserve the existing GAIL fields and, when collected with continuous expert
   control, add `actions_continuous_env` with columns

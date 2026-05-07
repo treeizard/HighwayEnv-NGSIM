@@ -134,7 +134,8 @@ def build_sequence_windows(
     *,
     sequence_length: int,
     stride: int = 1,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_window_indices: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
     features = np.asarray(features, dtype=np.float32)
     trajectory_ids = np.asarray(trajectory_ids)
     if features.ndim != 2:
@@ -147,6 +148,7 @@ def build_sequence_windows(
     stride = max(1, int(stride))
     windows: list[np.ndarray] = []
     last_indices: list[int] = []
+    window_index_rows: list[np.ndarray] = []
     for trajectory_id in np.unique(trajectory_ids):
         indices = np.flatnonzero(trajectory_ids == trajectory_id)
         if indices.size < sequence_length:
@@ -155,15 +157,30 @@ def build_sequence_windows(
             window_indices = indices[start : start + sequence_length]
             windows.append(features[window_indices])
             last_indices.append(int(window_indices[-1]))
+            window_index_rows.append(window_indices.astype(np.int64, copy=True))
     if not windows:
-        return (
+        empty_windows = (
             np.zeros((0, sequence_length, features.shape[1]), dtype=np.float32),
             np.zeros((0,), dtype=np.int64),
         )
-    return (
+        if return_window_indices:
+            return (
+                empty_windows[0],
+                empty_windows[1],
+                np.zeros((0, sequence_length), dtype=np.int64),
+            )
+        return empty_windows
+    result = (
         np.stack(windows, axis=0).astype(np.float32, copy=False),
         np.asarray(last_indices, dtype=np.int64),
     )
+    if return_window_indices:
+        return (
+            result[0],
+            result[1],
+            np.stack(window_index_rows, axis=0).astype(np.int64, copy=False),
+        )
+    return result
 
 
 def transform_sequence_features(

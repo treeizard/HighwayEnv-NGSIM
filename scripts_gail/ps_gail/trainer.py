@@ -65,6 +65,7 @@ class RolloutBatch:
     transition_scene_indices: np.ndarray
     sequence_features: np.ndarray
     sequence_last_indices: np.ndarray
+    sequence_transition_indices: np.ndarray
     num_env_steps: int
     num_agent_steps: int
     num_episodes: int = 0
@@ -293,6 +294,72 @@ def discriminator_input_mode(cfg: PSGAILConfig) -> str:
     return mode
 
 
+def sequence_rewards_to_transition_rewards(
+    sequence_rewards: np.ndarray,
+    *,
+    num_transitions: int,
+    sequence_last_indices: np.ndarray,
+    sequence_transition_indices: np.ndarray | None = None,
+    assignment: str = "last",
+) -> np.ndarray:
+    sequence_rewards = np.asarray(sequence_rewards, dtype=np.float32).reshape(-1)
+    num_transitions = max(0, int(num_transitions))
+    per_transition = np.zeros(num_transitions, dtype=np.float32)
+    if sequence_rewards.size == 0 or num_transitions == 0:
+        return per_transition
+
+    mode = str(assignment).lower()
+    if mode in {"last", "last_step", "terminal"}:
+        last_indices = np.asarray(sequence_last_indices, dtype=np.int64).reshape(-1)
+        if len(last_indices) != len(sequence_rewards):
+            raise ValueError(
+                "Sequence reward/last-index count mismatch: "
+                f"{len(sequence_rewards)} != {len(last_indices)}."
+            )
+        counts = np.zeros(num_transitions, dtype=np.float32)
+        for reward, last_idx in zip(sequence_rewards, last_indices):
+            last_idx = int(last_idx)
+            if 0 <= last_idx < num_transitions:
+                per_transition[last_idx] += float(reward)
+                counts[last_idx] += 1.0
+        mask = counts > 0
+        per_transition[mask] /= counts[mask]
+        return per_transition
+
+    if sequence_transition_indices is None:
+        raise ValueError(
+            f"sequence_reward_assignment={mode!r} requires sequence_transition_indices."
+        )
+    transition_indices = np.asarray(sequence_transition_indices, dtype=np.int64)
+    if transition_indices.ndim != 2 or transition_indices.shape[0] != len(sequence_rewards):
+        raise ValueError(
+            "Sequence reward/window-index shape mismatch: "
+            f"rewards={sequence_rewards.shape} window_indices={transition_indices.shape}."
+        )
+
+    if mode in {"mean", "average", "dense_mean"}:
+        counts = np.zeros(num_transitions, dtype=np.float32)
+        for reward, window_indices in zip(sequence_rewards, transition_indices):
+            valid = window_indices[(0 <= window_indices) & (window_indices < num_transitions)]
+            if valid.size:
+                per_transition[valid] += float(reward)
+                counts[valid] += 1.0
+        mask = counts > 0
+        per_transition[mask] /= counts[mask]
+        return per_transition
+
+    if mode in {"sum", "dense_sum"}:
+        for reward, window_indices in zip(sequence_rewards, transition_indices):
+            valid = window_indices[(0 <= window_indices) & (window_indices < num_transitions)]
+            if valid.size:
+                per_transition[valid] += float(reward)
+        return per_transition
+
+    raise ValueError(
+        f"Unsupported sequence_reward_assignment={mode!r}. Expected 'last', 'mean', or 'sum'."
+    )
+
+
 def action_conditioned_features(policy_observations: np.ndarray, actions: np.ndarray) -> np.ndarray:
     policy_observations = np.asarray(policy_observations, dtype=np.float32)
     actions = np.asarray(actions, dtype=np.float32)
@@ -397,16 +464,13 @@ def refresh_rollout_rewards(
             loss_type=str(getattr(cfg, "discriminator_loss", "bce")),
         )
         sequence_rewards = sequence_rewards * float(cfg.sequence_reward_coef)
-        per_transition = np.zeros_like(combined_raw_gail_rewards, dtype=np.float32)
-        counts = np.zeros_like(combined_raw_gail_rewards, dtype=np.float32)
-        for reward, last_idx in zip(sequence_rewards, rollout.sequence_last_indices):
-            last_idx = int(last_idx)
-            if 0 <= last_idx < len(per_transition):
-                per_transition[last_idx] += float(reward)
-                counts[last_idx] += 1.0
-        mask = counts > 0
-        per_transition[mask] /= counts[mask]
-        combined_raw_gail_rewards += per_transition
+        combined_raw_gail_rewards += sequence_rewards_to_transition_rewards(
+            sequence_rewards,
+            num_transitions=len(combined_raw_gail_rewards),
+            sequence_last_indices=rollout.sequence_last_indices,
+            sequence_transition_indices=rollout.sequence_transition_indices,
+            assignment=str(getattr(cfg, "sequence_reward_assignment", "last")),
+        )
     rewards, normalized_gail_rewards = shape_rollout_rewards(
         combined_raw_gail_rewards,
         rollout.env_penalties,
@@ -439,6 +503,7 @@ def refresh_rollout_rewards(
         transition_scene_indices=rollout.transition_scene_indices,
         sequence_features=rollout.sequence_features,
         sequence_last_indices=rollout.sequence_last_indices,
+        sequence_transition_indices=rollout.sequence_transition_indices,
         num_env_steps=rollout.num_env_steps,
         num_agent_steps=rollout.num_agent_steps,
         num_episodes=rollout.num_episodes,
@@ -639,11 +704,12 @@ def collect_rollout(
         gen_features = action_conditioned_features(policy_obs, actions)
     else:
         gen_features = discriminator_features(policy_obs, trajectory_states)
-    sequence_features, sequence_last_indices = build_sequence_windows(
+    sequence_features, sequence_last_indices, sequence_transition_indices = build_sequence_windows(
         gen_features,
         trajectory_ids,
         sequence_length=int(cfg.sequence_length),
         stride=int(cfg.sequence_stride),
+        return_window_indices=True,
     )
     sequence_features = transform_sequence_features(
         sequence_features,
@@ -676,6 +742,7 @@ def collect_rollout(
         transition_scene_indices=transition_scene_indices,
         sequence_features=sequence_features,
         sequence_last_indices=sequence_last_indices,
+        sequence_transition_indices=sequence_transition_indices,
         num_env_steps=env_steps,
         num_agent_steps=len(transitions),
         num_episodes=len(episode_lengths),
@@ -706,6 +773,7 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
     scene_offset = 0
     transition_scene_indices: list[np.ndarray] = []
     sequence_last_indices: list[np.ndarray] = []
+    sequence_transition_indices: list[np.ndarray] = []
     for batch in batches:
         ids = batch.trajectory_ids.astype(np.int32, copy=True)
         if ids.size:
@@ -721,6 +789,11 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
         if last_ids.size:
             last_ids += transition_offset
         sequence_last_indices.append(last_ids)
+        window_ids = batch.sequence_transition_indices.astype(np.int64, copy=True)
+        if window_ids.size:
+            valid = window_ids >= 0
+            window_ids[valid] += transition_offset
+        sequence_transition_indices.append(window_ids)
         transition_offset += int(batch.num_agent_steps)
         scene_offset += int(len(batch.scene_features))
 
@@ -773,6 +846,7 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
         transition_scene_indices=np.concatenate(transition_scene_indices, axis=0).astype(np.int64),
         sequence_features=np.concatenate([batch.sequence_features for batch in batches], axis=0).astype(np.float32),
         sequence_last_indices=np.concatenate(sequence_last_indices, axis=0).astype(np.int64),
+        sequence_transition_indices=np.concatenate(sequence_transition_indices, axis=0).astype(np.int64),
         num_env_steps=sum(batch.num_env_steps for batch in batches),
         num_agent_steps=sum(batch.num_agent_steps for batch in batches),
         num_episodes=sum(batch.num_episodes for batch in batches),

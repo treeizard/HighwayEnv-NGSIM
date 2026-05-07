@@ -83,6 +83,7 @@ from scripts_gail.ps_gail.data import (
     ACTION_CONTINUOUS_ENV_KEY,
     ACTION_STEERING_ACCELERATION_COLUMNS,
     ACTION_STEERING_ACCELERATION_KEY,
+    build_sequence_windows,
     fit_feature_standardizer,
     load_expert_policy_and_disc_data,
     load_expert_transition_data,
@@ -94,6 +95,7 @@ from scripts_gail.ps_gail.trainer import (
     RolloutBatch,
     policy_distribution_and_values,
     refresh_rollout_rewards,
+    sequence_rewards_to_transition_rewards,
     shape_rollout_rewards,
     update_discriminator,
     update_policy,
@@ -110,8 +112,27 @@ def _minimal_rollout(
     returns: np.ndarray,
     advantages: np.ndarray,
     generator_features: np.ndarray | None = None,
+    env_penalties: np.ndarray | None = None,
+    sequence_features: np.ndarray | None = None,
+    sequence_last_indices: np.ndarray | None = None,
+    sequence_transition_indices: np.ndarray | None = None,
 ) -> RolloutBatch:
     n = int(len(observations))
+    sequence_features = (
+        sequence_features.astype(np.float32)
+        if sequence_features is not None
+        else np.zeros((0, 1, 2), dtype=np.float32)
+    )
+    sequence_last_indices = (
+        sequence_last_indices.astype(np.int64)
+        if sequence_last_indices is not None
+        else np.zeros((0,), dtype=np.int64)
+    )
+    sequence_transition_indices = (
+        sequence_transition_indices.astype(np.int64)
+        if sequence_transition_indices is not None
+        else np.zeros((0, sequence_features.shape[1]), dtype=np.int64)
+    )
     return RolloutBatch(
         policy_observations=observations.astype(np.float32),
         next_policy_observations=observations.astype(np.float32),
@@ -124,7 +145,11 @@ def _minimal_rollout(
         rewards=np.zeros(n, dtype=np.float32),
         gail_rewards_raw=np.zeros(n, dtype=np.float32),
         gail_rewards_normalized=np.zeros(n, dtype=np.float32),
-        env_penalties=np.zeros(n, dtype=np.float32),
+        env_penalties=(
+            env_penalties.astype(np.float32)
+            if env_penalties is not None
+            else np.zeros(n, dtype=np.float32)
+        ),
         returns=returns.astype(np.float32),
         advantages=advantages.astype(np.float32),
         generator_features=(
@@ -134,8 +159,9 @@ def _minimal_rollout(
         ),
         scene_features=np.zeros((0, 2), dtype=np.float32),
         transition_scene_indices=np.full(n, -1, dtype=np.int64),
-        sequence_features=np.zeros((0, 1, 2), dtype=np.float32),
-        sequence_last_indices=np.zeros((0,), dtype=np.int64),
+        sequence_features=sequence_features,
+        sequence_last_indices=sequence_last_indices,
+        sequence_transition_indices=sequence_transition_indices,
         num_env_steps=n,
         num_agent_steps=n,
     )
@@ -323,6 +349,90 @@ def test_sequence_feature_local_deltas_remove_cumulative_progress():
 
     np.testing.assert_allclose(transformed[0, 0, -3:], [0.0, 0.0, 0.0])
     np.testing.assert_allclose(transformed[0, 1:, -3:], [[3.0, 1.0, 2.0], [4.0, -0.5, -1.0], [3.0, -0.5, 0.5]])
+
+
+def test_build_sequence_windows_can_return_transition_indices():
+    features = np.arange(10, dtype=np.float32).reshape(5, 2)
+    trajectory_ids = np.asarray([1, 1, 2, 2, 2], dtype=np.int64)
+
+    windows, last_indices, window_indices = build_sequence_windows(
+        features,
+        trajectory_ids,
+        sequence_length=2,
+        stride=1,
+        return_window_indices=True,
+    )
+
+    assert windows.shape == (3, 2, 2)
+    np.testing.assert_array_equal(last_indices, [1, 3, 4])
+    np.testing.assert_array_equal(window_indices, [[0, 1], [2, 3], [3, 4]])
+
+
+def test_sequence_reward_assignment_last_preserves_existing_sparse_credit():
+    rewards = sequence_rewards_to_transition_rewards(
+        np.asarray([10.0, 20.0, 30.0], dtype=np.float32),
+        num_transitions=4,
+        sequence_last_indices=np.asarray([1, 2, 2], dtype=np.int64),
+        assignment="last",
+    )
+
+    np.testing.assert_allclose(rewards, [0.0, 10.0, 25.0, 0.0], rtol=1e-6)
+
+
+def test_sequence_reward_assignment_mean_densifies_overlapping_windows():
+    rewards = sequence_rewards_to_transition_rewards(
+        np.asarray([10.0, 20.0], dtype=np.float32),
+        num_transitions=4,
+        sequence_last_indices=np.asarray([2, 3], dtype=np.int64),
+        sequence_transition_indices=np.asarray([[0, 1, 2], [1, 2, 3]], dtype=np.int64),
+        assignment="mean",
+    )
+
+    np.testing.assert_allclose(rewards, [10.0, 15.0, 15.0, 20.0], rtol=1e-6)
+
+
+def test_refresh_rollout_rewards_can_use_dense_sequence_assignment():
+    class FirstTokenDiscriminator(torch.nn.Module):
+        def forward(self, features: torch.Tensor) -> torch.Tensor:
+            return features[:, 0, 0]
+
+    cfg = PSGAILConfig(
+        discriminator_loss="wgan_gp",
+        sequence_reward_assignment="mean",
+        sequence_reward_coef=1.0,
+        wgan_reward_center=False,
+        wgan_reward_clip=0.0,
+        normalize_gail_reward=False,
+        gail_reward_clip=0.0,
+        final_reward_clip=0.0,
+    )
+    rollout = _minimal_rollout(
+        observations=np.zeros((4, 1), dtype=np.float32),
+        actions=np.zeros((4,), dtype=np.int64),
+        old_log_probs=np.zeros((4,), dtype=np.float32),
+        old_values=np.zeros((4,), dtype=np.float32),
+        returns=np.zeros((4,), dtype=np.float32),
+        advantages=np.zeros((4,), dtype=np.float32),
+        sequence_features=np.asarray(
+            [
+                [[10.0], [0.0], [0.0]],
+                [[20.0], [0.0], [0.0]],
+            ],
+            dtype=np.float32,
+        ),
+        sequence_last_indices=np.asarray([2, 3], dtype=np.int64),
+        sequence_transition_indices=np.asarray([[0, 1, 2], [1, 2, 3]], dtype=np.int64),
+    )
+
+    refreshed = refresh_rollout_rewards(
+        rollout,
+        None,
+        cfg,
+        torch.device("cpu"),
+        sequence_discriminator=FirstTokenDiscriminator(),
+    )
+
+    np.testing.assert_allclose(refreshed.gail_rewards_raw, [10.0, 15.0, 15.0, 20.0], rtol=1e-6)
 
 
 def test_refresh_rollout_rewards_applies_discriminator_feature_normalizer():

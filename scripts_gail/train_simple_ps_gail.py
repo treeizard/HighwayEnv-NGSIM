@@ -130,6 +130,34 @@ def checkpoint_expert_metadata(metadata: dict[str, object]) -> dict[str, object]
     }
 
 
+def training_risk_warnings(cfg: PSGAILConfig) -> list[str]:
+    messages: list[str] = []
+    if bool(cfg.enable_collision) and bool(cfg.terminate_when_all_controlled_crashed):
+        messages.append(
+            "Collision termination is enabled. This can create variable-horizon leakage in "
+            "adversarial imitation; compare against a fixed-horizon run if imitation quality is unstable."
+        )
+    if bool(cfg.enable_sequence_discriminator) and str(cfg.sequence_reward_assignment).lower() in {
+        "last",
+        "last_step",
+        "terminal",
+    }:
+        messages.append(
+            "Sequence discriminator rewards are assigned only to the final transition of each window. "
+            "Use --sequence-reward-assignment mean for denser credit assignment experiments."
+        )
+    if (
+        str(cfg.discriminator_loss).lower() == "wgan_gp"
+        and bool(cfg.wgan_reward_center)
+        and bool(cfg.normalize_gail_reward)
+    ):
+        messages.append(
+            "WGAN rewards are both centered and rollout-normalized. This is allowed, but it makes the "
+            "critic reward scale nonstationary; compare with one normalization layer disabled if needed."
+        )
+    return messages
+
+
 def _policy_action_tuple(
     policy: SharedActorCritic,
     obs,
@@ -254,6 +282,8 @@ def parse_args() -> PSGAILConfig:
 
 def main() -> None:
     cfg = parse_args()
+    for message in training_risk_warnings(cfg):
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
     if bool(cfg.enable_sequence_discriminator) and bool(cfg.enable_scene_discriminator):
         raise ValueError(
             "Sequence-discriminator training now uses a single sequential discriminator. "
@@ -421,6 +451,7 @@ def main() -> None:
             f"disc_feature_clip={cfg.discriminator_feature_clip} "
             f"action_masking={cfg.enable_action_masking} "
             f"sequence_feature_mode={cfg.sequence_feature_mode} "
+            f"sequence_reward_assignment={cfg.sequence_reward_assignment} "
             f"cgail_k={cfg.cgail_k} "
             f"rollout_workers={cfg.num_rollout_workers} "
             f"rollout_worker_threads={cfg.rollout_worker_threads}"
@@ -438,6 +469,7 @@ def main() -> None:
                 f"samples={expert_sequence_metadata.get('num_sequence_samples')} "
                 f"length={expert_sequence_metadata.get('sequence_length')} "
                 f"feature_dim={expert_sequence_metadata.get('sequence_feature_dim')} "
+                f"reward_assignment={cfg.sequence_reward_assignment} "
                 f"trajectory_frame={cfg.trajectory_frame}"
             )
         if cfg.controlled_vehicle_curriculum:
@@ -663,6 +695,15 @@ def main() -> None:
                 "train/wgan_reward_scale": float(cfg.wgan_reward_scale),
                 "train/sequence_feature_mode_local_deltas": int(
                     str(cfg.sequence_feature_mode).lower() == "local_deltas"
+                ),
+                "train/sequence_reward_assignment_last": int(
+                    str(cfg.sequence_reward_assignment).lower() in {"last", "last_step", "terminal"}
+                ),
+                "train/sequence_reward_assignment_mean": int(
+                    str(cfg.sequence_reward_assignment).lower() in {"mean", "average", "dense_mean"}
+                ),
+                "train/sequence_reward_assignment_sum": int(
+                    str(cfg.sequence_reward_assignment).lower() in {"sum", "dense_sum"}
                 ),
                 "train/rollout_workers": int(cfg.num_rollout_workers),
                 "train/rollout_worker_threads": int(cfg.rollout_worker_threads),
