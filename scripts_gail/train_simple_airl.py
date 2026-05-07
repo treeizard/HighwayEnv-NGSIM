@@ -435,11 +435,18 @@ def main() -> None:
             print(
                 f"[round {round_idx:04d}] env_steps={rollout.num_env_steps} "
                 f"agent_steps={rollout.num_agent_steps} episodes={rollout.num_episodes} "
+                f"ep_len={rollout.mean_episode_length:.1f} "
+                f"[{rollout.min_episode_length}-{rollout.max_episode_length}] "
+                f"term/trunc={rollout.num_terminated}/{rollout.num_truncated} "
+                f"crash/offroad={rollout.num_crash_events}/{rollout.num_offroad_events} "
                 f"ctrl_frac={round_cfg.percentage_controlled_vehicles:.4f} "
                 f"veh={rollout.mean_controlled_vehicles:.1f}/{rollout.mean_road_vehicles:.1f} "
                 f"reward_loss={reward_stats['reward_loss']:.4f} "
                 f"expert_acc={reward_stats['expert_acc']:.3f} gen_acc={reward_stats['gen_acc']:.3f} "
                 f"policy_loss={policy_stats['policy_loss']:.4f} value_loss={policy_stats['value_loss']:.4f} "
+                f"kl={policy_stats['approx_kl']:.5f} entropy={policy_stats['entropy']:.4f} "
+                f"clip={policy_stats['clip_fraction']:.3f} "
+                f"airl_reward={reward_stats['expert_reward']:.3f}/{reward_stats['gen_reward']:.3f} "
                 f"reward={float(rollout.rewards.mean()):.4f}"
             )
             metrics = {
@@ -447,10 +454,18 @@ def main() -> None:
                 "rollout/env_steps": rollout.num_env_steps,
                 "rollout/agent_steps": rollout.num_agent_steps,
                 "rollout/episodes": rollout.num_episodes,
+                "rollout/terminated": rollout.num_terminated,
+                "rollout/truncated": rollout.num_truncated,
+                "rollout/crash_events": rollout.num_crash_events,
+                "rollout/offroad_events": rollout.num_offroad_events,
+                "rollout/mean_episode_length": rollout.mean_episode_length,
+                "rollout/min_episode_length": rollout.min_episode_length,
+                "rollout/max_episode_length": rollout.max_episode_length,
                 "rollout/controlled_vehicle_fraction": float(round_cfg.percentage_controlled_vehicles),
                 "rollout/mean_controlled_vehicles": rollout.mean_controlled_vehicles,
                 "rollout/mean_road_vehicles": rollout.mean_road_vehicles,
                 "rollout/mean_reward": float(rollout.rewards.mean()),
+                "rollout/reward_std": float(rollout.rewards.std()),
                 "airl/reward_loss": reward_stats["reward_loss"],
                 "airl/expert_acc": reward_stats["expert_acc"],
                 "airl/gen_acc": reward_stats["gen_acc"],
@@ -460,6 +475,9 @@ def main() -> None:
                 "policy/value_loss": policy_stats["value_loss"],
                 "policy/entropy": policy_stats["entropy"],
                 "policy/approx_kl": policy_stats["approx_kl"],
+                "policy/clip_fraction": policy_stats["clip_fraction"],
+                "policy/ratio_mean": policy_stats["ratio_mean"],
+                "policy/ratio_std": policy_stats["ratio_std"],
             }
             monitor.log(metrics, step=round_idx)
             if cfg.checkpoint_every > 0 and round_idx % int(cfg.checkpoint_every) == 0:

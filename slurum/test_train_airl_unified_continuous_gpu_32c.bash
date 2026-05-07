@@ -59,7 +59,8 @@ CONTROLLED_VEHICLE_CURRICULUM_ROUNDS="${CONTROLLED_VEHICLE_CURRICULUM_ROUNDS:-${
 BATCH_SIZE="${BATCH_SIZE:-4096}"
 REWARD_BATCH_SIZE="${REWARD_BATCH_SIZE:-4096}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
-DISC_LEARNING_RATE="${DISC_LEARNING_RATE:-1e-4}"
+DISC_LEARNING_RATE="${DISC_LEARNING_RATE:-5e-5}"
+DISC_UPDATES_PER_ROUND="${DISC_UPDATES_PER_ROUND:-2}"
 DISC_EXPERT_LABEL="${DISC_EXPERT_LABEL:-0.9}"
 DISC_GENERATOR_LABEL="${DISC_GENERATOR_LABEL:-0.1}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10}"
@@ -80,6 +81,9 @@ echo "Rollout min episodes: ${ROLLOUT_MIN_EPISODES}"
 echo "CPUs per task: ${SLURM_CPUS}"
 echo "Rollout workers: ${ROLLOUT_WORKERS}"
 echo "Rollout worker threads: ${ROLLOUT_WORKER_THREADS}"
+echo "AIRL reward lr: ${DISC_LEARNING_RATE}"
+echo "AIRL reward updates per round: ${DISC_UPDATES_PER_ROUND}"
+echo "AIRL reward labels: expert=${DISC_EXPERT_LABEL}, generator=${DISC_GENERATOR_LABEL}"
 echo "CUDA devices: ${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi || true
 
@@ -142,6 +146,7 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --reward-batch-size "${REWARD_BATCH_SIZE}" \
     --discriminator-loss airl_bce \
     --disc-learning-rate "${DISC_LEARNING_RATE}" \
+    --disc-updates-per-round "${DISC_UPDATES_PER_ROUND}" \
     --disc-expert-label "${DISC_EXPERT_LABEL}" \
     --disc-generator-label "${DISC_GENERATOR_LABEL}" \
     --checkpoint-every "${CHECKPOINT_EVERY}" \
@@ -149,5 +154,5 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --checkpoint-video-steps "${CHECKPOINT_VIDEO_STEPS}" \
     --wandb-mode "${WANDB_MODE}" \
     --wandb-project highwayenv-ps-gail \
-    --wandb-tags ps-airl,airl,continuous,unified-expert,curriculum,gpu,32c \
+    --wandb-tags ps-airl,airl,continuous,unified-expert,curriculum,gpu,32c,disc-updates-${DISC_UPDATES_PER_ROUND} \
     --run-name "${RUN_NAME}"
