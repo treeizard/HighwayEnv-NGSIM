@@ -12,7 +12,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Independent, Normal
 
 PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PARENT_DIR not in sys.path:
@@ -178,7 +177,13 @@ def update_reward_model(
             expert_logits = expert_shaped - expert_log_pi
             gen_logits = gen_shaped - gen_log_pi
             logits = torch.cat([expert_logits, gen_logits], dim=0)
-            labels = torch.cat([torch.ones_like(expert_logits), torch.zeros_like(gen_logits)], dim=0)
+            labels = torch.cat(
+                [
+                    torch.full_like(expert_logits, float(cfg.disc_expert_label)),
+                    torch.full_like(gen_logits, float(cfg.disc_generator_label)),
+                ],
+                dim=0,
+            )
             loss = F.binary_cross_entropy_with_logits(logits, labels)
             optimizer.zero_grad()
             loss.backward()
@@ -222,7 +227,9 @@ def refresh_airl_rewards(
             _as_tensor(rollout.dones.astype(np.float32), device=device),
             gamma=float(cfg.gamma),
         ).detach().cpu().numpy().astype(np.float32)
-    shaped = shaped_logits.astype(np.float32, copy=True)
+    # Canonical AIRL trains the policy on log D - log(1-D), which simplifies to
+    # f(s,a,s') - log pi(a|s) for D = exp(f)/(exp(f) + pi(a|s)).
+    shaped = (shaped_logits - rollout.old_log_probs).astype(np.float32, copy=True)
     if bool(cfg.normalize_gail_reward) and shaped.size > 1:
         shaped = (shaped - shaped.mean()) / (shaped.std() + 1e-8)
     if float(cfg.gail_reward_clip) > 0.0:
@@ -306,7 +313,12 @@ def save_checkpoint_video(policy: nn.Module, cfg: PSGAILConfig, *, run_dir: str,
 
 
 def parse_args() -> tuple[PSGAILConfig, int]:
-    defaults = PSGAILConfig(action_mode="continuous", run_name="simple_airl")
+    defaults = PSGAILConfig(
+        action_mode="continuous",
+        run_name="simple_airl",
+        discriminator_loss="airl_bce",
+        disc_learning_rate=1e-4,
+    )
     parser = argparse.ArgumentParser(description="Lightweight continuous AIRL test trainer for unified NGSIM expert data.")
     for field in fields(PSGAILConfig):
         value = getattr(defaults, field.name)
@@ -326,6 +338,13 @@ def main() -> None:
     cfg, reward_batch_size = parse_args()
     if str(cfg.action_mode).lower() != "continuous":
         raise ValueError("This AIRL test trainer currently supports --action-mode continuous only.")
+    airl_objective = str(cfg.discriminator_loss).lower()
+    if airl_objective not in {"airl", "airl_bce", "bce"}:
+        raise ValueError(
+            "train_simple_airl.py implements canonical BCE AIRL. "
+            f"Received discriminator_loss={cfg.discriminator_loss!r}; WGAN/WGAN-GP is a "
+            "WAIL-style objective and should use a separate trainer/objective."
+        )
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     device = resolve_device(cfg.device)

@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical, Independent, Normal
+from torch.distributions import Categorical, Normal
 
 from .config import PSGAILConfig
 from .data import (
@@ -84,6 +84,28 @@ class RolloutBatch:
     episode_names: tuple[str, ...] = ()
     mean_controlled_vehicles: float = 0.0
     mean_road_vehicles: float = 0.0
+
+
+class SquashedNormal:
+    """Tanh-squashed diagonal Gaussian over bounded continuous actions."""
+
+    def __init__(self, mean: torch.Tensor, std: torch.Tensor, eps: float = 1e-6) -> None:
+        self.normal = Normal(mean, std)
+        self.eps = float(eps)
+
+    def sample(self) -> torch.Tensor:
+        return torch.tanh(self.normal.sample())
+
+    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        clipped = torch.clamp(actions, -1.0 + self.eps, 1.0 - self.eps)
+        raw = torch.atanh(clipped)
+        correction = torch.log1p(-clipped.pow(2) + self.eps)
+        return (self.normal.log_prob(raw) - correction).sum(dim=-1)
+
+    def entropy(self) -> torch.Tensor:
+        # The tanh-transformed entropy has no simple closed form. The base
+        # entropy is a stable proxy for PPO's entropy bonus and diagnostics.
+        return self.normal.entropy().sum(dim=-1)
 
 
 def resolve_device(name: str) -> torch.device:
@@ -175,23 +197,21 @@ def policy_distribution_and_values(
     obs_tensor: torch.Tensor,
     cfg: PSGAILConfig,
     action_masks: torch.Tensor | None = None,
-) -> tuple[Categorical | Independent, torch.Tensor]:
+) -> tuple[Categorical | SquashedNormal, torch.Tensor]:
     policy_out, values = policy(obs_tensor)
     if _is_continuous(cfg):
         if policy.log_std is None:
             raise RuntimeError("Continuous action mode requires policy.log_std.")
         std = torch.exp(policy.log_std).expand_as(policy_out)
-        return Independent(Normal(policy_out, std), 1), values
+        return SquashedNormal(policy_out, std), values
     return Categorical(logits=_masked_discrete_logits(policy_out, action_masks)), values
 
 
 def _sample_policy_actions(
-    dist: Categorical | Independent,
+    dist: Categorical | SquashedNormal,
     cfg: PSGAILConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     actions = dist.sample()
-    if _is_continuous(cfg):
-        actions = torch.clamp(actions, -1.0, 1.0)
     return actions, dist.log_prob(actions)
 
 

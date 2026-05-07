@@ -45,10 +45,11 @@ AIRL_TRAIN_SCRIPT="${AIRL_TRAIN_SCRIPT:-${REPODIR}/scripts_gail/train_simple_air
 RUN_NAME="${RUN_NAME:-ps_airl_unified_continuous_gpu_32c_${SLURM_JOB_ID}}"
 WANDB_MODE="${WANDB_MODE:-online}"
 
-# Training defaults: 200 AIRL update rounds, each collecting 200 rollout steps.
+# Training defaults: full-episode AIRL rounds. With --rollout-full-episodes,
+# active rollout workers are capped by ROLLOUT_MIN_EPISODES.
 TOTAL_ROUNDS="${TOTAL_ROUNDS:-200}"
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-200}"
-ROLLOUT_MIN_EPISODES="${ROLLOUT_MIN_EPISODES:-4}"
+ROLLOUT_MIN_EPISODES="${ROLLOUT_MIN_EPISODES:-${ROLLOUT_WORKERS}}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
 MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-100000}"
 TRAJECTORY_FRAME="${TRAJECTORY_FRAME:-relative}"
@@ -58,8 +59,11 @@ CONTROLLED_VEHICLE_CURRICULUM_ROUNDS="${CONTROLLED_VEHICLE_CURRICULUM_ROUNDS:-${
 BATCH_SIZE="${BATCH_SIZE:-4096}"
 REWARD_BATCH_SIZE="${REWARD_BATCH_SIZE:-4096}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
+DISC_LEARNING_RATE="${DISC_LEARNING_RATE:-1e-4}"
+DISC_EXPERT_LABEL="${DISC_EXPERT_LABEL:-0.9}"
+DISC_GENERATOR_LABEL="${DISC_GENERATOR_LABEL:-0.1}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10}"
-SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-false}"
+SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-true}"
 CHECKPOINT_VIDEO_STEPS="${CHECKPOINT_VIDEO_STEPS:-120}"
 if [ "${SAVE_CHECKPOINT_VIDEO}" = "true" ]; then
     CHECKPOINT_VIDEO_ARG="--save-checkpoint-video"
@@ -72,6 +76,7 @@ echo "Expert data: ${EXPERT_DATA}"
 echo "AIRL trainer: ${AIRL_TRAIN_SCRIPT}"
 echo "Total rounds: ${TOTAL_ROUNDS}"
 echo "Rollout steps: ${ROLLOUT_STEPS}"
+echo "Rollout min episodes: ${ROLLOUT_MIN_EPISODES}"
 echo "CPUs per task: ${SLURM_CPUS}"
 echo "Rollout workers: ${ROLLOUT_WORKERS}"
 echo "Rollout worker threads: ${ROLLOUT_WORKER_THREADS}"
@@ -135,6 +140,10 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --hidden-size "${HIDDEN_SIZE}" \
     --batch-size "${BATCH_SIZE}" \
     --reward-batch-size "${REWARD_BATCH_SIZE}" \
+    --discriminator-loss airl_bce \
+    --disc-learning-rate "${DISC_LEARNING_RATE}" \
+    --disc-expert-label "${DISC_EXPERT_LABEL}" \
+    --disc-generator-label "${DISC_GENERATOR_LABEL}" \
     --checkpoint-every "${CHECKPOINT_EVERY}" \
     "${CHECKPOINT_VIDEO_ARG}" \
     --checkpoint-video-steps "${CHECKPOINT_VIDEO_STEPS}" \
