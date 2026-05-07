@@ -18,10 +18,16 @@ export PYTHONPATH="${REPODIR}:${PYTHONPATH:-}"
 # Rollouts run in multiple CPU worker processes while PyTorch updates run on
 # the allocated GPU. Give each rollout worker a small native thread pool so the
 # total CPU use stays near SLURM_CPUS_PER_TASK.
+SLURM_CPUS="${SLURM_CPUS_PER_TASK:-32}"
 ROLLOUT_WORKER_THREADS="${ROLLOUT_WORKER_THREADS:-2}"
-ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-$((SLURM_CPUS_PER_TASK / ROLLOUT_WORKER_THREADS))}"
+ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-16}"
 if [ "${ROLLOUT_WORKERS}" -lt 1 ]; then
     ROLLOUT_WORKERS=1
+fi
+REQUESTED_ROLLOUT_CPUS=$((ROLLOUT_WORKERS * ROLLOUT_WORKER_THREADS))
+if [ "${REQUESTED_ROLLOUT_CPUS}" -gt "${SLURM_CPUS}" ]; then
+    echo "Requested rollout CPU use (${REQUESTED_ROLLOUT_CPUS}) exceeds SLURM_CPUS_PER_TASK (${SLURM_CPUS})." >&2
+    exit 1
 fi
 
 export OMP_NUM_THREADS="${ROLLOUT_WORKER_THREADS}"
@@ -42,9 +48,10 @@ conda activate ngsim_env
 
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Node: ${SLURMD_NODENAME:-unknown}"
-echo "CPUs per task: ${SLURM_CPUS_PER_TASK}"
+echo "CPUs per task: ${SLURM_CPUS}"
 echo "Rollout workers: ${ROLLOUT_WORKERS}"
 echo "Rollout worker threads: ${ROLLOUT_WORKER_THREADS}"
+echo "Requested rollout CPUs: ${REQUESTED_ROLLOUT_CPUS}"
 echo "CUDA devices: ${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi || true
 
@@ -62,7 +69,7 @@ EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_unified_expert_conti
 WANDB_MODE="${WANDB_MODE:-online}"
 TOTAL_ROUNDS="${TOTAL_ROUNDS:-200}"
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-200}"
-ROLLOUT_MIN_EPISODES="${ROLLOUT_MIN_EPISODES:-4}"
+ROLLOUT_MIN_EPISODES="${ROLLOUT_MIN_EPISODES:-${ROLLOUT_WORKERS}}"
 ROLLOUT_MAX_EPISODE_STEPS="${ROLLOUT_MAX_EPISODE_STEPS:-0}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
 MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-100000}"
