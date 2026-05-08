@@ -107,7 +107,11 @@ SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-false}"
 CHECKPOINT_VIDEO_STEPS="${CHECKPOINT_VIDEO_STEPS:-120}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
 DISC_BATCH_SIZE="${DISC_BATCH_SIZE:-4096}"
+POLICY_MODEL="${POLICY_MODEL:-transformer}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
+TRANSFORMER_LAYERS="${TRANSFORMER_LAYERS:-2}"
+TRANSFORMER_HEADS="${TRANSFORMER_HEADS:-4}"
+TRANSFORMER_DROPOUT="${TRANSFORMER_DROPOUT:-0.1}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10}"
 TERMINATE_WHEN_ALL_CONTROLLED_CRASHED="${TERMINATE_WHEN_ALL_CONTROLLED_CRASHED:-true}"
 export EXPERT_DATA
@@ -135,6 +139,7 @@ fi
 echo "Expert data: ${EXPERT_DATA}"
 echo "BC pretrain epochs: ${BC_PRETRAIN_EPOCHS}"
 echo "Paper-style training: ${PAPER_STYLE_TRAINING}"
+echo "Policy model: ${POLICY_MODEL}"
 echo "Discriminator learning rate: ${DISC_LEARNING_RATE}"
 echo "Discriminator updates per round: ${DISC_UPDATES_PER_ROUND}"
 
@@ -216,7 +221,11 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --num-rollout-workers "${ROLLOUT_WORKERS}" \
     --rollout-worker-threads "${ROLLOUT_WORKER_THREADS}" \
     --max-expert-samples "${MAX_EXPERT_SAMPLES}" \
+    --policy-model "${POLICY_MODEL}" \
     --hidden-size "${HIDDEN_SIZE}" \
+    --transformer-layers "${TRANSFORMER_LAYERS}" \
+    --transformer-heads "${TRANSFORMER_HEADS}" \
+    --transformer-dropout "${TRANSFORMER_DROPOUT}" \
     --batch-size "${BATCH_SIZE}" \
     --disc-batch-size "${DISC_BATCH_SIZE}" \
     --disc-updates-per-round "${DISC_UPDATES_PER_ROUND}" \
