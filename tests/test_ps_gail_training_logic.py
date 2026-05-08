@@ -100,6 +100,8 @@ from scripts_gail.ps_gail.trainer import (
     update_discriminator,
     update_policy,
 )
+from scripts_gail.train_simple_ps_gail import behavior_clone_pretrain
+from scripts_gail.train_simple_ps_gail import config_for_round as ps_gail_config_for_round
 from scripts_gail.train_simple_airl import config_for_round as airl_config_for_round
 
 
@@ -333,6 +335,50 @@ def test_discrete_policy_distribution_respects_action_masks():
     assert torch.isneginf(dist.logits[0, 0]) or dist.logits[0, 0] < -1.0e8
 
 
+def test_behavior_clone_pretrain_matches_continuous_actions():
+    torch.manual_seed(0)
+    np.random.seed(0)
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        bc_pretrain_epochs=20,
+        bc_pretrain_batch_size=16,
+        bc_pretrain_learning_rate=1e-2,
+        bc_pretrain_validation_fraction=0.0,
+        hidden_size=32,
+    )
+    observations = np.random.uniform(-1.0, 1.0, size=(64, 4)).astype(np.float32)
+    actions = np.tanh(
+        np.stack(
+            [
+                0.8 * observations[:, 0] - 0.2 * observations[:, 1],
+                -0.5 * observations[:, 2] + 0.3 * observations[:, 3],
+            ],
+            axis=1,
+        )
+    ).astype(np.float32)
+    transitions = types.SimpleNamespace(
+        policy_observations=observations,
+        actions_continuous_env=actions,
+    )
+    policy = make_actor_critic(
+        "mlp",
+        obs_dim=4,
+        hidden_size=32,
+        action_mode="continuous",
+        continuous_action_dim=2,
+    )
+
+    before = behavior_clone_pretrain(
+        policy,
+        transitions,
+        cfg,
+        torch.device("cpu"),
+    )
+
+    assert before["bc/train_mse"] < 0.05
+    assert before["bc/train_mae"] < 0.2
+
+
 def test_sequence_feature_local_deltas_remove_cumulative_progress():
     sequence = np.zeros((1, 4, 5), dtype=np.float32)
     sequence[0, :, -3:] = np.asarray(
@@ -555,3 +601,39 @@ def test_airl_controlled_vehicle_curriculum_matches_ps_gail_schedule():
 
     np.testing.assert_allclose(fractions, [0.2, 0.4, 0.6, 0.8, 0.8], rtol=1e-6)
     assert airl_config_for_round(cfg, 1).control_all_vehicles is False
+
+
+def test_paper_style_ps_gail_schedule_uses_stepwise_agent_counts_and_phases():
+    cfg = PSGAILConfig(
+        paper_style_training=True,
+        total_rounds=6,
+        paper_phase1_rounds=4,
+        paper_phase2_rounds=2,
+        paper_initial_agent_count=10,
+        paper_agent_increment=10,
+        paper_agent_increment_interval=2,
+        paper_phase2_agent_count=100,
+        paper_phase1_agent_steps=10_000,
+        paper_phase2_agent_steps=40_000,
+    )
+
+    round_cfgs = [ps_gail_config_for_round(cfg, round_idx) for round_idx in range(1, 7)]
+
+    assert [item.percentage_controlled_vehicles for item in round_cfgs] == [
+        10.0,
+        10.0,
+        20.0,
+        20.0,
+        100.0,
+        100.0,
+    ]
+    np.testing.assert_allclose([item.gamma for item in round_cfgs], [0.95, 0.95, 0.95, 0.95, 0.99, 0.99])
+    assert [item.rollout_target_agent_steps for item in round_cfgs] == [
+        10_000,
+        10_000,
+        10_000,
+        10_000,
+        40_000,
+        40_000,
+    ]
+    assert all(item.control_all_vehicles is False for item in round_cfgs)

@@ -67,7 +67,7 @@ RUN_NAME="${RUN_NAME:-ps_gail_continuous_gpu_32c_${SLURM_JOB_ID}}"
 ACTION_MODE="${ACTION_MODE:-continuous}"
 EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_unified_expert_continuous_55145982}"
 WANDB_MODE="${WANDB_MODE:-online}"
-TOTAL_ROUNDS="${TOTAL_ROUNDS:-200}"
+TOTAL_ROUNDS="${TOTAL_ROUNDS:-1200}"
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-200}"
 ROLLOUT_MIN_EPISODES="${ROLLOUT_MIN_EPISODES:-${ROLLOUT_WORKERS}}"
 ROLLOUT_MAX_EPISODE_STEPS="${ROLLOUT_MAX_EPISODE_STEPS:-0}"
@@ -81,6 +81,24 @@ DISC_EXPERT_LABEL="${DISC_EXPERT_LABEL:-0.8}"
 DISC_GENERATOR_LABEL="${DISC_GENERATOR_LABEL:-0.2}"
 DISC_LEARNING_RATE="${DISC_LEARNING_RATE:-5e-5}"
 DISC_UPDATES_PER_ROUND="${DISC_UPDATES_PER_ROUND:-2}"
+BC_PRETRAIN_EPOCHS="${BC_PRETRAIN_EPOCHS:-0}"
+BC_PRETRAIN_LEARNING_RATE="${BC_PRETRAIN_LEARNING_RATE:-3e-4}"
+BC_PRETRAIN_BATCH_SIZE="${BC_PRETRAIN_BATCH_SIZE:-4096}"
+BC_PRETRAIN_VALIDATION_FRACTION="${BC_PRETRAIN_VALIDATION_FRACTION:-0.1}"
+BC_PRETRAIN_EVAL_EPISODES="${BC_PRETRAIN_EVAL_EPISODES:-4}"
+BC_PRETRAIN_MIN_MEAN_EPISODE_LENGTH="${BC_PRETRAIN_MIN_MEAN_EPISODE_LENGTH:-0}"
+BC_PRETRAIN_ABORT_ON_FAILED_EVAL="${BC_PRETRAIN_ABORT_ON_FAILED_EVAL:-false}"
+PAPER_STYLE_TRAINING="${PAPER_STYLE_TRAINING:-true}"
+PAPER_PHASE1_ROUNDS="${PAPER_PHASE1_ROUNDS:-1000}"
+PAPER_PHASE2_ROUNDS="${PAPER_PHASE2_ROUNDS:-200}"
+PAPER_PHASE1_GAMMA="${PAPER_PHASE1_GAMMA:-0.95}"
+PAPER_PHASE2_GAMMA="${PAPER_PHASE2_GAMMA:-0.99}"
+PAPER_PHASE1_AGENT_STEPS="${PAPER_PHASE1_AGENT_STEPS:-10000}"
+PAPER_PHASE2_AGENT_STEPS="${PAPER_PHASE2_AGENT_STEPS:-40000}"
+PAPER_INITIAL_AGENT_COUNT="${PAPER_INITIAL_AGENT_COUNT:-10}"
+PAPER_AGENT_INCREMENT="${PAPER_AGENT_INCREMENT:-10}"
+PAPER_AGENT_INCREMENT_INTERVAL="${PAPER_AGENT_INCREMENT_INTERVAL:-200}"
+PAPER_PHASE2_AGENT_COUNT="${PAPER_PHASE2_AGENT_COUNT:-100}"
 COLLISION_PENALTY="${COLLISION_PENALTY:-2.0}"
 OFFROAD_PENALTY="${OFFROAD_PENALTY:-2.0}"
 GAIL_REWARD_CLIP="${GAIL_REWARD_CLIP:-5.0}"
@@ -103,8 +121,20 @@ if [ "${SAVE_CHECKPOINT_VIDEO}" = "true" ]; then
 else
     CHECKPOINT_VIDEO_ARG="--no-save-checkpoint-video"
 fi
+if [ "${BC_PRETRAIN_ABORT_ON_FAILED_EVAL}" = "true" ]; then
+    BC_PRETRAIN_ABORT_ARG="--bc-pretrain-abort-on-failed-eval"
+else
+    BC_PRETRAIN_ABORT_ARG="--no-bc-pretrain-abort-on-failed-eval"
+fi
+if [ "${PAPER_STYLE_TRAINING}" = "true" ]; then
+    PAPER_STYLE_ARG="--paper-style-training"
+else
+    PAPER_STYLE_ARG="--no-paper-style-training"
+fi
 
 echo "Expert data: ${EXPERT_DATA}"
+echo "BC pretrain epochs: ${BC_PRETRAIN_EPOCHS}"
+echo "Paper-style training: ${PAPER_STYLE_TRAINING}"
 echo "Discriminator learning rate: ${DISC_LEARNING_RATE}"
 echo "Discriminator updates per round: ${DISC_UPDATES_PER_ROUND}"
 
@@ -155,6 +185,24 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --disc-expert-label "${DISC_EXPERT_LABEL}" \
     --disc-generator-label "${DISC_GENERATOR_LABEL}" \
     --disc-learning-rate "${DISC_LEARNING_RATE}" \
+    --bc-pretrain-epochs "${BC_PRETRAIN_EPOCHS}" \
+    --bc-pretrain-learning-rate "${BC_PRETRAIN_LEARNING_RATE}" \
+    --bc-pretrain-batch-size "${BC_PRETRAIN_BATCH_SIZE}" \
+    --bc-pretrain-validation-fraction "${BC_PRETRAIN_VALIDATION_FRACTION}" \
+    --bc-pretrain-eval-episodes "${BC_PRETRAIN_EVAL_EPISODES}" \
+    --bc-pretrain-min-mean-episode-length "${BC_PRETRAIN_MIN_MEAN_EPISODE_LENGTH}" \
+    "${BC_PRETRAIN_ABORT_ARG}" \
+    "${PAPER_STYLE_ARG}" \
+    --paper-phase1-rounds "${PAPER_PHASE1_ROUNDS}" \
+    --paper-phase2-rounds "${PAPER_PHASE2_ROUNDS}" \
+    --paper-phase1-gamma "${PAPER_PHASE1_GAMMA}" \
+    --paper-phase2-gamma "${PAPER_PHASE2_GAMMA}" \
+    --paper-phase1-agent-steps "${PAPER_PHASE1_AGENT_STEPS}" \
+    --paper-phase2-agent-steps "${PAPER_PHASE2_AGENT_STEPS}" \
+    --paper-initial-agent-count "${PAPER_INITIAL_AGENT_COUNT}" \
+    --paper-agent-increment "${PAPER_AGENT_INCREMENT}" \
+    --paper-agent-increment-interval "${PAPER_AGENT_INCREMENT_INTERVAL}" \
+    --paper-phase2-agent-count "${PAPER_PHASE2_AGENT_COUNT}" \
     "${TERMINATION_ARG}" \
     --allow-idm \
     --device cuda \

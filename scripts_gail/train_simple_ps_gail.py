@@ -10,6 +10,7 @@ from dataclasses import replace
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.distributions import Categorical, Independent, Normal
 
 PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -43,6 +44,7 @@ from scripts_gail.ps_gail.trainer import (
     infer_continuous_action_dim,
     infer_policy_obs_dim,
     make_rollout_executor,
+    merge_rollout_batches,
     policy_action_dim,
     refresh_rollout_rewards,
     resolve_device,
@@ -56,6 +58,29 @@ def _clamp_fraction(value: float) -> float:
 
 
 def config_for_round(cfg: PSGAILConfig, round_idx: int) -> PSGAILConfig:
+    if bool(getattr(cfg, "paper_style_training", False)):
+        phase1_rounds = max(1, int(getattr(cfg, "paper_phase1_rounds", 1000)))
+        if int(round_idx) <= phase1_rounds:
+            interval = max(1, int(getattr(cfg, "paper_agent_increment_interval", 200)))
+            increments = (max(1, int(round_idx)) - 1) // interval
+            agent_count = int(getattr(cfg, "paper_initial_agent_count", 10)) + increments * int(
+                getattr(cfg, "paper_agent_increment", 10)
+            )
+            return replace(
+                cfg,
+                control_all_vehicles=False,
+                percentage_controlled_vehicles=float(max(1, agent_count)),
+                gamma=float(getattr(cfg, "paper_phase1_gamma", 0.95)),
+                rollout_target_agent_steps=max(1, int(getattr(cfg, "paper_phase1_agent_steps", 10_000))),
+            )
+        return replace(
+            cfg,
+            control_all_vehicles=False,
+            percentage_controlled_vehicles=float(max(1, int(getattr(cfg, "paper_phase2_agent_count", 100)))),
+            gamma=float(getattr(cfg, "paper_phase2_gamma", 0.99)),
+            rollout_target_agent_steps=max(1, int(getattr(cfg, "paper_phase2_agent_steps", 40_000))),
+        )
+
     if not bool(cfg.controlled_vehicle_curriculum):
         return cfg
 
@@ -71,6 +96,43 @@ def config_for_round(cfg: PSGAILConfig, round_idx: int) -> PSGAILConfig:
         control_all_vehicles=False,
         percentage_controlled_vehicles=_clamp_fraction(fraction),
     )
+
+
+def collect_round_rollouts(
+    env,
+    policy: torch.nn.Module,
+    round_cfg: PSGAILConfig,
+    device: torch.device,
+    policy_obs_dim: int,
+    *,
+    round_idx: int,
+    rollout_executor,
+):
+    target_agent_steps = max(0, int(getattr(round_cfg, "rollout_target_agent_steps", 0)))
+    worker_stride = max(1, int(round_cfg.num_rollout_workers))
+    batches = []
+    attempt = 0
+    while True:
+        seed_offset = (int(round_idx) - 1) * worker_stride + attempt * 1_000_003
+        batch = collect_rollouts(
+            env,
+            policy,
+            round_cfg,
+            device,
+            policy_obs_dim,
+            seed_offset=seed_offset,
+            executor=rollout_executor,
+        )
+        batches.append(batch)
+        agent_steps = sum(int(item.num_agent_steps) for item in batches)
+        if target_agent_steps <= 0 or agent_steps >= target_agent_steps:
+            break
+        attempt += 1
+        print(
+            f"[round {round_idx:04d}] accumulating rollout agent_steps="
+            f"{agent_steps}/{target_agent_steps}"
+        )
+    return batches[0] if len(batches) == 1 else merge_rollout_batches(batches, round_cfg)
 
 
 def env_signature(cfg: PSGAILConfig) -> tuple[object, ...]:
@@ -155,6 +217,16 @@ def training_risk_warnings(cfg: PSGAILConfig) -> list[str]:
             "WGAN rewards are both centered and rollout-normalized. This is allowed, but it makes the "
             "critic reward scale nonstationary; compare with one normalization layer disabled if needed."
         )
+    if bool(getattr(cfg, "paper_style_training", False)):
+        expected_rounds = int(getattr(cfg, "paper_phase1_rounds", 1000)) + int(
+            getattr(cfg, "paper_phase2_rounds", 200)
+        )
+        if int(cfg.total_rounds) != expected_rounds:
+            messages.append(
+                "Paper-style training is enabled, but total_rounds does not match "
+                f"phase1+phase2 ({cfg.total_rounds} != {expected_rounds}). "
+                "This is allowed for smoke tests; use the full sum for a paper-like run."
+            )
     return messages
 
 
@@ -259,6 +331,174 @@ def save_checkpoint_video(
     return path
 
 
+def behavior_clone_pretrain(
+    policy: torch.nn.Module,
+    transitions,
+    cfg: PSGAILConfig,
+    device: torch.device,
+) -> dict[str, float]:
+    if str(cfg.action_mode).lower() != "continuous":
+        raise ValueError("BC pretraining currently requires --action-mode continuous.")
+
+    observations = np.asarray(transitions.policy_observations, dtype=np.float32)
+    actions = np.clip(
+        np.asarray(transitions.actions_continuous_env, dtype=np.float32),
+        -1.0,
+        1.0,
+    )
+    if observations.ndim != 2 or actions.ndim != 2:
+        raise ValueError(f"BC data must be rank-2 obs/actions, got {observations.shape} and {actions.shape}.")
+    if len(observations) != len(actions):
+        raise ValueError(f"BC observation/action length mismatch: {len(observations)} != {len(actions)}.")
+
+    rng = np.random.default_rng(int(cfg.seed) + 17)
+    indices = rng.permutation(len(observations))
+    val_fraction = min(0.5, max(0.0, float(cfg.bc_pretrain_validation_fraction)))
+    val_count = int(round(len(indices) * val_fraction))
+    if len(indices) - val_count <= 0:
+        val_count = 0
+    val_indices = indices[:val_count]
+    train_indices = indices[val_count:]
+    if train_indices.size == 0:
+        raise RuntimeError("BC pretraining has no training samples.")
+
+    optimizer = torch.optim.AdamW(
+        policy.parameters(),
+        lr=float(cfg.bc_pretrain_learning_rate),
+        weight_decay=float(cfg.bc_pretrain_weight_decay),
+    )
+    batch_size = max(1, int(cfg.bc_pretrain_batch_size))
+    epochs = max(0, int(cfg.bc_pretrain_epochs))
+    was_training = policy.training
+    policy.train()
+
+    last_train_loss = float("nan")
+    last_train_mae = float("nan")
+    for epoch in range(1, epochs + 1):
+        shuffled = rng.permutation(train_indices)
+        losses: list[float] = []
+        maes: list[float] = []
+        for start in range(0, len(shuffled), batch_size):
+            batch_idx = shuffled[start : start + batch_size]
+            obs_tensor = torch.as_tensor(observations[batch_idx], dtype=torch.float32, device=device)
+            action_tensor = torch.as_tensor(actions[batch_idx], dtype=torch.float32, device=device)
+            pred_actions, values = policy(obs_tensor)
+            action_loss = F.mse_loss(pred_actions, action_tensor)
+            value_loss = torch.mean(values.square())
+            loss = action_loss + 1.0e-3 * value_loss
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), float(cfg.max_grad_norm))
+            optimizer.step()
+            losses.append(float(action_loss.detach().cpu().item()))
+            maes.append(float(torch.mean(torch.abs(pred_actions.detach() - action_tensor)).cpu().item()))
+        last_train_loss = float(np.mean(losses)) if losses else float("nan")
+        last_train_mae = float(np.mean(maes)) if maes else float("nan")
+        print(
+            f"[bc epoch {epoch:04d}/{epochs:04d}] "
+            f"train_mse={last_train_loss:.6f} train_mae={last_train_mae:.6f}"
+        )
+
+    def _eval_split(split_indices: np.ndarray) -> tuple[float, float]:
+        if split_indices.size == 0:
+            return float("nan"), float("nan")
+        policy.eval()
+        losses = []
+        maes = []
+        with torch.no_grad():
+            for start in range(0, len(split_indices), batch_size):
+                batch_idx = split_indices[start : start + batch_size]
+                obs_tensor = torch.as_tensor(observations[batch_idx], dtype=torch.float32, device=device)
+                action_tensor = torch.as_tensor(actions[batch_idx], dtype=torch.float32, device=device)
+                pred_actions, _values = policy(obs_tensor)
+                losses.append(float(F.mse_loss(pred_actions, action_tensor).cpu().item()))
+                maes.append(float(torch.mean(torch.abs(pred_actions - action_tensor)).cpu().item()))
+        return float(np.mean(losses)), float(np.mean(maes))
+
+    train_mse, train_mae = _eval_split(train_indices)
+    val_mse, val_mae = _eval_split(val_indices)
+    if was_training:
+        policy.train()
+    return {
+        "bc/train_mse": train_mse,
+        "bc/train_mae": train_mae,
+        "bc/val_mse": val_mse,
+        "bc/val_mae": val_mae,
+        "bc/train_samples": float(train_indices.size),
+        "bc/val_samples": float(val_indices.size),
+        "bc/last_epoch_train_mse": last_train_loss,
+        "bc/last_epoch_train_mae": last_train_mae,
+    }
+
+
+def evaluate_policy_survival(
+    policy: torch.nn.Module,
+    cfg: PSGAILConfig,
+    device: torch.device,
+    *,
+    episodes: int,
+    seed_offset: int,
+) -> dict[str, float]:
+    eval_episodes = max(0, int(episodes))
+    if eval_episodes <= 0:
+        return {}
+    env = make_training_env(cfg)
+    lengths: list[int] = []
+    crash_episodes = 0
+    offroad_episodes = 0
+    controlled_counts: list[int] = []
+    road_counts: list[int] = []
+    was_training = policy.training
+    policy.eval()
+    try:
+        for episode_idx in range(eval_episodes):
+            obs, _info = env.reset(seed=int(cfg.seed) + int(seed_offset) + episode_idx)
+            episode_had_crash = False
+            episode_had_offroad = False
+            length = 0
+            for _step in range(max(1, int(cfg.max_episode_steps))):
+                road = getattr(env.unwrapped, "road", None)
+                road_vehicles = list(getattr(road, "vehicles", ())) if road is not None else []
+                controlled = list(getattr(env.unwrapped, "controlled_vehicles", ()) or ())
+                controlled_counts.append(len(controlled))
+                road_counts.append(len(road_vehicles))
+                action = _policy_action_tuple(
+                    policy,
+                    obs,
+                    env,
+                    device=device,
+                    deterministic=bool(cfg.bc_pretrain_eval_deterministic),
+                    cfg=cfg,
+                )
+                obs, _reward, terminated, truncated, info = env.step(action)
+                length += 1
+                crash_flags = info.get("controlled_vehicle_crashes", [])
+                offroad_flags = info.get("controlled_vehicle_offroad", [])
+                episode_had_crash = bool(episode_had_crash or any(bool(flag) for flag in crash_flags))
+                episode_had_offroad = bool(episode_had_offroad or any(bool(flag) for flag in offroad_flags))
+                if terminated or truncated:
+                    break
+            lengths.append(length)
+            crash_episodes += int(episode_had_crash)
+            offroad_episodes += int(episode_had_offroad)
+    finally:
+        env.close()
+        if was_training:
+            policy.train()
+    return {
+        "bc_eval/episodes": float(eval_episodes),
+        "bc_eval/mean_episode_length": float(np.mean(lengths)) if lengths else 0.0,
+        "bc_eval/min_episode_length": float(np.min(lengths)) if lengths else 0.0,
+        "bc_eval/max_episode_length": float(np.max(lengths)) if lengths else 0.0,
+        "bc_eval/crash_episodes": float(crash_episodes),
+        "bc_eval/offroad_episodes": float(offroad_episodes),
+        "bc_eval/crash_episode_fraction": float(crash_episodes / eval_episodes),
+        "bc_eval/offroad_episode_fraction": float(offroad_episodes / eval_episodes),
+        "bc_eval/mean_controlled_vehicles": float(np.mean(controlled_counts)) if controlled_counts else 0.0,
+        "bc_eval/mean_road_vehicles": float(np.mean(road_counts)) if road_counts else 0.0,
+    }
+
+
 def parse_args() -> PSGAILConfig:
     defaults = PSGAILConfig()
     parser = argparse.ArgumentParser(
@@ -303,6 +543,7 @@ def main() -> None:
     rollout_executor = None
     try:
         sequence_only_discriminator = bool(cfg.enable_sequence_discriminator)
+        expert_transitions = None
         if discriminator_input_mode(cfg) == "action":
             if sequence_only_discriminator or bool(cfg.enable_scene_discriminator):
                 raise ValueError(
@@ -328,6 +569,13 @@ def main() -> None:
                 seed=cfg.seed,
                 trajectory_frame=cfg.trajectory_frame,
             )
+            if int(cfg.bc_pretrain_epochs) > 0:
+                expert_transitions = load_expert_transition_data(
+                    cfg.expert_data,
+                    max_samples=cfg.max_expert_samples,
+                    seed=cfg.seed,
+                    trajectory_frame=cfg.trajectory_frame,
+                )
         expert_scene_features = None
         expert_scene_metadata = {}
         if bool(cfg.enable_scene_discriminator):
@@ -456,6 +704,15 @@ def main() -> None:
             f"rollout_workers={cfg.num_rollout_workers} "
             f"rollout_worker_threads={cfg.rollout_worker_threads}"
         )
+        if int(cfg.bc_pretrain_epochs) > 0:
+            print(
+                "bc_pretrain="
+                f"epochs={cfg.bc_pretrain_epochs} "
+                f"batch={cfg.bc_pretrain_batch_size} "
+                f"lr={cfg.bc_pretrain_learning_rate} "
+                f"val_fraction={cfg.bc_pretrain_validation_fraction} "
+                f"eval_episodes={cfg.bc_pretrain_eval_episodes}"
+            )
         if expert_scene_features is not None:
             print(
                 "scene_discriminator="
@@ -479,6 +736,78 @@ def main() -> None:
                 f"final={cfg.final_controlled_vehicle_fraction:.4f} "
                 f"rounds={cfg.controlled_vehicle_curriculum_rounds}"
             )
+        if bool(getattr(cfg, "paper_style_training", False)):
+            print(
+                "paper_style_training="
+                f"phase1_rounds={cfg.paper_phase1_rounds} "
+                f"phase1_gamma={cfg.paper_phase1_gamma} "
+                f"phase1_agent_steps={cfg.paper_phase1_agent_steps} "
+                f"agents={cfg.paper_initial_agent_count}+"
+                f"{cfg.paper_agent_increment}/"
+                f"{cfg.paper_agent_increment_interval}rounds "
+                f"phase2_rounds={cfg.paper_phase2_rounds} "
+                f"phase2_gamma={cfg.paper_phase2_gamma} "
+                f"phase2_agent_steps={cfg.paper_phase2_agent_steps} "
+                f"phase2_agents={cfg.paper_phase2_agent_count}"
+            )
+
+        if int(cfg.bc_pretrain_epochs) > 0:
+            if expert_transitions is None:
+                raise RuntimeError("BC pretraining requires action-conditioned expert transition data.")
+            bc_stats = behavior_clone_pretrain(policy, expert_transitions, cfg, device)
+            bc_eval_stats = evaluate_policy_survival(
+                policy,
+                env_cfg,
+                device,
+                episodes=int(cfg.bc_pretrain_eval_episodes),
+                seed_offset=50_000,
+            )
+            print(
+                "[bc final] "
+                f"train_mse={bc_stats['bc/train_mse']:.6f} "
+                f"train_mae={bc_stats['bc/train_mae']:.6f} "
+                f"val_mse={bc_stats['bc/val_mse']:.6f} "
+                f"val_mae={bc_stats['bc/val_mae']:.6f}"
+            )
+            if bc_eval_stats:
+                print(
+                    "[bc env_eval] "
+                    f"episodes={int(bc_eval_stats['bc_eval/episodes'])} "
+                    f"ep_len={bc_eval_stats['bc_eval/mean_episode_length']:.1f}"
+                    f"[{int(bc_eval_stats['bc_eval/min_episode_length'])},"
+                    f"{int(bc_eval_stats['bc_eval/max_episode_length'])}] "
+                    f"crash_eps={int(bc_eval_stats['bc_eval/crash_episodes'])} "
+                    f"offroad_eps={int(bc_eval_stats['bc_eval/offroad_episodes'])} "
+                    f"veh={bc_eval_stats['bc_eval/mean_controlled_vehicles']:.1f}/"
+                    f"{bc_eval_stats['bc_eval/mean_road_vehicles']:.1f}"
+                )
+                min_mean_len = float(cfg.bc_pretrain_min_mean_episode_length)
+                if (
+                    min_mean_len > 0.0
+                    and bc_eval_stats["bc_eval/mean_episode_length"] < min_mean_len
+                ):
+                    message = (
+                        "BC env validation did not reach the requested mean episode length: "
+                        f"{bc_eval_stats['bc_eval/mean_episode_length']:.1f} < {min_mean_len:.1f}."
+                    )
+                    if bool(cfg.bc_pretrain_abort_on_failed_eval):
+                        raise RuntimeError(message)
+                    warnings.warn(message, RuntimeWarning, stacklevel=2)
+            monitor.log({**bc_stats, **bc_eval_stats}, step=0)
+            bc_path = os.path.join(ckpt_dir, "bc_pretrained.pt")
+            torch.save(
+                {
+                    "round": 0,
+                    "policy_state_dict": policy.state_dict(),
+                    "expert_metadata": checkpoint_expert_metadata(expert_metadata),
+                    "config": vars(cfg),
+                    "round_config": vars(env_cfg),
+                    "bc_stats": bc_stats,
+                    "bc_eval_stats": bc_eval_stats,
+                },
+                bc_path,
+            )
+            monitor.save(bc_path)
         rollout_executor = make_rollout_executor(cfg)
 
         for round_idx in range(1, int(cfg.total_rounds) + 1):
@@ -490,14 +819,14 @@ def main() -> None:
                 env = make_training_env(round_cfg)
                 current_env_signature = round_env_signature
 
-            rollout = collect_rollouts(
+            rollout = collect_round_rollouts(
                 env,
                 policy,
                 round_cfg,
                 device,
                 policy_obs_dim,
-                seed_offset=(round_idx - 1) * max(1, int(cfg.num_rollout_workers)),
-                executor=rollout_executor,
+                round_idx=round_idx,
+                rollout_executor=rollout_executor,
             )
             if sequence_only_discriminator and not rollout.sequence_features.size:
                 raise RuntimeError(
