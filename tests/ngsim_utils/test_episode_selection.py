@@ -28,6 +28,23 @@ def test_select_ego_ids_accepts_percentage_request():
     assert all(vehicle_id in valid_ids for vehicle_id in selected_ids)
 
 
+def test_select_ego_ids_can_clip_implicit_request_to_available_ids():
+    valid_ids = np.asarray([10, 20, 30], dtype=np.int64)
+    rng = np.random.default_rng(0)
+
+    selected_ids = select_ego_ids(
+        valid_ids,
+        explicit_ego_ids=None,
+        percentage_controlled_vehicles=10,
+        np_random=rng,
+        episode_name="episode",
+        clip_to_available=True,
+    )
+
+    assert len(selected_ids) == 3
+    assert sorted(selected_ids) == [10, 20, 30]
+
+
 def test_select_ego_ids_honors_explicit_ids_when_control_all_is_enabled():
     valid_ids = np.asarray([1, 2, 3, 4], dtype=np.int64)
     rng = np.random.default_rng(0)

@@ -147,6 +147,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 "expert_test_mode": False,
                 "discrete_expert_policy": "planner",
                 "percentage_controlled_vehicles": 0.1,
+                "clip_controlled_vehicles_to_available": True,
                 "terminate_when_all_controlled_crashed": True,
                 "truncate_to_trajectory_length": False, # allow for replay
                 "scene_dataset_collection_mode": False,
@@ -350,6 +351,9 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             np_random=self.np_random,
             episode_name=self.episode_name,
             control_all_vehicles=bool(self.config.get("control_all_vehicles", False)),
+            clip_to_available=bool(
+                self.config.get("clip_controlled_vehicles_to_available", True)
+            ),
         )
         self.ego_id = self.ego_ids[0] if self.ego_ids else None
         self.trajectory_set = build_trajectory_set(

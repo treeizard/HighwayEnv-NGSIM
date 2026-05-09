@@ -46,6 +46,7 @@ def select_ego_ids(
     np_random,
     episode_name: str,
     control_all_vehicles: bool = False,
+    clip_to_available: bool = False,
 ) -> list[int]:
     resolved_num_vehicles = resolve_num_ego_vehicles(
         percentage_controlled_vehicles,
@@ -54,10 +55,12 @@ def select_ego_ids(
 
     if explicit_ego_ids is None:
         if resolved_num_vehicles > len(valid_ids):
-            raise ValueError(
-                f"Requested {resolved_num_vehicles} ego vehicles, but only "
-                f"{len(valid_ids)} valid ids are available"
-            )
+            if not clip_to_available:
+                raise ValueError(
+                    f"Requested {resolved_num_vehicles} ego vehicles, but only "
+                    f"{len(valid_ids)} valid ids are available"
+                )
+            resolved_num_vehicles = len(valid_ids)
         if control_all_vehicles:
             ego_ids = [int(eid) for eid in valid_ids]
             if not ego_ids:

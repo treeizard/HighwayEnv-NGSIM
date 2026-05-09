@@ -77,6 +77,7 @@ TRAJECTORY_FRAME="${TRAJECTORY_FRAME:-relative}"
 INITIAL_CONTROLLED_VEHICLE_FRACTION="${INITIAL_CONTROLLED_VEHICLE_FRACTION:-0.05}"
 FINAL_CONTROLLED_VEHICLE_FRACTION="${FINAL_CONTROLLED_VEHICLE_FRACTION:-1.0}"
 CONTROLLED_VEHICLE_CURRICULUM_ROUNDS="${CONTROLLED_VEHICLE_CURRICULUM_ROUNDS:-${TOTAL_ROUNDS}}"
+CONTROLLED_VEHICLE_CURRICULUM="${CONTROLLED_VEHICLE_CURRICULUM:-true}"
 DISC_EXPERT_LABEL="${DISC_EXPERT_LABEL:-0.8}"
 DISC_GENERATOR_LABEL="${DISC_GENERATOR_LABEL:-0.2}"
 DISC_LEARNING_RATE="${DISC_LEARNING_RATE:-5e-5}"
@@ -115,6 +116,7 @@ TRANSFORMER_DROPOUT="${TRANSFORMER_DROPOUT:-0.1}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10}"
 TERMINATE_WHEN_ALL_CONTROLLED_CRASHED="${TERMINATE_WHEN_ALL_CONTROLLED_CRASHED:-true}"
 export EXPERT_DATA
+export PAPER_INITIAL_AGENT_COUNT
 if [ "${TERMINATE_WHEN_ALL_CONTROLLED_CRASHED}" = "true" ]; then
     TERMINATION_ARG="--terminate-when-all-controlled-crashed"
 else
@@ -135,10 +137,16 @@ if [ "${PAPER_STYLE_TRAINING}" = "true" ]; then
 else
     PAPER_STYLE_ARG="--no-paper-style-training"
 fi
+if [ "${CONTROLLED_VEHICLE_CURRICULUM}" = "true" ] && [ "${PAPER_STYLE_TRAINING}" != "true" ]; then
+    CONTROLLED_VEHICLE_CURRICULUM_ARG="--controlled-vehicle-curriculum"
+else
+    CONTROLLED_VEHICLE_CURRICULUM_ARG="--no-controlled-vehicle-curriculum"
+fi
 
 echo "Expert data: ${EXPERT_DATA}"
 echo "BC pretrain epochs: ${BC_PRETRAIN_EPOCHS}"
 echo "Paper-style training: ${PAPER_STYLE_TRAINING}"
+echo "Controlled-vehicle curriculum: ${CONTROLLED_VEHICLE_CURRICULUM_ARG}"
 echo "Policy model: ${POLICY_MODEL}"
 echo "Discriminator learning rate: ${DISC_LEARNING_RATE}"
 echo "Discriminator updates per round: ${DISC_UPDATES_PER_ROUND}"
@@ -169,6 +177,52 @@ with np.load(files[0], allow_pickle=True) as data:
     print("continuous expert preflight ok:", files[0], "samples", len(actions))
 PY
 
+python - <<'PY'
+import os
+
+import gymnasium as gym
+
+from highway_env.imitation.expert_dataset import ENV_ID, register_ngsim_env
+
+episode_name = "t1118846979700"
+requested = float(os.environ["PAPER_INITIAL_AGENT_COUNT"])
+register_ngsim_env()
+cfg = {
+    "scene": "us-101",
+    "episode_root": os.path.join(os.environ["REPODIR"], "highway_env/data/processed_20s"),
+    "prebuilt_split": "train",
+    "simulation_period": {"episode_name": episode_name},
+    "percentage_controlled_vehicles": requested,
+    "control_all_vehicles": False,
+    "show_trajectories": False,
+    "max_episode_steps": 5,
+    "observation": {
+        "type": "LidarObservation",
+        "cells": 16,
+        "maximum_range": 64,
+        "normalize": True,
+    },
+    "action": {"type": "ContinuousAction"},
+    "action_mode": "continuous",
+}
+env = gym.make(ENV_ID, config=cfg)
+try:
+    env.reset(seed=0)
+    selected = len(env.unwrapped.ego_ids)
+finally:
+    env.close()
+if selected > requested:
+    raise SystemExit(f"selected {selected} ego vehicles from request {requested}")
+print(
+    "sparse episode preflight ok:",
+    episode_name,
+    "requested",
+    int(requested),
+    "selected",
+    selected,
+)
+PY
+
 python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --expert-data "${EXPERT_DATA}" \
     --scene us-101 \
@@ -177,7 +231,7 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --episode-root "${REPODIR}/highway_env/data/processed_20s" \
     --prebuilt-split train \
     --no-control-all-vehicles \
-    --controlled-vehicle-curriculum \
+    "${CONTROLLED_VEHICLE_CURRICULUM_ARG}" \
     --initial-controlled-vehicle-fraction "${INITIAL_CONTROLLED_VEHICLE_FRACTION}" \
     --final-controlled-vehicle-fraction "${FINAL_CONTROLLED_VEHICLE_FRACTION}" \
     --controlled-vehicle-curriculum-rounds "${CONTROLLED_VEHICLE_CURRICULUM_ROUNDS}" \

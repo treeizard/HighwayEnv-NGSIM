@@ -109,6 +109,7 @@ def build_env_config(
     ego_vehicle_id: int | list[int] | None = None,
     scene_dataset_collection_mode: bool = False,
     allow_idm: bool = True,
+    clip_controlled_vehicles_to_available: bool = True,
 ) -> dict[str, Any]:
     """
     Build a repo-native NGSim config for expert replay collection.
@@ -155,6 +156,7 @@ def build_env_config(
         "ego_vehicle_ID": ego_vehicle_id,
         "percentage_controlled_vehicles": float(percentage_controlled_vehicles),
         "control_all_vehicles": bool(control_all_vehicles),
+        "clip_controlled_vehicles_to_available": bool(clip_controlled_vehicles_to_available),
         "max_surrounding": max_surrounding,
         "expert_test_mode": True,
         "truncate_to_trajectory_length": True,
