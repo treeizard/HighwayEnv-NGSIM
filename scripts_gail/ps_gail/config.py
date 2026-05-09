@@ -73,6 +73,7 @@ class PSGAILConfig:
     clip_range: float = 0.2
     ppo_epochs: int = 4
     batch_size: int = 1024
+    ppo_micro_batch_size: int = 0
     disc_batch_size: int = 1024
     disc_updates_per_round: int = 4
     disc_expert_label: float = 0.9

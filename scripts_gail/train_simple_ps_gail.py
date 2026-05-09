@@ -933,6 +933,7 @@ def main() -> None:
                 f"value_loss={policy_stats['value_loss']:.4f} "
                 f"kl={policy_stats['approx_kl']:.5f} "
                 f"clip_frac={policy_stats['clip_fraction']:.3f} "
+                f"ppo_micro={int(policy_stats['ppo_micro_batch_size'])} "
                 f"entropy={policy_stats['entropy']:.4f} "
                 f"raw_gail={rollout.mean_raw_gail_reward:.4f} "
                 f"norm_gail={rollout.mean_normalized_gail_reward:.4f} "
@@ -1011,6 +1012,7 @@ def main() -> None:
                 "policy/clip_fraction": policy_stats["clip_fraction"],
                 "policy/ratio_mean": policy_stats["ratio_mean"],
                 "policy/ratio_std": policy_stats["ratio_std"],
+                "policy/ppo_micro_batch_size": policy_stats["ppo_micro_batch_size"],
                 "train/policy_obs_dim": policy_obs_dim,
                 "train/disc_feature_dim": feature_dim,
                 "train/expert_samples": int(expert_features.shape[0]),
