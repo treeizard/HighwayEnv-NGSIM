@@ -103,6 +103,7 @@ from scripts_gail.ps_gail.trainer import (
 from scripts_gail.train_simple_ps_gail import behavior_clone_pretrain
 from scripts_gail.train_simple_ps_gail import config_for_round as ps_gail_config_for_round
 from scripts_gail.train_simple_airl import config_for_round as airl_config_for_round
+from scripts_gail.train_simple_iq_learn import convergence_reached, convergence_score
 
 
 def _minimal_rollout(
@@ -377,6 +378,45 @@ def test_behavior_clone_pretrain_matches_continuous_actions():
 
     assert before["bc/train_mse"] < 0.05
     assert before["bc/train_mae"] < 0.2
+
+
+def test_iq_learn_convergence_score_rewards_survival_and_penalizes_crashes():
+    update_stats = {"bc_loss": 0.25}
+    clean_eval = {"eval/mean_length": 120.0, "eval/mean_reward": 5.0, "eval/crashes": 0.0}
+    crashed_eval = {"eval/mean_length": 120.0, "eval/mean_reward": 5.0, "eval/crashes": 2.0}
+
+    clean_score = convergence_score(
+        update_stats,
+        clean_eval,
+        crash_penalty=25.0,
+        bc_score_weight=1.0,
+    )
+    crashed_score = convergence_score(
+        update_stats,
+        crashed_eval,
+        crash_penalty=25.0,
+        bc_score_weight=1.0,
+    )
+
+    assert clean_score == pytest.approx(124.75)
+    assert crashed_score == pytest.approx(74.75)
+
+
+def test_iq_learn_convergence_target_requires_length_bc_and_crash_budget():
+    assert convergence_reached(
+        {"bc_loss": 0.02},
+        {"eval/mean_length": 180.0, "eval/crashes": 0.0},
+        target_eval_mean_length=150.0,
+        target_bc_loss=0.05,
+        max_eval_crashes=0.0,
+    )
+    assert not convergence_reached(
+        {"bc_loss": 0.08},
+        {"eval/mean_length": 180.0, "eval/crashes": 0.0},
+        target_eval_mean_length=150.0,
+        target_bc_loss=0.05,
+        max_eval_crashes=0.0,
+    )
 
 
 def test_sequence_feature_local_deltas_remove_cumulative_progress():

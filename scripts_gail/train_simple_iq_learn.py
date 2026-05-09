@@ -53,6 +53,56 @@ class SoftQNetwork(nn.Module):
         return self.net(torch.cat([obs, action], dim=-1)).squeeze(-1)
 
 
+@dataclass
+class ConvergenceTracker:
+    best_score: float = float("-inf")
+    best_update: int = 0
+    eval_count: int = 0
+    stale_evals: int = 0
+
+
+def _require_finite_metrics(metrics: dict[str, float], *, update_idx: int) -> None:
+    bad = [
+        key
+        for key, value in metrics.items()
+        if isinstance(value, (int, float, np.floating)) and not np.isfinite(float(value))
+    ]
+    if bad:
+        raise RuntimeError(f"Non-finite IQ-Learn metric(s) at update {update_idx}: {', '.join(sorted(bad))}")
+
+
+def convergence_score(
+    update_stats: dict[str, float],
+    eval_stats: dict[str, float],
+    *,
+    crash_penalty: float,
+    bc_score_weight: float,
+) -> float:
+    return (
+        float(eval_stats.get("eval/mean_length", 0.0))
+        + float(eval_stats.get("eval/mean_reward", 0.0))
+        - float(crash_penalty) * float(eval_stats.get("eval/crashes", 0.0))
+        - float(bc_score_weight) * float(update_stats.get("bc_loss", 0.0))
+    )
+
+
+def convergence_reached(
+    update_stats: dict[str, float],
+    eval_stats: dict[str, float],
+    *,
+    target_eval_mean_length: float,
+    target_bc_loss: float,
+    max_eval_crashes: float,
+) -> bool:
+    if float(target_eval_mean_length) > 0.0 and float(eval_stats.get("eval/mean_length", 0.0)) < float(target_eval_mean_length):
+        return False
+    if float(target_bc_loss) > 0.0 and float(update_stats.get("bc_loss", float("inf"))) > float(target_bc_loss):
+        return False
+    if float(max_eval_crashes) >= 0.0 and float(eval_stats.get("eval/crashes", 0.0)) > float(max_eval_crashes):
+        return False
+    return float(target_eval_mean_length) > 0.0 or float(target_bc_loss) > 0.0
+
+
 def _resolve_replay_device(requested: str, train_device: torch.device) -> torch.device:
     requested = str(requested).lower()
     if requested == "auto":
@@ -395,6 +445,18 @@ def parse_args() -> tuple[PSGAILConfig, argparse.Namespace]:
     parser.add_argument("--log-std-max", type=float, default=0.5)
     parser.add_argument("--replay-device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--pin-cpu-replay", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--save-best-checkpoint", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--abort-on-nonfinite", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--abort-on-stalled-convergence", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--convergence-patience-evals", type=int, default=8)
+    parser.add_argument("--min-evals-before-stall", type=int, default=4)
+    parser.add_argument("--convergence-min-delta", type=float, default=1e-3)
+    parser.add_argument("--convergence-crash-penalty", type=float, default=25.0)
+    parser.add_argument("--bc-score-weight", type=float, default=1.0)
+    parser.add_argument("--target-eval-mean-length", type=float, default=0.0)
+    parser.add_argument("--target-bc-loss", type=float, default=0.0)
+    parser.add_argument("--max-eval-crashes", type=float, default=0.0)
+    parser.add_argument("--max-q-abs", type=float, default=100.0)
     parser.add_argument(
         "--torch-matmul-precision",
         choices=("default", "highest", "high", "medium"),
@@ -422,6 +484,18 @@ def parse_args() -> tuple[PSGAILConfig, argparse.Namespace]:
         "log_std_max",
         "replay_device",
         "pin_cpu_replay",
+        "save_best_checkpoint",
+        "abort_on_nonfinite",
+        "abort_on_stalled_convergence",
+        "convergence_patience_evals",
+        "min_evals_before_stall",
+        "convergence_min_delta",
+        "convergence_crash_penalty",
+        "bc_score_weight",
+        "target_eval_mean_length",
+        "target_bc_loss",
+        "max_eval_crashes",
+        "max_q_abs",
         "torch_matmul_precision",
     }
     cfg_values = {key: value for key, value in values.items() if key not in extra_keys}
@@ -499,7 +573,11 @@ def main() -> None:
         )
 
         latest_stats: dict[str, float] = {}
+        convergence = ConvergenceTracker()
+        best_path = os.path.join(run_dir, "best.pt")
+        completed_update = 0
         for update_idx in range(1, int(extras.total_updates) + 1):
+            completed_update = int(update_idx)
             should_log = update_idx == 1 or update_idx % max(1, int(extras.eval_every)) == 0
             update_stats = update_iq_learn(
                 policy,
@@ -530,9 +608,62 @@ def main() -> None:
             )
             if should_log:
                 latest_stats = update_stats
+                if bool(extras.abort_on_nonfinite):
+                    _require_finite_metrics(latest_stats, update_idx=update_idx)
+                max_q_abs = float(extras.max_q_abs)
+                q_abs = max(
+                    abs(float(latest_stats.get("expert_q", 0.0))),
+                    abs(float(latest_stats.get("policy_q", 0.0))),
+                    abs(float(latest_stats.get("target_v", 0.0))),
+                    abs(float(latest_stats.get("target_v_unclipped", 0.0))),
+                )
+                if max_q_abs > 0.0 and q_abs > max_q_abs:
+                    raise RuntimeError(
+                        f"Q scale diverged at update {update_idx}: abs_q={q_abs:.4f} > max_q_abs={max_q_abs:.4f}. "
+                        "Lower --learning-rate/--disc-learning-rate or increase Q regularization."
+                    )
                 metrics = {"update": update_idx, **{f"iq/{k}": v for k, v in latest_stats.items()}}
                 eval_stats = evaluate_policy(policy, cfg, device, episodes=int(extras.eval_episodes))
                 metrics.update(eval_stats)
+                score = convergence_score(
+                    latest_stats,
+                    eval_stats,
+                    crash_penalty=float(extras.convergence_crash_penalty),
+                    bc_score_weight=float(extras.bc_score_weight),
+                )
+                convergence.eval_count += 1
+                improved = score > convergence.best_score + float(extras.convergence_min_delta)
+                if improved:
+                    convergence.best_score = float(score)
+                    convergence.best_update = int(update_idx)
+                    convergence.stale_evals = 0
+                    if bool(extras.save_best_checkpoint):
+                        torch.save(
+                            {
+                                "update": update_idx,
+                                "policy_state_dict": policy.state_dict(),
+                                "q_state_dict": q_net.state_dict(),
+                                "target_q_state_dict": target_q_net.state_dict(),
+                                "expert_metadata": expert.metadata,
+                                "config": vars(cfg),
+                                "iq_config": vars(extras),
+                                "latest_stats": latest_stats,
+                                "eval_stats": eval_stats,
+                                "convergence_score": float(score),
+                            },
+                            best_path,
+                        )
+                        monitor.save(best_path)
+                else:
+                    convergence.stale_evals += 1
+                metrics.update(
+                    {
+                        "convergence/score": float(score),
+                        "convergence/best_score": float(convergence.best_score),
+                        "convergence/best_update": float(convergence.best_update),
+                        "convergence/stale_evals": float(convergence.stale_evals),
+                    }
+                )
                 monitor.log(metrics, step=update_idx)
                 print(
                     f"[update {update_idx:06d}] q_loss={latest_stats['q_loss']:.4f} "
@@ -542,8 +673,34 @@ def main() -> None:
                     f"policy_q={latest_stats['policy_q']:.4f} "
                     f"bc_coef={latest_stats['bc_coef']:.3f} "
                     f"cuda_peak_mb={latest_stats['cuda_peak_mb']:.1f} "
-                    f"eval_reward={eval_stats['eval/mean_reward']:.4f}"
+                    f"eval_reward={eval_stats['eval/mean_reward']:.4f} "
+                    f"eval_len={eval_stats['eval/mean_length']:.1f} "
+                    f"score={score:.4f} best={convergence.best_score:.4f}@{convergence.best_update}"
                 )
+                if convergence_reached(
+                    latest_stats,
+                    eval_stats,
+                    target_eval_mean_length=float(extras.target_eval_mean_length),
+                    target_bc_loss=float(extras.target_bc_loss),
+                    max_eval_crashes=float(extras.max_eval_crashes),
+                ):
+                    print(
+                        "Convergence target reached: "
+                        f"eval_len={eval_stats['eval/mean_length']:.1f}, "
+                        f"bc_loss={latest_stats['bc_loss']:.6f}, "
+                        f"crashes={eval_stats['eval/crashes']:.0f}."
+                    )
+                    break
+                if (
+                    bool(extras.abort_on_stalled_convergence)
+                    and convergence.eval_count >= int(extras.min_evals_before_stall)
+                    and convergence.stale_evals >= int(extras.convergence_patience_evals)
+                ):
+                    raise RuntimeError(
+                        "Convergence appears stalled: "
+                        f"best_score={convergence.best_score:.4f} at update {convergence.best_update}, "
+                        f"no improvement for {convergence.stale_evals} evals."
+                    )
             if cfg.checkpoint_every > 0 and update_idx % int(cfg.checkpoint_every) == 0:
                 checkpoint_path = os.path.join(ckpt_dir, f"update_{update_idx:06d}.pt")
                 torch.save(
@@ -566,7 +723,7 @@ def main() -> None:
         final_path = os.path.join(run_dir, "final.pt")
         torch.save(
             {
-                "update": int(extras.total_updates),
+                "update": int(completed_update),
                 "policy_state_dict": policy.state_dict(),
                 "q_state_dict": q_net.state_dict(),
                 "target_q_state_dict": target_q_net.state_dict(),
@@ -574,13 +731,15 @@ def main() -> None:
                 "config": vars(cfg),
                 "iq_config": vars(extras),
                 "latest_stats": latest_stats,
+                "best_update": int(convergence.best_update),
+                "best_score": float(convergence.best_score),
             },
             final_path,
         )
         monitor.save(final_path)
-        final_video_path = save_checkpoint_video(policy, cfg, run_dir=run_dir, round_idx=int(extras.total_updates), device=device)
+        final_video_path = save_checkpoint_video(policy, cfg, run_dir=run_dir, round_idx=int(completed_update), device=device)
         if final_video_path is not None:
-            monitor.log_video("checkpoint/final_policy_video", final_video_path, step=int(extras.total_updates), fps=int(cfg.policy_frequency))
+            monitor.log_video("checkpoint/final_policy_video", final_video_path, step=int(completed_update), fps=int(cfg.policy_frequency))
     finally:
         if env is not None:
             env.close()
