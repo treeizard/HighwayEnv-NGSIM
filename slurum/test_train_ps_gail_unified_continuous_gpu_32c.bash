@@ -29,6 +29,8 @@ export MKL_NUM_THREADS="${ROLLOUT_WORKER_THREADS}"
 export OPENBLAS_NUM_THREADS="${ROLLOUT_WORKER_THREADS}"
 export NUMEXPR_NUM_THREADS="${ROLLOUT_WORKER_THREADS}"
 export MPLCONFIGDIR="${REPODIR}/logs/matplotlib_${SLURM_JOB_ID}"
+export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-dummy}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 cd "${REPODIR}"
 
@@ -57,11 +59,17 @@ INITIAL_CONTROLLED_VEHICLE_FRACTION="${INITIAL_CONTROLLED_VEHICLE_FRACTION:-0.20
 FINAL_CONTROLLED_VEHICLE_FRACTION="${FINAL_CONTROLLED_VEHICLE_FRACTION:-1.0}"
 CONTROLLED_VEHICLE_CURRICULUM_ROUNDS="${CONTROLLED_VEHICLE_CURRICULUM_ROUNDS:-${TOTAL_ROUNDS}}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
+PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-128}"
 DISC_BATCH_SIZE="${DISC_BATCH_SIZE:-4096}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10}"
 SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-true}"
 CHECKPOINT_VIDEO_STEPS="${CHECKPOINT_VIDEO_STEPS:-120}"
+CHECKPOINT_VIDEO_DIR="${CHECKPOINT_VIDEO_DIR:-checkpoint_videos}"
+CHECKPOINT_VIDEO_DETERMINISTIC="${CHECKPOINT_VIDEO_DETERMINISTIC:-true}"
+CHECKPOINT_VIDEO_WIDTH="${CHECKPOINT_VIDEO_WIDTH:-1200}"
+CHECKPOINT_VIDEO_HEIGHT="${CHECKPOINT_VIDEO_HEIGHT:-608}"
+CHECKPOINT_VIDEO_SCALING="${CHECKPOINT_VIDEO_SCALING:-5.5}"
 DISC_EXPERT_LABEL="${DISC_EXPERT_LABEL:-0.9}"
 DISC_GENERATOR_LABEL="${DISC_GENERATOR_LABEL:-0.1}"
 COLLISION_PENALTY="${COLLISION_PENALTY:-2.0}"
@@ -80,6 +88,11 @@ if [ "${SAVE_CHECKPOINT_VIDEO}" = "true" ]; then
 else
     CHECKPOINT_VIDEO_ARG="--no-save-checkpoint-video"
 fi
+if [ "${CHECKPOINT_VIDEO_DETERMINISTIC}" = "true" ]; then
+    CHECKPOINT_VIDEO_DETERMINISTIC_ARG="--checkpoint-video-deterministic"
+else
+    CHECKPOINT_VIDEO_DETERMINISTIC_ARG="--no-checkpoint-video-deterministic"
+fi
 
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Expert data: ${EXPERT_DATA}"
@@ -87,6 +100,8 @@ echo "CPUs per task: ${SLURM_CPUS}"
 echo "Rollout workers: ${ROLLOUT_WORKERS}"
 echo "Rollout worker threads: ${ROLLOUT_WORKER_THREADS}"
 echo "CUDA devices: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "Checkpoint video: save=${SAVE_CHECKPOINT_VIDEO} every=${CHECKPOINT_EVERY} steps=${CHECKPOINT_VIDEO_STEPS} dir=logs/simple_ps_gail/${RUN_NAME}/${CHECKPOINT_VIDEO_DIR}"
+echo "PPO micro batch size: ${PPO_MICRO_BATCH_SIZE}"
 nvidia-smi || true
 
 python - <<'PY'
@@ -149,10 +164,16 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --max-expert-samples "${MAX_EXPERT_SAMPLES}" \
     --hidden-size "${HIDDEN_SIZE}" \
     --batch-size "${BATCH_SIZE}" \
+    --ppo-micro-batch-size "${PPO_MICRO_BATCH_SIZE}" \
     --disc-batch-size "${DISC_BATCH_SIZE}" \
     --checkpoint-every "${CHECKPOINT_EVERY}" \
     "${CHECKPOINT_VIDEO_ARG}" \
     --checkpoint-video-steps "${CHECKPOINT_VIDEO_STEPS}" \
+    --checkpoint-video-dir "${CHECKPOINT_VIDEO_DIR}" \
+    "${CHECKPOINT_VIDEO_DETERMINISTIC_ARG}" \
+    --checkpoint-video-width "${CHECKPOINT_VIDEO_WIDTH}" \
+    --checkpoint-video-height "${CHECKPOINT_VIDEO_HEIGHT}" \
+    --checkpoint-video-scaling "${CHECKPOINT_VIDEO_SCALING}" \
     --wandb-mode "${WANDB_MODE}" \
     --wandb-project highwayenv-ps-gail \
     --wandb-tags ps-gail,continuous,unified-expert,test,gpu,32c \

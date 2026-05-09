@@ -1218,80 +1218,120 @@ def update_policy(
     # forwards in eval mode prevents dropout from corrupting the likelihood
     # ratio, while gradients still flow through all parameters.
     policy.eval()
+    cpu_device = torch.device("cpu")
     action_tensor = (
-        _as_device_tensor(rollout.actions, dtype=torch.float32, device=device)
+        torch.as_tensor(rollout.actions, dtype=torch.float32, device=cpu_device)
         if _is_continuous(cfg)
-        else _as_device_tensor(rollout.actions, dtype=torch.long, device=device)
+        else torch.as_tensor(rollout.actions, dtype=torch.long, device=cpu_device)
     )
-    obs_tensor = _as_device_tensor(rollout.policy_observations, dtype=torch.float32, device=device)
+    obs_tensor = torch.as_tensor(rollout.policy_observations, dtype=torch.float32, device=cpu_device)
     action_mask_tensor = (
-        _as_device_tensor(rollout.action_masks, dtype=torch.bool, device=device)
+        torch.as_tensor(rollout.action_masks, dtype=torch.bool, device=cpu_device)
         if not _is_continuous(cfg)
         and bool(getattr(cfg, "enable_action_masking", True))
         and rollout.action_masks.size
         else None
     )
-    old_log_probs_tensor = _as_device_tensor(rollout.old_log_probs, dtype=torch.float32, device=device)
-    returns_tensor = _as_device_tensor(rollout.returns, dtype=torch.float32, device=device)
-    advantages_tensor = _as_device_tensor(rollout.advantages, dtype=torch.float32, device=device)
-    policy_losses: list[torch.Tensor] = []
-    value_losses: list[torch.Tensor] = []
-    entropies: list[torch.Tensor] = []
-    approx_kls: list[torch.Tensor] = []
-    clip_fractions: list[torch.Tensor] = []
-    ratio_means: list[torch.Tensor] = []
-    ratio_stds: list[torch.Tensor] = []
+    old_log_probs_tensor = torch.as_tensor(rollout.old_log_probs, dtype=torch.float32, device=cpu_device)
+    returns_tensor = torch.as_tensor(rollout.returns, dtype=torch.float32, device=cpu_device)
+    advantages_tensor = torch.as_tensor(rollout.advantages, dtype=torch.float32, device=cpu_device)
+    policy_losses: list[float] = []
+    value_losses: list[float] = []
+    entropies: list[float] = []
+    approx_kls: list[float] = []
+    clip_fractions: list[float] = []
+    ratio_means: list[float] = []
+    ratio_stds: list[float] = []
     batch_size = max(1, int(cfg.batch_size))
     num_samples = int(obs_tensor.shape[0])
+
+    configured_micro_batch_size = int(getattr(cfg, "ppo_micro_batch_size", 0))
+    if configured_micro_batch_size > 0:
+        micro_batch_size = max(1, min(batch_size, configured_micro_batch_size))
+    elif str(getattr(cfg, "policy_model", "")).lower() == "transformer":
+        micro_batch_size = min(batch_size, 128)
+    else:
+        micro_batch_size = batch_size
+
+    def device_batch(tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        batch = tensor[indices]
+        if device.type == "cuda":
+            batch = batch.pin_memory().to(device=device, non_blocking=True)
+        else:
+            batch = batch.to(device=device)
+        return batch
+
     try:
         for _ in range(int(cfg.ppo_epochs)):
-            permutation = torch.randperm(num_samples, device=device)
+            permutation = torch.randperm(num_samples)
             for start in range(0, num_samples, batch_size):
                 batch_idx = permutation[start : start + batch_size]
-                obs = obs_tensor[batch_idx]
-                actions = action_tensor[batch_idx]
-                old_log_probs = old_log_probs_tensor[batch_idx]
-                returns = returns_tensor[batch_idx]
-                advantages = advantages_tensor[batch_idx]
-                masks = action_mask_tensor[batch_idx] if action_mask_tensor is not None else None
-                dist, values = policy_distribution_and_values(policy, obs, cfg, masks)
-                log_probs = dist.log_prob(actions)
-                log_ratio = log_probs - old_log_probs
-                ratio = torch.exp(log_ratio)
-                clipped_ratio = torch.clamp(ratio, 1.0 - cfg.clip_range, 1.0 + cfg.clip_range)
-                policy_loss = -torch.min(
-                    ratio * advantages,
-                    clipped_ratio * advantages,
-                ).mean()
-                value_loss = F.mse_loss(values, returns)
-                entropy = dist.entropy().mean()
-                loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
-                optimizer.zero_grad()
-                loss.backward()
+                batch_count = int(batch_idx.numel())
+                optimizer.zero_grad(set_to_none=True)
+                weighted_policy_loss = 0.0
+                weighted_value_loss = 0.0
+                weighted_entropy = 0.0
+                weighted_approx_kl = 0.0
+                weighted_clip_fraction = 0.0
+                weighted_ratio_mean = 0.0
+                weighted_ratio_std = 0.0
+                for micro_start in range(0, batch_count, micro_batch_size):
+                    micro_idx = batch_idx[micro_start : micro_start + micro_batch_size]
+                    micro_count = int(micro_idx.numel())
+                    micro_weight = float(micro_count) / float(batch_count)
+                    obs = device_batch(obs_tensor, micro_idx)
+                    actions = device_batch(action_tensor, micro_idx)
+                    old_log_probs = device_batch(old_log_probs_tensor, micro_idx)
+                    returns = device_batch(returns_tensor, micro_idx)
+                    advantages = device_batch(advantages_tensor, micro_idx)
+                    masks = device_batch(action_mask_tensor, micro_idx) if action_mask_tensor is not None else None
+                    dist, values = policy_distribution_and_values(policy, obs, cfg, masks)
+                    log_probs = dist.log_prob(actions)
+                    log_ratio = log_probs - old_log_probs
+                    ratio = torch.exp(log_ratio)
+                    clipped_ratio = torch.clamp(ratio, 1.0 - cfg.clip_range, 1.0 + cfg.clip_range)
+                    policy_loss = -torch.min(
+                        ratio * advantages,
+                        clipped_ratio * advantages,
+                    ).mean()
+                    value_loss = F.mse_loss(values, returns)
+                    entropy = dist.entropy().mean()
+                    loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
+                    (loss * micro_weight).backward()
+                    with torch.no_grad():
+                        approx_kl = ((ratio - 1.0) - log_ratio).mean()
+                        clip_fraction = (
+                            (torch.abs(ratio - 1.0) > float(cfg.clip_range)).float().mean()
+                        )
+                        weighted_policy_loss += micro_weight * float(policy_loss.detach().cpu().item())
+                        weighted_value_loss += micro_weight * float(value_loss.detach().cpu().item())
+                        weighted_entropy += micro_weight * float(entropy.detach().cpu().item())
+                        weighted_approx_kl += micro_weight * float(approx_kl.detach().cpu().item())
+                        weighted_clip_fraction += micro_weight * float(clip_fraction.detach().cpu().item())
+                        weighted_ratio_mean += micro_weight * float(ratio.mean().detach().cpu().item())
+                        weighted_ratio_std += micro_weight * float(
+                            ratio.std(unbiased=False).detach().cpu().item()
+                        )
                 nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
                 optimizer.step()
-                with torch.no_grad():
-                    approx_kl = ((ratio - 1.0) - log_ratio).mean()
-                    clip_fraction = (
-                        (torch.abs(ratio - 1.0) > float(cfg.clip_range)).float().mean()
-                    )
-                    approx_kls.append(approx_kl.detach())
-                    clip_fractions.append(clip_fraction.detach())
-                    ratio_means.append(ratio.mean().detach())
-                    ratio_stds.append(ratio.std(unbiased=False).detach())
-                policy_losses.append(policy_loss.detach())
-                value_losses.append(value_loss.detach())
-                entropies.append(entropy.detach())
+                policy_losses.append(weighted_policy_loss)
+                value_losses.append(weighted_value_loss)
+                entropies.append(weighted_entropy)
+                approx_kls.append(weighted_approx_kl)
+                clip_fractions.append(weighted_clip_fraction)
+                ratio_means.append(weighted_ratio_mean)
+                ratio_stds.append(weighted_ratio_std)
     finally:
         if was_training:
             policy.train()
 
     return {
-        "policy_loss": float(torch.stack(policy_losses).mean().cpu().item()),
-        "value_loss": float(torch.stack(value_losses).mean().cpu().item()),
-        "entropy": float(torch.stack(entropies).mean().cpu().item()),
-        "approx_kl": float(torch.stack(approx_kls).mean().cpu().item()),
-        "clip_fraction": float(torch.stack(clip_fractions).mean().cpu().item()),
-        "ratio_mean": float(torch.stack(ratio_means).mean().cpu().item()),
-        "ratio_std": float(torch.stack(ratio_stds).mean().cpu().item()),
+        "policy_loss": float(np.mean(policy_losses)),
+        "value_loss": float(np.mean(value_losses)),
+        "entropy": float(np.mean(entropies)),
+        "approx_kl": float(np.mean(approx_kls)),
+        "clip_fraction": float(np.mean(clip_fractions)),
+        "ratio_mean": float(np.mean(ratio_means)),
+        "ratio_std": float(np.mean(ratio_stds)),
+        "ppo_micro_batch_size": float(micro_batch_size),
     }
