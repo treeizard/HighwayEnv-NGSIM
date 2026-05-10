@@ -1,23 +1,20 @@
 #!/bin/bash
-#SBATCH --job-name=iqlearn_full_conv
+#SBATCH --job-name=iqlearn_stable_conv
 #SBATCH --account=bt60
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
-#SBATCH --output=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/iqlearn_full_conv_%j.out
-#SBATCH --error=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/iqlearn_full_conv_%j.err
+#SBATCH --output=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/iqlearn_stable_conv_%j.out
+#SBATCH --error=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/iqlearn_stable_conv_%j.err
 
 set -euo pipefail
 
 export REPODIR="${REPODIR:-/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM}"
 export PYTHONPATH="${REPODIR}:${PYTHONPATH:-}"
 
-# IQ-Learn can train mostly from expert transitions, so it needs far fewer CPU
-# rollout workers than PS-GAIL/AIRL for a first test. Keep one GPU for batched
-# critic/policy updates.
 WORKER_THREADS="${WORKER_THREADS:-2}"
 SLURM_CPUS="${SLURM_CPUS_PER_TASK:-32}"
 ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-2}"
@@ -47,12 +44,12 @@ conda activate ngsim_env
 
 EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_unified_expert_continuous_55145982}"
 IQ_TRAIN_SCRIPT="${IQ_TRAIN_SCRIPT:-${REPODIR}/scripts_gail/train_simple_iq_learn.py}"
-RUN_NAME="${RUN_NAME:-iqlearn_unified_continuous_full_conv_${SLURM_JOB_ID}}"
+RUN_NAME="${RUN_NAME:-iqlearn_unified_continuous_stable_${SLURM_JOB_ID}}"
 WANDB_MODE="${WANDB_MODE:-online}"
 
-TOTAL_UPDATES="${TOTAL_UPDATES:-150000}"
+TOTAL_UPDATES="${TOTAL_UPDATES:-30000}"
 EVAL_EVERY="${EVAL_EVERY:-1000}"
-EVAL_EPISODES="${EVAL_EPISODES:-6}"
+EVAL_EPISODES="${EVAL_EPISODES:-12}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
 MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-200000}"
 BATCH_SIZE="${BATCH_SIZE:-8192}"
@@ -61,30 +58,36 @@ REPLAY_SIZE="${REPLAY_SIZE:-200000}"
 REPLAY_DEVICE="${REPLAY_DEVICE:-cuda}"
 PIN_CPU_REPLAY="${PIN_CPU_REPLAY:-true}"
 TORCH_MATMUL_PRECISION="${TORCH_MATMUL_PRECISION:-high}"
-LEARNING_RATE="${LEARNING_RATE:-7.5e-5}"
-DISC_LEARNING_RATE="${DISC_LEARNING_RATE:-7.5e-5}"
+
+LEARNING_RATE="${LEARNING_RATE:-3e-5}"
+DISC_LEARNING_RATE="${DISC_LEARNING_RATE:-3e-5}"
 GAMMA="${GAMMA:-0.95}"
 IQ_ALPHA="${IQ_ALPHA:-0.05}"
-TARGET_TAU="${TARGET_TAU:-0.002}"
-BC_COEF="${BC_COEF:-0.35}"
+TARGET_TAU="${TARGET_TAU:-0.001}"
+
+BC_COEF="${BC_COEF:-1.0}"
 BC_WARMUP_COEF="${BC_WARMUP_COEF:-2.0}"
-BC_WARMUP_UPDATES="${BC_WARMUP_UPDATES:-10000}"
-POLICY_BC_ONLY_UPDATES="${POLICY_BC_ONLY_UPDATES:-2500}"
-Q_L2_COEF="${Q_L2_COEF:-0.002}"
-Q_POLICY_REG_COEF="${Q_POLICY_REG_COEF:-0.002}"
-CONSERVATIVE_Q_COEF="${CONSERVATIVE_Q_COEF:-0.08}"
-TARGET_VALUE_CLIP="${TARGET_VALUE_CLIP:-20.0}"
-POLICY_Q_CLIP="${POLICY_Q_CLIP:-20.0}"
-MAX_Q_ABS="${MAX_Q_ABS:-80.0}"
+BC_WARMUP_UPDATES="${BC_WARMUP_UPDATES:-25000}"
+POLICY_BC_ONLY_UPDATES="${POLICY_BC_ONLY_UPDATES:-5000}"
+
+Q_L2_COEF="${Q_L2_COEF:-0.01}"
+Q_POLICY_REG_COEF="${Q_POLICY_REG_COEF:-0.01}"
+CONSERVATIVE_Q_COEF="${CONSERVATIVE_Q_COEF:-0.2}"
+TARGET_VALUE_CLIP="${TARGET_VALUE_CLIP:-10.0}"
+POLICY_Q_CLIP="${POLICY_Q_CLIP:-10.0}"
+MAX_Q_ABS="${MAX_Q_ABS:-30.0}"
+
 LOG_STD_MIN="${LOG_STD_MIN:--5.0}"
 LOG_STD_MAX="${LOG_STD_MAX:-0.5}"
-CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5000}"
+
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-1000}"
 SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-true}"
 CHECKPOINT_VIDEO_STEPS="${CHECKPOINT_VIDEO_STEPS:-200}"
 SAVE_BEST_CHECKPOINT="${SAVE_BEST_CHECKPOINT:-true}"
+
 ABORT_ON_NONFINITE="${ABORT_ON_NONFINITE:-true}"
-ABORT_ON_STALLED_CONVERGENCE="${ABORT_ON_STALLED_CONVERGENCE:-false}"
-CONVERGENCE_PATIENCE_EVALS="${CONVERGENCE_PATIENCE_EVALS:-12}"
+ABORT_ON_STALLED_CONVERGENCE="${ABORT_ON_STALLED_CONVERGENCE:-true}"
+CONVERGENCE_PATIENCE_EVALS="${CONVERGENCE_PATIENCE_EVALS:-8}"
 MIN_EVALS_BEFORE_STALL="${MIN_EVALS_BEFORE_STALL:-6}"
 CONVERGENCE_MIN_DELTA="${CONVERGENCE_MIN_DELTA:-1e-3}"
 CONVERGENCE_CRASH_PENALTY="${CONVERGENCE_CRASH_PENALTY:-25.0}"
@@ -92,28 +95,34 @@ BC_SCORE_WEIGHT="${BC_SCORE_WEIGHT:-1.0}"
 TARGET_EVAL_MEAN_LENGTH="${TARGET_EVAL_MEAN_LENGTH:-195.0}"
 TARGET_BC_LOSS="${TARGET_BC_LOSS:-0.02}"
 MAX_EVAL_CRASHES="${MAX_EVAL_CRASHES:-0.0}"
+
 export WANDB_MODE
 export SAVE_CHECKPOINT_VIDEO
+
 if [ "${SAVE_CHECKPOINT_VIDEO}" = "true" ]; then
     CHECKPOINT_VIDEO_ARG="--save-checkpoint-video"
 else
     CHECKPOINT_VIDEO_ARG="--no-save-checkpoint-video"
 fi
+
 if [ "${SAVE_BEST_CHECKPOINT}" = "true" ]; then
     SAVE_BEST_CHECKPOINT_ARG="--save-best-checkpoint"
 else
     SAVE_BEST_CHECKPOINT_ARG="--no-save-best-checkpoint"
 fi
+
 if [ "${ABORT_ON_NONFINITE}" = "true" ]; then
     ABORT_ON_NONFINITE_ARG="--abort-on-nonfinite"
 else
     ABORT_ON_NONFINITE_ARG="--no-abort-on-nonfinite"
 fi
+
 if [ "${ABORT_ON_STALLED_CONVERGENCE}" = "true" ]; then
     ABORT_ON_STALLED_CONVERGENCE_ARG="--abort-on-stalled-convergence"
 else
     ABORT_ON_STALLED_CONVERGENCE_ARG="--no-abort-on-stalled-convergence"
 fi
+
 if [ "${PIN_CPU_REPLAY}" = "true" ]; then
     PIN_CPU_REPLAY_ARG="--pin-cpu-replay"
 else
@@ -141,10 +150,12 @@ nvidia-smi || true
 python - <<'PY'
 import os
 import torch
+
 print("torch:", torch.__version__)
 print("cuda available:", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("cuda device:", torch.cuda.get_device_name(0))
+
 wandb_mode = os.environ.get("WANDB_MODE", "online").lower()
 print("wandb mode:", wandb_mode)
 if wandb_mode != "disabled":
@@ -155,6 +166,7 @@ if wandb_mode != "disabled":
         np.complex_ = np.complex128
     import wandb
     print("wandb:", wandb.__version__)
+
 save_video = os.environ.get("SAVE_CHECKPOINT_VIDEO", "true").lower()
 print("save checkpoint video:", save_video)
 if save_video == "true":
@@ -224,5 +236,5 @@ python "${IQ_TRAIN_SCRIPT}" \
     --checkpoint-video-steps "${CHECKPOINT_VIDEO_STEPS}" \
     --wandb-mode "${WANDB_MODE}" \
     --wandb-project highwayenv-ps-gail \
-    --wandb-tags iq-learn,continuous,unified-expert,full-convergence,periodic-video,gpu,32c \
+    --wandb-tags iq-learn,continuous,unified-expert,stable-q,strong-bc,early-stop,gpu,32c \
     --run-name "${RUN_NAME}"
