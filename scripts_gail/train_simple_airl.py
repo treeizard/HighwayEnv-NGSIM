@@ -23,9 +23,10 @@ from scripts_gail.ps_gail.envs import make_training_env
 from scripts_gail.ps_gail.monitoring import WandbMonitor
 from scripts_gail.ps_gail.models import make_actor_critic
 from scripts_gail.ps_gail.observations import flatten_agent_observations, policy_observations_from_flat
+from scripts_gail.ps_gail.schedule import config_for_round
 from scripts_gail.ps_gail.trainer import (
     RolloutBatch,
-    collect_rollouts,
+    collect_round_rollouts,
     compute_returns_and_advantages,
     infer_continuous_action_dim,
     infer_policy_obs_dim,
@@ -74,24 +75,6 @@ class AIRLReward(nn.Module):
 
 def _as_tensor(array: np.ndarray, *, device: torch.device) -> torch.Tensor:
     return torch.as_tensor(array, dtype=torch.float32, device=device)
-
-
-def _clamp_fraction(value: float) -> float:
-    return float(min(1.0, max(1e-6, float(value))))
-
-
-def config_for_round(cfg: PSGAILConfig, round_idx: int) -> PSGAILConfig:
-    if not bool(cfg.controlled_vehicle_curriculum):
-        return cfg
-    rounds = max(1, int(cfg.controlled_vehicle_curriculum_rounds))
-    progress = 1.0 if rounds == 1 else min(1.0, max(0.0, (int(round_idx) - 1) / float(rounds - 1)))
-    initial = _clamp_fraction(cfg.initial_controlled_vehicle_fraction)
-    final = _clamp_fraction(cfg.final_controlled_vehicle_fraction)
-    return replace(
-        cfg,
-        control_all_vehicles=False,
-        percentage_controlled_vehicles=_clamp_fraction(initial + (final - initial) * progress),
-    )
 
 
 def env_signature(cfg: PSGAILConfig) -> tuple[object, ...]:
@@ -397,7 +380,26 @@ def main() -> None:
                 f"final={cfg.final_controlled_vehicle_fraction:.4f} "
                 f"rounds={cfg.controlled_vehicle_curriculum_rounds}"
             )
+        if bool(getattr(cfg, "paper_style_training", False)):
+            print(
+                "paper_style_training="
+                f"phase1_rounds={cfg.paper_phase1_rounds} "
+                f"phase1_gamma={cfg.paper_phase1_gamma} "
+                f"phase1_agent_steps={cfg.paper_phase1_agent_steps} "
+                f"agents={cfg.paper_initial_agent_count}+"
+                f"{cfg.paper_agent_increment}/"
+                f"{cfg.paper_agent_increment_interval}rounds "
+                f"phase2_rounds={cfg.paper_phase2_rounds} "
+                f"phase2_gamma={cfg.paper_phase2_gamma} "
+                f"phase2_agent_steps={cfg.paper_phase2_agent_steps} "
+                f"phase2_agents={cfg.paper_phase2_agent_count} "
+                f"phase2_ramp={cfg.paper_phase2_initial_agent_count}->"
+                f"{cfg.paper_phase2_agent_count}/"
+                f"{cfg.paper_phase2_agent_ramp_rounds}rounds"
+            )
 
+        last_checkpoint_video_path = None
+        last_checkpoint_video_round = 0
         for round_idx in range(1, int(cfg.total_rounds) + 1):
             round_cfg = config_for_round(cfg, round_idx)
             round_cfg.continuous_action_dim = cfg.continuous_action_dim
@@ -405,14 +407,14 @@ def main() -> None:
                 env.close()
                 env = make_training_env(round_cfg)
                 current_env_signature = env_signature(round_cfg)
-            rollout = collect_rollouts(
+            rollout = collect_round_rollouts(
                 env,
                 policy,
                 round_cfg,
                 device,
                 policy_obs_dim,
-                seed_offset=(round_idx - 1) * max(1, int(cfg.num_rollout_workers)),
-                executor=rollout_executor,
+                round_idx=round_idx,
+                rollout_executor=rollout_executor,
             )
             reward_stats = update_reward_model(
                 reward_model,
@@ -496,24 +498,47 @@ def main() -> None:
                 monitor.save(checkpoint_path)
                 video_path = save_checkpoint_video(policy, round_cfg, run_dir=run_dir, round_idx=round_idx, device=device)
                 if video_path is not None:
+                    last_checkpoint_video_path = video_path
+                    last_checkpoint_video_round = round_idx
                     monitor.log_video("checkpoint/policy_video", video_path, step=round_idx, fps=int(round_cfg.policy_frequency))
 
+        final_round = int(cfg.total_rounds)
+        final_round_cfg = config_for_round(cfg, final_round)
         final_path = os.path.join(run_dir, "final.pt")
         torch.save(
             {
-                "round": int(cfg.total_rounds),
+                "round": final_round,
                 "policy_state_dict": policy.state_dict(),
                 "reward_state_dict": reward_model.state_dict(),
                 "expert_metadata": expert.metadata,
                 "config": vars(cfg),
-                "round_config": vars(config_for_round(cfg, int(cfg.total_rounds))),
+                "round_config": vars(final_round_cfg),
             },
             final_path,
         )
         monitor.save(final_path)
-        final_video_path = save_checkpoint_video(policy, config_for_round(cfg, int(cfg.total_rounds)), run_dir=run_dir, round_idx=int(cfg.total_rounds), device=device)
+        final_video_path = (
+            last_checkpoint_video_path
+            if last_checkpoint_video_round == final_round
+            else None
+        )
+        if final_video_path is None or not (
+            int(cfg.checkpoint_every) > 0 and final_round % int(cfg.checkpoint_every) == 0
+        ):
+            final_video_path = save_checkpoint_video(
+                policy,
+                final_round_cfg,
+                run_dir=run_dir,
+                round_idx=final_round,
+                device=device,
+            )
         if final_video_path is not None:
-            monitor.log_video("checkpoint/final_policy_video", final_video_path, step=int(cfg.total_rounds), fps=int(cfg.policy_frequency))
+            monitor.log_video(
+                "checkpoint/final_policy_video",
+                final_video_path,
+                step=final_round,
+                fps=int(cfg.policy_frequency),
+            )
     finally:
         if rollout_executor is not None:
             rollout_executor.shutdown(wait=True, cancel_futures=True)

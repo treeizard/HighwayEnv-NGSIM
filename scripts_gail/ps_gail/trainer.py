@@ -905,6 +905,43 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
     )
 
 
+def collect_round_rollouts(
+    env: gym.Env,
+    policy: nn.Module,
+    cfg: PSGAILConfig,
+    device: torch.device,
+    policy_obs_dim: int,
+    *,
+    round_idx: int,
+    rollout_executor,
+) -> RolloutBatch:
+    target_agent_steps = max(0, int(getattr(cfg, "rollout_target_agent_steps", 0)))
+    worker_stride = max(1, int(cfg.num_rollout_workers))
+    batches: list[RolloutBatch] = []
+    attempt = 0
+    while True:
+        seed_offset = (int(round_idx) - 1) * worker_stride + attempt * 1_000_003
+        batch = collect_rollouts(
+            env,
+            policy,
+            cfg,
+            device,
+            policy_obs_dim,
+            seed_offset=seed_offset,
+            executor=rollout_executor,
+        )
+        batches.append(batch)
+        agent_steps = sum(int(item.num_agent_steps) for item in batches)
+        if target_agent_steps <= 0 or agent_steps >= target_agent_steps:
+            break
+        attempt += 1
+        print(
+            f"[round {round_idx:04d}] accumulating rollout agent_steps="
+            f"{agent_steps}/{target_agent_steps}"
+        )
+    return batches[0] if len(batches) == 1 else merge_rollout_batches(batches, cfg)
+
+
 def _rollout_worker(
     cfg: PSGAILConfig,
     policy_state_dict: dict[str, torch.Tensor],

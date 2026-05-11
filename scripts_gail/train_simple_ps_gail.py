@@ -6,7 +6,6 @@ import os
 import sys
 import warnings
 from dataclasses import fields
-from dataclasses import replace
 
 import numpy as np
 import torch
@@ -36,103 +35,21 @@ from scripts_gail.ps_gail.models import (
     make_actor_critic,
 )
 from scripts_gail.ps_gail.observations import flatten_agent_observations, policy_observations_from_flat
+from scripts_gail.ps_gail.schedule import config_for_round
 from scripts_gail.ps_gail.trainer import (
-    collect_rollouts,
     action_conditioned_features,
+    collect_round_rollouts,
     discrete_action_masks_from_env,
     discriminator_input_mode,
     infer_continuous_action_dim,
     infer_policy_obs_dim,
     make_rollout_executor,
-    merge_rollout_batches,
     policy_action_dim,
     refresh_rollout_rewards,
     resolve_device,
     update_discriminator,
     update_policy,
 )
-
-
-def _clamp_fraction(value: float) -> float:
-    return float(min(1.0, max(1e-6, float(value))))
-
-
-def config_for_round(cfg: PSGAILConfig, round_idx: int) -> PSGAILConfig:
-    if bool(getattr(cfg, "paper_style_training", False)):
-        phase1_rounds = max(1, int(getattr(cfg, "paper_phase1_rounds", 1000)))
-        if int(round_idx) <= phase1_rounds:
-            interval = max(1, int(getattr(cfg, "paper_agent_increment_interval", 200)))
-            increments = (max(1, int(round_idx)) - 1) // interval
-            agent_count = int(getattr(cfg, "paper_initial_agent_count", 10)) + increments * int(
-                getattr(cfg, "paper_agent_increment", 10)
-            )
-            return replace(
-                cfg,
-                control_all_vehicles=False,
-                percentage_controlled_vehicles=float(max(1, agent_count)),
-                gamma=float(getattr(cfg, "paper_phase1_gamma", 0.95)),
-                rollout_target_agent_steps=max(1, int(getattr(cfg, "paper_phase1_agent_steps", 10_000))),
-            )
-        return replace(
-            cfg,
-            control_all_vehicles=False,
-            percentage_controlled_vehicles=float(max(1, int(getattr(cfg, "paper_phase2_agent_count", 100)))),
-            gamma=float(getattr(cfg, "paper_phase2_gamma", 0.99)),
-            rollout_target_agent_steps=max(1, int(getattr(cfg, "paper_phase2_agent_steps", 40_000))),
-        )
-
-    if not bool(cfg.controlled_vehicle_curriculum):
-        return cfg
-
-    curriculum_rounds = max(1, int(cfg.controlled_vehicle_curriculum_rounds))
-    progress = 1.0 if curriculum_rounds == 1 else (
-        min(1.0, max(0.0, (int(round_idx) - 1) / float(curriculum_rounds - 1)))
-    )
-    initial = _clamp_fraction(cfg.initial_controlled_vehicle_fraction)
-    final = _clamp_fraction(cfg.final_controlled_vehicle_fraction)
-    fraction = initial + (final - initial) * progress
-    return replace(
-        cfg,
-        control_all_vehicles=False,
-        percentage_controlled_vehicles=_clamp_fraction(fraction),
-    )
-
-
-def collect_round_rollouts(
-    env,
-    policy: torch.nn.Module,
-    round_cfg: PSGAILConfig,
-    device: torch.device,
-    policy_obs_dim: int,
-    *,
-    round_idx: int,
-    rollout_executor,
-):
-    target_agent_steps = max(0, int(getattr(round_cfg, "rollout_target_agent_steps", 0)))
-    worker_stride = max(1, int(round_cfg.num_rollout_workers))
-    batches = []
-    attempt = 0
-    while True:
-        seed_offset = (int(round_idx) - 1) * worker_stride + attempt * 1_000_003
-        batch = collect_rollouts(
-            env,
-            policy,
-            round_cfg,
-            device,
-            policy_obs_dim,
-            seed_offset=seed_offset,
-            executor=rollout_executor,
-        )
-        batches.append(batch)
-        agent_steps = sum(int(item.num_agent_steps) for item in batches)
-        if target_agent_steps <= 0 or agent_steps >= target_agent_steps:
-            break
-        attempt += 1
-        print(
-            f"[round {round_idx:04d}] accumulating rollout agent_steps="
-            f"{agent_steps}/{target_agent_steps}"
-        )
-    return batches[0] if len(batches) == 1 else merge_rollout_batches(batches, round_cfg)
 
 
 def env_signature(cfg: PSGAILConfig) -> tuple[object, ...]:
@@ -748,7 +665,10 @@ def main() -> None:
                 f"phase2_rounds={cfg.paper_phase2_rounds} "
                 f"phase2_gamma={cfg.paper_phase2_gamma} "
                 f"phase2_agent_steps={cfg.paper_phase2_agent_steps} "
-                f"phase2_agents={cfg.paper_phase2_agent_count}"
+                f"phase2_agents={cfg.paper_phase2_agent_count} "
+                f"phase2_ramp={cfg.paper_phase2_initial_agent_count}->"
+                f"{cfg.paper_phase2_agent_count}/"
+                f"{cfg.paper_phase2_agent_ramp_rounds}rounds"
             )
 
         if int(cfg.bc_pretrain_epochs) > 0:
@@ -809,6 +729,8 @@ def main() -> None:
             )
             monitor.save(bc_path)
         rollout_executor = make_rollout_executor(cfg)
+        last_checkpoint_video_path = None
+        last_checkpoint_video_round = 0
 
         for round_idx in range(1, int(cfg.total_rounds) + 1):
             round_cfg = config_for_round(cfg, round_idx)
@@ -1125,6 +1047,8 @@ def main() -> None:
                     device=device,
                 )
                 if video_path is not None:
+                    last_checkpoint_video_path = video_path
+                    last_checkpoint_video_round = round_idx
                     monitor.log_video(
                         "checkpoint/policy_video",
                         video_path,
@@ -1132,10 +1056,12 @@ def main() -> None:
                         fps=int(round_cfg.policy_frequency),
                     )
 
+        final_round = int(cfg.total_rounds)
+        final_round_cfg = config_for_round(cfg, final_round)
         final_path = os.path.join(run_dir, "final.pt")
         torch.save(
             {
-                "round": int(cfg.total_rounds),
+                "round": final_round,
                 "policy_state_dict": policy.state_dict(),
                 "discriminator_state_dict": discriminator.state_dict(),
                 "scene_discriminator_state_dict": scene_discriminator.state_dict()
@@ -1149,23 +1075,31 @@ def main() -> None:
                 "discriminator_type": discriminator_name,
                 "expert_metadata": checkpoint_expert_metadata(expert_metadata),
                 "config": vars(cfg),
-                "round_config": vars(config_for_round(cfg, int(cfg.total_rounds))),
+                "round_config": vars(final_round_cfg),
             },
             final_path,
         )
         monitor.save(final_path)
-        final_video_path = save_checkpoint_video(
-            policy,
-            config_for_round(cfg, int(cfg.total_rounds)),
-            run_dir=run_dir,
-            round_idx=int(cfg.total_rounds),
-            device=device,
+        final_video_path = (
+            last_checkpoint_video_path
+            if last_checkpoint_video_round == final_round
+            else None
         )
+        if final_video_path is None or not (
+            int(cfg.checkpoint_every) > 0 and final_round % int(cfg.checkpoint_every) == 0
+        ):
+            final_video_path = save_checkpoint_video(
+                policy,
+                final_round_cfg,
+                run_dir=run_dir,
+                round_idx=final_round,
+                device=device,
+            )
         if final_video_path is not None:
             monitor.log_video(
                 "checkpoint/final_policy_video",
                 final_video_path,
-                step=int(cfg.total_rounds),
+                step=final_round,
                 fps=int(cfg.policy_frequency),
             )
     finally:

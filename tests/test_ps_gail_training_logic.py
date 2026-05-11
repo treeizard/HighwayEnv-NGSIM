@@ -677,3 +677,36 @@ def test_paper_style_ps_gail_schedule_uses_stepwise_agent_counts_and_phases():
         40_000,
     ]
     assert all(item.control_all_vehicles is False for item in round_cfgs)
+
+
+def test_paper_style_phase2_agent_ramp_is_shared_with_airl():
+    cfg = PSGAILConfig(
+        paper_style_training=True,
+        total_rounds=8,
+        paper_phase1_rounds=4,
+        paper_phase2_rounds=4,
+        paper_initial_agent_count=10,
+        paper_agent_increment=10,
+        paper_agent_increment_interval=2,
+        paper_phase2_initial_agent_count=20,
+        paper_phase2_agent_count=40,
+        paper_phase2_agent_ramp_rounds=3,
+        paper_phase1_agent_steps=10_000,
+        paper_phase2_agent_steps=40_000,
+    )
+
+    ps_gail_counts = [
+        ps_gail_config_for_round(cfg, round_idx).percentage_controlled_vehicles
+        for round_idx in range(1, 9)
+    ]
+    airl_counts = [
+        airl_config_for_round(cfg, round_idx).percentage_controlled_vehicles
+        for round_idx in range(1, 9)
+    ]
+
+    assert ps_gail_counts == [10.0, 10.0, 20.0, 20.0, 20.0, 30.0, 40.0, 40.0]
+    assert airl_counts == ps_gail_counts
+    assert [airl_config_for_round(cfg, round_idx).rollout_target_agent_steps for round_idx in (4, 5)] == [
+        10_000,
+        40_000,
+    ]

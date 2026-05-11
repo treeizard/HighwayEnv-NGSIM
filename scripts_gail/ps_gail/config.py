@@ -41,6 +41,8 @@ class PSGAILConfig:
     paper_agent_increment: int = 10
     paper_agent_increment_interval: int = 200
     paper_phase2_agent_count: int = 100
+    paper_phase2_initial_agent_count: int = 0
+    paper_phase2_agent_ramp_rounds: int = 0
     rollout_target_agent_steps: int = 0
     enable_collision: bool = True
     terminate_when_all_controlled_crashed: bool = True
