@@ -17,9 +17,9 @@ export PYTHONPATH="${REPODIR}:${PYTHONPATH:-}"
 
 # PS-AIRL uses the AIRL reward model with the same paper-style controlled-vehicle
 # schedule as PS-GAIL. Rollouts run in CPU workers while PyTorch updates use GPU.
-ROLLOUT_WORKER_THREADS="${ROLLOUT_WORKER_THREADS:-2}"
 SLURM_CPUS="${SLURM_CPUS_PER_TASK:-32}"
-ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-$((SLURM_CPUS / ROLLOUT_WORKER_THREADS))}"
+ROLLOUT_WORKER_THREADS="${ROLLOUT_WORKER_THREADS:-2}"
+ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-16}"
 if [ "${ROLLOUT_WORKERS}" -lt 1 ]; then
     ROLLOUT_WORKERS=1
 fi
@@ -77,15 +77,37 @@ PAPER_PHASE2_INITIAL_AGENT_COUNT="${PAPER_PHASE2_INITIAL_AGENT_COUNT:-50}"
 PAPER_PHASE2_AGENT_COUNT="${PAPER_PHASE2_AGENT_COUNT:-100}"
 PAPER_PHASE2_AGENT_RAMP_ROUNDS="${PAPER_PHASE2_AGENT_RAMP_ROUNDS:-100}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
-REWARD_BATCH_SIZE="${REWARD_BATCH_SIZE:-4096}"
-HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
 DISC_LEARNING_RATE="${DISC_LEARNING_RATE:-5e-5}"
 DISC_UPDATES_PER_ROUND="${DISC_UPDATES_PER_ROUND:-2}"
-DISC_EXPERT_LABEL="${DISC_EXPERT_LABEL:-0.9}"
-DISC_GENERATOR_LABEL="${DISC_GENERATOR_LABEL:-0.1}"
+DISC_BATCH_SIZE="${DISC_BATCH_SIZE:-4096}"
+REWARD_BATCH_SIZE="${REWARD_BATCH_SIZE:-${DISC_BATCH_SIZE}}"
+DISC_EXPERT_LABEL="${DISC_EXPERT_LABEL:-0.8}"
+DISC_GENERATOR_LABEL="${DISC_GENERATOR_LABEL:-0.2}"
+BC_PRETRAIN_EPOCHS="${BC_PRETRAIN_EPOCHS:-0}"
+BC_PRETRAIN_LEARNING_RATE="${BC_PRETRAIN_LEARNING_RATE:-3e-4}"
+BC_PRETRAIN_BATCH_SIZE="${BC_PRETRAIN_BATCH_SIZE:-4096}"
+BC_PRETRAIN_VALIDATION_FRACTION="${BC_PRETRAIN_VALIDATION_FRACTION:-0.1}"
+BC_PRETRAIN_EVAL_EPISODES="${BC_PRETRAIN_EVAL_EPISODES:-4}"
+BC_PRETRAIN_MIN_MEAN_EPISODE_LENGTH="${BC_PRETRAIN_MIN_MEAN_EPISODE_LENGTH:-0}"
+BC_PRETRAIN_ABORT_ON_FAILED_EVAL="${BC_PRETRAIN_ABORT_ON_FAILED_EVAL:-false}"
+DISCRIMINATOR_LOSS="${DISCRIMINATOR_LOSS:-wgan_gp}"
+WGAN_GP_LAMBDA="${WGAN_GP_LAMBDA:-2.0}"
+WGAN_REWARD_CENTER="${WGAN_REWARD_CENTER:-true}"
+WGAN_REWARD_CLIP="${WGAN_REWARD_CLIP:-2.0}"
+WGAN_REWARD_SCALE="${WGAN_REWARD_SCALE:-1.0}"
+COLLISION_PENALTY="${COLLISION_PENALTY:-2.0}"
+OFFROAD_PENALTY="${OFFROAD_PENALTY:-2.0}"
+GAIL_REWARD_CLIP="${GAIL_REWARD_CLIP:-5.0}"
+FINAL_REWARD_CLIP="${FINAL_REWARD_CLIP:-10.0}"
+POLICY_MODEL="${POLICY_MODEL:-transformer}"
+HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
+TRANSFORMER_LAYERS="${TRANSFORMER_LAYERS:-2}"
+TRANSFORMER_HEADS="${TRANSFORMER_HEADS:-4}"
+TRANSFORMER_DROPOUT="${TRANSFORMER_DROPOUT:-0.1}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-50}"
 SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-true}"
 CHECKPOINT_VIDEO_STEPS="${CHECKPOINT_VIDEO_STEPS:-200}"
+TERMINATE_WHEN_ALL_CONTROLLED_CRASHED="${TERMINATE_WHEN_ALL_CONTROLLED_CRASHED:-true}"
 if [ "${PAPER_STYLE_TRAINING}" = "true" ]; then
     PAPER_STYLE_ARG="--paper-style-training"
 else
@@ -101,6 +123,21 @@ if [ "${SAVE_CHECKPOINT_VIDEO}" = "true" ]; then
 else
     CHECKPOINT_VIDEO_ARG="--no-save-checkpoint-video"
 fi
+if [ "${BC_PRETRAIN_ABORT_ON_FAILED_EVAL}" = "true" ]; then
+    BC_PRETRAIN_ABORT_ARG="--bc-pretrain-abort-on-failed-eval"
+else
+    BC_PRETRAIN_ABORT_ARG="--no-bc-pretrain-abort-on-failed-eval"
+fi
+if [ "${WGAN_REWARD_CENTER}" = "true" ]; then
+    WGAN_REWARD_CENTER_ARG="--wgan-reward-center"
+else
+    WGAN_REWARD_CENTER_ARG="--no-wgan-reward-center"
+fi
+if [ "${TERMINATE_WHEN_ALL_CONTROLLED_CRASHED}" = "true" ]; then
+    TERMINATION_ARG="--terminate-when-all-controlled-crashed"
+else
+    TERMINATION_ARG="--no-terminate-when-all-controlled-crashed"
+fi
 
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Expert data: ${EXPERT_DATA}"
@@ -115,9 +152,18 @@ echo "Requested rollout CPUs: ${REQUESTED_ROLLOUT_CPUS}"
 echo "Paper-style training: ${PAPER_STYLE_TRAINING}"
 echo "Paper schedule: phase1=${PAPER_PHASE1_ROUNDS} rounds, agents ${PAPER_INITIAL_AGENT_COUNT}+${PAPER_AGENT_INCREMENT}/${PAPER_AGENT_INCREMENT_INTERVAL} rounds; phase2=${PAPER_PHASE2_ROUNDS} rounds, ramp ${PAPER_PHASE2_INITIAL_AGENT_COUNT}->${PAPER_PHASE2_AGENT_COUNT}/${PAPER_PHASE2_AGENT_RAMP_ROUNDS} rounds"
 echo "Controlled-vehicle curriculum: ${CONTROLLED_VEHICLE_CURRICULUM_ARG}"
+echo "Policy model: ${POLICY_MODEL}"
+echo "Transformer: layers=${TRANSFORMER_LAYERS} heads=${TRANSFORMER_HEADS} dropout=${TRANSFORMER_DROPOUT}"
+echo "BC pretrain epochs: ${BC_PRETRAIN_EPOCHS}"
 echo "AIRL reward lr: ${DISC_LEARNING_RATE}"
 echo "AIRL reward updates per round: ${DISC_UPDATES_PER_ROUND}"
-echo "AIRL reward labels: expert=${DISC_EXPERT_LABEL}, generator=${DISC_GENERATOR_LABEL}"
+echo "AIRL reward batch size: ${REWARD_BATCH_SIZE}"
+echo "AIRL objective: ${DISCRIMINATOR_LOSS}"
+echo "AIRL reward labels (BCE only): expert=${DISC_EXPERT_LABEL}, generator=${DISC_GENERATOR_LABEL}"
+echo "WGAN-GP lambda: ${WGAN_GP_LAMBDA}"
+echo "WGAN reward center: ${WGAN_REWARD_CENTER}"
+echo "WGAN reward clip: ${WGAN_REWARD_CLIP}"
+echo "WGAN reward scale: ${WGAN_REWARD_SCALE}"
 echo "Checkpoint every: ${CHECKPOINT_EVERY}"
 echo "Save checkpoint video: ${SAVE_CHECKPOINT_VIDEO}"
 echo "CUDA devices: ${CUDA_VISIBLE_DEVICES:-unset}"
@@ -179,6 +225,12 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --paper-phase2-agent-count "${PAPER_PHASE2_AGENT_COUNT}" \
     --paper-phase2-agent-ramp-rounds "${PAPER_PHASE2_AGENT_RAMP_ROUNDS}" \
     --enable-collision \
+    --normalize-gail-reward \
+    --gail-reward-clip "${GAIL_REWARD_CLIP}" \
+    --collision-penalty "${COLLISION_PENALTY}" \
+    --offroad-penalty "${OFFROAD_PENALTY}" \
+    --final-reward-clip "${FINAL_REWARD_CLIP}" \
+    "${TERMINATION_ARG}" \
     --allow-idm \
     --device cuda \
     --total-rounds "${TOTAL_ROUNDS}" \
@@ -191,10 +243,25 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --num-rollout-workers "${ROLLOUT_WORKERS}" \
     --rollout-worker-threads "${ROLLOUT_WORKER_THREADS}" \
     --max-expert-samples "${MAX_EXPERT_SAMPLES}" \
+    --policy-model "${POLICY_MODEL}" \
     --hidden-size "${HIDDEN_SIZE}" \
+    --transformer-layers "${TRANSFORMER_LAYERS}" \
+    --transformer-heads "${TRANSFORMER_HEADS}" \
+    --transformer-dropout "${TRANSFORMER_DROPOUT}" \
     --batch-size "${BATCH_SIZE}" \
     --reward-batch-size "${REWARD_BATCH_SIZE}" \
-    --discriminator-loss airl_bce \
+    --bc-pretrain-epochs "${BC_PRETRAIN_EPOCHS}" \
+    --bc-pretrain-learning-rate "${BC_PRETRAIN_LEARNING_RATE}" \
+    --bc-pretrain-batch-size "${BC_PRETRAIN_BATCH_SIZE}" \
+    --bc-pretrain-validation-fraction "${BC_PRETRAIN_VALIDATION_FRACTION}" \
+    --bc-pretrain-eval-episodes "${BC_PRETRAIN_EVAL_EPISODES}" \
+    --bc-pretrain-min-mean-episode-length "${BC_PRETRAIN_MIN_MEAN_EPISODE_LENGTH}" \
+    "${BC_PRETRAIN_ABORT_ARG}" \
+    --discriminator-loss "${DISCRIMINATOR_LOSS}" \
+    --wgan-gp-lambda "${WGAN_GP_LAMBDA}" \
+    "${WGAN_REWARD_CENTER_ARG}" \
+    --wgan-reward-clip "${WGAN_REWARD_CLIP}" \
+    --wgan-reward-scale "${WGAN_REWARD_SCALE}" \
     --disc-learning-rate "${DISC_LEARNING_RATE}" \
     --disc-updates-per-round "${DISC_UPDATES_PER_ROUND}" \
     --disc-expert-label "${DISC_EXPERT_LABEL}" \
@@ -204,5 +271,5 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --checkpoint-video-steps "${CHECKPOINT_VIDEO_STEPS}" \
     --wandb-mode "${WANDB_MODE}" \
     --wandb-project highwayenv-ps-gail \
-    --wandb-tags ps-airl,airl,continuous,unified-expert,paper-style,gpu,32c,disc-updates-${DISC_UPDATES_PER_ROUND} \
+    --wandb-tags ps-airl,airl,${DISCRIMINATOR_LOSS},continuous,unified-expert,paper-style,gpu,32c,disc-updates-${DISC_UPDATES_PER_ROUND} \
     --run-name "${RUN_NAME}"

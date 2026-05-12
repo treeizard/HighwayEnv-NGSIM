@@ -35,6 +35,7 @@ from scripts_gail.ps_gail.trainer import (
     resolve_device,
     update_policy,
 )
+from scripts_gail.train_simple_ps_gail import behavior_clone_pretrain, evaluate_policy_survival
 
 
 class AIRLReward(nn.Module):
@@ -101,6 +102,39 @@ def _policy_log_probs(
     return dist.log_prob(actions)
 
 
+def _airl_wgan_gradient_penalty(
+    reward_model: AIRLReward,
+    expert_obs: torch.Tensor,
+    expert_actions: torch.Tensor,
+    expert_next_obs: torch.Tensor,
+    expert_dones: torch.Tensor,
+    gen_obs: torch.Tensor,
+    gen_actions: torch.Tensor,
+    gen_next_obs: torch.Tensor,
+    gen_dones: torch.Tensor,
+    *,
+    gamma: float,
+    gp_lambda: float,
+) -> torch.Tensor:
+    alpha = torch.rand((expert_obs.shape[0], 1), dtype=expert_obs.dtype, device=expert_obs.device)
+    obs = (alpha * expert_obs + (1.0 - alpha) * gen_obs).requires_grad_(True)
+    actions = (alpha * expert_actions + (1.0 - alpha) * gen_actions).requires_grad_(True)
+    next_obs = (alpha * expert_next_obs + (1.0 - alpha) * gen_next_obs).requires_grad_(True)
+    dones = (alpha.squeeze(-1) * expert_dones + (1.0 - alpha.squeeze(-1)) * gen_dones).requires_grad_(True)
+    scores = reward_model.shaped_logits(obs, actions, next_obs, dones, gamma=gamma)
+    gradients = torch.autograd.grad(
+        outputs=scores,
+        inputs=(obs, actions, next_obs, dones),
+        grad_outputs=torch.ones_like(scores),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )
+    flat_gradients = torch.cat([gradient.reshape(gradient.shape[0], -1) for gradient in gradients], dim=1)
+    gradient_norm = flat_gradients.norm(2, dim=1)
+    return float(gp_lambda) * torch.square(gradient_norm - 1.0).mean()
+
+
 def update_reward_model(
     reward_model: AIRLReward,
     optimizer: torch.optim.Optimizer,
@@ -132,11 +166,18 @@ def update_reward_model(
     policy.eval()
     reward_model.train()
     losses: list[torch.Tensor] = []
+    bce_losses: list[torch.Tensor] = []
+    wgan_losses: list[torch.Tensor] = []
+    gradient_penalties: list[torch.Tensor] = []
+    critic_gaps: list[torch.Tensor] = []
     expert_accs: list[torch.Tensor] = []
     gen_accs: list[torch.Tensor] = []
     expert_rewards: list[torch.Tensor] = []
     gen_rewards: list[torch.Tensor] = []
     batch_size = max(1, int(reward_batch_size))
+    loss_type = str(getattr(cfg, "discriminator_loss", "airl_bce")).lower()
+    if loss_type not in {"airl", "airl_bce", "bce", "wgan_gp"}:
+        raise ValueError(f"Unsupported AIRL discriminator_loss={loss_type!r}.")
 
     for _ in range(max(1, int(cfg.disc_updates_per_round))):
         permutation = torch.randperm(n, device=device)
@@ -150,31 +191,59 @@ def update_reward_model(
             ga = gen_actions_t[idx]
             gno = gen_next_obs_t[idx]
             gd = gen_dones_t[idx]
-            with torch.no_grad():
-                expert_log_pi = _policy_log_probs(policy, cfg, eo, ea)
-                gen_log_pi = _policy_log_probs(policy, cfg, go, ga)
             expert_shaped = reward_model.shaped_logits(eo, ea, eno, ed, gamma=float(cfg.gamma))
             gen_shaped = reward_model.shaped_logits(go, ga, gno, gd, gamma=float(cfg.gamma))
             expert_reward = reward_model(eo, ea)
             gen_reward = reward_model(go, ga)
-            expert_logits = expert_shaped - expert_log_pi
-            gen_logits = gen_shaped - gen_log_pi
-            logits = torch.cat([expert_logits, gen_logits], dim=0)
-            labels = torch.cat(
-                [
-                    torch.full_like(expert_logits, float(cfg.disc_expert_label)),
-                    torch.full_like(gen_logits, float(cfg.disc_generator_label)),
-                ],
-                dim=0,
-            )
-            loss = F.binary_cross_entropy_with_logits(logits, labels)
+            if loss_type == "wgan_gp":
+                wgan_loss = gen_shaped.mean() - expert_shaped.mean()
+                gradient_penalty = _airl_wgan_gradient_penalty(
+                    reward_model,
+                    eo,
+                    ea,
+                    eno,
+                    ed,
+                    go,
+                    ga,
+                    gno,
+                    gd,
+                    gamma=float(cfg.gamma),
+                    gp_lambda=float(getattr(cfg, "wgan_gp_lambda", 2.0)),
+                )
+                loss = wgan_loss + gradient_penalty
+            else:
+                with torch.no_grad():
+                    expert_log_pi = _policy_log_probs(policy, cfg, eo, ea)
+                    gen_log_pi = _policy_log_probs(policy, cfg, go, ga)
+                expert_logits = expert_shaped - expert_log_pi
+                gen_logits = gen_shaped - gen_log_pi
+                logits = torch.cat([expert_logits, gen_logits], dim=0)
+                labels = torch.cat(
+                    [
+                        torch.full_like(expert_logits, float(cfg.disc_expert_label)),
+                        torch.full_like(gen_logits, float(cfg.disc_generator_label)),
+                    ],
+                    dim=0,
+                )
+                bce_loss = F.binary_cross_entropy_with_logits(logits, labels)
+                loss = bce_loss
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(reward_model.parameters(), float(cfg.max_grad_norm))
             optimizer.step()
             with torch.no_grad():
-                expert_accs.append((expert_logits > 0.0).float().mean())
-                gen_accs.append((gen_logits < 0.0).float().mean())
+                if loss_type == "wgan_gp":
+                    centered_threshold = 0.5 * (expert_shaped.mean() + gen_shaped.mean())
+                    expert_accs.append((expert_shaped > centered_threshold).float().mean())
+                    gen_accs.append((gen_shaped < centered_threshold).float().mean())
+                    wgan_losses.append(wgan_loss.detach())
+                    gradient_penalties.append(gradient_penalty.detach())
+                    critic_gaps.append((expert_shaped.mean() - gen_shaped.mean()).detach())
+                else:
+                    expert_accs.append((expert_logits > 0.0).float().mean())
+                    gen_accs.append((gen_logits < 0.0).float().mean())
+                    bce_losses.append(bce_loss.detach())
+                    critic_gaps.append((expert_logits.mean() - gen_logits.mean()).detach())
                 expert_rewards.append(expert_reward.mean())
                 gen_rewards.append(gen_reward.mean())
             losses.append(loss.detach())
@@ -184,6 +253,10 @@ def update_reward_model(
 
     return {
         "reward_loss": mean(losses),
+        "bce_loss": mean(bce_losses),
+        "wgan_loss": mean(wgan_losses),
+        "gradient_penalty": mean(gradient_penalties),
+        "critic_gap": mean(critic_gaps),
         "expert_acc": mean(expert_accs),
         "gen_acc": mean(gen_accs),
         "expert_reward": mean(expert_rewards),
@@ -210,9 +283,20 @@ def refresh_airl_rewards(
             _as_tensor(rollout.dones.astype(np.float32), device=device),
             gamma=float(cfg.gamma),
         ).detach().cpu().numpy().astype(np.float32)
-    # Canonical AIRL trains the policy on log D - log(1-D), which simplifies to
-    # f(s,a,s') - log pi(a|s) for D = exp(f)/(exp(f) + pi(a|s)).
-    shaped = (shaped_logits - rollout.old_log_probs).astype(np.float32, copy=True)
+    if str(getattr(cfg, "discriminator_loss", "airl_bce")).lower() == "wgan_gp":
+        shaped = shaped_logits.astype(np.float32, copy=True)
+        if bool(getattr(cfg, "wgan_reward_center", False)) and shaped.size > 1:
+            shaped = shaped - shaped.mean()
+        reward_scale = float(getattr(cfg, "wgan_reward_scale", 1.0))
+        if reward_scale != 1.0:
+            shaped = shaped * reward_scale
+        wgan_clip = float(getattr(cfg, "wgan_reward_clip", 0.0))
+        if wgan_clip > 0.0:
+            shaped = np.clip(shaped, -wgan_clip, wgan_clip)
+    else:
+        # Canonical AIRL trains the policy on log D - log(1-D), which simplifies to
+        # f(s,a,s') - log pi(a|s) for D = exp(f)/(exp(f) + pi(a|s)).
+        shaped = (shaped_logits - rollout.old_log_probs).astype(np.float32, copy=True)
     if bool(cfg.normalize_gail_reward) and shaped.size > 1:
         shaped = (shaped - shaped.mean()) / (shaped.std() + 1e-8)
     if float(cfg.gail_reward_clip) > 0.0:
@@ -299,8 +383,14 @@ def parse_args() -> tuple[PSGAILConfig, int]:
     defaults = PSGAILConfig(
         action_mode="continuous",
         run_name="simple_airl",
-        discriminator_loss="airl_bce",
-        disc_learning_rate=1e-4,
+        policy_model="transformer",
+        batch_size=4096,
+        disc_batch_size=4096,
+        discriminator_loss="wgan_gp",
+        disc_learning_rate=5e-5,
+        disc_updates_per_round=2,
+        disc_expert_label=0.8,
+        disc_generator_label=0.2,
     )
     parser = argparse.ArgumentParser(description="Lightweight continuous AIRL test trainer for unified NGSIM expert data.")
     for field in fields(PSGAILConfig):
@@ -310,7 +400,7 @@ def parse_args() -> tuple[PSGAILConfig, int]:
             parser.add_argument(arg, action=argparse.BooleanOptionalAction, default=value)
         else:
             parser.add_argument(arg, type=type(value), default=value)
-    parser.add_argument("--reward-batch-size", type=int, default=1024)
+    parser.add_argument("--reward-batch-size", type=int, default=int(defaults.disc_batch_size))
     args = parser.parse_args()
     values = vars(args)
     reward_batch_size = int(values.pop("reward_batch_size"))
@@ -322,11 +412,10 @@ def main() -> None:
     if str(cfg.action_mode).lower() != "continuous":
         raise ValueError("This AIRL test trainer currently supports --action-mode continuous only.")
     airl_objective = str(cfg.discriminator_loss).lower()
-    if airl_objective not in {"airl", "airl_bce", "bce"}:
+    if airl_objective not in {"airl", "airl_bce", "bce", "wgan_gp"}:
         raise ValueError(
-            "train_simple_airl.py implements canonical BCE AIRL. "
-            f"Received discriminator_loss={cfg.discriminator_loss!r}; WGAN/WGAN-GP is a "
-            "WAIL-style objective and should use a separate trainer/objective."
+            "train_simple_airl.py supports canonical BCE AIRL and WGAN-GP AIRL-style training. "
+            f"Received discriminator_loss={cfg.discriminator_loss!r}."
         )
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -372,7 +461,23 @@ def main() -> None:
 
         print(f"Loaded expert folder: {os.path.abspath(cfg.expert_data)}")
         print(f"expert_obs={expert.policy_observations.shape} expert_actions={expert.actions_continuous_env.shape}")
-        print(f"policy_obs_dim={policy_obs_dim} action_dim={cfg.continuous_action_dim} device={device}")
+        print(
+            f"policy_obs_dim={policy_obs_dim} action_dim={cfg.continuous_action_dim} device={device} "
+            f"policy_model={cfg.policy_model} transformer_layers={cfg.transformer_layers} "
+            f"transformer_heads={cfg.transformer_heads} transformer_dropout={cfg.transformer_dropout} "
+            f"airl_objective={cfg.discriminator_loss} wgan_gp_lambda={cfg.wgan_gp_lambda} "
+            f"wgan_reward_center={cfg.wgan_reward_center} wgan_reward_clip={cfg.wgan_reward_clip} "
+            f"wgan_reward_scale={cfg.wgan_reward_scale}"
+        )
+        if int(cfg.bc_pretrain_epochs) > 0:
+            print(
+                "bc_pretrain="
+                f"epochs={cfg.bc_pretrain_epochs} "
+                f"batch={cfg.bc_pretrain_batch_size} "
+                f"lr={cfg.bc_pretrain_learning_rate} "
+                f"val_fraction={cfg.bc_pretrain_validation_fraction} "
+                f"eval_episodes={cfg.bc_pretrain_eval_episodes}"
+            )
         if cfg.controlled_vehicle_curriculum:
             print(
                 "controlled_vehicle_curriculum="
@@ -397,6 +502,63 @@ def main() -> None:
                 f"{cfg.paper_phase2_agent_count}/"
                 f"{cfg.paper_phase2_agent_ramp_rounds}rounds"
             )
+
+        if int(cfg.bc_pretrain_epochs) > 0:
+            bc_stats = behavior_clone_pretrain(policy, expert, cfg, device)
+            bc_eval_stats = evaluate_policy_survival(
+                policy,
+                env_cfg,
+                device,
+                episodes=int(cfg.bc_pretrain_eval_episodes),
+                seed_offset=50_000,
+            )
+            print(
+                "[bc final] "
+                f"train_mse={bc_stats['bc/train_mse']:.6f} "
+                f"train_mae={bc_stats['bc/train_mae']:.6f} "
+                f"val_mse={bc_stats['bc/val_mse']:.6f} "
+                f"val_mae={bc_stats['bc/val_mae']:.6f}"
+            )
+            if bc_eval_stats:
+                print(
+                    "[bc env_eval] "
+                    f"episodes={int(bc_eval_stats['bc_eval/episodes'])} "
+                    f"ep_len={bc_eval_stats['bc_eval/mean_episode_length']:.1f}"
+                    f"[{int(bc_eval_stats['bc_eval/min_episode_length'])},"
+                    f"{int(bc_eval_stats['bc_eval/max_episode_length'])}] "
+                    f"crash_eps={int(bc_eval_stats['bc_eval/crash_episodes'])} "
+                    f"offroad_eps={int(bc_eval_stats['bc_eval/offroad_episodes'])} "
+                    f"veh={bc_eval_stats['bc_eval/mean_controlled_vehicles']:.1f}/"
+                    f"{bc_eval_stats['bc_eval/mean_road_vehicles']:.1f}"
+                )
+                min_mean_len = float(cfg.bc_pretrain_min_mean_episode_length)
+                if (
+                    min_mean_len > 0.0
+                    and bc_eval_stats["bc_eval/mean_episode_length"] < min_mean_len
+                ):
+                    message = (
+                        "BC env validation did not reach the requested mean episode length: "
+                        f"{bc_eval_stats['bc_eval/mean_episode_length']:.1f} < {min_mean_len:.1f}."
+                    )
+                    if bool(cfg.bc_pretrain_abort_on_failed_eval):
+                        raise RuntimeError(message)
+                    warnings.warn(message, RuntimeWarning, stacklevel=2)
+            monitor.log({**bc_stats, **bc_eval_stats}, step=0)
+            bc_path = os.path.join(ckpt_dir, "bc_pretrained.pt")
+            torch.save(
+                {
+                    "round": 0,
+                    "policy_state_dict": policy.state_dict(),
+                    "reward_state_dict": reward_model.state_dict(),
+                    "expert_metadata": expert.metadata,
+                    "config": vars(cfg),
+                    "round_config": vars(env_cfg),
+                    "bc_stats": bc_stats,
+                    "bc_eval_stats": bc_eval_stats,
+                },
+                bc_path,
+            )
+            monitor.save(bc_path)
 
         last_checkpoint_video_path = None
         last_checkpoint_video_round = 0
@@ -444,12 +606,21 @@ def main() -> None:
                 f"ctrl_frac={round_cfg.percentage_controlled_vehicles:.4f} "
                 f"veh={rollout.mean_controlled_vehicles:.1f}/{rollout.mean_road_vehicles:.1f} "
                 f"reward_loss={reward_stats['reward_loss']:.4f} "
+                + (
+                    f"gap={reward_stats['critic_gap']:.4f} "
+                    f"wgan_loss={reward_stats['wgan_loss']:.4f} "
+                    f"gp={reward_stats['gradient_penalty']:.4f} "
+                    if str(round_cfg.discriminator_loss).lower() == "wgan_gp"
+                    else ""
+                )
+                + (
                 f"expert_acc={reward_stats['expert_acc']:.3f} gen_acc={reward_stats['gen_acc']:.3f} "
                 f"policy_loss={policy_stats['policy_loss']:.4f} value_loss={policy_stats['value_loss']:.4f} "
                 f"kl={policy_stats['approx_kl']:.5f} entropy={policy_stats['entropy']:.4f} "
                 f"clip={policy_stats['clip_fraction']:.3f} "
                 f"airl_reward={reward_stats['expert_reward']:.3f}/{reward_stats['gen_reward']:.3f} "
                 f"reward={float(rollout.rewards.mean()):.4f}"
+                )
             )
             metrics = {
                 "round": round_idx,
@@ -469,10 +640,21 @@ def main() -> None:
                 "rollout/mean_reward": float(rollout.rewards.mean()),
                 "rollout/reward_std": float(rollout.rewards.std()),
                 "airl/reward_loss": reward_stats["reward_loss"],
+                "airl/bce_loss": reward_stats["bce_loss"],
+                "airl/wgan_loss": reward_stats["wgan_loss"],
+                "airl/gradient_penalty": reward_stats["gradient_penalty"],
+                "airl/critic_gap": reward_stats["critic_gap"],
                 "airl/expert_acc": reward_stats["expert_acc"],
                 "airl/gen_acc": reward_stats["gen_acc"],
                 "airl/expert_reward": reward_stats["expert_reward"],
                 "airl/gen_reward": reward_stats["gen_reward"],
+                "train/discriminator_loss_type_wgan_gp": int(
+                    str(round_cfg.discriminator_loss).lower() == "wgan_gp"
+                ),
+                "train/wgan_gp_lambda": float(round_cfg.wgan_gp_lambda),
+                "train/wgan_reward_center": int(bool(round_cfg.wgan_reward_center)),
+                "train/wgan_reward_clip": float(round_cfg.wgan_reward_clip),
+                "train/wgan_reward_scale": float(round_cfg.wgan_reward_scale),
                 "policy/loss": policy_stats["policy_loss"],
                 "policy/value_loss": policy_stats["value_loss"],
                 "policy/entropy": policy_stats["entropy"],
