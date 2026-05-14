@@ -5,76 +5,102 @@ from dataclasses import replace
 from .config import PSGAILConfig
 
 
-def _clamp_fraction(value: float) -> float:
-    return float(min(1.0, max(1e-6, float(value))))
+def _positive_value(value: float | int, *, name: str) -> float:
+    value = float(value)
+    if value <= 0.0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return value
 
 
-def _phase1_agent_count(cfg: PSGAILConfig, round_idx: int) -> int:
-    interval = max(1, int(getattr(cfg, "paper_agent_increment_interval", 200)))
-    increments = (max(1, int(round_idx)) - 1) // interval
-    return max(
-        1,
-        int(getattr(cfg, "paper_initial_agent_count", 10))
-        + increments * int(getattr(cfg, "paper_agent_increment", 10)),
+def _linear_schedule(
+    *,
+    start: float,
+    end: float,
+    round_idx: int,
+    rounds: int,
+) -> float:
+    rounds = max(1, int(rounds))
+    if rounds == 1:
+        return float(end)
+    progress = min(1.0, max(0.0, (int(round_idx) - 1) / float(rounds - 1)))
+    return float(start + (end - start) * progress)
+
+
+def _scheduled_controlled_vehicles(cfg: PSGAILConfig, round_idx: int) -> float:
+    start = _positive_value(
+        cfg.initial_controlled_vehicles,
+        name="initial_controlled_vehicles",
+    )
+    end = _positive_value(
+        cfg.final_controlled_vehicles,
+        name="final_controlled_vehicles",
+    )
+    return _linear_schedule(
+        start=start,
+        end=end,
+        round_idx=int(round_idx),
+        rounds=int(cfg.controlled_vehicle_curriculum_rounds),
     )
 
 
-def _phase2_agent_count(cfg: PSGAILConfig, phase2_round_idx: int) -> int:
-    final_count = max(1, int(getattr(cfg, "paper_phase2_agent_count", 100)))
-    ramp_rounds = max(0, int(getattr(cfg, "paper_phase2_agent_ramp_rounds", 0)))
-    initial_count = int(getattr(cfg, "paper_phase2_initial_agent_count", 0))
-    if ramp_rounds <= 0 or initial_count <= 0:
-        return final_count
-    if ramp_rounds == 1:
-        return final_count
+def _scheduled_rollout_target_agent_steps(cfg: PSGAILConfig, round_idx: int) -> int:
+    start = int(cfg.initial_rollout_target_agent_steps)
+    end = int(cfg.final_rollout_target_agent_steps)
+    if start <= 0 and end <= 0:
+        return int(cfg.rollout_target_agent_steps)
+    if start <= 0:
+        start = (
+            int(cfg.rollout_target_agent_steps)
+            if int(cfg.rollout_target_agent_steps) > 0
+            else end
+        )
+    if end <= 0:
+        end = start
+    return max(
+        1,
+        int(
+            round(
+                _linear_schedule(
+                    start=float(start),
+                    end=float(end),
+                    round_idx=int(round_idx),
+                    rounds=int(cfg.rollout_target_agent_steps_curriculum_rounds),
+                )
+            )
+        ),
+    )
 
-    start = max(1, initial_count)
-    progress = min(1.0, max(0.0, (int(phase2_round_idx) - 1) / float(ramp_rounds - 1)))
-    count = round(start + (final_count - start) * progress)
-    return max(1, int(count))
+
+def _scheduled_gamma(cfg: PSGAILConfig, round_idx: int) -> float:
+    start = (
+        float(cfg.initial_gamma)
+        if float(cfg.initial_gamma) > 0.0
+        else float(cfg.gamma)
+    )
+    end = float(cfg.final_gamma) if float(cfg.final_gamma) > 0.0 else start
+    if int(cfg.gamma_curriculum_rounds) <= 0 and float(cfg.final_gamma) <= 0.0:
+        return float(cfg.gamma)
+    return _linear_schedule(
+        start=start,
+        end=end,
+        round_idx=int(round_idx),
+        rounds=int(cfg.gamma_curriculum_rounds),
+    )
 
 
 def config_for_round(cfg: PSGAILConfig, round_idx: int) -> PSGAILConfig:
-    if bool(getattr(cfg, "paper_style_training", False)):
-        phase1_rounds = max(1, int(getattr(cfg, "paper_phase1_rounds", 1000)))
-        if int(round_idx) <= phase1_rounds:
-            return replace(
-                cfg,
-                control_all_vehicles=False,
-                percentage_controlled_vehicles=float(_phase1_agent_count(cfg, round_idx)),
-                gamma=float(getattr(cfg, "paper_phase1_gamma", 0.95)),
-                rollout_target_agent_steps=max(
-                    1,
-                    int(getattr(cfg, "paper_phase1_agent_steps", 10_000)),
-                ),
-            )
+    percentage_controlled_vehicles = float(cfg.percentage_controlled_vehicles)
+    if bool(cfg.controlled_vehicle_curriculum):
+        percentage_controlled_vehicles = _scheduled_controlled_vehicles(cfg, round_idx)
 
-        phase2_round_idx = int(round_idx) - phase1_rounds
-        return replace(
-            cfg,
-            control_all_vehicles=False,
-            percentage_controlled_vehicles=float(_phase2_agent_count(cfg, phase2_round_idx)),
-            gamma=float(getattr(cfg, "paper_phase2_gamma", 0.99)),
-            rollout_target_agent_steps=max(
-                1,
-                int(getattr(cfg, "paper_phase2_agent_steps", 40_000)),
-            ),
-        )
-
-    if not bool(cfg.controlled_vehicle_curriculum):
-        return cfg
-
-    curriculum_rounds = max(1, int(cfg.controlled_vehicle_curriculum_rounds))
-    progress = (
-        1.0
-        if curriculum_rounds == 1
-        else min(1.0, max(0.0, (int(round_idx) - 1) / float(curriculum_rounds - 1)))
-    )
-    initial = _clamp_fraction(cfg.initial_controlled_vehicle_fraction)
-    final = _clamp_fraction(cfg.final_controlled_vehicle_fraction)
-    fraction = initial + (final - initial) * progress
     return replace(
         cfg,
-        control_all_vehicles=False,
-        percentage_controlled_vehicles=_clamp_fraction(fraction),
+        control_all_vehicles=(
+            False
+            if bool(cfg.controlled_vehicle_curriculum)
+            else bool(cfg.control_all_vehicles)
+        ),
+        percentage_controlled_vehicles=percentage_controlled_vehicles,
+        rollout_target_agent_steps=_scheduled_rollout_target_agent_steps(cfg, round_idx),
+        gamma=_scheduled_gamma(cfg, round_idx),
     )

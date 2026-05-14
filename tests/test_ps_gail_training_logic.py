@@ -629,8 +629,8 @@ def test_airl_controlled_vehicle_curriculum_matches_ps_gail_schedule():
         controlled_vehicle_curriculum=True,
         control_all_vehicles=True,
         percentage_controlled_vehicles=1.0,
-        initial_controlled_vehicle_fraction=0.2,
-        final_controlled_vehicle_fraction=0.8,
+        initial_controlled_vehicles=0.2,
+        final_controlled_vehicles=0.8,
         controlled_vehicle_curriculum_rounds=4,
     )
 
@@ -643,70 +643,65 @@ def test_airl_controlled_vehicle_curriculum_matches_ps_gail_schedule():
     assert airl_config_for_round(cfg, 1).control_all_vehicles is False
 
 
-def test_paper_style_ps_gail_schedule_uses_stepwise_agent_counts_and_phases():
+def test_absolute_controlled_vehicle_curriculum_is_shared_by_ps_gail_and_airl():
     cfg = PSGAILConfig(
-        paper_style_training=True,
         total_rounds=6,
-        paper_phase1_rounds=4,
-        paper_phase2_rounds=2,
-        paper_initial_agent_count=10,
-        paper_agent_increment=10,
-        paper_agent_increment_interval=2,
-        paper_phase2_agent_count=100,
-        paper_phase1_agent_steps=10_000,
-        paper_phase2_agent_steps=40_000,
+        controlled_vehicle_curriculum=True,
+        initial_controlled_vehicles=10,
+        final_controlled_vehicles=100,
+        controlled_vehicle_curriculum_rounds=6,
+        initial_rollout_target_agent_steps=10_000,
+        final_rollout_target_agent_steps=40_000,
+        rollout_target_agent_steps_curriculum_rounds=6,
+        initial_gamma=0.95,
+        final_gamma=0.99,
+        gamma_curriculum_rounds=6,
     )
 
     round_cfgs = [ps_gail_config_for_round(cfg, round_idx) for round_idx in range(1, 7)]
+    airl_round_cfgs = [airl_config_for_round(cfg, round_idx) for round_idx in range(1, 7)]
 
-    assert [item.percentage_controlled_vehicles for item in round_cfgs] == [
-        10.0,
-        10.0,
-        20.0,
-        20.0,
-        100.0,
-        100.0,
+    np.testing.assert_allclose(
+        [item.percentage_controlled_vehicles for item in round_cfgs],
+        [10.0, 28.0, 46.0, 64.0, 82.0, 100.0],
+    )
+    assert [item.percentage_controlled_vehicles for item in airl_round_cfgs] == [
+        item.percentage_controlled_vehicles for item in round_cfgs
     ]
-    np.testing.assert_allclose([item.gamma for item in round_cfgs], [0.95, 0.95, 0.95, 0.95, 0.99, 0.99])
+    np.testing.assert_allclose(
+        [item.gamma for item in round_cfgs],
+        [0.95, 0.958, 0.966, 0.974, 0.982, 0.99],
+        rtol=1e-6,
+    )
     assert [item.rollout_target_agent_steps for item in round_cfgs] == [
         10_000,
-        10_000,
-        10_000,
-        10_000,
-        40_000,
+        16_000,
+        22_000,
+        28_000,
+        34_000,
         40_000,
     ]
     assert all(item.control_all_vehicles is False for item in round_cfgs)
 
 
-def test_paper_style_phase2_agent_ramp_is_shared_with_airl():
+def test_constant_rollout_target_agent_steps_remains_supported():
     cfg = PSGAILConfig(
-        paper_style_training=True,
-        total_rounds=8,
-        paper_phase1_rounds=4,
-        paper_phase2_rounds=4,
-        paper_initial_agent_count=10,
-        paper_agent_increment=10,
-        paper_agent_increment_interval=2,
-        paper_phase2_initial_agent_count=20,
-        paper_phase2_agent_count=40,
-        paper_phase2_agent_ramp_rounds=3,
-        paper_phase1_agent_steps=10_000,
-        paper_phase2_agent_steps=40_000,
+        controlled_vehicle_curriculum=True,
+        initial_controlled_vehicles=20,
+        final_controlled_vehicles=40,
+        controlled_vehicle_curriculum_rounds=3,
+        rollout_target_agent_steps=12_345,
     )
 
     ps_gail_counts = [
         ps_gail_config_for_round(cfg, round_idx).percentage_controlled_vehicles
-        for round_idx in range(1, 9)
+        for round_idx in range(1, 5)
     ]
     airl_counts = [
         airl_config_for_round(cfg, round_idx).percentage_controlled_vehicles
-        for round_idx in range(1, 9)
+        for round_idx in range(1, 5)
     ]
 
-    assert ps_gail_counts == [10.0, 10.0, 20.0, 20.0, 20.0, 30.0, 40.0, 40.0]
+    assert ps_gail_counts == [20.0, 30.0, 40.0, 40.0]
     assert airl_counts == ps_gail_counts
-    assert [airl_config_for_round(cfg, round_idx).rollout_target_agent_steps for round_idx in (4, 5)] == [
-        10_000,
-        40_000,
-    ]
+    assert airl_config_for_round(cfg, 4).rollout_target_agent_steps == 12_345

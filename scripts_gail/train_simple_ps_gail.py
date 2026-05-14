@@ -134,16 +134,6 @@ def training_risk_warnings(cfg: PSGAILConfig) -> list[str]:
             "WGAN rewards are both centered and rollout-normalized. This is allowed, but it makes the "
             "critic reward scale nonstationary; compare with one normalization layer disabled if needed."
         )
-    if bool(getattr(cfg, "paper_style_training", False)):
-        expected_rounds = int(getattr(cfg, "paper_phase1_rounds", 1000)) + int(
-            getattr(cfg, "paper_phase2_rounds", 200)
-        )
-        if int(cfg.total_rounds) != expected_rounds:
-            messages.append(
-                "Paper-style training is enabled, but total_rounds does not match "
-                f"phase1+phase2 ({cfg.total_rounds} != {expected_rounds}). "
-                "This is allowed for smoke tests; use the full sum for a paper-like run."
-            )
     return messages
 
 
@@ -649,26 +639,23 @@ def main() -> None:
         if cfg.controlled_vehicle_curriculum:
             print(
                 "controlled_vehicle_curriculum="
-                f"initial={cfg.initial_controlled_vehicle_fraction:.4f} "
-                f"final={cfg.final_controlled_vehicle_fraction:.4f} "
+                f"initial={cfg.initial_controlled_vehicles:.4f} "
+                f"final={cfg.final_controlled_vehicles:.4f} "
                 f"rounds={cfg.controlled_vehicle_curriculum_rounds}"
             )
-        if bool(getattr(cfg, "paper_style_training", False)):
+        if int(cfg.initial_rollout_target_agent_steps) > 0 or int(cfg.final_rollout_target_agent_steps) > 0:
             print(
-                "paper_style_training="
-                f"phase1_rounds={cfg.paper_phase1_rounds} "
-                f"phase1_gamma={cfg.paper_phase1_gamma} "
-                f"phase1_agent_steps={cfg.paper_phase1_agent_steps} "
-                f"agents={cfg.paper_initial_agent_count}+"
-                f"{cfg.paper_agent_increment}/"
-                f"{cfg.paper_agent_increment_interval}rounds "
-                f"phase2_rounds={cfg.paper_phase2_rounds} "
-                f"phase2_gamma={cfg.paper_phase2_gamma} "
-                f"phase2_agent_steps={cfg.paper_phase2_agent_steps} "
-                f"phase2_agents={cfg.paper_phase2_agent_count} "
-                f"phase2_ramp={cfg.paper_phase2_initial_agent_count}->"
-                f"{cfg.paper_phase2_agent_count}/"
-                f"{cfg.paper_phase2_agent_ramp_rounds}rounds"
+                "rollout_target_agent_steps_curriculum="
+                f"initial={cfg.initial_rollout_target_agent_steps} "
+                f"final={cfg.final_rollout_target_agent_steps} "
+                f"rounds={cfg.rollout_target_agent_steps_curriculum_rounds}"
+            )
+        if float(cfg.initial_gamma) > 0.0 or float(cfg.final_gamma) > 0.0:
+            print(
+                "gamma_curriculum="
+                f"initial={cfg.initial_gamma or cfg.gamma:.4f} "
+                f"final={cfg.final_gamma or cfg.gamma:.4f} "
+                f"rounds={cfg.gamma_curriculum_rounds}"
             )
 
         if int(cfg.bc_pretrain_epochs) > 0:

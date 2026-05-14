@@ -153,6 +153,8 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 "scene_dataset_collection_mode": False,
                 "disable_controlled_vehicle_collisions": False,
                 "crash_controlled_vehicles_offroad": True,
+                "complete_controlled_vehicles_at_road_end": True,
+                "road_end_completion_lateral_margin": 0.25,
                 "disable_scene_collection_spawn_safety": False,
                 "allow_idm": True,
                 "controlled_vehicle_min_occupancy": 0.8,
@@ -302,6 +304,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
 
             self.road.act()
             self.road.step(dt)
+            self._complete_road_end_controlled_vehicles()
             self._crash_offroad_controlled_vehicles()
             self._prune_removed_vehicles()
             self.steps += 1
@@ -310,6 +313,64 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 self._automatic_rendering()
 
         self.enable_auto_render = False
+
+    def _complete_road_end_controlled_vehicles(self) -> None:
+        if (
+            not bool(self.config.get("complete_controlled_vehicles_at_road_end", True))
+            or self.scene_dataset_collection_mode
+        ):
+            return
+        for vehicle in list(getattr(self, "controlled_vehicles", ())):
+            if vehicle is None or bool(getattr(vehicle, "crashed", False)):
+                continue
+            if bool(getattr(vehicle, "completed", False)):
+                continue
+            if self._vehicle_reached_terminal_road_end(vehicle):
+                vehicle.completed = True
+                vehicle.reached_road_end = True
+                vehicle.remove_from_road = True
+                vehicle.collidable = False
+                vehicle.check_collisions = False
+
+    def _vehicle_reached_terminal_road_end(self, vehicle: EgoVehicle) -> bool:
+        lane_indexes = [
+            getattr(vehicle, "target_lane_index", None),
+            getattr(vehicle, "lane_index", None),
+        ]
+        seen: set[tuple[str, str, int]] = set()
+        for lane_index in lane_indexes:
+            if lane_index is None or lane_index in seen:
+                continue
+            seen.add(lane_index)
+            if self._lane_has_downstream_drivable_road(lane_index):
+                continue
+            try:
+                lane = self.road.network.get_lane(lane_index)
+                longitudinal, lateral = lane.local_coordinates(vehicle.position)
+                width = float(lane.width_at(longitudinal))
+            except Exception:
+                continue
+
+            length = float(getattr(vehicle, "LENGTH", lane.VEHICLE_LENGTH))
+            front_bumper_reached_end = longitudinal >= float(lane.length) - 0.5 * length
+            lateral_margin = float(
+                self.config.get("road_end_completion_lateral_margin", 0.25)
+            )
+            laterally_on_lane = abs(float(lateral)) <= width / 2.0 + lateral_margin
+            if front_bumper_reached_end and laterally_on_lane:
+                return True
+        return False
+
+    def _lane_has_downstream_drivable_road(self, lane_index: tuple[str, str, int]) -> bool:
+        try:
+            downstream = self.road.network.graph.get(lane_index[1], {})
+        except Exception:
+            return False
+        for lanes in downstream.values():
+            for lane in lanes:
+                if not bool(getattr(lane, "forbidden", False)):
+                    return True
+        return False
 
     def _crash_offroad_controlled_vehicles(self) -> None:
         if (
@@ -320,6 +381,8 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             return
         for vehicle in list(getattr(self, "controlled_vehicles", ())):
             if vehicle is None or bool(getattr(vehicle, "crashed", False)):
+                continue
+            if bool(getattr(vehicle, "completed", False)):
                 continue
             try:
                 is_on_road = bool(getattr(vehicle, "on_road", True))
@@ -983,6 +1046,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             getattr(vehicle, "vehicle_ID", None)
             for vehicle in self.controlled_vehicles
             if not vehicle.crashed
+            and not bool(getattr(vehicle, "completed", False))
             and (
                 not self.scene_dataset_collection_mode
                 or bool(getattr(vehicle, "scene_collection_is_active", False))
@@ -997,11 +1061,19 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         info["controlled_vehicle_crashes"] = [
             bool(vehicle.crashed) for vehicle in self.controlled_vehicles
         ]
+        info["controlled_vehicle_completed"] = [
+            bool(getattr(vehicle, "completed", False))
+            for vehicle in self.controlled_vehicles
+        ]
         info["controlled_vehicle_on_road"] = [
-            bool(getattr(vehicle, "on_road", True)) for vehicle in self.controlled_vehicles
+            bool(getattr(vehicle, "completed", False))
+            or bool(getattr(vehicle, "on_road", True))
+            for vehicle in self.controlled_vehicles
         ]
         info["controlled_vehicle_offroad"] = [
-            not bool(getattr(vehicle, "on_road", True)) for vehicle in self.controlled_vehicles
+            (not bool(getattr(vehicle, "completed", False)))
+            and (not bool(getattr(vehicle, "on_road", True)))
+            for vehicle in self.controlled_vehicles
         ]
         info["scene_dataset_collection_mode"] = self.scene_dataset_collection_mode
         return info
@@ -1017,6 +1089,14 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             "all_controlled_crashed": float(
                 all(vehicle.crashed for vehicle in termination_vehicles)
             ) if termination_vehicles else 0.0,
+            "all_controlled_terminal": float(
+                all(
+                    self._vehicle_is_terminal(vehicle)
+                    for vehicle in termination_vehicles
+                )
+            )
+            if termination_vehicles
+            else 0.0,
         }
 
     def _reward(self, action: Any) -> float:
@@ -1028,8 +1108,16 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             return False
 
         if self.config.get("terminate_when_all_controlled_crashed", True):
-            return all(vehicle.crashed for vehicle in termination_vehicles)
-        return any(vehicle.crashed for vehicle in termination_vehicles)
+            return all(
+                self._vehicle_is_terminal(vehicle) for vehicle in termination_vehicles
+            )
+        return any(self._vehicle_is_terminal(vehicle) for vehicle in termination_vehicles)
+
+    @staticmethod
+    def _vehicle_is_terminal(vehicle: EgoVehicle) -> bool:
+        return bool(getattr(vehicle, "crashed", False)) or bool(
+            getattr(vehicle, "completed", False)
+        )
 
     def _is_truncated(self) -> bool:
         max_steps_cfg = self.config.get("max_episode_steps", None)

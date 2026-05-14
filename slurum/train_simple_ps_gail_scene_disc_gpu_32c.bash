@@ -122,8 +122,8 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --prebuilt-split train \
     --no-control-all-vehicles \
     --controlled-vehicle-curriculum \
-    --initial-controlled-vehicle-fraction "${INITIAL_CONTROLLED_VEHICLE_FRACTION}" \
-    --final-controlled-vehicle-fraction "${FINAL_CONTROLLED_VEHICLE_FRACTION}" \
+    --initial-controlled-vehicles "${INITIAL_CONTROLLED_VEHICLE_FRACTION}" \
+    --final-controlled-vehicles "${FINAL_CONTROLLED_VEHICLE_FRACTION}" \
     --controlled-vehicle-curriculum-rounds "${CONTROLLED_VEHICLE_CURRICULUM_ROUNDS}" \
     --enable-collision \
     --normalize-gail-reward \
