@@ -479,10 +479,11 @@ def main() -> None:
                 f"val_fraction={cfg.bc_pretrain_validation_fraction} "
                 f"eval_episodes={cfg.bc_pretrain_eval_episodes}"
             )
-        if int(cfg.warmup_rounds) > 0:
+        if int(cfg.warmup_rounds) > 0 or int(cfg.vehicle_increase_warmup_rounds) > 0:
             print(
                 "warmup="
                 f"rounds={cfg.warmup_rounds} "
+                f"vehicle_increase_rounds={cfg.vehicle_increase_warmup_rounds} "
                 f"policy_lr={cfg.warmup_learning_rate or cfg.learning_rate}->{cfg.learning_rate} "
                 f"reward_lr={cfg.warmup_disc_learning_rate or cfg.disc_learning_rate}->{cfg.disc_learning_rate} "
                 f"entropy={cfg.warmup_entropy_coef if cfg.warmup_entropy_coef >= 0 else cfg.entropy_coef}->{cfg.entropy_coef} "
@@ -509,14 +510,16 @@ def main() -> None:
                 "rollout_target_agent_steps_curriculum="
                 f"initial={cfg.initial_rollout_target_agent_steps} "
                 f"final={cfg.final_rollout_target_agent_steps} "
-                f"rounds={cfg.rollout_target_agent_steps_curriculum_rounds}"
+                f"rounds={cfg.rollout_target_agent_steps_curriculum_rounds} "
+                f"schedule={cfg.rollout_target_agent_steps_schedule or 'linear'}"
             )
         if float(cfg.initial_gamma) > 0.0 or float(cfg.final_gamma) > 0.0:
             print(
                 "gamma_curriculum="
                 f"initial={cfg.initial_gamma or cfg.gamma:.4f} "
                 f"final={cfg.final_gamma or cfg.gamma:.4f} "
-                f"rounds={cfg.gamma_curriculum_rounds}"
+                f"rounds={cfg.gamma_curriculum_rounds} "
+                f"schedule={cfg.gamma_schedule or 'linear'}"
             )
 
         if int(cfg.bc_pretrain_epochs) > 0:

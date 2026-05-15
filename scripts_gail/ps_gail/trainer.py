@@ -116,8 +116,10 @@ def resolve_device(name: str) -> torch.device:
 
 
 def set_optimizer_lr(optimizer: torch.optim.Optimizer, learning_rate: float) -> None:
+    learning_rate = float(learning_rate)
     for group in optimizer.param_groups:
-        group["lr"] = float(learning_rate)
+        if float(group.get("lr", learning_rate)) != learning_rate:
+            group["lr"] = learning_rate
 
 
 def infer_policy_obs_dim(env: gym.Env) -> int:

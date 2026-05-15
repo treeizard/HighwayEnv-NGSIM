@@ -40,10 +40,12 @@ class PSGAILConfig:
     warmup_disc_updates_per_round: int = 0
     warmup_gail_reward_clip: float = 0.0
     warmup_final_reward_clip: float = 0.0
+    vehicle_increase_warmup_rounds: int = 0
     rollout_target_agent_steps: int = 0
     initial_rollout_target_agent_steps: int = 0
     final_rollout_target_agent_steps: int = 0
     rollout_target_agent_steps_curriculum_rounds: int = 0
+    rollout_target_agent_steps_schedule: str = ""
     enable_collision: bool = True
     terminate_when_all_controlled_crashed: bool = True
     allow_idm: bool = True
@@ -77,6 +79,7 @@ class PSGAILConfig:
     initial_gamma: float = 0.0
     final_gamma: float = 0.0
     gamma_curriculum_rounds: int = 0
+    gamma_schedule: str = ""
     gae_lambda: float = 0.95
     clip_range: float = 0.2
     ppo_epochs: int = 4
