@@ -133,6 +133,8 @@ BATCH_SIZE="${BATCH_SIZE:-4096}"
 DISC_BATCH_SIZE="${DISC_BATCH_SIZE:-4096}"
 POLICY_MODEL="${POLICY_MODEL:-transformer}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
+DISCRIMINATOR_HIDDEN_SIZES="${DISCRIMINATOR_HIDDEN_SIZES:-128,128,64}"
+DISCRIMINATOR_DROPOUT="${DISCRIMINATOR_DROPOUT:-0.2}"
 TRANSFORMER_LAYERS="${TRANSFORMER_LAYERS:-2}"
 TRANSFORMER_HEADS="${TRANSFORMER_HEADS:-4}"
 TRANSFORMER_DROPOUT="${TRANSFORMER_DROPOUT:-0.1}"
@@ -187,6 +189,7 @@ echo "Gamma curriculum: ${INITIAL_GAMMA}->${FINAL_GAMMA}/${GAMMA_CURRICULUM_ROUN
 echo "Gamma schedule: ${GAMMA_SCHEDULE}"
 echo "Max episode steps schedule: ${MAX_EPISODE_STEPS_SCHEDULE}"
 echo "Policy model: ${POLICY_MODEL}"
+echo "Discriminator architecture: ${DISCRIMINATOR_HIDDEN_SIZES} dropout=${DISCRIMINATOR_DROPOUT}"
 echo "Discriminator learning rate: ${DISC_LEARNING_RATE}"
 echo "Discriminator updates per round: ${DISC_UPDATES_PER_ROUND}"
 echo "Checkpoint every: ${CHECKPOINT_EVERY}"
@@ -337,6 +340,8 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --max-expert-samples "${MAX_EXPERT_SAMPLES}" \
     --policy-model "${POLICY_MODEL}" \
     --hidden-size "${HIDDEN_SIZE}" \
+    --discriminator-hidden-sizes "${DISCRIMINATOR_HIDDEN_SIZES}" \
+    --discriminator-dropout "${DISCRIMINATOR_DROPOUT}" \
     --transformer-layers "${TRANSFORMER_LAYERS}" \
     --transformer-heads "${TRANSFORMER_HEADS}" \
     --transformer-dropout "${TRANSFORMER_DROPOUT}" \

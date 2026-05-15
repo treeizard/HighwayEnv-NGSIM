@@ -5,6 +5,44 @@ import torch.nn as nn
 
 
 NUM_DISCRETE_META_ACTIONS = 5
+DEFAULT_CRITIC_HIDDEN_SIZES = (128, 128, 64)
+DEFAULT_CRITIC_DROPOUT = 0.2
+
+
+def parse_hidden_sizes(hidden_sizes: str | int | tuple[int, ...] | list[int] | None) -> tuple[int, ...]:
+    if hidden_sizes is None:
+        return DEFAULT_CRITIC_HIDDEN_SIZES
+    if isinstance(hidden_sizes, int):
+        return (int(hidden_sizes), int(hidden_sizes))
+    if isinstance(hidden_sizes, str):
+        values = tuple(int(value.strip()) for value in hidden_sizes.split(",") if value.strip())
+    else:
+        values = tuple(int(value) for value in hidden_sizes)
+    if not values:
+        raise ValueError("At least one critic hidden size is required.")
+    if any(value <= 0 for value in values):
+        raise ValueError(f"Critic hidden sizes must be positive, got {values!r}.")
+    return values
+
+
+def make_relu_mlp(
+    input_dim: int,
+    hidden_sizes: str | int | tuple[int, ...] | list[int] | None,
+    output_dim: int,
+    *,
+    dropout: float = DEFAULT_CRITIC_DROPOUT,
+) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    in_dim = int(input_dim)
+    dropout = float(dropout)
+    for hidden_dim in parse_hidden_sizes(hidden_sizes):
+        layers.append(nn.Linear(in_dim, int(hidden_dim)))
+        layers.append(nn.ReLU())
+        if dropout > 0.0:
+            layers.append(nn.Dropout(p=dropout))
+        in_dim = int(hidden_dim)
+    layers.append(nn.Linear(in_dim, int(output_dim)))
+    return nn.Sequential(*layers)
 
 
 class SharedActorCritic(nn.Module):
@@ -140,14 +178,20 @@ def make_actor_critic(
 
 
 class TrajectoryDiscriminator(nn.Module):
-    def __init__(self, input_dim: int, hidden_size: int) -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_size: int | None = None,
+        *,
+        hidden_sizes: str | int | tuple[int, ...] | list[int] | None = None,
+        dropout: float = DEFAULT_CRITIC_DROPOUT,
+    ) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1),
+        self.net = make_relu_mlp(
+            input_dim,
+            hidden_sizes if hidden_sizes is not None else hidden_size,
+            1,
+            dropout=dropout,
         )
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
@@ -161,17 +205,30 @@ class SceneDiscriminator(TrajectoryDiscriminator):
 class SequenceTrajectoryDiscriminator(nn.Module):
     """Autoregressive discriminator over fixed-length trajectory feature windows."""
 
-    def __init__(self, input_dim: int, hidden_size: int) -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_size: int | None = None,
+        *,
+        hidden_sizes: str | int | tuple[int, ...] | list[int] | None = None,
+        dropout: float = DEFAULT_CRITIC_DROPOUT,
+    ) -> None:
         super().__init__()
+        recurrent_and_head_sizes = parse_hidden_sizes(
+            hidden_sizes if hidden_sizes is not None else hidden_size
+        )
+        recurrent_size = int(recurrent_and_head_sizes[0])
+        head_sizes = recurrent_and_head_sizes[1:] or (recurrent_size,)
         self.encoder = nn.GRU(
             input_size=int(input_dim),
-            hidden_size=int(hidden_size),
+            hidden_size=recurrent_size,
             batch_first=True,
         )
-        self.head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1),
+        self.head = make_relu_mlp(
+            recurrent_size,
+            head_sizes,
+            1,
+            dropout=dropout,
         )
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:

@@ -22,6 +22,7 @@ from scripts_gail.ps_gail.data import load_expert_transition_data
 from scripts_gail.ps_gail.envs import make_training_env
 from scripts_gail.ps_gail.monitoring import WandbMonitor
 from scripts_gail.ps_gail.models import make_actor_critic
+from scripts_gail.ps_gail.models import make_relu_mlp
 from scripts_gail.ps_gail.observations import flatten_agent_observations, policy_observations_from_flat
 from scripts_gail.ps_gail.schedule import config_for_round
 from scripts_gail.ps_gail.trainer import (
@@ -43,19 +44,28 @@ from scripts_gail.train_simple_ps_gail import behavior_clone_pretrain, evaluate_
 class AIRLReward(nn.Module):
     """Potential-based AIRL reward model for continuous NGSIM actions."""
 
-    def __init__(self, obs_dim: int, action_dim: int, hidden_size: int) -> None:
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        hidden_size: int | None = None,
+        *,
+        hidden_sizes: str | int | tuple[int, ...] | list[int] | None = None,
+        dropout: float = 0.2,
+    ) -> None:
         super().__init__()
-        self.reward = nn.Sequential(
-            nn.Linear(int(obs_dim) + int(action_dim), int(hidden_size)),
-            nn.ReLU(),
-            nn.Linear(int(hidden_size), int(hidden_size)),
-            nn.ReLU(),
-            nn.Linear(int(hidden_size), 1),
+        critic_hidden_sizes = hidden_sizes if hidden_sizes is not None else hidden_size
+        self.reward = make_relu_mlp(
+            int(obs_dim) + int(action_dim),
+            critic_hidden_sizes,
+            1,
+            dropout=dropout,
         )
-        self.potential = nn.Sequential(
-            nn.Linear(int(obs_dim), int(hidden_size)),
-            nn.ReLU(),
-            nn.Linear(int(hidden_size), 1),
+        self.potential = make_relu_mlp(
+            int(obs_dim),
+            critic_hidden_sizes,
+            1,
+            dropout=dropout,
         )
 
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -454,7 +464,12 @@ def main() -> None:
             transformer_heads=int(cfg.transformer_heads),
             transformer_dropout=float(cfg.transformer_dropout),
         ).to(device)
-        reward_model = AIRLReward(policy_obs_dim, int(cfg.continuous_action_dim), cfg.hidden_size).to(device)
+        reward_model = AIRLReward(
+            policy_obs_dim,
+            int(cfg.continuous_action_dim),
+            hidden_sizes=cfg.discriminator_hidden_sizes,
+            dropout=float(cfg.discriminator_dropout),
+        ).to(device)
         policy_optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.learning_rate)
         reward_optimizer = torch.optim.Adam(reward_model.parameters(), lr=cfg.disc_learning_rate)
         monitor.watch(policy, reward_model)

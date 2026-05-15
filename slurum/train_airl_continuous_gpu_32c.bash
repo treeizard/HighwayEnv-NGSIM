@@ -121,6 +121,8 @@ GAIL_REWARD_CLIP="${GAIL_REWARD_CLIP:-5.0}"
 FINAL_REWARD_CLIP="${FINAL_REWARD_CLIP:-10.0}"
 POLICY_MODEL="${POLICY_MODEL:-transformer}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
+DISCRIMINATOR_HIDDEN_SIZES="${DISCRIMINATOR_HIDDEN_SIZES:-128,128,64}"
+DISCRIMINATOR_DROPOUT="${DISCRIMINATOR_DROPOUT:-0.2}"
 TRANSFORMER_LAYERS="${TRANSFORMER_LAYERS:-2}"
 TRANSFORMER_HEADS="${TRANSFORMER_HEADS:-4}"
 TRANSFORMER_DROPOUT="${TRANSFORMER_DROPOUT:-0.1}"
@@ -189,6 +191,7 @@ echo "Gamma schedule: ${GAMMA_SCHEDULE}"
 echo "Max episode steps schedule: ${MAX_EPISODE_STEPS_SCHEDULE}"
 echo "Policy model: ${POLICY_MODEL}"
 echo "Transformer: layers=${TRANSFORMER_LAYERS} heads=${TRANSFORMER_HEADS} dropout=${TRANSFORMER_DROPOUT}"
+echo "AIRL critic architecture: ${DISCRIMINATOR_HIDDEN_SIZES} dropout=${DISCRIMINATOR_DROPOUT}"
 echo "BC pretrain epochs: ${BC_PRETRAIN_EPOCHS}"
 echo "AIRL reward lr: ${DISC_LEARNING_RATE}"
 echo "AIRL reward updates per round: ${DISC_UPDATES_PER_ROUND}"
@@ -294,6 +297,8 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --max-expert-samples "${MAX_EXPERT_SAMPLES}" \
     --policy-model "${POLICY_MODEL}" \
     --hidden-size "${HIDDEN_SIZE}" \
+    --discriminator-hidden-sizes "${DISCRIMINATOR_HIDDEN_SIZES}" \
+    --discriminator-dropout "${DISCRIMINATOR_DROPOUT}" \
     --transformer-layers "${TRANSFORMER_LAYERS}" \
     --transformer-heads "${TRANSFORMER_HEADS}" \
     --transformer-dropout "${TRANSFORMER_DROPOUT}" \

@@ -97,6 +97,8 @@ class PSGAILConfig:
     disc_generator_label: float = 0.1
     discriminator_input: str = "auto"
     discriminator_loss: str = "wgan_gp"
+    discriminator_hidden_sizes: str = "128,128,64"
+    discriminator_dropout: float = 0.2
     wgan_gp_lambda: float = 2.0
     wgan_reward_center: bool = False
     wgan_reward_clip: float = 0.0

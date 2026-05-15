@@ -535,16 +535,25 @@ def main() -> None:
                 raise RuntimeError("Sequence discriminator was enabled but no expert sequence features were loaded.")
             discriminator = SequenceTrajectoryDiscriminator(
                 int(expert_sequence_features.shape[-1]),
-                cfg.hidden_size,
+                hidden_sizes=cfg.discriminator_hidden_sizes,
+                dropout=float(cfg.discriminator_dropout),
             ).to(device)
             discriminator_expert_features = expert_sequence_features
             discriminator_name = "sequence"
         else:
-            discriminator = TrajectoryDiscriminator(feature_dim, cfg.hidden_size).to(device)
+            discriminator = TrajectoryDiscriminator(
+                feature_dim,
+                hidden_sizes=cfg.discriminator_hidden_sizes,
+                dropout=float(cfg.discriminator_dropout),
+            ).to(device)
             discriminator_expert_features = expert_features
             discriminator_name = "trajectory"
         scene_discriminator = (
-            SceneDiscriminator(int(expert_scene_features.shape[1]), cfg.hidden_size).to(device)
+            SceneDiscriminator(
+                int(expert_scene_features.shape[1]),
+                hidden_sizes=cfg.discriminator_hidden_sizes,
+                dropout=float(cfg.discriminator_dropout),
+            ).to(device)
             if expert_scene_features is not None
             else None
         )

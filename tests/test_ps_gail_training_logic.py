@@ -90,7 +90,11 @@ from scripts_gail.ps_gail.data import (
     standardize_features,
     transform_sequence_features,
 )
-from scripts_gail.ps_gail.models import SequenceTrajectoryDiscriminator, make_actor_critic
+from scripts_gail.ps_gail.models import (
+    SequenceTrajectoryDiscriminator,
+    TrajectoryDiscriminator,
+    make_actor_critic,
+)
 from scripts_gail.ps_gail.trainer import (
     RolloutBatch,
     policy_distribution_and_values,
@@ -311,6 +315,15 @@ def test_feature_standardizer_supports_sequence_features_and_clipping():
     assert std.shape == (2,)
     assert normalized.shape == features.shape
     assert np.max(np.abs(normalized)) <= 1.0
+
+
+def test_default_trajectory_discriminator_uses_paper_critic_architecture():
+    discriminator = TrajectoryDiscriminator(input_dim=10, dropout=0.2)
+    linear_layers = [module for module in discriminator.net if isinstance(module, torch.nn.Linear)]
+    dropout_layers = [module for module in discriminator.net if isinstance(module, torch.nn.Dropout)]
+
+    assert [layer.out_features for layer in linear_layers] == [128, 128, 64, 1]
+    assert [layer.p for layer in dropout_layers] == [0.2, 0.2, 0.2]
 
 
 def test_transformer_policy_update_uses_rollout_consistent_eval_mode():

@@ -282,9 +282,15 @@ def discriminator_reward(
     if feature_normalizer is not None:
         mean, std = feature_normalizer
         features = standardize_features(features, mean, std, clip=feature_clip)
-    with torch.no_grad():
-        logits = discriminator(_as_device_tensor(features, dtype=torch.float32, device=device))
-        rewards = logits if str(loss_type).lower() == "wgan_gp" else F.softplus(logits)
+    was_training = discriminator.training
+    discriminator.eval()
+    try:
+        with torch.no_grad():
+            logits = discriminator(_as_device_tensor(features, dtype=torch.float32, device=device))
+            rewards = logits if str(loss_type).lower() == "wgan_gp" else F.softplus(logits)
+    finally:
+        if was_training:
+            discriminator.train()
     return rewards.cpu().numpy().astype(np.float32)
 
 
