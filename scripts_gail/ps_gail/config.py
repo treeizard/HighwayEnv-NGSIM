@@ -71,6 +71,7 @@ class PSGAILConfig:
     bc_pretrain_epochs: int = 0
     bc_pretrain_learning_rate: float = 3e-4
     bc_pretrain_batch_size: int = 4096
+    bc_pretrain_micro_batch_size: int = 0
     bc_pretrain_weight_decay: float = 0.0
     bc_pretrain_validation_fraction: float = 0.1
     bc_pretrain_eval_episodes: int = 4

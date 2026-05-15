@@ -491,6 +491,7 @@ def main() -> None:
                 "bc_pretrain="
                 f"epochs={cfg.bc_pretrain_epochs} "
                 f"batch={cfg.bc_pretrain_batch_size} "
+                f"micro_batch={cfg.bc_pretrain_micro_batch_size} "
                 f"lr={cfg.bc_pretrain_learning_rate} "
                 f"val_fraction={cfg.bc_pretrain_validation_fraction} "
                 f"eval_episodes={cfg.bc_pretrain_eval_episodes}"

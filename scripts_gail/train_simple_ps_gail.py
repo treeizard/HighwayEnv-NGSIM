@@ -277,6 +277,13 @@ def behavior_clone_pretrain(
         weight_decay=float(cfg.bc_pretrain_weight_decay),
     )
     batch_size = max(1, int(cfg.bc_pretrain_batch_size))
+    configured_micro_batch_size = int(getattr(cfg, "bc_pretrain_micro_batch_size", 0))
+    if configured_micro_batch_size > 0:
+        micro_batch_size = max(1, min(batch_size, configured_micro_batch_size))
+    elif str(getattr(cfg, "policy_model", "")).lower() == "transformer":
+        micro_batch_size = min(batch_size, 128)
+    else:
+        micro_batch_size = batch_size
     epochs = max(0, int(cfg.bc_pretrain_epochs))
     was_training = policy.training
     policy.train()
@@ -289,23 +296,36 @@ def behavior_clone_pretrain(
         maes: list[float] = []
         for start in range(0, len(shuffled), batch_size):
             batch_idx = shuffled[start : start + batch_size]
-            obs_tensor = torch.as_tensor(observations[batch_idx], dtype=torch.float32, device=device)
-            action_tensor = torch.as_tensor(actions[batch_idx], dtype=torch.float32, device=device)
-            pred_actions, values = policy(obs_tensor)
-            action_loss = F.mse_loss(pred_actions, action_tensor)
-            value_loss = torch.mean(values.square())
-            loss = action_loss + 1.0e-3 * value_loss
+            batch_count = int(len(batch_idx))
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            weighted_loss = 0.0
+            weighted_mae = 0.0
+            for micro_start in range(0, batch_count, micro_batch_size):
+                micro_idx = batch_idx[micro_start : micro_start + micro_batch_size]
+                micro_count = int(len(micro_idx))
+                micro_weight = float(micro_count) / float(batch_count)
+                obs_tensor = torch.as_tensor(observations[micro_idx], dtype=torch.float32, device=device)
+                action_tensor = torch.as_tensor(actions[micro_idx], dtype=torch.float32, device=device)
+                pred_actions, values = policy(obs_tensor)
+                action_loss = F.mse_loss(pred_actions, action_tensor)
+                value_loss = torch.mean(values.square())
+                loss = action_loss + 1.0e-3 * value_loss
+                (loss * micro_weight).backward()
+                with torch.no_grad():
+                    weighted_loss += micro_weight * float(action_loss.detach().cpu().item())
+                    weighted_mae += micro_weight * float(
+                        torch.mean(torch.abs(pred_actions - action_tensor)).detach().cpu().item()
+                    )
             torch.nn.utils.clip_grad_norm_(policy.parameters(), float(cfg.max_grad_norm))
             optimizer.step()
-            losses.append(float(action_loss.detach().cpu().item()))
-            maes.append(float(torch.mean(torch.abs(pred_actions.detach() - action_tensor)).cpu().item()))
+            losses.append(weighted_loss)
+            maes.append(weighted_mae)
         last_train_loss = float(np.mean(losses)) if losses else float("nan")
         last_train_mae = float(np.mean(maes)) if maes else float("nan")
         print(
             f"[bc epoch {epoch:04d}/{epochs:04d}] "
-            f"train_mse={last_train_loss:.6f} train_mae={last_train_mae:.6f}"
+            f"train_mse={last_train_loss:.6f} train_mae={last_train_mae:.6f} "
+            f"batch={batch_size} micro={micro_batch_size}"
         )
 
     def _eval_split(split_indices: np.ndarray) -> tuple[float, float]:
@@ -317,11 +337,24 @@ def behavior_clone_pretrain(
         with torch.no_grad():
             for start in range(0, len(split_indices), batch_size):
                 batch_idx = split_indices[start : start + batch_size]
-                obs_tensor = torch.as_tensor(observations[batch_idx], dtype=torch.float32, device=device)
-                action_tensor = torch.as_tensor(actions[batch_idx], dtype=torch.float32, device=device)
-                pred_actions, _values = policy(obs_tensor)
-                losses.append(float(F.mse_loss(pred_actions, action_tensor).cpu().item()))
-                maes.append(float(torch.mean(torch.abs(pred_actions - action_tensor)).cpu().item()))
+                batch_count = int(len(batch_idx))
+                weighted_loss = 0.0
+                weighted_mae = 0.0
+                for micro_start in range(0, batch_count, micro_batch_size):
+                    micro_idx = batch_idx[micro_start : micro_start + micro_batch_size]
+                    micro_count = int(len(micro_idx))
+                    micro_weight = float(micro_count) / float(batch_count)
+                    obs_tensor = torch.as_tensor(observations[micro_idx], dtype=torch.float32, device=device)
+                    action_tensor = torch.as_tensor(actions[micro_idx], dtype=torch.float32, device=device)
+                    pred_actions, _values = policy(obs_tensor)
+                    weighted_loss += micro_weight * float(
+                        F.mse_loss(pred_actions, action_tensor).detach().cpu().item()
+                    )
+                    weighted_mae += micro_weight * float(
+                        torch.mean(torch.abs(pred_actions - action_tensor)).detach().cpu().item()
+                    )
+                losses.append(weighted_loss)
+                maes.append(weighted_mae)
         return float(np.mean(losses)), float(np.mean(maes))
 
     train_mse, train_mae = _eval_split(train_indices)
@@ -337,6 +370,7 @@ def behavior_clone_pretrain(
         "bc/val_samples": float(val_indices.size),
         "bc/last_epoch_train_mse": last_train_loss,
         "bc/last_epoch_train_mae": last_train_mae,
+        "bc/micro_batch_size": float(micro_batch_size),
     }
 
 
@@ -627,6 +661,7 @@ def main() -> None:
                 "bc_pretrain="
                 f"epochs={cfg.bc_pretrain_epochs} "
                 f"batch={cfg.bc_pretrain_batch_size} "
+                f"micro_batch={cfg.bc_pretrain_micro_batch_size} "
                 f"lr={cfg.bc_pretrain_learning_rate} "
                 f"val_fraction={cfg.bc_pretrain_validation_fraction} "
                 f"eval_episodes={cfg.bc_pretrain_eval_episodes}"

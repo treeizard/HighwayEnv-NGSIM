@@ -37,6 +37,7 @@ export NUMEXPR_NUM_THREADS="${ROLLOUT_WORKER_THREADS}"
 export MPLCONFIGDIR="${REPODIR}/logs/matplotlib_${SLURM_JOB_ID}"
 export MPLBACKEND="${MPLBACKEND:-Agg}"
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 cd "${REPODIR}"
 
@@ -115,6 +116,7 @@ DISC_UPDATES_PER_ROUND="${DISC_UPDATES_PER_ROUND:-2}"
 BC_PRETRAIN_EPOCHS="${BC_PRETRAIN_EPOCHS:-5}"
 BC_PRETRAIN_LEARNING_RATE="${BC_PRETRAIN_LEARNING_RATE:-3e-4}"
 BC_PRETRAIN_BATCH_SIZE="${BC_PRETRAIN_BATCH_SIZE:-4096}"
+BC_PRETRAIN_MICRO_BATCH_SIZE="${BC_PRETRAIN_MICRO_BATCH_SIZE:-128}"
 BC_PRETRAIN_VALIDATION_FRACTION="${BC_PRETRAIN_VALIDATION_FRACTION:-0.1}"
 BC_PRETRAIN_EVAL_EPISODES="${BC_PRETRAIN_EVAL_EPISODES:-4}"
 BC_PRETRAIN_MIN_MEAN_EPISODE_LENGTH="${BC_PRETRAIN_MIN_MEAN_EPISODE_LENGTH:-0}"
@@ -195,6 +197,9 @@ echo "Discriminator updates per round: ${DISC_UPDATES_PER_ROUND}"
 echo "Checkpoint every: ${CHECKPOINT_EVERY}"
 echo "Save checkpoint video: ${SAVE_CHECKPOINT_VIDEO}"
 echo "Checkpoint video every: ${CHECKPOINT_VIDEO_EVERY}"
+echo "BC pretrain batch size: ${BC_PRETRAIN_BATCH_SIZE}"
+echo "BC pretrain micro-batch size: ${BC_PRETRAIN_MICRO_BATCH_SIZE}"
+echo "PyTorch CUDA alloc conf: ${PYTORCH_CUDA_ALLOC_CONF}"
 
 python - <<'PY'
 import os
@@ -303,6 +308,7 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --bc-pretrain-epochs "${BC_PRETRAIN_EPOCHS}" \
     --bc-pretrain-learning-rate "${BC_PRETRAIN_LEARNING_RATE}" \
     --bc-pretrain-batch-size "${BC_PRETRAIN_BATCH_SIZE}" \
+    --bc-pretrain-micro-batch-size "${BC_PRETRAIN_MICRO_BATCH_SIZE}" \
     --bc-pretrain-validation-fraction "${BC_PRETRAIN_VALIDATION_FRACTION}" \
     --bc-pretrain-eval-episodes "${BC_PRETRAIN_EVAL_EPISODES}" \
     --bc-pretrain-min-mean-episode-length "${BC_PRETRAIN_MIN_MEAN_EPISODE_LENGTH}" \
