@@ -16,14 +16,20 @@ PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
-from scripts_gail.ps_gail.config import PSGAILConfig
+from scripts_gail.ps_gail.config import PSGAILConfig, should_save_checkpoint_video
 from scripts_gail.ps_gail.data import load_expert_transition_data
 from scripts_gail.ps_gail.envs import make_training_env
 from scripts_gail.ps_gail.monitoring import WandbMonitor
 from scripts_gail.ps_gail.models import make_actor_critic
 from scripts_gail.ps_gail.observations import flatten_agent_observations, policy_observations_from_flat
-from scripts_gail.ps_gail.trainer import infer_continuous_action_dim, infer_policy_obs_dim, resolve_device
-from scripts_gail.train_simple_airl import config_for_round, save_checkpoint_video
+from scripts_gail.ps_gail.schedule import config_for_round
+from scripts_gail.ps_gail.trainer import (
+    infer_continuous_action_dim,
+    infer_policy_obs_dim,
+    resolve_device,
+    set_optimizer_lr,
+)
+from scripts_gail.train_simple_airl import save_checkpoint_video
 
 
 @dataclass(frozen=True)
@@ -578,6 +584,10 @@ def main() -> None:
         completed_update = 0
         for update_idx in range(1, int(extras.total_updates) + 1):
             completed_update = int(update_idx)
+            round_cfg = config_for_round(cfg, update_idx)
+            round_cfg.continuous_action_dim = cfg.continuous_action_dim
+            set_optimizer_lr(policy_optimizer, float(round_cfg.learning_rate))
+            set_optimizer_lr(q_optimizer, float(round_cfg.disc_learning_rate))
             should_log = update_idx == 1 or update_idx % max(1, int(extras.eval_every)) == 0
             update_stats = update_iq_learn(
                 policy,
@@ -586,11 +596,11 @@ def main() -> None:
                 policy_optimizer,
                 q_optimizer,
                 replay,
-                cfg,
+                round_cfg,
                 device,
                 update_idx=update_idx,
                 batch_size=int(cfg.batch_size),
-                gamma=float(cfg.gamma),
+                gamma=float(round_cfg.gamma),
                 alpha=float(extras.iq_alpha),
                 tau=float(extras.target_tau),
                 bc_coef=float(extras.bc_coef),
@@ -623,8 +633,11 @@ def main() -> None:
                         "Lower --learning-rate/--disc-learning-rate or increase Q regularization."
                     )
                 metrics = {"update": update_idx, **{f"iq/{k}": v for k, v in latest_stats.items()}}
-                eval_stats = evaluate_policy(policy, cfg, device, episodes=int(extras.eval_episodes))
+                eval_stats = evaluate_policy(policy, round_cfg, device, episodes=int(extras.eval_episodes))
                 metrics.update(eval_stats)
+                metrics["train/gamma"] = float(round_cfg.gamma)
+                metrics["train/policy_learning_rate"] = float(round_cfg.learning_rate)
+                metrics["train/q_learning_rate"] = float(round_cfg.disc_learning_rate)
                 score = convergence_score(
                     latest_stats,
                     eval_stats,
@@ -716,9 +729,10 @@ def main() -> None:
                     checkpoint_path,
                 )
                 monitor.save(checkpoint_path)
-                video_path = save_checkpoint_video(policy, cfg, run_dir=run_dir, round_idx=update_idx, device=device)
+            if should_save_checkpoint_video(cfg, update_idx):
+                video_path = save_checkpoint_video(policy, round_cfg, run_dir=run_dir, round_idx=update_idx, device=device)
                 if video_path is not None:
-                    monitor.log_video("checkpoint/policy_video", video_path, step=update_idx, fps=int(cfg.policy_frequency))
+                    monitor.log_video("checkpoint/policy_video", video_path, step=update_idx, fps=int(round_cfg.policy_frequency))
 
         final_path = os.path.join(run_dir, "final.pt")
         torch.save(
@@ -737,9 +751,11 @@ def main() -> None:
             final_path,
         )
         monitor.save(final_path)
-        final_video_path = save_checkpoint_video(policy, cfg, run_dir=run_dir, round_idx=int(completed_update), device=device)
+        final_cfg = config_for_round(cfg, int(completed_update))
+        final_cfg.continuous_action_dim = cfg.continuous_action_dim
+        final_video_path = save_checkpoint_video(policy, final_cfg, run_dir=run_dir, round_idx=int(completed_update), device=device)
         if final_video_path is not None:
-            monitor.log_video("checkpoint/final_policy_video", final_video_path, step=int(completed_update), fps=int(cfg.policy_frequency))
+            monitor.log_video("checkpoint/final_policy_video", final_video_path, step=int(completed_update), fps=int(final_cfg.policy_frequency))
     finally:
         if env is not None:
             env.close()

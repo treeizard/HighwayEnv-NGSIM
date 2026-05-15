@@ -57,8 +57,14 @@ WANDB_MODE="${WANDB_MODE:-online}"
 TOTAL_ROUNDS="${TOTAL_ROUNDS:-1100}"
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-200}"
 ROLLOUT_MIN_EPISODES="${ROLLOUT_MIN_EPISODES:-2}"
+ROLLOUT_TARGET_AWARE_EPISODES="${ROLLOUT_TARGET_AWARE_EPISODES:-true}"
+ROLLOUT_TARGET_MIN_EPISODES="${ROLLOUT_TARGET_MIN_EPISODES:-${ROLLOUT_WORKERS}}"
+ROLLOUT_TARGET_EPISODE_SAFETY_FACTOR="${ROLLOUT_TARGET_EPISODE_SAFETY_FACTOR:-1.25}"
+ROLLOUT_TRAINING_SUBSAMPLE="${ROLLOUT_TRAINING_SUBSAMPLE:-true}"
+ROLLOUT_TRAINING_AGENT_STEPS="${ROLLOUT_TRAINING_AGENT_STEPS:-0}"
 ROLLOUT_MAX_EPISODE_STEPS="${ROLLOUT_MAX_EPISODE_STEPS:-0}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
+MAX_EPISODE_STEPS_SCHEDULE="${MAX_EPISODE_STEPS_SCHEDULE:-0:30:100:100;31:99:200:200;100:129:100:100;130:199:200:200;200:229:100:100;230:299:200:200;300:329:100:100;330:399:200:200;400:429:100:100;430:499:200:200;500:529:100:100;530:599:200:200;600:629:100:100;630:699:200:200;700:729:100:100;730:799:200:200;800:829:100:100;830:899:200:200;900:929:100:100;930:1100:200:200}"
 MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-100000}"
 TRAJECTORY_FRAME="${TRAJECTORY_FRAME:-relative}"
 INITIAL_CONTROLLED_VEHICLE_FRACTION="${INITIAL_CONTROLLED_VEHICLE_FRACTION:-0.05}"
@@ -118,8 +124,9 @@ HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
 TRANSFORMER_LAYERS="${TRANSFORMER_LAYERS:-2}"
 TRANSFORMER_HEADS="${TRANSFORMER_HEADS:-4}"
 TRANSFORMER_DROPOUT="${TRANSFORMER_DROPOUT:-0.1}"
-CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-50}"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-20}"
 SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-true}"
+CHECKPOINT_VIDEO_EVERY="${CHECKPOINT_VIDEO_EVERY:-50}"
 CHECKPOINT_VIDEO_STEPS="${CHECKPOINT_VIDEO_STEPS:-200}"
 TERMINATE_WHEN_ALL_CONTROLLED_CRASHED="${TERMINATE_WHEN_ALL_CONTROLLED_CRASHED:-true}"
 if [ "${CONTROLLED_VEHICLE_CURRICULUM}" = "true" ]; then
@@ -147,6 +154,16 @@ if [ "${TERMINATE_WHEN_ALL_CONTROLLED_CRASHED}" = "true" ]; then
 else
     TERMINATION_ARG="--no-terminate-when-all-controlled-crashed"
 fi
+if [ "${ROLLOUT_TARGET_AWARE_EPISODES}" = "true" ]; then
+    ROLLOUT_TARGET_AWARE_ARG="--rollout-target-aware-episodes"
+else
+    ROLLOUT_TARGET_AWARE_ARG="--no-rollout-target-aware-episodes"
+fi
+if [ "${ROLLOUT_TRAINING_SUBSAMPLE}" = "true" ]; then
+    ROLLOUT_TRAINING_SUBSAMPLE_ARG="--rollout-training-subsample"
+else
+    ROLLOUT_TRAINING_SUBSAMPLE_ARG="--no-rollout-training-subsample"
+fi
 
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Expert data: ${EXPERT_DATA}"
@@ -154,6 +171,8 @@ echo "AIRL trainer: ${AIRL_TRAIN_SCRIPT}"
 echo "Total rounds: ${TOTAL_ROUNDS}"
 echo "Rollout steps: ${ROLLOUT_STEPS}"
 echo "Rollout min episodes: ${ROLLOUT_MIN_EPISODES}"
+echo "Rollout target-aware episodes: ${ROLLOUT_TARGET_AWARE_EPISODES} min=${ROLLOUT_TARGET_MIN_EPISODES} safety=${ROLLOUT_TARGET_EPISODE_SAFETY_FACTOR}"
+echo "Rollout training subsample: ${ROLLOUT_TRAINING_SUBSAMPLE} cap=${ROLLOUT_TRAINING_AGENT_STEPS:-0} (0 follows rollout target)"
 echo "CPUs per task: ${SLURM_CPUS}"
 echo "Rollout workers: ${ROLLOUT_WORKERS}"
 echo "Rollout worker threads: ${ROLLOUT_WORKER_THREADS}"
@@ -167,6 +186,7 @@ echo "Rollout target agent steps: base=${ROLLOUT_TARGET_AGENT_STEPS} curriculum=
 echo "Rollout target agent steps schedule: ${ROLLOUT_TARGET_AGENT_STEPS_SCHEDULE}"
 echo "Gamma curriculum: ${INITIAL_GAMMA}->${FINAL_GAMMA}/${GAMMA_CURRICULUM_ROUNDS} rounds"
 echo "Gamma schedule: ${GAMMA_SCHEDULE}"
+echo "Max episode steps schedule: ${MAX_EPISODE_STEPS_SCHEDULE}"
 echo "Policy model: ${POLICY_MODEL}"
 echo "Transformer: layers=${TRANSFORMER_LAYERS} heads=${TRANSFORMER_HEADS} dropout=${TRANSFORMER_DROPOUT}"
 echo "BC pretrain epochs: ${BC_PRETRAIN_EPOCHS}"
@@ -181,6 +201,7 @@ echo "WGAN reward clip: ${WGAN_REWARD_CLIP}"
 echo "WGAN reward scale: ${WGAN_REWARD_SCALE}"
 echo "Checkpoint every: ${CHECKPOINT_EVERY}"
 echo "Save checkpoint video: ${SAVE_CHECKPOINT_VIDEO}"
+echo "Checkpoint video every: ${CHECKPOINT_VIDEO_EVERY}"
 echo "CUDA devices: ${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi || true
 
@@ -259,8 +280,14 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --rollout-steps "${ROLLOUT_STEPS}" \
     --rollout-min-episodes "${ROLLOUT_MIN_EPISODES}" \
     --rollout-full-episodes \
+    "${ROLLOUT_TARGET_AWARE_ARG}" \
+    --rollout-target-min-episodes "${ROLLOUT_TARGET_MIN_EPISODES}" \
+    --rollout-target-episode-safety-factor "${ROLLOUT_TARGET_EPISODE_SAFETY_FACTOR}" \
+    "${ROLLOUT_TRAINING_SUBSAMPLE_ARG}" \
+    --rollout-training-agent-steps "${ROLLOUT_TRAINING_AGENT_STEPS}" \
     --rollout-max-episode-steps "${ROLLOUT_MAX_EPISODE_STEPS}" \
     --max-episode-steps "${MAX_EPISODE_STEPS}" \
+    --max-episode-steps-schedule "${MAX_EPISODE_STEPS_SCHEDULE}" \
     --trajectory-frame "${TRAJECTORY_FRAME}" \
     --num-rollout-workers "${ROLLOUT_WORKERS}" \
     --rollout-worker-threads "${ROLLOUT_WORKER_THREADS}" \
@@ -293,6 +320,7 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --disc-generator-label "${DISC_GENERATOR_LABEL}" \
     --checkpoint-every "${CHECKPOINT_EVERY}" \
     "${CHECKPOINT_VIDEO_ARG}" \
+    --checkpoint-video-every "${CHECKPOINT_VIDEO_EVERY}" \
     --checkpoint-video-steps "${CHECKPOINT_VIDEO_STEPS}" \
     --wandb-mode "${WANDB_MODE}" \
     --wandb-project highwayenv-ps-gail \

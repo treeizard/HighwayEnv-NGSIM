@@ -421,6 +421,39 @@ def _target_rollout_episodes(cfg: PSGAILConfig) -> int:
     return target
 
 
+def _estimate_controlled_vehicles_for_target(cfg: PSGAILConfig) -> int:
+    configured = float(getattr(cfg, "percentage_controlled_vehicles", 1.0))
+    if configured >= 1.0:
+        return max(1, int(round(configured)))
+    return 1
+
+
+def _target_aware_rollout_episodes(
+    cfg: PSGAILConfig,
+    *,
+    remaining_agent_steps: int,
+) -> int:
+    if (
+        not bool(getattr(cfg, "rollout_full_episodes", True))
+        or not bool(getattr(cfg, "rollout_target_aware_episodes", True))
+        or int(remaining_agent_steps) <= 0
+    ):
+        return _target_rollout_episodes(cfg)
+    max_episode_steps = max(1, int(cfg.max_episode_steps))
+    estimated_controlled = _estimate_controlled_vehicles_for_target(cfg)
+    estimated_agent_steps_per_episode = max(1, max_episode_steps * estimated_controlled)
+    safety_factor = max(1.0, float(getattr(cfg, "rollout_target_episode_safety_factor", 1.0)))
+    target_episodes = int(
+        np.ceil(
+            safety_factor
+            * int(remaining_agent_steps)
+            / float(estimated_agent_steps_per_episode)
+        )
+    )
+    diversity_floor = max(1, int(getattr(cfg, "rollout_target_min_episodes", 1)))
+    return max(diversity_floor, target_episodes)
+
+
 def refresh_rollout_rewards(
     rollout: RolloutBatch,
     discriminator: nn.Module | None,
@@ -912,6 +945,210 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
     )
 
 
+def rollout_training_agent_step_cap(cfg: PSGAILConfig) -> int:
+    if not bool(getattr(cfg, "rollout_training_subsample", True)):
+        return 0
+    configured = int(getattr(cfg, "rollout_training_agent_steps", 0))
+    if configured < 0:
+        return 0
+    if configured > 0:
+        return configured
+    return max(0, int(getattr(cfg, "rollout_target_agent_steps", 0)))
+
+
+def _trajectory_sample_indices(
+    trajectory_ids: np.ndarray,
+    *,
+    target_agent_steps: int,
+    seed: int,
+) -> np.ndarray:
+    ids = np.asarray(trajectory_ids, dtype=np.int64)
+    if ids.size <= max(0, int(target_agent_steps)):
+        return np.arange(ids.size, dtype=np.int64)
+    unique_ids, counts = np.unique(ids, return_counts=True)
+    if unique_ids.size == 0:
+        return np.arange(ids.size, dtype=np.int64)
+
+    rng = np.random.default_rng(int(seed))
+    selected: list[int] = []
+    selected_steps = 0
+    for unique_index in rng.permutation(unique_ids.size):
+        selected_id = int(unique_ids[int(unique_index)])
+        selected.append(selected_id)
+        selected_steps += int(counts[int(unique_index)])
+        if selected_steps >= int(target_agent_steps):
+            break
+    if not selected:
+        selected.append(int(unique_ids[0]))
+    mask = np.isin(ids, np.asarray(selected, dtype=ids.dtype))
+    return np.nonzero(mask)[0].astype(np.int64, copy=False)
+
+
+def _remap_trajectory_ids(trajectory_ids: np.ndarray) -> np.ndarray:
+    old_ids = np.asarray(trajectory_ids, dtype=np.int64)
+    unique_ids = np.unique(old_ids)
+    mapping = {int(old_id): new_id for new_id, old_id in enumerate(unique_ids)}
+    return np.asarray([mapping[int(old_id)] for old_id in old_ids], dtype=np.int32)
+
+
+def _subset_scene_features(
+    rollout: RolloutBatch,
+    selected_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    transition_scene_indices = rollout.transition_scene_indices[selected_indices].astype(np.int64, copy=True)
+    scene_features = rollout.scene_features
+    if not scene_features.size or not transition_scene_indices.size:
+        return scene_features[:0].astype(np.float32, copy=False), np.full(
+            transition_scene_indices.shape,
+            -1,
+            dtype=np.int64,
+        )
+
+    valid = (transition_scene_indices >= 0) & (transition_scene_indices < len(scene_features))
+    used_scene_ids = np.unique(transition_scene_indices[valid])
+    if used_scene_ids.size == 0:
+        return scene_features[:0].astype(np.float32, copy=False), np.full(
+            transition_scene_indices.shape,
+            -1,
+            dtype=np.int64,
+        )
+
+    scene_id_map = np.full(len(scene_features), -1, dtype=np.int64)
+    scene_id_map[used_scene_ids] = np.arange(used_scene_ids.size, dtype=np.int64)
+    remapped = np.full(transition_scene_indices.shape, -1, dtype=np.int64)
+    remapped[valid] = scene_id_map[transition_scene_indices[valid]]
+    return scene_features[used_scene_ids].astype(np.float32, copy=False), remapped
+
+
+def _subset_sequence_features(
+    rollout: RolloutBatch,
+    transition_id_map: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    sequence_transition_indices = rollout.sequence_transition_indices
+    if not rollout.sequence_features.size or not sequence_transition_indices.size:
+        return (
+            rollout.sequence_features[:0].astype(np.float32, copy=False),
+            rollout.sequence_last_indices[:0].astype(np.int64, copy=False),
+            sequence_transition_indices[:0].astype(np.int64, copy=False),
+        )
+
+    clipped_windows = np.maximum(sequence_transition_indices, 0)
+    mapped_windows = transition_id_map[clipped_windows]
+    valid_entries = sequence_transition_indices >= 0
+    valid_windows = np.all(~valid_entries | (mapped_windows >= 0), axis=1)
+    if rollout.sequence_last_indices.size:
+        last_indices = rollout.sequence_last_indices.astype(np.int64, copy=False)
+        valid_last = last_indices >= 0
+        last_selected = np.ones(last_indices.shape, dtype=bool)
+        last_selected[valid_last] = transition_id_map[last_indices[valid_last]] >= 0
+        valid_windows &= last_selected
+    if not np.any(valid_windows):
+        return (
+            rollout.sequence_features[:0].astype(np.float32, copy=False),
+            rollout.sequence_last_indices[:0].astype(np.int64, copy=False),
+            sequence_transition_indices[:0].astype(np.int64, copy=False),
+        )
+
+    remapped_windows = sequence_transition_indices[valid_windows].astype(np.int64, copy=True)
+    valid_remapped_entries = remapped_windows >= 0
+    remapped_windows[valid_remapped_entries] = transition_id_map[
+        remapped_windows[valid_remapped_entries]
+    ]
+    remapped_last_indices = rollout.sequence_last_indices[valid_windows].astype(np.int64, copy=True)
+    valid_last = remapped_last_indices >= 0
+    remapped_last_indices[valid_last] = transition_id_map[remapped_last_indices[valid_last]]
+    return (
+        rollout.sequence_features[valid_windows].astype(np.float32, copy=False),
+        remapped_last_indices,
+        remapped_windows,
+    )
+
+
+def subsample_rollout_for_training(
+    rollout: RolloutBatch,
+    cfg: PSGAILConfig,
+    *,
+    seed: int,
+) -> RolloutBatch:
+    target_agent_steps = rollout_training_agent_step_cap(cfg)
+    if target_agent_steps <= 0 or int(rollout.num_agent_steps) <= int(target_agent_steps):
+        return rollout
+
+    selected_indices = _trajectory_sample_indices(
+        rollout.trajectory_ids,
+        target_agent_steps=int(target_agent_steps),
+        seed=int(seed),
+    )
+    if selected_indices.size == 0 or selected_indices.size >= int(rollout.num_agent_steps):
+        return rollout
+
+    transition_id_map = np.full(int(rollout.num_agent_steps), -1, dtype=np.int64)
+    transition_id_map[selected_indices] = np.arange(selected_indices.size, dtype=np.int64)
+    scene_features, transition_scene_indices = _subset_scene_features(rollout, selected_indices)
+    sequence_features, sequence_last_indices, sequence_transition_indices = _subset_sequence_features(
+        rollout,
+        transition_id_map,
+    )
+
+    trajectory_ids = _remap_trajectory_ids(rollout.trajectory_ids[selected_indices])
+    rewards = rollout.rewards[selected_indices].astype(np.float32, copy=False)
+    old_values = rollout.old_values[selected_indices].astype(np.float32, copy=False)
+    dones = rollout.dones[selected_indices].astype(bool, copy=False)
+    returns, advantages = compute_returns_and_advantages(rewards, old_values, dones, trajectory_ids, cfg)
+    env_penalties = rollout.env_penalties[selected_indices].astype(np.float32, copy=False)
+    gail_rewards_raw = rollout.gail_rewards_raw[selected_indices].astype(np.float32, copy=False)
+    gail_rewards_normalized = rollout.gail_rewards_normalized[selected_indices].astype(
+        np.float32,
+        copy=False,
+    )
+    return RolloutBatch(
+        policy_observations=rollout.policy_observations[selected_indices].astype(np.float32, copy=False),
+        next_policy_observations=rollout.next_policy_observations[selected_indices].astype(
+            np.float32,
+            copy=False,
+        ),
+        actions=rollout.actions[selected_indices].astype(rollout.actions.dtype, copy=False),
+        action_masks=rollout.action_masks[selected_indices].astype(bool, copy=False),
+        old_log_probs=rollout.old_log_probs[selected_indices].astype(np.float32, copy=False),
+        old_values=old_values,
+        trajectory_ids=trajectory_ids,
+        dones=dones,
+        rewards=rewards,
+        gail_rewards_raw=gail_rewards_raw,
+        gail_rewards_normalized=gail_rewards_normalized,
+        env_penalties=env_penalties,
+        returns=returns,
+        advantages=advantages,
+        generator_features=rollout.generator_features[selected_indices].astype(np.float32, copy=False),
+        scene_features=scene_features,
+        transition_scene_indices=transition_scene_indices,
+        sequence_features=sequence_features,
+        sequence_last_indices=sequence_last_indices,
+        sequence_transition_indices=sequence_transition_indices,
+        num_env_steps=rollout.num_env_steps,
+        num_agent_steps=int(selected_indices.size),
+        num_episodes=rollout.num_episodes,
+        num_terminated=rollout.num_terminated,
+        num_truncated=rollout.num_truncated,
+        num_crash_events=rollout.num_crash_events,
+        num_offroad_events=rollout.num_offroad_events,
+        crash_agent_fraction=rollout.crash_agent_fraction,
+        offroad_agent_fraction=rollout.offroad_agent_fraction,
+        mean_env_penalty=float(env_penalties.mean()) if env_penalties.size else 0.0,
+        mean_raw_gail_reward=float(gail_rewards_raw.mean()) if gail_rewards_raw.size else 0.0,
+        mean_normalized_gail_reward=float(gail_rewards_normalized.mean())
+        if gail_rewards_normalized.size
+        else 0.0,
+        mean_episode_length=rollout.mean_episode_length,
+        min_episode_length=rollout.min_episode_length,
+        max_episode_length=rollout.max_episode_length,
+        unique_episode_names=rollout.unique_episode_names,
+        episode_names=rollout.episode_names,
+        mean_controlled_vehicles=rollout.mean_controlled_vehicles,
+        mean_road_vehicles=rollout.mean_road_vehicles,
+    )
+
+
 def collect_round_rollouts(
     env: gym.Env,
     policy: nn.Module,
@@ -928,10 +1165,27 @@ def collect_round_rollouts(
     attempt = 0
     while True:
         seed_offset = (int(round_idx) - 1) * worker_stride + attempt * 1_000_003
+        collected_agent_steps = sum(int(item.num_agent_steps) for item in batches)
+        remaining_agent_steps = (
+            max(0, target_agent_steps - collected_agent_steps)
+            if target_agent_steps > 0
+            else 0
+        )
+        rollout_cfg = (
+            replace(
+                cfg,
+                rollout_min_episodes=_target_aware_rollout_episodes(
+                    cfg,
+                    remaining_agent_steps=remaining_agent_steps,
+                ),
+            )
+            if target_agent_steps > 0
+            else cfg
+        )
         batch = collect_rollouts(
             env,
             policy,
-            cfg,
+            rollout_cfg,
             device,
             policy_obs_dim,
             seed_offset=seed_offset,

@@ -19,6 +19,11 @@ class PSGAILConfig:
     rollout_min_episodes: int = 1
     rollout_full_episodes: bool = True
     rollout_max_episode_steps: int = 0
+    rollout_target_aware_episodes: bool = True
+    rollout_target_min_episodes: int = 1
+    rollout_target_episode_safety_factor: float = 1.25
+    rollout_training_subsample: bool = True
+    rollout_training_agent_steps: int = 0
     num_rollout_workers: int = 1
     rollout_worker_threads: int = 1
     max_expert_samples: int = 100_000
@@ -55,6 +60,7 @@ class PSGAILConfig:
     simulation_frequency: int = 10
     policy_frequency: int = 10
     max_episode_steps: int = 200
+    max_episode_steps_schedule: str = ""
 
     policy_model: str = "mlp"
     hidden_size: int = 256
@@ -119,6 +125,7 @@ class PSGAILConfig:
     final_reward_clip: float = 10.0
     checkpoint_every: int = 5
     save_checkpoint_video: bool = False
+    checkpoint_video_every: int = 0
     checkpoint_video_steps: int = 120
     checkpoint_video_dir: str = "videos"
     checkpoint_video_deterministic: bool = True
@@ -133,3 +140,17 @@ class PSGAILConfig:
     wandb_group: str = ""
     wandb_tags: str = ""
     wandb_watch: bool = False
+
+
+def checkpoint_video_interval(cfg: PSGAILConfig) -> int:
+    video_every = int(getattr(cfg, "checkpoint_video_every", 0))
+    if video_every > 0:
+        return video_every
+    return max(0, int(getattr(cfg, "checkpoint_every", 0)))
+
+
+def should_save_checkpoint_video(cfg: PSGAILConfig, step: int) -> bool:
+    if not bool(getattr(cfg, "save_checkpoint_video", False)):
+        return False
+    interval = checkpoint_video_interval(cfg)
+    return interval > 0 and int(step) % interval == 0

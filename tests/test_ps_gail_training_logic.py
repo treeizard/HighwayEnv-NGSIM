@@ -97,6 +97,7 @@ from scripts_gail.ps_gail.trainer import (
     refresh_rollout_rewards,
     sequence_rewards_to_transition_rewards,
     shape_rollout_rewards,
+    subsample_rollout_for_training,
     update_discriminator,
     update_policy,
 )
@@ -168,6 +169,47 @@ def _minimal_rollout(
         num_env_steps=n,
         num_agent_steps=n,
     )
+
+
+def test_rollout_training_subsample_keeps_complete_trajectories_and_remaps_indices():
+    n = 12
+    rollout = _minimal_rollout(
+        observations=np.arange(n * 2, dtype=np.float32).reshape(n, 2),
+        actions=np.zeros((n, 2), dtype=np.float32),
+        old_log_probs=np.zeros(n, dtype=np.float32),
+        old_values=np.zeros(n, dtype=np.float32),
+        returns=np.zeros(n, dtype=np.float32),
+        advantages=np.zeros(n, dtype=np.float32),
+        generator_features=np.arange(n * 3, dtype=np.float32).reshape(n, 3),
+        sequence_features=np.arange(11 * 2, dtype=np.float32).reshape(11, 2),
+        sequence_last_indices=np.arange(1, n, dtype=np.int64),
+        sequence_transition_indices=np.stack(
+            [np.arange(0, n - 1), np.arange(1, n)],
+            axis=1,
+        ).astype(np.int64),
+    )
+    rollout.trajectory_ids = np.repeat(np.arange(4, dtype=np.int32), 3)
+    rollout.scene_features = np.arange(n * 2, dtype=np.float32).reshape(n, 2)
+    rollout.transition_scene_indices = np.arange(n, dtype=np.int64)
+    cfg = PSGAILConfig(
+        rollout_training_subsample=True,
+        rollout_training_agent_steps=5,
+        gamma=0.95,
+    )
+
+    sampled = subsample_rollout_for_training(rollout, cfg, seed=7)
+
+    assert sampled.num_agent_steps == 6
+    unique_ids, counts = np.unique(sampled.trajectory_ids, return_counts=True)
+    np.testing.assert_array_equal(unique_ids, np.arange(len(unique_ids)))
+    np.testing.assert_array_equal(counts, np.full(len(unique_ids), 3))
+    assert sampled.policy_observations.shape[0] == sampled.num_agent_steps
+    assert sampled.generator_features.shape[0] == sampled.num_agent_steps
+    assert sampled.scene_features.shape[0] == sampled.num_agent_steps
+    assert np.all(sampled.transition_scene_indices >= 0)
+    if sampled.sequence_transition_indices.size:
+        assert int(sampled.sequence_transition_indices.max()) < sampled.num_agent_steps
+        assert int(sampled.sequence_last_indices.max()) < sampled.num_agent_steps
 
 
 def _write_action_conditioned_expert_file(path, *, include_actions: bool = True) -> None:

@@ -253,6 +253,17 @@ def _scheduled_rollout_target_agent_steps(cfg: PSGAILConfig, round_idx: int) -> 
     )
 
 
+def _scheduled_max_episode_steps(cfg: PSGAILConfig, round_idx: int) -> int:
+    piecewise = _scheduled_piecewise_value(
+        str(getattr(cfg, "max_episode_steps_schedule", "") or ""),
+        int(round_idx),
+        name="max_episode_steps_schedule",
+    )
+    if piecewise is not None:
+        return max(1, int(round(piecewise)))
+    return int(cfg.max_episode_steps)
+
+
 def _scheduled_gamma(cfg: PSGAILConfig, round_idx: int) -> float:
     piecewise = _scheduled_piecewise_value(
         str(getattr(cfg, "gamma_schedule", "") or ""),
@@ -447,6 +458,7 @@ def config_for_round(cfg: PSGAILConfig, round_idx: int) -> PSGAILConfig:
         disc_updates_per_round=disc_updates_per_round,
         gail_reward_clip=gail_reward_clip,
         final_reward_clip=final_reward_clip,
+        max_episode_steps=_scheduled_max_episode_steps(cfg, round_idx),
         policy_bc_regularization_coef=_scheduled_policy_bc_coef(cfg, round_idx),
         rollout_target_agent_steps=_scheduled_rollout_target_agent_steps(cfg, round_idx),
         gamma=_scheduled_gamma(cfg, round_idx),

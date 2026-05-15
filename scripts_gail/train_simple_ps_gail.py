@@ -16,7 +16,7 @@ PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
-from scripts_gail.ps_gail.config import PSGAILConfig
+from scripts_gail.ps_gail.config import PSGAILConfig, should_save_checkpoint_video
 from scripts_gail.ps_gail.data import (
     fit_feature_standardizer,
     load_expert_policy_and_disc_data,
@@ -48,6 +48,7 @@ from scripts_gail.ps_gail.trainer import (
     refresh_rollout_rewards,
     resolve_device,
     set_optimizer_lr,
+    subsample_rollout_for_training,
     update_discriminator,
     update_policy,
 )
@@ -679,6 +680,8 @@ def main() -> None:
                 f"rounds={cfg.gamma_curriculum_rounds} "
                 f"schedule={cfg.gamma_schedule or 'linear'}"
             )
+        if cfg.max_episode_steps_schedule:
+            print(f"max_episode_steps_schedule={cfg.max_episode_steps_schedule}")
 
         if int(cfg.bc_pretrain_epochs) > 0:
             if expert_transitions is None:
@@ -754,7 +757,7 @@ def main() -> None:
                 env = make_training_env(round_cfg)
                 current_env_signature = round_env_signature
 
-            rollout = collect_round_rollouts(
+            collected_rollout = collect_round_rollouts(
                 env,
                 policy,
                 round_cfg,
@@ -763,6 +766,12 @@ def main() -> None:
                 round_idx=round_idx,
                 rollout_executor=rollout_executor,
             )
+            rollout = subsample_rollout_for_training(
+                collected_rollout,
+                round_cfg,
+                seed=int(round_cfg.seed) + int(round_idx) * 104729,
+            )
+            rollout_was_subsampled = int(rollout.num_agent_steps) != int(collected_rollout.num_agent_steps)
             if sequence_only_discriminator and not rollout.sequence_features.size:
                 raise RuntimeError(
                     "Sequence discriminator was enabled but rollout produced no sequence windows. "
@@ -834,15 +843,17 @@ def main() -> None:
 
             print(
                 f"[round {round_idx:04d}] "
-                f"env_steps={rollout.num_env_steps} agent_steps={rollout.num_agent_steps} "
-                f"episodes={rollout.num_episodes} term={rollout.num_terminated} "
-                f"trunc={rollout.num_truncated} crash_eps={rollout.num_crash_events} "
-                f"offroad_eps={rollout.num_offroad_events} "
-                f"ep_len={rollout.mean_episode_length:.1f}"
-                f"[{rollout.min_episode_length},{rollout.max_episode_length}] "
-                f"uniq_eps={rollout.unique_episode_names} "
+                f"env_steps={collected_rollout.num_env_steps} "
+                f"agent_steps={collected_rollout.num_agent_steps} "
+                f"train_steps={rollout.num_agent_steps} "
+                f"episodes={collected_rollout.num_episodes} term={collected_rollout.num_terminated} "
+                f"trunc={collected_rollout.num_truncated} crash_eps={collected_rollout.num_crash_events} "
+                f"offroad_eps={collected_rollout.num_offroad_events} "
+                f"ep_len={collected_rollout.mean_episode_length:.1f}"
+                f"[{collected_rollout.min_episode_length},{collected_rollout.max_episode_length}] "
+                f"uniq_eps={collected_rollout.unique_episode_names} "
                 f"ctrl_frac={round_cfg.percentage_controlled_vehicles:.4f} "
-                f"veh={rollout.mean_controlled_vehicles:.1f}/{rollout.mean_road_vehicles:.1f} "
+                f"veh={collected_rollout.mean_controlled_vehicles:.1f}/{collected_rollout.mean_road_vehicles:.1f} "
                 f"disc_loss={disc_stats['disc_loss']:.4f} "
                 + (
                     f"gap={disc_stats['critic_gap']:.4f} "
@@ -920,22 +931,24 @@ def main() -> None:
                 mean_available_actions = float(rollout.action_masks.sum(axis=1).mean())
             metrics = {
                 "round": round_idx,
-                "rollout/env_steps": rollout.num_env_steps,
-                "rollout/agent_steps": rollout.num_agent_steps,
-                "rollout/episodes": rollout.num_episodes,
-                "rollout/terminated": rollout.num_terminated,
-                "rollout/truncated": rollout.num_truncated,
-                "rollout/crash_episodes": rollout.num_crash_events,
-                "rollout/offroad_episodes": rollout.num_offroad_events,
-                "rollout/crash_agent_fraction": rollout.crash_agent_fraction,
-                "rollout/offroad_agent_fraction": rollout.offroad_agent_fraction,
-                "rollout/mean_episode_length": rollout.mean_episode_length,
-                "rollout/min_episode_length": rollout.min_episode_length,
-                "rollout/max_episode_length": rollout.max_episode_length,
-                "rollout/unique_episode_names": rollout.unique_episode_names,
+                "rollout/env_steps": collected_rollout.num_env_steps,
+                "rollout/agent_steps": collected_rollout.num_agent_steps,
+                "rollout/training_agent_steps": rollout.num_agent_steps,
+                "rollout/training_subsampled": int(rollout_was_subsampled),
+                "rollout/episodes": collected_rollout.num_episodes,
+                "rollout/terminated": collected_rollout.num_terminated,
+                "rollout/truncated": collected_rollout.num_truncated,
+                "rollout/crash_episodes": collected_rollout.num_crash_events,
+                "rollout/offroad_episodes": collected_rollout.num_offroad_events,
+                "rollout/crash_agent_fraction": collected_rollout.crash_agent_fraction,
+                "rollout/offroad_agent_fraction": collected_rollout.offroad_agent_fraction,
+                "rollout/mean_episode_length": collected_rollout.mean_episode_length,
+                "rollout/min_episode_length": collected_rollout.min_episode_length,
+                "rollout/max_episode_length": collected_rollout.max_episode_length,
+                "rollout/unique_episode_names": collected_rollout.unique_episode_names,
                 "rollout/controlled_vehicle_fraction": float(round_cfg.percentage_controlled_vehicles),
-                "rollout/mean_controlled_vehicles": rollout.mean_controlled_vehicles,
-                "rollout/mean_road_vehicles": rollout.mean_road_vehicles,
+                "rollout/mean_controlled_vehicles": collected_rollout.mean_controlled_vehicles,
+                "rollout/mean_road_vehicles": collected_rollout.mean_road_vehicles,
                 "rollout/scene_samples": int(len(rollout.scene_features)),
                 "rollout/sequence_samples": int(len(rollout.sequence_features)),
                 "rollout/mean_gail_reward": float(rollout.rewards.mean()),
@@ -1084,6 +1097,7 @@ def main() -> None:
                     checkpoint_path,
                 )
                 monitor.save(checkpoint_path)
+            if should_save_checkpoint_video(round_cfg, round_idx):
                 video_path = save_checkpoint_video(
                     policy,
                     round_cfg,
@@ -1130,9 +1144,7 @@ def main() -> None:
             if last_checkpoint_video_round == final_round
             else None
         )
-        if final_video_path is None or not (
-            int(cfg.checkpoint_every) > 0 and final_round % int(cfg.checkpoint_every) == 0
-        ):
+        if final_video_path is None:
             final_video_path = save_checkpoint_video(
                 policy,
                 final_round_cfg,
