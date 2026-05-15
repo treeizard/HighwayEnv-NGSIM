@@ -47,6 +47,7 @@ from scripts_gail.ps_gail.trainer import (
     policy_action_dim,
     refresh_rollout_rewards,
     resolve_device,
+    set_optimizer_lr,
     update_discriminator,
     update_policy,
 )
@@ -476,7 +477,7 @@ def main() -> None:
                 seed=cfg.seed,
                 trajectory_frame=cfg.trajectory_frame,
             )
-            if int(cfg.bc_pretrain_epochs) > 0:
+            if int(cfg.bc_pretrain_epochs) > 0 or float(cfg.policy_bc_regularization_coef) > 0.0:
                 expert_transitions = load_expert_transition_data(
                     cfg.expert_data,
                     max_samples=cfg.max_expert_samples,
@@ -620,6 +621,22 @@ def main() -> None:
                 f"val_fraction={cfg.bc_pretrain_validation_fraction} "
                 f"eval_episodes={cfg.bc_pretrain_eval_episodes}"
             )
+        if int(cfg.warmup_rounds) > 0:
+            print(
+                "warmup="
+                f"rounds={cfg.warmup_rounds} "
+                f"policy_lr={cfg.warmup_learning_rate or cfg.learning_rate}->{cfg.learning_rate} "
+                f"disc_lr={cfg.warmup_disc_learning_rate or cfg.disc_learning_rate}->{cfg.disc_learning_rate} "
+                f"entropy={cfg.warmup_entropy_coef if cfg.warmup_entropy_coef >= 0 else cfg.entropy_coef}->{cfg.entropy_coef} "
+                f"clip={cfg.warmup_clip_range or cfg.clip_range}->{cfg.clip_range}"
+            )
+        if float(cfg.policy_bc_regularization_coef) > 0.0:
+            print(
+                "policy_bc_regularization="
+                f"coef={cfg.policy_bc_regularization_coef} "
+                f"final={cfg.policy_bc_regularization_final_coef} "
+                f"decay_rounds={cfg.policy_bc_regularization_decay_rounds}"
+            )
         if expert_scene_features is not None:
             print(
                 "scene_discriminator="
@@ -641,7 +658,9 @@ def main() -> None:
                 "controlled_vehicle_curriculum="
                 f"initial={cfg.initial_controlled_vehicles:.4f} "
                 f"final={cfg.final_controlled_vehicles:.4f} "
-                f"rounds={cfg.controlled_vehicle_curriculum_rounds}"
+                f"rounds={cfg.controlled_vehicle_curriculum_rounds} "
+                f"increment_rounds={cfg.controlled_vehicle_increment_rounds} "
+                f"schedule={cfg.controlled_vehicle_schedule or 'linear'}"
             )
         if int(cfg.initial_rollout_target_agent_steps) > 0 or int(cfg.final_rollout_target_agent_steps) > 0:
             print(
@@ -721,6 +740,10 @@ def main() -> None:
 
         for round_idx in range(1, int(cfg.total_rounds) + 1):
             round_cfg = config_for_round(cfg, round_idx)
+            set_optimizer_lr(policy_optimizer, float(round_cfg.learning_rate))
+            set_optimizer_lr(disc_optimizer, float(round_cfg.disc_learning_rate))
+            if scene_disc_optimizer is not None:
+                set_optimizer_lr(scene_disc_optimizer, float(round_cfg.disc_learning_rate))
             round_env_signature = env_signature(round_cfg)
             if round_env_signature != current_env_signature:
                 if env is not None:
@@ -788,7 +811,23 @@ def main() -> None:
                     primary_discriminator_normalizer if sequence_only_discriminator else None
                 ),
             )
-            policy_stats = update_policy(policy, policy_optimizer, rollout, round_cfg, device)
+            policy_stats = update_policy(
+                policy,
+                policy_optimizer,
+                rollout,
+                round_cfg,
+                device,
+                expert_policy_observations=(
+                    expert_transitions.policy_observations
+                    if expert_transitions is not None
+                    else None
+                ),
+                expert_actions=(
+                    expert_transitions.actions_continuous_env
+                    if expert_transitions is not None
+                    else None
+                ),
+            )
 
             print(
                 f"[round {round_idx:04d}] "
@@ -840,6 +879,14 @@ def main() -> None:
                 f"expert_acc={disc_stats['expert_acc']:.3f} gen_acc={disc_stats['gen_acc']:.3f} "
                 f"policy_loss={policy_stats['policy_loss']:.4f} "
                 f"value_loss={policy_stats['value_loss']:.4f} "
+                + (
+                    f"bc_reg={policy_stats['bc_regularization_loss']:.6f} "
+                    f"bc_coef={policy_stats['bc_regularization_coef']:.4f} "
+                    if float(policy_stats["bc_regularization_coef"]) > 0.0
+                    else ""
+                )
+                + (
+                f"lr={round_cfg.learning_rate:.2e}/{round_cfg.disc_learning_rate:.2e} "
                 f"kl={policy_stats['approx_kl']:.5f} "
                 f"clip_frac={policy_stats['clip_fraction']:.3f} "
                 f"ppo_micro={int(policy_stats['ppo_micro_batch_size'])} "
@@ -851,6 +898,7 @@ def main() -> None:
                 f"env_penalty={rollout.mean_env_penalty:.4f} "
                 f"reward={float(rollout.rewards.mean()):.4f} "
                 f"reward_std={float(rollout.rewards.std()):.4f}"
+                )
                 )
             )
             selected_action_valid = float("nan")
@@ -916,6 +964,8 @@ def main() -> None:
                 "discriminator/gen_centered_acc": disc_stats["gen_centered_acc"],
                 "policy/loss": policy_stats["policy_loss"],
                 "policy/value_loss": policy_stats["value_loss"],
+                "policy/bc_regularization_loss": policy_stats["bc_regularization_loss"],
+                "policy/bc_regularization_coef": policy_stats["bc_regularization_coef"],
                 "policy/entropy": policy_stats["entropy"],
                 "policy/approx_kl": policy_stats["approx_kl"],
                 "policy/clip_fraction": policy_stats["clip_fraction"],
@@ -924,6 +974,11 @@ def main() -> None:
                 "policy/ppo_micro_batch_size": policy_stats["ppo_micro_batch_size"],
                 "train/policy_obs_dim": policy_obs_dim,
                 "train/disc_feature_dim": feature_dim,
+                "train/policy_learning_rate": float(round_cfg.learning_rate),
+                "train/disc_learning_rate": float(round_cfg.disc_learning_rate),
+                "train/entropy_coef": float(round_cfg.entropy_coef),
+                "train/clip_range": float(round_cfg.clip_range),
+                "train/disc_updates_per_round": int(round_cfg.disc_updates_per_round),
                 "train/expert_samples": int(expert_features.shape[0]),
                 "train/disc_feature_norm": int(bool(cfg.normalize_discriminator_features)),
                 "train/disc_feature_clip": float(cfg.discriminator_feature_clip),

@@ -115,6 +115,11 @@ def resolve_device(name: str) -> torch.device:
     return torch.device(name)
 
 
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, learning_rate: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = float(learning_rate)
+
+
 def infer_policy_obs_dim(env: gym.Env) -> int:
     obs, _ = env.reset()
     return int(policy_observations_from_flat(flatten_agent_observations(obs)).shape[1])
@@ -1249,6 +1254,9 @@ def update_policy(
     rollout: RolloutBatch,
     cfg: PSGAILConfig,
     device: torch.device,
+    *,
+    expert_policy_observations: np.ndarray | None = None,
+    expert_actions: np.ndarray | None = None,
 ) -> dict[str, float]:
     was_training = policy.training
     # Rollout log-probabilities are collected with policy.eval(). Keeping PPO
@@ -1272,6 +1280,32 @@ def update_policy(
     old_log_probs_tensor = torch.as_tensor(rollout.old_log_probs, dtype=torch.float32, device=cpu_device)
     returns_tensor = torch.as_tensor(rollout.returns, dtype=torch.float32, device=cpu_device)
     advantages_tensor = torch.as_tensor(rollout.advantages, dtype=torch.float32, device=cpu_device)
+    bc_coef = max(0.0, float(getattr(cfg, "policy_bc_regularization_coef", 0.0)))
+    if bc_coef > 0.0:
+        if not _is_continuous(cfg):
+            raise ValueError("policy_bc_regularization_coef currently requires continuous action mode.")
+        if expert_policy_observations is None or expert_actions is None:
+            raise ValueError("policy_bc_regularization_coef requires expert policy observations and actions.")
+        expert_obs_tensor = torch.as_tensor(
+            np.asarray(expert_policy_observations, dtype=np.float32),
+            dtype=torch.float32,
+            device=cpu_device,
+        )
+        expert_action_tensor = torch.as_tensor(
+            np.clip(np.asarray(expert_actions, dtype=np.float32), -1.0, 1.0),
+            dtype=torch.float32,
+            device=cpu_device,
+        )
+        if len(expert_obs_tensor) != len(expert_action_tensor):
+            raise ValueError(
+                "Expert BC regularization observation/action count mismatch: "
+                f"{len(expert_obs_tensor)} != {len(expert_action_tensor)}."
+            )
+        if len(expert_obs_tensor) == 0:
+            raise ValueError("Expert BC regularization received no expert samples.")
+    else:
+        expert_obs_tensor = None
+        expert_action_tensor = None
     policy_losses: list[float] = []
     value_losses: list[float] = []
     entropies: list[float] = []
@@ -1279,6 +1313,7 @@ def update_policy(
     clip_fractions: list[float] = []
     ratio_means: list[float] = []
     ratio_stds: list[float] = []
+    bc_losses: list[float] = []
     batch_size = max(1, int(cfg.batch_size))
     num_samples = int(obs_tensor.shape[0])
 
@@ -1334,6 +1369,19 @@ def update_policy(
                     value_loss = F.mse_loss(values, returns)
                     entropy = dist.entropy().mean()
                     loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
+                    bc_loss = None
+                    if bc_coef > 0.0 and expert_obs_tensor is not None and expert_action_tensor is not None:
+                        expert_idx = torch.randint(
+                            0,
+                            int(expert_obs_tensor.shape[0]),
+                            (micro_count,),
+                            device=cpu_device,
+                        )
+                        expert_obs = device_batch(expert_obs_tensor, expert_idx)
+                        expert_actions_for_bc = device_batch(expert_action_tensor, expert_idx)
+                        pred_expert_actions, _expert_values = policy(expert_obs)
+                        bc_loss = F.mse_loss(pred_expert_actions, expert_actions_for_bc)
+                        loss = loss + bc_coef * bc_loss
                     (loss * micro_weight).backward()
                     with torch.no_grad():
                         approx_kl = ((ratio - 1.0) - log_ratio).mean()
@@ -1349,6 +1397,8 @@ def update_policy(
                         weighted_ratio_std += micro_weight * float(
                             ratio.std(unbiased=False).detach().cpu().item()
                         )
+                        if bc_loss is not None:
+                            bc_losses.append(float(bc_loss.detach().cpu().item()))
                 nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
                 optimizer.step()
                 policy_losses.append(weighted_policy_loss)
@@ -1370,5 +1420,7 @@ def update_policy(
         "clip_fraction": float(np.mean(clip_fractions)),
         "ratio_mean": float(np.mean(ratio_means)),
         "ratio_std": float(np.mean(ratio_stds)),
+        "bc_regularization_loss": float(np.mean(bc_losses)) if bc_losses else 0.0,
+        "bc_regularization_coef": float(bc_coef),
         "ppo_micro_batch_size": float(micro_batch_size),
     }

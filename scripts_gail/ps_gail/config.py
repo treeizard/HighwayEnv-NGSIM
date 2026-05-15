@@ -30,6 +30,16 @@ class PSGAILConfig:
     initial_controlled_vehicles: float = 0.2
     final_controlled_vehicles: float = 1.0
     controlled_vehicle_curriculum_rounds: int = 100
+    controlled_vehicle_increment_rounds: int = 0
+    controlled_vehicle_schedule: str = ""
+    warmup_rounds: int = 0
+    warmup_learning_rate: float = 0.0
+    warmup_disc_learning_rate: float = 0.0
+    warmup_entropy_coef: float = -1.0
+    warmup_clip_range: float = 0.0
+    warmup_disc_updates_per_round: int = 0
+    warmup_gail_reward_clip: float = 0.0
+    warmup_final_reward_clip: float = 0.0
     rollout_target_agent_steps: int = 0
     initial_rollout_target_agent_steps: int = 0
     final_rollout_target_agent_steps: int = 0
@@ -59,6 +69,9 @@ class PSGAILConfig:
     bc_pretrain_eval_deterministic: bool = True
     bc_pretrain_min_mean_episode_length: float = 0.0
     bc_pretrain_abort_on_failed_eval: bool = False
+    policy_bc_regularization_coef: float = 0.0
+    policy_bc_regularization_final_coef: float = 0.0
+    policy_bc_regularization_decay_rounds: int = 0
     disc_learning_rate: float = 3e-4
     gamma: float = 0.99
     initial_gamma: float = 0.0
