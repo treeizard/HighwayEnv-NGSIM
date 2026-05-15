@@ -261,13 +261,17 @@ try:
     selected = len(env.unwrapped.ego_ids)
 finally:
     env.close()
-if selected > requested:
-    raise SystemExit(f"selected {selected} ego vehicles from request {requested}")
+if selected < 1:
+    raise SystemExit(f"selected no ego vehicles from request {requested:g}")
+if requested >= 1.0 and float(requested).is_integer() and selected > int(requested):
+    raise SystemExit(
+        f"selected {selected} ego vehicles from absolute-count request {int(requested)}"
+    )
 print(
     "sparse episode preflight ok:",
     episode_name,
     "requested",
-    int(requested),
+    f"{requested:g}",
     "selected",
     selected,
 )
