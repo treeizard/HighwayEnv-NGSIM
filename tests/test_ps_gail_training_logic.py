@@ -97,6 +97,8 @@ from scripts_gail.ps_gail.models import (
 )
 from scripts_gail.ps_gail.trainer import (
     RolloutBatch,
+    central_critic_observation_dim,
+    central_critic_observations,
     policy_distribution_and_values,
     refresh_rollout_rewards,
     sequence_rewards_to_transition_rewards,
@@ -119,6 +121,8 @@ def _minimal_rollout(
     old_values: np.ndarray,
     returns: np.ndarray,
     advantages: np.ndarray,
+    critic_observations: np.ndarray | None = None,
+    next_critic_observations: np.ndarray | None = None,
     generator_features: np.ndarray | None = None,
     env_penalties: np.ndarray | None = None,
     sequence_features: np.ndarray | None = None,
@@ -144,6 +148,20 @@ def _minimal_rollout(
     return RolloutBatch(
         policy_observations=observations.astype(np.float32),
         next_policy_observations=observations.astype(np.float32),
+        critic_observations=(
+            critic_observations.astype(np.float32)
+            if critic_observations is not None
+            else observations.astype(np.float32)
+        ),
+        next_critic_observations=(
+            next_critic_observations.astype(np.float32)
+            if next_critic_observations is not None
+            else (
+                critic_observations.astype(np.float32)
+                if critic_observations is not None
+                else observations.astype(np.float32)
+            )
+        ),
         actions=actions,
         action_masks=np.ones((n, 5), dtype=bool),
         old_log_probs=old_log_probs.astype(np.float32),
@@ -208,6 +226,7 @@ def test_rollout_training_subsample_keeps_complete_trajectories_and_remaps_indic
     np.testing.assert_array_equal(unique_ids, np.arange(len(unique_ids)))
     np.testing.assert_array_equal(counts, np.full(len(unique_ids), 3))
     assert sampled.policy_observations.shape[0] == sampled.num_agent_steps
+    assert sampled.critic_observations.shape[0] == sampled.num_agent_steps
     assert sampled.generator_features.shape[0] == sampled.num_agent_steps
     assert sampled.scene_features.shape[0] == sampled.num_agent_steps
     assert np.all(sampled.transition_scene_indices >= 0)
@@ -370,6 +389,110 @@ def test_transformer_policy_update_uses_rollout_consistent_eval_mode():
     assert abs(stats["approx_kl"]) < 1e-7
     assert stats["clip_fraction"] == 0.0
     assert abs(stats["ratio_mean"] - 1.0) < 1e-7
+
+
+def test_centralized_critic_uses_separate_observation_path():
+    torch.manual_seed(0)
+    policy = make_actor_critic(
+        "mlp",
+        obs_dim=3,
+        hidden_size=8,
+        centralized_critic=True,
+        critic_obs_dim=7,
+    )
+    obs = torch.randn(5, 3)
+    critic_a = torch.randn(5, 7)
+    critic_b = critic_a + 0.5
+
+    logits_a, values_a = policy(obs, critic_a)
+    logits_b, values_b = policy(obs, critic_b)
+
+    assert logits_a.shape == (5, 5)
+    assert values_a.shape == (5,)
+    torch.testing.assert_close(logits_a, logits_b)
+    assert not torch.allclose(values_a, values_b)
+
+
+def test_update_policy_trains_centralized_critic_values():
+    torch.manual_seed(0)
+    np.random.seed(0)
+    cfg = PSGAILConfig(
+        centralized_critic=True,
+        batch_size=8,
+        ppo_epochs=1,
+        entropy_coef=0.0,
+        value_coef=0.5,
+    )
+    policy = make_actor_critic(
+        "mlp",
+        obs_dim=3,
+        hidden_size=16,
+        centralized_critic=True,
+        critic_obs_dim=7,
+    )
+    observations = torch.randn(16, 3)
+    critic_observations = torch.randn(16, 7)
+    policy.eval()
+    with torch.no_grad():
+        logits, values = policy(observations, critic_observations)
+        dist = Categorical(logits=logits)
+        actions = dist.sample()
+        old_log_probs = dist.log_prob(actions)
+
+    rollout = _minimal_rollout(
+        observations=observations.numpy(),
+        critic_observations=critic_observations.numpy(),
+        actions=actions.numpy().astype(np.int64),
+        old_log_probs=old_log_probs.numpy(),
+        old_values=values.numpy(),
+        returns=(values.numpy() + 1.0).astype(np.float32),
+        advantages=np.ones(16, dtype=np.float32),
+    )
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+
+    stats = update_policy(policy, optimizer, rollout, cfg, torch.device("cpu"))
+
+    assert np.isfinite(stats["value_loss"])
+    assert stats["value_loss"] > 0.0
+
+
+def test_central_critic_observations_encode_per_agent_scene_context():
+    class Vehicle:
+        def __init__(self, x, y, vx, vy, speed, heading, vehicle_id):
+            self.position = np.asarray([x, y], dtype=np.float32)
+            self.velocity = np.asarray([vx, vy], dtype=np.float32)
+            self.speed = speed
+            self.heading = heading
+            self.WIDTH = 2.0
+            self.LENGTH = 4.5
+            self.vehicle_ID = vehicle_id
+
+    vehicles = [
+        Vehicle(10.0, 0.0, 1.0, 0.0, 10.0, 0.1, 1),
+        Vehicle(20.0, 1.0, 2.0, 0.0, 11.0, 0.2, 2),
+        Vehicle(30.0, 2.0, 3.0, 0.0, 12.0, 0.3, 3),
+    ]
+    env = types.SimpleNamespace(
+        unwrapped=types.SimpleNamespace(
+            controlled_vehicles=vehicles[:2],
+            road=types.SimpleNamespace(vehicles=vehicles),
+        )
+    )
+    cfg = PSGAILConfig(
+        centralized_critic=True,
+        central_critic_max_vehicles=3,
+        central_critic_include_local_obs=True,
+    )
+    local_obs = np.arange(8, dtype=np.float32).reshape(2, 4)
+
+    critic_obs = central_critic_observations(env, cfg, local_obs)
+
+    assert critic_obs.shape == (2, central_critic_observation_dim(4, cfg))
+    np.testing.assert_allclose(critic_obs[0, -4:], local_obs[0])
+    np.testing.assert_allclose(critic_obs[1, -4:], local_obs[1])
+    assert critic_obs[0, 1] == pytest.approx(0.0)
+    assert critic_obs[1, 1] == pytest.approx(0.0)
+    assert not np.allclose(critic_obs[0], critic_obs[1])
 
 
 def test_discrete_policy_distribution_respects_action_masks():

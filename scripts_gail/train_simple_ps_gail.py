@@ -42,6 +42,7 @@ from scripts_gail.ps_gail.trainer import (
     discrete_action_masks_from_env,
     discriminator_input_mode,
     infer_continuous_action_dim,
+    infer_critic_obs_dim,
     infer_policy_obs_dim,
     make_rollout_executor,
     policy_action_dim,
@@ -548,6 +549,7 @@ def main() -> None:
             env_cfg.continuous_action_dim = continuous_action_dim
         current_env_signature = env_signature(env_cfg)
         policy_obs_dim = infer_policy_obs_dim(env)
+        critic_obs_dim = infer_critic_obs_dim(env, cfg, policy_obs_dim=policy_obs_dim)
         if policy_obs_dim != expert_metadata["policy_observation_dim"]:
             raise RuntimeError(
                 "Expert/generator policy observation dimensions differ: "
@@ -563,6 +565,8 @@ def main() -> None:
             transformer_layers=int(cfg.transformer_layers),
             transformer_heads=int(cfg.transformer_heads),
             transformer_dropout=float(cfg.transformer_dropout),
+            centralized_critic=bool(cfg.centralized_critic),
+            critic_obs_dim=critic_obs_dim,
         ).to(device)
         if sequence_only_discriminator:
             if expert_sequence_features is None:
@@ -571,6 +575,7 @@ def main() -> None:
                 int(expert_sequence_features.shape[-1]),
                 hidden_sizes=cfg.discriminator_hidden_sizes,
                 dropout=float(cfg.discriminator_dropout),
+                spectral_norm=bool(cfg.discriminator_spectral_norm),
             ).to(device)
             discriminator_expert_features = expert_sequence_features
             discriminator_name = "sequence"
@@ -579,6 +584,7 @@ def main() -> None:
                 feature_dim,
                 hidden_sizes=cfg.discriminator_hidden_sizes,
                 dropout=float(cfg.discriminator_dropout),
+                spectral_norm=bool(cfg.discriminator_spectral_norm),
             ).to(device)
             discriminator_expert_features = expert_features
             discriminator_name = "trajectory"
@@ -587,6 +593,7 @@ def main() -> None:
                 int(expert_scene_features.shape[1]),
                 hidden_sizes=cfg.discriminator_hidden_sizes,
                 dropout=float(cfg.discriminator_dropout),
+                spectral_norm=bool(cfg.discriminator_spectral_norm),
             ).to(device)
             if expert_scene_features is not None
             else None
@@ -640,10 +647,17 @@ def main() -> None:
             f"collision_enabled={cfg.enable_collision} allow_idm={cfg.allow_idm} "
             f"action_mode={cfg.action_mode} "
             f"policy_model={cfg.policy_model} "
-            f"policy_obs_dim={policy_obs_dim} disc_feature_dim={feature_dim} device={device} "
+            f"policy_obs_dim={policy_obs_dim} critic_obs_dim={critic_obs_dim} device={device} "
+            f"centralized_critic={cfg.centralized_critic} "
+            f"central_critic_max_vehicles={cfg.central_critic_max_vehicles} "
+            f"central_critic_include_local_obs={cfg.central_critic_include_local_obs} "
+            f"disc_feature_dim={feature_dim} "
             f"discriminator={discriminator_name} "
             f"discriminator_input={discriminator_input_mode(cfg)} "
             f"disc_loss={cfg.discriminator_loss} "
+            f"disc_hidden={cfg.discriminator_hidden_sizes} "
+            f"disc_dropout={cfg.discriminator_dropout} "
+            f"disc_spectral_norm={cfg.discriminator_spectral_norm} "
             f"wgan_reward_center={cfg.wgan_reward_center} "
             f"wgan_reward_clip={cfg.wgan_reward_clip} "
             f"wgan_reward_scale={cfg.wgan_reward_scale} "
@@ -807,6 +821,7 @@ def main() -> None:
                 round_cfg,
                 device,
                 policy_obs_dim,
+                critic_obs_dim,
                 round_idx=round_idx,
                 rollout_executor=rollout_executor,
             )
@@ -1033,6 +1048,8 @@ def main() -> None:
                 "policy/ratio_std": policy_stats["ratio_std"],
                 "policy/ppo_micro_batch_size": policy_stats["ppo_micro_batch_size"],
                 "train/policy_obs_dim": policy_obs_dim,
+                "train/critic_obs_dim": critic_obs_dim,
+                "train/centralized_critic": int(bool(round_cfg.centralized_critic)),
                 "train/disc_feature_dim": feature_dim,
                 "train/policy_learning_rate": float(round_cfg.learning_rate),
                 "train/disc_learning_rate": float(round_cfg.disc_learning_rate),
@@ -1042,6 +1059,7 @@ def main() -> None:
                 "train/expert_samples": int(expert_features.shape[0]),
                 "train/disc_feature_norm": int(bool(cfg.normalize_discriminator_features)),
                 "train/disc_feature_clip": float(cfg.discriminator_feature_clip),
+                "train/discriminator_spectral_norm": int(bool(round_cfg.discriminator_spectral_norm)),
                 "train/action_masking": int(bool(cfg.enable_action_masking)),
                 "train/discriminator_loss_type_wgan_gp": int(str(cfg.discriminator_loss).lower() == "wgan_gp"),
                 "train/wgan_gp_lambda": float(cfg.wgan_gp_lambda),

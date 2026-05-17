@@ -30,6 +30,7 @@ from scripts_gail.ps_gail.trainer import (
     collect_round_rollouts,
     compute_returns_and_advantages,
     infer_continuous_action_dim,
+    infer_critic_obs_dim,
     infer_policy_obs_dim,
     make_rollout_executor,
     policy_distribution_and_values,
@@ -52,6 +53,7 @@ class AIRLReward(nn.Module):
         *,
         hidden_sizes: str | int | tuple[int, ...] | list[int] | None = None,
         dropout: float = 0.2,
+        spectral_norm: bool = False,
     ) -> None:
         super().__init__()
         critic_hidden_sizes = hidden_sizes if hidden_sizes is not None else hidden_size
@@ -60,12 +62,14 @@ class AIRLReward(nn.Module):
             critic_hidden_sizes,
             1,
             dropout=dropout,
+            spectral_norm=spectral_norm,
         )
         self.potential = make_relu_mlp(
             int(obs_dim),
             critic_hidden_sizes,
             1,
             dropout=dropout,
+            spectral_norm=spectral_norm,
         )
 
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -452,6 +456,7 @@ def main() -> None:
         cfg.continuous_action_dim = infer_continuous_action_dim(env)
         env_cfg.continuous_action_dim = cfg.continuous_action_dim
         policy_obs_dim = infer_policy_obs_dim(env)
+        critic_obs_dim = infer_critic_obs_dim(env, cfg, policy_obs_dim=policy_obs_dim)
         if policy_obs_dim != expert.policy_observations.shape[1]:
             raise RuntimeError(f"Expert/env observation mismatch: {expert.policy_observations.shape[1]} != {policy_obs_dim}.")
         policy = make_actor_critic(
@@ -463,12 +468,15 @@ def main() -> None:
             transformer_layers=int(cfg.transformer_layers),
             transformer_heads=int(cfg.transformer_heads),
             transformer_dropout=float(cfg.transformer_dropout),
+            centralized_critic=bool(cfg.centralized_critic),
+            critic_obs_dim=critic_obs_dim,
         ).to(device)
         reward_model = AIRLReward(
             policy_obs_dim,
             int(cfg.continuous_action_dim),
             hidden_sizes=cfg.discriminator_hidden_sizes,
             dropout=float(cfg.discriminator_dropout),
+            spectral_norm=bool(cfg.discriminator_spectral_norm),
         ).to(device)
         policy_optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.learning_rate)
         reward_optimizer = torch.optim.Adam(reward_model.parameters(), lr=cfg.disc_learning_rate)
@@ -479,10 +487,17 @@ def main() -> None:
         print(f"Loaded expert folder: {os.path.abspath(cfg.expert_data)}")
         print(f"expert_obs={expert.policy_observations.shape} expert_actions={expert.actions_continuous_env.shape}")
         print(
-            f"policy_obs_dim={policy_obs_dim} action_dim={cfg.continuous_action_dim} device={device} "
+            f"policy_obs_dim={policy_obs_dim} critic_obs_dim={critic_obs_dim} "
+            f"centralized_critic={cfg.centralized_critic} "
+            f"central_critic_max_vehicles={cfg.central_critic_max_vehicles} "
+            f"central_critic_include_local_obs={cfg.central_critic_include_local_obs} "
+            f"action_dim={cfg.continuous_action_dim} device={device} "
             f"policy_model={cfg.policy_model} transformer_layers={cfg.transformer_layers} "
             f"transformer_heads={cfg.transformer_heads} transformer_dropout={cfg.transformer_dropout} "
             f"airl_objective={cfg.discriminator_loss} wgan_gp_lambda={cfg.wgan_gp_lambda} "
+            f"reward_hidden={cfg.discriminator_hidden_sizes} "
+            f"reward_dropout={cfg.discriminator_dropout} "
+            f"reward_spectral_norm={cfg.discriminator_spectral_norm} "
             f"wgan_reward_center={cfg.wgan_reward_center} wgan_reward_clip={cfg.wgan_reward_clip} "
             f"wgan_reward_scale={cfg.wgan_reward_scale}"
         )
@@ -615,6 +630,7 @@ def main() -> None:
                 round_cfg,
                 device,
                 policy_obs_dim,
+                critic_obs_dim,
                 round_idx=round_idx,
                 rollout_executor=rollout_executor,
             )
@@ -718,6 +734,10 @@ def main() -> None:
                     str(round_cfg.discriminator_loss).lower() == "wgan_gp"
                 ),
                 "train/wgan_gp_lambda": float(round_cfg.wgan_gp_lambda),
+                "train/reward_spectral_norm": int(bool(round_cfg.discriminator_spectral_norm)),
+                "train/policy_obs_dim": policy_obs_dim,
+                "train/critic_obs_dim": critic_obs_dim,
+                "train/centralized_critic": int(bool(round_cfg.centralized_critic)),
                 "train/wgan_reward_center": int(bool(round_cfg.wgan_reward_center)),
                 "train/wgan_reward_clip": float(round_cfg.wgan_reward_clip),
                 "train/wgan_reward_scale": float(round_cfg.wgan_reward_scale),

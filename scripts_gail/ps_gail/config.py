@@ -67,6 +67,9 @@ class PSGAILConfig:
     transformer_layers: int = 2
     transformer_heads: int = 4
     transformer_dropout: float = 0.1
+    centralized_critic: bool = False
+    central_critic_max_vehicles: int = 64
+    central_critic_include_local_obs: bool = False
     learning_rate: float = 3e-4
     bc_pretrain_epochs: int = 0
     bc_pretrain_learning_rate: float = 3e-4
@@ -100,6 +103,7 @@ class PSGAILConfig:
     discriminator_loss: str = "wgan_gp"
     discriminator_hidden_sizes: str = "128,128,64"
     discriminator_dropout: float = 0.2
+    discriminator_spectral_norm: bool = False
     wgan_gp_lambda: float = 2.0
     wgan_reward_center: bool = False
     wgan_reward_clip: float = 0.0

@@ -15,6 +15,7 @@ from torch.distributions import Categorical, Normal
 
 from .config import PSGAILConfig
 from .data import (
+    SCENE_FEATURE_DIM_PER_VEHICLE,
     build_sequence_windows,
     discriminator_features,
     normalize_trajectory_frame,
@@ -31,6 +32,8 @@ from .observations import flatten_agent_observations, policy_observations_from_f
 class AgentTransition:
     policy_observation: np.ndarray
     next_policy_observation: np.ndarray
+    critic_observation: np.ndarray
+    next_critic_observation: np.ndarray
     action: object
     action_mask: np.ndarray
     log_prob: float
@@ -48,6 +51,8 @@ class AgentTransition:
 class RolloutBatch:
     policy_observations: np.ndarray
     next_policy_observations: np.ndarray
+    critic_observations: np.ndarray
+    next_critic_observations: np.ndarray
     actions: np.ndarray
     action_masks: np.ndarray
     old_log_probs: np.ndarray
@@ -127,6 +132,33 @@ def infer_policy_obs_dim(env: gym.Env) -> int:
     return int(policy_observations_from_flat(flatten_agent_observations(obs)).shape[1])
 
 
+CENTRAL_CRITIC_CONTEXT_DIM = 4
+
+
+def centralized_critic_enabled(cfg: PSGAILConfig) -> bool:
+    return bool(getattr(cfg, "centralized_critic", False))
+
+
+def central_critic_observation_dim(policy_obs_dim: int, cfg: PSGAILConfig) -> int:
+    if not centralized_critic_enabled(cfg):
+        return int(policy_obs_dim)
+    base_dim = max(1, int(getattr(cfg, "central_critic_max_vehicles", 64))) * SCENE_FEATURE_DIM_PER_VEHICLE
+    if bool(getattr(cfg, "central_critic_include_local_obs", False)):
+        base_dim += int(policy_obs_dim)
+    return int(base_dim + CENTRAL_CRITIC_CONTEXT_DIM)
+
+
+def infer_critic_obs_dim(
+    env: gym.Env,
+    cfg: PSGAILConfig,
+    *,
+    policy_obs_dim: int | None = None,
+) -> int:
+    if policy_obs_dim is None:
+        policy_obs_dim = infer_policy_obs_dim(env)
+    return central_critic_observation_dim(int(policy_obs_dim), cfg)
+
+
 def infer_continuous_action_dim(env: gym.Env) -> int:
     action_space = env.action_space
     if isinstance(action_space, gym.spaces.Tuple):
@@ -200,13 +232,90 @@ def discrete_action_masks_from_env(
     return masks
 
 
+def _finite_scalar(value: object, default: float = 0.0) -> float:
+    try:
+        scalar = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return scalar if np.isfinite(scalar) else float(default)
+
+
+def _vehicle_scalar(vehicle: object | None, names: tuple[str, ...], default: float = 0.0) -> float:
+    if vehicle is None:
+        return float(default)
+    for name in names:
+        if hasattr(vehicle, name):
+            return _finite_scalar(getattr(vehicle, name), default)
+    return float(default)
+
+
+def _vehicle_origin(vehicle: object | None) -> np.ndarray | None:
+    if vehicle is None or getattr(vehicle, "position", None) is None:
+        return None
+    try:
+        origin = np.asarray(getattr(vehicle, "position"), dtype=np.float32).reshape(2)
+    except (TypeError, ValueError):
+        return None
+    return origin if np.all(np.isfinite(origin)) else None
+
+
+def central_critic_observations(
+    env: gym.Env,
+    cfg: PSGAILConfig,
+    policy_observations: np.ndarray,
+) -> np.ndarray:
+    policy_obs = np.asarray(policy_observations, dtype=np.float32)
+    if policy_obs.ndim != 2:
+        raise ValueError(f"Expected rank-2 policy observations, got {policy_obs.shape}.")
+    if not centralized_critic_enabled(cfg):
+        return policy_obs.astype(np.float32, copy=True)
+
+    controlled_vehicles = list(getattr(env.unwrapped, "controlled_vehicles", ()) or ())
+    road = getattr(env.unwrapped, "road", None)
+    road_vehicles = (
+        list(getattr(road, "vehicles", ()) or ())
+        if road is not None
+        else controlled_vehicles
+    )
+    max_vehicles = max(1, int(getattr(cfg, "central_critic_max_vehicles", 64)))
+    include_local_obs = bool(getattr(cfg, "central_critic_include_local_obs", False))
+    rows: list[np.ndarray] = []
+    for agent_idx in range(policy_obs.shape[0]):
+        vehicle = controlled_vehicles[agent_idx] if agent_idx < len(controlled_vehicles) else None
+        scene = scene_snapshot_features(
+            road_vehicles,
+            max_vehicles=max_vehicles,
+            origin=_vehicle_origin(vehicle),
+        )
+        context = np.asarray(
+            [
+                _vehicle_scalar(vehicle, ("speed",)),
+                _vehicle_scalar(vehicle, ("heading",)),
+                _vehicle_scalar(vehicle, ("WIDTH", "width")),
+                _vehicle_scalar(vehicle, ("LENGTH", "length")),
+            ],
+            dtype=np.float32,
+        )
+        parts = [scene, context]
+        if include_local_obs:
+            parts.append(policy_obs[agent_idx])
+        rows.append(np.concatenate(parts, axis=0).astype(np.float32, copy=False))
+    if not rows:
+        return np.zeros(
+            (0, central_critic_observation_dim(policy_obs.shape[1], cfg)),
+            dtype=np.float32,
+        )
+    return np.stack(rows, axis=0).astype(np.float32, copy=False)
+
+
 def policy_distribution_and_values(
     policy: nn.Module,
     obs_tensor: torch.Tensor,
     cfg: PSGAILConfig,
     action_masks: torch.Tensor | None = None,
+    critic_obs_tensor: torch.Tensor | None = None,
 ) -> tuple[Categorical | SquashedNormal, torch.Tensor]:
-    policy_out, values = policy(obs_tensor)
+    policy_out, values = policy(obs_tensor, critic_obs_tensor)
     if _is_continuous(cfg):
         if policy.log_std is None:
             raise RuntimeError("Continuous action mode requires policy.log_std.")
@@ -532,6 +641,8 @@ def refresh_rollout_rewards(
     return RolloutBatch(
         policy_observations=rollout.policy_observations,
         next_policy_observations=rollout.next_policy_observations,
+        critic_observations=rollout.critic_observations,
+        next_critic_observations=rollout.next_critic_observations,
         actions=rollout.actions,
         action_masks=rollout.action_masks,
         old_log_probs=rollout.old_log_probs,
@@ -643,8 +754,10 @@ def collect_rollout(
             if key not in key_to_trajectory_id:
                 key_to_trajectory_id[key] = len(key_to_trajectory_id)
 
+        critic_obs_agents = central_critic_observations(env, cfg, obs_agents)
         with torch.no_grad():
             obs_tensor = torch.as_tensor(obs_agents, dtype=torch.float32, device=device)
+            critic_obs_tensor = torch.as_tensor(critic_obs_agents, dtype=torch.float32, device=device)
             action_masks = (
                 discrete_action_masks_from_env(
                     env,
@@ -660,7 +773,13 @@ def collect_rollout(
                 if not _is_continuous(cfg)
                 else None
             )
-            dist, values = policy_distribution_and_values(policy, obs_tensor, cfg, action_mask_tensor)
+            dist, values = policy_distribution_and_values(
+                policy,
+                obs_tensor,
+                cfg,
+                action_mask_tensor,
+                critic_obs_tensor=critic_obs_tensor,
+            )
             actions, log_probs = _sample_policy_actions(dist, cfg)
 
         action_tuple = _actions_to_env_tuple(actions, cfg)
@@ -668,6 +787,11 @@ def collect_rollout(
         next_obs_agents = policy_observations_from_flat(flatten_agent_observations(next_obs))
         if len(next_obs_agents) != len(obs_agents):
             next_obs_agents = obs_agents.copy()
+            next_critic_obs_agents = critic_obs_agents.copy()
+        else:
+            next_critic_obs_agents = central_critic_observations(env, cfg, next_obs_agents)
+            if next_critic_obs_agents.shape != critic_obs_agents.shape:
+                next_critic_obs_agents = critic_obs_agents.copy()
         episode_steps += 1
         force_rollout_reset = forced_reset_cap > 0 and episode_steps >= forced_reset_cap
         done = bool(terminated or truncated or force_rollout_reset)
@@ -688,6 +812,8 @@ def collect_rollout(
                 AgentTransition(
                     policy_observation=obs_agents[i].copy(),
                     next_policy_observation=next_obs_agents[i].copy(),
+                    critic_observation=critic_obs_agents[i].copy(),
+                    next_critic_observation=next_critic_obs_agents[i].copy(),
                     action=(
                         np.asarray(action_tuple[i], dtype=np.float32).copy()
                         if _is_continuous(cfg)
@@ -730,6 +856,8 @@ def collect_rollout(
 
     policy_obs = np.stack([tr.policy_observation for tr in transitions], axis=0).astype(np.float32)
     next_policy_obs = np.stack([tr.next_policy_observation for tr in transitions], axis=0).astype(np.float32)
+    critic_obs = np.stack([tr.critic_observation for tr in transitions], axis=0).astype(np.float32)
+    next_critic_obs = np.stack([tr.next_critic_observation for tr in transitions], axis=0).astype(np.float32)
     trajectory_states = np.stack([tr.trajectory_state for tr in transitions], axis=0).astype(np.float32)
     actions = _actions_to_rollout_array(transitions, cfg)
     action_masks = np.stack([tr.action_mask for tr in transitions], axis=0).astype(bool)
@@ -766,6 +894,8 @@ def collect_rollout(
     return RolloutBatch(
         policy_observations=policy_obs,
         next_policy_observations=next_policy_obs,
+        critic_observations=critic_obs,
+        next_critic_observations=next_critic_obs,
         actions=actions,
         action_masks=action_masks,
         old_log_probs=old_log_probs,
@@ -869,6 +999,13 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
         ),
         next_policy_observations=np.concatenate(
             [batch.next_policy_observations for batch in batches],
+            axis=0,
+        ).astype(np.float32),
+        critic_observations=np.concatenate([batch.critic_observations for batch in batches], axis=0).astype(
+            np.float32
+        ),
+        next_critic_observations=np.concatenate(
+            [batch.next_critic_observations for batch in batches],
             axis=0,
         ).astype(np.float32),
         actions=np.concatenate([batch.actions for batch in batches], axis=0).astype(
@@ -1113,6 +1250,11 @@ def subsample_rollout_for_training(
             np.float32,
             copy=False,
         ),
+        critic_observations=rollout.critic_observations[selected_indices].astype(np.float32, copy=False),
+        next_critic_observations=rollout.next_critic_observations[selected_indices].astype(
+            np.float32,
+            copy=False,
+        ),
         actions=rollout.actions[selected_indices].astype(rollout.actions.dtype, copy=False),
         action_masks=rollout.action_masks[selected_indices].astype(bool, copy=False),
         old_log_probs=rollout.old_log_probs[selected_indices].astype(np.float32, copy=False),
@@ -1161,6 +1303,7 @@ def collect_round_rollouts(
     cfg: PSGAILConfig,
     device: torch.device,
     policy_obs_dim: int,
+    critic_obs_dim: int | None = None,
     *,
     round_idx: int,
     rollout_executor,
@@ -1194,6 +1337,7 @@ def collect_round_rollouts(
             rollout_cfg,
             device,
             policy_obs_dim,
+            critic_obs_dim=critic_obs_dim,
             seed_offset=seed_offset,
             executor=rollout_executor,
         )
@@ -1213,6 +1357,7 @@ def _rollout_worker(
     cfg: PSGAILConfig,
     policy_state_dict: dict[str, torch.Tensor],
     policy_obs_dim: int,
+    critic_obs_dim: int,
     worker_id: int,
     rollout_steps: int,
     rollout_min_episodes: int,
@@ -1239,6 +1384,8 @@ def _rollout_worker(
         transformer_layers=int(cfg.transformer_layers),
         transformer_heads=int(cfg.transformer_heads),
         transformer_dropout=float(cfg.transformer_dropout),
+        centralized_critic=centralized_critic_enabled(cfg),
+        critic_obs_dim=int(critic_obs_dim),
     )
     policy.load_state_dict(policy_state_dict)
     policy.to(torch.device("cpu"))
@@ -1262,6 +1409,7 @@ def collect_rollouts(
     cfg: PSGAILConfig,
     device: torch.device,
     policy_obs_dim: int,
+    critic_obs_dim: int | None = None,
     seed_offset: int = 0,
     executor: ProcessPoolExecutor | None = None,
 ) -> RolloutBatch:
@@ -1270,6 +1418,11 @@ def collect_rollouts(
     rollout_seed = int(cfg.seed) + int(seed_offset)
     if num_workers == 1:
         return collect_rollout(env, policy, cfg, device, seed=rollout_seed)
+    critic_obs_dim = int(
+        critic_obs_dim
+        if critic_obs_dim is not None
+        else central_critic_observation_dim(int(policy_obs_dim), cfg)
+    )
 
     if bool(getattr(cfg, "rollout_full_episodes", True)):
         total_episodes = _target_rollout_episodes(cfg)
@@ -1309,6 +1462,7 @@ def collect_rollouts(
                 cfg,
                 cpu_state_dict,
                 int(policy_obs_dim),
+                int(critic_obs_dim),
                 int(seed_offset) + worker_id,
                 int(worker_steps[worker_id]),
                 int(worker_episodes[worker_id]),
@@ -1532,6 +1686,7 @@ def update_policy(
         else torch.as_tensor(rollout.actions, dtype=torch.long, device=cpu_device)
     )
     obs_tensor = torch.as_tensor(rollout.policy_observations, dtype=torch.float32, device=cpu_device)
+    critic_obs_tensor = torch.as_tensor(rollout.critic_observations, dtype=torch.float32, device=cpu_device)
     action_mask_tensor = (
         torch.as_tensor(rollout.action_masks, dtype=torch.bool, device=cpu_device)
         if not _is_continuous(cfg)
@@ -1618,8 +1773,15 @@ def update_policy(
                     old_log_probs = device_batch(old_log_probs_tensor, micro_idx)
                     returns = device_batch(returns_tensor, micro_idx)
                     advantages = device_batch(advantages_tensor, micro_idx)
+                    critic_obs = device_batch(critic_obs_tensor, micro_idx)
                     masks = device_batch(action_mask_tensor, micro_idx) if action_mask_tensor is not None else None
-                    dist, values = policy_distribution_and_values(policy, obs, cfg, masks)
+                    dist, values = policy_distribution_and_values(
+                        policy,
+                        obs,
+                        cfg,
+                        masks,
+                        critic_obs_tensor=critic_obs,
+                    )
                     log_probs = dist.log_prob(actions)
                     log_ratio = log_probs - old_log_probs
                     ratio = torch.exp(log_ratio)
