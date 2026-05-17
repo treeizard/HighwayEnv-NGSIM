@@ -702,6 +702,20 @@ def main() -> None:
                 )
                 )
             )
+            selected_action_valid = float("nan")
+            mean_available_actions = float("nan")
+            if (
+                str(round_cfg.action_mode).lower() != "continuous"
+                and rollout.action_masks.size
+                and rollout.actions.ndim == 1
+            ):
+                action_indices = rollout.actions.astype(np.int64, copy=False)
+                row_indices = np.arange(len(action_indices), dtype=np.int64)
+                in_range = (action_indices >= 0) & (action_indices < rollout.action_masks.shape[1])
+                selected_valid = np.zeros(len(action_indices), dtype=bool)
+                selected_valid[in_range] = rollout.action_masks[row_indices[in_range], action_indices[in_range]]
+                selected_action_valid = float(selected_valid.mean()) if selected_valid.size else float("nan")
+                mean_available_actions = float(rollout.action_masks.sum(axis=1).mean())
             metrics = {
                 "round": round_idx,
                 "rollout/env_steps": collected_rollout.num_env_steps,
@@ -711,16 +725,38 @@ def main() -> None:
                 "rollout/episodes": collected_rollout.num_episodes,
                 "rollout/terminated": collected_rollout.num_terminated,
                 "rollout/truncated": collected_rollout.num_truncated,
+                "rollout/crash_episodes": collected_rollout.num_crash_events,
+                "rollout/offroad_episodes": collected_rollout.num_offroad_events,
                 "rollout/crash_events": collected_rollout.num_crash_events,
                 "rollout/offroad_events": collected_rollout.num_offroad_events,
+                "rollout/crash_agent_fraction": collected_rollout.crash_agent_fraction,
+                "rollout/offroad_agent_fraction": collected_rollout.offroad_agent_fraction,
                 "rollout/mean_episode_length": collected_rollout.mean_episode_length,
                 "rollout/min_episode_length": collected_rollout.min_episode_length,
                 "rollout/max_episode_length": collected_rollout.max_episode_length,
+                "rollout/unique_episode_names": collected_rollout.unique_episode_names,
                 "rollout/controlled_vehicle_fraction": float(round_cfg.percentage_controlled_vehicles),
                 "rollout/mean_controlled_vehicles": collected_rollout.mean_controlled_vehicles,
                 "rollout/mean_road_vehicles": collected_rollout.mean_road_vehicles,
+                "rollout/scene_samples": int(len(rollout.scene_features)),
+                "rollout/sequence_samples": int(len(rollout.sequence_features)),
                 "rollout/mean_reward": float(rollout.rewards.mean()),
+                "rollout/mean_gail_reward": float(rollout.rewards.mean()),
+                "rollout/mean_airl_reward": float(rollout.rewards.mean()),
+                "rollout/mean_raw_gail_reward": rollout.mean_raw_gail_reward,
+                "rollout/mean_raw_airl_reward": rollout.mean_raw_gail_reward,
+                "rollout/mean_normalized_gail_reward": rollout.mean_normalized_gail_reward,
+                "rollout/mean_normalized_airl_reward": rollout.mean_normalized_gail_reward,
+                "rollout/mean_env_penalty": rollout.mean_env_penalty,
                 "rollout/reward_std": float(rollout.rewards.std()),
+                "rollout/raw_gail_reward_std": float(rollout.gail_rewards_raw.std()),
+                "rollout/raw_airl_reward_std": float(rollout.gail_rewards_raw.std()),
+                "rollout/normalized_gail_reward_std": float(rollout.gail_rewards_normalized.std()),
+                "rollout/normalized_airl_reward_std": float(rollout.gail_rewards_normalized.std()),
+                "rollout/action_mean": float(rollout.actions.mean()),
+                "rollout/action_std": float(rollout.actions.std()),
+                "rollout/selected_action_valid_fraction": selected_action_valid,
+                "rollout/mean_available_actions": mean_available_actions,
                 "airl/reward_loss": reward_stats["reward_loss"],
                 "airl/bce_loss": reward_stats["bce_loss"],
                 "airl/wgan_loss": reward_stats["wgan_loss"],
@@ -730,11 +766,21 @@ def main() -> None:
                 "airl/gen_acc": reward_stats["gen_acc"],
                 "airl/expert_reward": reward_stats["expert_reward"],
                 "airl/gen_reward": reward_stats["gen_reward"],
+                "discriminator/loss": reward_stats["reward_loss"],
+                "discriminator/bce_loss": reward_stats["bce_loss"],
+                "discriminator/wgan_loss": reward_stats["wgan_loss"],
+                "discriminator/gradient_penalty": reward_stats["gradient_penalty"],
+                "discriminator/critic_gap": reward_stats["critic_gap"],
+                "discriminator/expert_acc": reward_stats["expert_acc"],
+                "discriminator/gen_acc": reward_stats["gen_acc"],
+                "discriminator/expert_reward": reward_stats["expert_reward"],
+                "discriminator/gen_reward": reward_stats["gen_reward"],
                 "train/discriminator_loss_type_wgan_gp": int(
                     str(round_cfg.discriminator_loss).lower() == "wgan_gp"
                 ),
                 "train/wgan_gp_lambda": float(round_cfg.wgan_gp_lambda),
                 "train/reward_spectral_norm": int(bool(round_cfg.discriminator_spectral_norm)),
+                "train/discriminator_spectral_norm": int(bool(round_cfg.discriminator_spectral_norm)),
                 "train/policy_obs_dim": policy_obs_dim,
                 "train/critic_obs_dim": critic_obs_dim,
                 "train/centralized_critic": int(bool(round_cfg.centralized_critic)),
@@ -750,11 +796,18 @@ def main() -> None:
                 "policy/clip_fraction": policy_stats["clip_fraction"],
                 "policy/ratio_mean": policy_stats["ratio_mean"],
                 "policy/ratio_std": policy_stats["ratio_std"],
+                "policy/ppo_micro_batch_size": policy_stats["ppo_micro_batch_size"],
                 "train/policy_learning_rate": float(round_cfg.learning_rate),
                 "train/reward_learning_rate": float(round_cfg.disc_learning_rate),
+                "train/disc_learning_rate": float(round_cfg.disc_learning_rate),
                 "train/entropy_coef": float(round_cfg.entropy_coef),
                 "train/clip_range": float(round_cfg.clip_range),
                 "train/reward_updates_per_round": int(round_cfg.disc_updates_per_round),
+                "train/disc_updates_per_round": int(round_cfg.disc_updates_per_round),
+                "train/expert_samples": int(expert.policy_observations.shape[0]),
+                "train/reward_batch_size": int(reward_batch_size),
+                "train/rollout_workers": int(round_cfg.num_rollout_workers),
+                "train/rollout_worker_threads": int(round_cfg.rollout_worker_threads),
             }
             monitor.log(metrics, step=round_idx)
             if cfg.checkpoint_every > 0 and round_idx % int(cfg.checkpoint_every) == 0:
