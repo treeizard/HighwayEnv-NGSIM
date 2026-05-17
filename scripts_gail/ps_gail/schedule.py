@@ -289,6 +289,41 @@ def _scheduled_gamma(cfg: PSGAILConfig, round_idx: int) -> float:
     )
 
 
+def _scheduled_float_or_default(
+    cfg: PSGAILConfig,
+    round_idx: int,
+    *,
+    schedule_attr: str,
+    name: str,
+    default: float,
+) -> float:
+    piecewise = _scheduled_piecewise_value(
+        str(getattr(cfg, schedule_attr, "") or ""),
+        int(round_idx),
+        name=name,
+    )
+    return float(default if piecewise is None else piecewise)
+
+
+def _scheduled_int_or_default(
+    cfg: PSGAILConfig,
+    round_idx: int,
+    *,
+    schedule_attr: str,
+    name: str,
+    default: int,
+    minimum: int = 1,
+) -> int:
+    piecewise = _scheduled_piecewise_value(
+        str(getattr(cfg, schedule_attr, "") or ""),
+        int(round_idx),
+        name=name,
+    )
+    if piecewise is None:
+        return int(default)
+    return max(int(minimum), int(round(piecewise)))
+
+
 def _scheduled_policy_bc_coef(cfg: PSGAILConfig, round_idx: int) -> float:
     start = max(0.0, float(getattr(cfg, "policy_bc_regularization_coef", 0.0)))
     end = max(0.0, float(getattr(cfg, "policy_bc_regularization_final_coef", 0.0)))
@@ -442,6 +477,43 @@ def config_for_round(cfg: PSGAILConfig, round_idx: int) -> PSGAILConfig:
                 )
             ),
         )
+
+    learning_rate = _scheduled_float_or_default(
+        cfg,
+        round_idx,
+        schedule_attr="learning_rate_schedule",
+        name="learning_rate_schedule",
+        default=learning_rate,
+    )
+    disc_learning_rate = _scheduled_float_or_default(
+        cfg,
+        round_idx,
+        schedule_attr="disc_learning_rate_schedule",
+        name="disc_learning_rate_schedule",
+        default=disc_learning_rate,
+    )
+    entropy_coef = _scheduled_float_or_default(
+        cfg,
+        round_idx,
+        schedule_attr="entropy_coef_schedule",
+        name="entropy_coef_schedule",
+        default=entropy_coef,
+    )
+    clip_range = _scheduled_float_or_default(
+        cfg,
+        round_idx,
+        schedule_attr="clip_range_schedule",
+        name="clip_range_schedule",
+        default=clip_range,
+    )
+    disc_updates_per_round = _scheduled_int_or_default(
+        cfg,
+        round_idx,
+        schedule_attr="disc_updates_per_round_schedule",
+        name="disc_updates_per_round_schedule",
+        default=disc_updates_per_round,
+        minimum=1,
+    )
 
     return replace(
         cfg,

@@ -71,6 +71,7 @@ class PSGAILConfig:
     central_critic_max_vehicles: int = 64
     central_critic_include_local_obs: bool = False
     learning_rate: float = 3e-4
+    learning_rate_schedule: str = ""
     bc_pretrain_epochs: int = 0
     bc_pretrain_learning_rate: float = 3e-4
     bc_pretrain_batch_size: int = 4096
@@ -85,6 +86,7 @@ class PSGAILConfig:
     policy_bc_regularization_final_coef: float = 0.0
     policy_bc_regularization_decay_rounds: int = 0
     disc_learning_rate: float = 3e-4
+    disc_learning_rate_schedule: str = ""
     gamma: float = 0.99
     initial_gamma: float = 0.0
     final_gamma: float = 0.0
@@ -92,11 +94,13 @@ class PSGAILConfig:
     gamma_schedule: str = ""
     gae_lambda: float = 0.95
     clip_range: float = 0.2
+    clip_range_schedule: str = ""
     ppo_epochs: int = 4
     batch_size: int = 1024
     ppo_micro_batch_size: int = 0
     disc_batch_size: int = 1024
     disc_updates_per_round: int = 4
+    disc_updates_per_round_schedule: str = ""
     disc_expert_label: float = 0.9
     disc_generator_label: float = 0.1
     discriminator_input: str = "auto"
@@ -123,6 +127,7 @@ class PSGAILConfig:
     sequence_reward_coef: float = 1.0
     sequence_reward_assignment: str = "last"
     entropy_coef: float = 0.015
+    entropy_coef_schedule: str = ""
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     normalize_gail_reward: bool = True
