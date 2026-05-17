@@ -36,10 +36,16 @@ from scripts_gail.ps_gail.trainer import (
     policy_distribution_and_values,
     resolve_device,
     set_optimizer_lr,
+    should_apply_gail_reward_clip,
+    should_normalize_gail_reward,
     subsample_rollout_for_training,
     update_policy,
 )
-from scripts_gail.train_simple_ps_gail import behavior_clone_pretrain, evaluate_policy_survival
+from scripts_gail.train_simple_ps_gail import (
+    behavior_clone_pretrain,
+    evaluate_policy_survival,
+    training_risk_warnings,
+)
 
 
 class AIRLReward(nn.Module):
@@ -313,9 +319,9 @@ def refresh_airl_rewards(
         # Canonical AIRL trains the policy on log D - log(1-D), which simplifies to
         # f(s,a,s') - log pi(a|s) for D = exp(f)/(exp(f) + pi(a|s)).
         shaped = (shaped_logits - rollout.old_log_probs).astype(np.float32, copy=True)
-    if bool(cfg.normalize_gail_reward) and shaped.size > 1:
+    if should_normalize_gail_reward(cfg) and shaped.size > 1:
         shaped = (shaped - shaped.mean()) / (shaped.std() + 1e-8)
-    if float(cfg.gail_reward_clip) > 0.0:
+    if should_apply_gail_reward_clip(cfg):
         shaped = np.clip(shaped, -float(cfg.gail_reward_clip), float(cfg.gail_reward_clip))
     rewards = shaped + rollout.env_penalties
     if float(cfg.final_reward_clip) > 0.0:
@@ -330,11 +336,15 @@ def refresh_airl_rewards(
     return replace(
         rollout,
         rewards=rewards.astype(np.float32),
-        gail_rewards_raw=raw,
+        gail_rewards_raw=shaped_logits if str(getattr(cfg, "discriminator_loss", "airl_bce")).lower() == "wgan_gp" else raw,
         gail_rewards_normalized=shaped.astype(np.float32),
         returns=returns,
         advantages=advantages,
-        mean_raw_gail_reward=float(raw.mean()) if raw.size else 0.0,
+        mean_raw_gail_reward=(
+            float(shaped_logits.mean())
+            if str(getattr(cfg, "discriminator_loss", "airl_bce")).lower() == "wgan_gp" and shaped_logits.size
+            else float(raw.mean()) if raw.size else 0.0
+        ),
         mean_normalized_gail_reward=float(shaped.mean()) if shaped.size else 0.0,
     )
 
@@ -501,6 +511,8 @@ def main() -> None:
             f"wgan_reward_center={cfg.wgan_reward_center} wgan_reward_clip={cfg.wgan_reward_clip} "
             f"wgan_reward_scale={cfg.wgan_reward_scale}"
         )
+        for message in training_risk_warnings(cfg):
+            print(f"training warning: {message}", flush=True)
         if int(cfg.bc_pretrain_epochs) > 0:
             print(
                 "bc_pretrain="
@@ -787,6 +799,13 @@ def main() -> None:
                 "train/wgan_reward_center": int(bool(round_cfg.wgan_reward_center)),
                 "train/wgan_reward_clip": float(round_cfg.wgan_reward_clip),
                 "train/wgan_reward_scale": float(round_cfg.wgan_reward_scale),
+                "train/normalize_gail_reward_requested": int(bool(round_cfg.normalize_gail_reward)),
+                "train/allow_wgan_reward_normalization": int(
+                    bool(getattr(round_cfg, "allow_wgan_reward_normalization", False))
+                ),
+                "train/normalize_gail_reward_effective": int(
+                    should_normalize_gail_reward(round_cfg)
+                ),
                 "policy/loss": policy_stats["policy_loss"],
                 "policy/value_loss": policy_stats["value_loss"],
                 "policy/bc_regularization_loss": policy_stats["bc_regularization_loss"],

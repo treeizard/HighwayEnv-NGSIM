@@ -115,7 +115,6 @@ class WandbMonitor:
             {key: self._wandb.Video(abs_path, fps=max(1, int(fps)), format="mp4")},
             step=int(step),
         )
-        self.save(abs_path)
 
     def finish(self) -> None:
         if not self.enabled or self._wandb is None:

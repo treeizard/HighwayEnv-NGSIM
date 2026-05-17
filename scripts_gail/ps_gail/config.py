@@ -131,6 +131,7 @@ class PSGAILConfig:
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     normalize_gail_reward: bool = True
+    allow_wgan_reward_normalization: bool = False
     gail_reward_clip: float = 5.0
     collision_penalty: float = 2.0
     offroad_penalty: float = 2.0

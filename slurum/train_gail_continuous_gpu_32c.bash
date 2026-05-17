@@ -133,6 +133,7 @@ GAMMA_CURRICULUM_ROUNDS="${GAMMA_CURRICULUM_ROUNDS:-${TOTAL_ROUNDS}}"
 GAMMA_SCHEDULE="${GAMMA_SCHEDULE:-0:500:0.95:0.95;500:600:0.95:0.99;600:800:0.99:0.99}"
 DISC_EXPERT_LABEL="${DISC_EXPERT_LABEL:-0.8}"
 DISC_GENERATOR_LABEL="${DISC_GENERATOR_LABEL:-0.2}"
+DISCRIMINATOR_LOSS="${DISCRIMINATOR_LOSS:-wgan_gp}"
 LEARNING_RATE="${LEARNING_RATE:-3e-4}"
 LEARNING_RATE_SCHEDULE="${LEARNING_RATE_SCHEDULE:-0:100:2e-4:3e-4;100:500:3e-4:3e-4;500:600:2e-4:3e-4;600:800:3e-4:3e-4}"
 DISC_LEARNING_RATE="${DISC_LEARNING_RATE:-5e-5}"
@@ -152,9 +153,17 @@ POLICY_BC_REGULARIZATION_FINAL_COEF="${POLICY_BC_REGULARIZATION_FINAL_COEF:-0.0}
 POLICY_BC_REGULARIZATION_DECAY_ROUNDS="${POLICY_BC_REGULARIZATION_DECAY_ROUNDS:-${TOTAL_ROUNDS}}"
 COLLISION_PENALTY="${COLLISION_PENALTY:-2.0}"
 OFFROAD_PENALTY="${OFFROAD_PENALTY:-2.0}"
+if [ -z "${NORMALIZE_GAIL_REWARD:-}" ]; then
+    if [ "${DISCRIMINATOR_LOSS}" = "wgan_gp" ]; then
+        NORMALIZE_GAIL_REWARD="false"
+    else
+        NORMALIZE_GAIL_REWARD="true"
+    fi
+fi
+ALLOW_WGAN_REWARD_NORMALIZATION="${ALLOW_WGAN_REWARD_NORMALIZATION:-false}"
 GAIL_REWARD_CLIP="${GAIL_REWARD_CLIP:-5.0}"
 FINAL_REWARD_CLIP="${FINAL_REWARD_CLIP:-10.0}"
-SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-true}"
+SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-false}"
 CHECKPOINT_VIDEO_EVERY="${CHECKPOINT_VIDEO_EVERY:-50}"
 CHECKPOINT_VIDEO_STEPS="${CHECKPOINT_VIDEO_STEPS:-200}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
@@ -213,6 +222,16 @@ if [ "${DISCRIMINATOR_SPECTRAL_NORM}" = "true" ]; then
 else
     DISCRIMINATOR_SPECTRAL_NORM_ARG="--no-discriminator-spectral-norm"
 fi
+if [ "${NORMALIZE_GAIL_REWARD}" = "true" ]; then
+    NORMALIZE_GAIL_REWARD_ARG="--normalize-gail-reward"
+else
+    NORMALIZE_GAIL_REWARD_ARG="--no-normalize-gail-reward"
+fi
+if [ "${ALLOW_WGAN_REWARD_NORMALIZATION}" = "true" ]; then
+    ALLOW_WGAN_REWARD_NORMALIZATION_ARG="--allow-wgan-reward-normalization"
+else
+    ALLOW_WGAN_REWARD_NORMALIZATION_ARG="--no-allow-wgan-reward-normalization"
+fi
 if [ "${CENTRALIZED_CRITIC}" = "true" ]; then
     CENTRALIZED_CRITIC_ARG="--centralized-critic"
 else
@@ -250,8 +269,11 @@ echo "Policy model: ${POLICY_MODEL}"
 echo "Centralized critic: ${CENTRALIZED_CRITIC} max_vehicles=${CENTRAL_CRITIC_MAX_VEHICLES} include_local_obs=${CENTRAL_CRITIC_INCLUDE_LOCAL_OBS}"
 echo "Discriminator architecture: ${DISCRIMINATOR_HIDDEN_SIZES} dropout=${DISCRIMINATOR_DROPOUT}"
 echo "Discriminator spectral norm: ${DISCRIMINATOR_SPECTRAL_NORM}"
+echo "Discriminator loss: ${DISCRIMINATOR_LOSS}"
 echo "Discriminator learning rate: ${DISC_LEARNING_RATE}"
 echo "Discriminator updates per round: ${DISC_UPDATES_PER_ROUND}"
+echo "Normalize GAIL reward: ${NORMALIZE_GAIL_REWARD}"
+echo "Allow WGAN reward normalization: ${ALLOW_WGAN_REWARD_NORMALIZATION}"
 echo "Checkpoint every: ${CHECKPOINT_EVERY}"
 echo "Save checkpoint video: ${SAVE_CHECKPOINT_VIDEO}"
 echo "Checkpoint video every: ${CHECKPOINT_VIDEO_EVERY}"
@@ -359,13 +381,15 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --warmup-final-reward-clip "${WARMUP_FINAL_REWARD_CLIP}" \
     --vehicle-increase-warmup-rounds "${VEHICLE_INCREASE_WARMUP_ROUNDS}" \
     --enable-collision \
-    --normalize-gail-reward \
+    "${NORMALIZE_GAIL_REWARD_ARG}" \
+    "${ALLOW_WGAN_REWARD_NORMALIZATION_ARG}" \
     --gail-reward-clip "${GAIL_REWARD_CLIP}" \
     --collision-penalty "${COLLISION_PENALTY}" \
     --offroad-penalty "${OFFROAD_PENALTY}" \
     --final-reward-clip "${FINAL_REWARD_CLIP}" \
     --disc-expert-label "${DISC_EXPERT_LABEL}" \
     --disc-generator-label "${DISC_GENERATOR_LABEL}" \
+    --discriminator-loss "${DISCRIMINATOR_LOSS}" \
     --disc-learning-rate "${DISC_LEARNING_RATE}" \
     --disc-learning-rate-schedule "${DISC_LEARNING_RATE_SCHEDULE}" \
     --bc-pretrain-epochs "${BC_PRETRAIN_EPOCHS}" \

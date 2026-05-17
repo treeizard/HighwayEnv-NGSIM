@@ -149,6 +149,14 @@ WGAN_REWARD_CLIP="${WGAN_REWARD_CLIP:-2.0}"
 WGAN_REWARD_SCALE="${WGAN_REWARD_SCALE:-1.0}"
 COLLISION_PENALTY="${COLLISION_PENALTY:-2.0}"
 OFFROAD_PENALTY="${OFFROAD_PENALTY:-2.0}"
+if [ -z "${NORMALIZE_GAIL_REWARD:-}" ]; then
+    if [ "${DISCRIMINATOR_LOSS}" = "wgan_gp" ]; then
+        NORMALIZE_GAIL_REWARD="false"
+    else
+        NORMALIZE_GAIL_REWARD="true"
+    fi
+fi
+ALLOW_WGAN_REWARD_NORMALIZATION="${ALLOW_WGAN_REWARD_NORMALIZATION:-false}"
 GAIL_REWARD_CLIP="${GAIL_REWARD_CLIP:-5.0}"
 FINAL_REWARD_CLIP="${FINAL_REWARD_CLIP:-10.0}"
 POLICY_MODEL="${POLICY_MODEL:-transformer}"
@@ -163,7 +171,7 @@ CENTRALIZED_CRITIC="${CENTRALIZED_CRITIC:-true}"
 CENTRAL_CRITIC_MAX_VEHICLES="${CENTRAL_CRITIC_MAX_VEHICLES:-128}"
 CENTRAL_CRITIC_INCLUDE_LOCAL_OBS="${CENTRAL_CRITIC_INCLUDE_LOCAL_OBS:-false}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-20}"
-SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-true}"
+SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-false}"
 CHECKPOINT_VIDEO_EVERY="${CHECKPOINT_VIDEO_EVERY:-50}"
 CHECKPOINT_VIDEO_STEPS="${CHECKPOINT_VIDEO_STEPS:-200}"
 TERMINATE_WHEN_ALL_CONTROLLED_CRASHED="${TERMINATE_WHEN_ALL_CONTROLLED_CRASHED:-true}"
@@ -186,6 +194,16 @@ if [ "${WGAN_REWARD_CENTER}" = "true" ]; then
     WGAN_REWARD_CENTER_ARG="--wgan-reward-center"
 else
     WGAN_REWARD_CENTER_ARG="--no-wgan-reward-center"
+fi
+if [ "${NORMALIZE_GAIL_REWARD}" = "true" ]; then
+    NORMALIZE_GAIL_REWARD_ARG="--normalize-gail-reward"
+else
+    NORMALIZE_GAIL_REWARD_ARG="--no-normalize-gail-reward"
+fi
+if [ "${ALLOW_WGAN_REWARD_NORMALIZATION}" = "true" ]; then
+    ALLOW_WGAN_REWARD_NORMALIZATION_ARG="--allow-wgan-reward-normalization"
+else
+    ALLOW_WGAN_REWARD_NORMALIZATION_ARG="--no-allow-wgan-reward-normalization"
 fi
 if [ "${TERMINATE_WHEN_ALL_CONTROLLED_CRASHED}" = "true" ]; then
     TERMINATION_ARG="--terminate-when-all-controlled-crashed"
@@ -236,6 +254,8 @@ echo "Controlled-vehicle piecewise schedule: ${CONTROLLED_VEHICLE_SCHEDULE}"
 echo "Warmup: rounds=${WARMUP_ROUNDS} policy_lr=${WARMUP_LEARNING_RATE}->default reward_lr=${WARMUP_DISC_LEARNING_RATE}->default entropy=${WARMUP_ENTROPY_COEF}->default clip=${WARMUP_CLIP_RANGE}->default"
 echo "Policy LR schedule: ${LEARNING_RATE_SCHEDULE}"
 echo "AIRL reward LR schedule: ${DISC_LEARNING_RATE_SCHEDULE}"
+echo "Normalize AIRL/GAIL reward: ${NORMALIZE_GAIL_REWARD}"
+echo "Allow WGAN reward normalization: ${ALLOW_WGAN_REWARD_NORMALIZATION}"
 echo "Entropy schedule: ${ENTROPY_COEF_SCHEDULE}"
 echo "PPO clip schedule: ${CLIP_RANGE_SCHEDULE}"
 echo "AIRL reward updates schedule: ${DISC_UPDATES_PER_ROUND_SCHEDULE}"
@@ -288,7 +308,7 @@ if wandb_mode != "disabled":
         np.complex_ = np.complex128
     import wandb
     print("wandb:", wandb.__version__)
-save_video = os.environ.get("SAVE_CHECKPOINT_VIDEO", "true").lower()
+save_video = os.environ.get("SAVE_CHECKPOINT_VIDEO", "false").lower()
 print("save checkpoint video:", save_video)
 if save_video == "true":
     import imageio
@@ -334,7 +354,8 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --gamma-curriculum-rounds "${GAMMA_CURRICULUM_ROUNDS}" \
     --gamma-schedule "${GAMMA_SCHEDULE}" \
     --enable-collision \
-    --normalize-gail-reward \
+    "${NORMALIZE_GAIL_REWARD_ARG}" \
+    "${ALLOW_WGAN_REWARD_NORMALIZATION_ARG}" \
     --gail-reward-clip "${GAIL_REWARD_CLIP}" \
     --collision-penalty "${COLLISION_PENALTY}" \
     --offroad-penalty "${OFFROAD_PENALTY}" \

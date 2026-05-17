@@ -132,10 +132,22 @@ def training_risk_warnings(cfg: PSGAILConfig) -> list[str]:
         str(cfg.discriminator_loss).lower() == "wgan_gp"
         and bool(cfg.wgan_reward_center)
         and bool(cfg.normalize_gail_reward)
+        and bool(getattr(cfg, "allow_wgan_reward_normalization", False))
     ):
         messages.append(
             "WGAN rewards are both centered and rollout-normalized. This is allowed, but it makes the "
             "critic reward scale nonstationary; compare with one normalization layer disabled if needed."
+        )
+    if (
+        str(cfg.discriminator_loss).lower() == "wgan_gp"
+        and bool(cfg.normalize_gail_reward)
+        and not bool(getattr(cfg, "allow_wgan_reward_normalization", False))
+    ):
+        messages.append(
+            "Per-rollout GAIL reward normalization is disabled for WGAN-GP unless "
+            "--allow-wgan-reward-normalization is set. WGAN critic rewards are used "
+            "as relative critic scores, and normalizing each rollout can erase the "
+            "absolute expert/generator score gap."
         )
     return messages
 
@@ -1037,6 +1049,8 @@ def main() -> None:
                 "discriminator/gen_acc": disc_stats["gen_acc"],
                 "discriminator/expert_centered_acc": disc_stats["expert_centered_acc"],
                 "discriminator/gen_centered_acc": disc_stats["gen_centered_acc"],
+                "discriminator/expert_positive_frac": disc_stats["expert_positive_frac"],
+                "discriminator/gen_negative_frac": disc_stats["gen_negative_frac"],
                 "policy/loss": policy_stats["policy_loss"],
                 "policy/value_loss": policy_stats["value_loss"],
                 "policy/bc_regularization_loss": policy_stats["bc_regularization_loss"],
@@ -1066,6 +1080,17 @@ def main() -> None:
                 "train/wgan_reward_center": int(bool(cfg.wgan_reward_center)),
                 "train/wgan_reward_clip": float(cfg.wgan_reward_clip),
                 "train/wgan_reward_scale": float(cfg.wgan_reward_scale),
+                "train/normalize_gail_reward_requested": int(bool(cfg.normalize_gail_reward)),
+                "train/allow_wgan_reward_normalization": int(
+                    bool(getattr(cfg, "allow_wgan_reward_normalization", False))
+                ),
+                "train/normalize_gail_reward_effective": int(
+                    bool(round_cfg.normalize_gail_reward)
+                    and (
+                        str(round_cfg.discriminator_loss).lower() != "wgan_gp"
+                        or bool(getattr(round_cfg, "allow_wgan_reward_normalization", False))
+                    )
+                ),
                 "train/sequence_feature_mode_local_deltas": int(
                     str(cfg.sequence_feature_mode).lower() == "local_deltas"
                 ),
@@ -1081,6 +1106,18 @@ def main() -> None:
                 "train/rollout_workers": int(cfg.num_rollout_workers),
                 "train/rollout_worker_threads": int(cfg.rollout_worker_threads),
             }
+            if str(round_cfg.action_mode).lower() == "continuous" and rollout.actions.ndim == 2:
+                action_names = ("acceleration", "steering")
+                for action_idx, action_name in enumerate(action_names[: rollout.actions.shape[1]]):
+                    action_values = rollout.actions[:, action_idx]
+                    metrics[f"rollout/{action_name}_action_mean"] = float(action_values.mean())
+                    metrics[f"rollout/{action_name}_action_std"] = float(action_values.std())
+                    metrics[f"rollout/{action_name}_action_negative_fraction"] = float(
+                        (action_values < 0.0).mean()
+                    )
+                    metrics[f"rollout/{action_name}_action_abs_mean"] = float(
+                        np.abs(action_values).mean()
+                    )
             if scene_disc_stats:
                 metrics.update(
                     {
@@ -1103,6 +1140,12 @@ def main() -> None:
                         ],
                         "scene_discriminator/gen_centered_acc": scene_disc_stats[
                             "gen_centered_acc"
+                        ],
+                        "scene_discriminator/expert_positive_frac": scene_disc_stats[
+                            "expert_positive_frac"
+                        ],
+                        "scene_discriminator/gen_negative_frac": scene_disc_stats[
+                            "gen_negative_frac"
                         ],
                     }
                 )
@@ -1128,6 +1171,12 @@ def main() -> None:
                         ],
                         "sequence_discriminator/gen_centered_acc": sequence_disc_stats[
                             "gen_centered_acc"
+                        ],
+                        "sequence_discriminator/expert_positive_frac": sequence_disc_stats[
+                            "expert_positive_frac"
+                        ],
+                        "sequence_discriminator/gen_negative_frac": sequence_disc_stats[
+                            "gen_negative_frac"
                         ],
                     }
                 )

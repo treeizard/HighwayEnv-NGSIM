@@ -110,6 +110,7 @@ from scripts_gail.ps_gail.trainer import (
 from scripts_gail.train_simple_ps_gail import behavior_clone_pretrain
 from scripts_gail.train_simple_ps_gail import config_for_round as ps_gail_config_for_round
 from scripts_gail.train_simple_airl import config_for_round as airl_config_for_round
+from scripts_gail.train_simple_airl import refresh_airl_rewards
 from scripts_gail.train_simple_iq_learn import convergence_reached, convergence_score
 
 
@@ -753,6 +754,99 @@ def test_wgan_reward_center_and_clip_are_applied_before_env_penalty():
 
     np.testing.assert_allclose(shaped_gail, [-2.0, -2.0, 2.0], rtol=1e-6)
     np.testing.assert_allclose(rewards, [-2.0, -7.0, 2.0], rtol=1e-6)
+
+
+def test_wgan_reward_normalization_is_disabled_unless_explicitly_allowed():
+    raw = np.asarray([-15.0, -10.0, -20.0], dtype=np.float32)
+    penalties = np.asarray([0.0, -2.0, 0.0], dtype=np.float32)
+    cfg = PSGAILConfig(
+        discriminator_loss="wgan_gp",
+        normalize_gail_reward=True,
+        allow_wgan_reward_normalization=False,
+        gail_reward_clip=5.0,
+        final_reward_clip=0.0,
+    )
+
+    rewards, shaped_gail = shape_rollout_rewards(raw, penalties, cfg)
+
+    np.testing.assert_allclose(shaped_gail, raw, rtol=1e-6)
+    np.testing.assert_allclose(rewards, [-15.0, -12.0, -20.0], rtol=1e-6)
+
+
+def test_wgan_reward_normalization_can_be_enabled_for_ablation():
+    cfg = PSGAILConfig(
+        discriminator_loss="wgan_gp",
+        normalize_gail_reward=True,
+        allow_wgan_reward_normalization=True,
+        gail_reward_clip=0.0,
+        final_reward_clip=0.0,
+    )
+
+    _rewards, shaped_gail = shape_rollout_rewards(
+        np.asarray([-15.0, -10.0, -20.0], dtype=np.float32),
+        np.zeros(3, dtype=np.float32),
+        cfg,
+    )
+
+    assert shaped_gail.mean() == pytest.approx(0.0, abs=1e-6)
+    assert shaped_gail.std() == pytest.approx(1.0, rel=1e-6)
+
+
+def test_bce_gail_reward_clip_still_applies_to_logistic_rewards():
+    cfg = PSGAILConfig(
+        discriminator_loss="bce",
+        normalize_gail_reward=False,
+        gail_reward_clip=5.0,
+        final_reward_clip=0.0,
+    )
+
+    _rewards, shaped_gail = shape_rollout_rewards(
+        np.asarray([-15.0, -10.0, 20.0], dtype=np.float32),
+        np.zeros(3, dtype=np.float32),
+        cfg,
+    )
+
+    np.testing.assert_allclose(shaped_gail, [-5.0, -5.0, 5.0], rtol=1e-6)
+
+
+def test_airl_wgan_uses_shaped_logits_without_rollout_normalization_or_generic_clip():
+    class FixedReward(torch.nn.Module):
+        def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+            return torch.full((obs.shape[0],), 123.0, dtype=torch.float32, device=obs.device)
+
+        def shaped_logits(
+            self,
+            obs: torch.Tensor,
+            actions: torch.Tensor,
+            next_obs: torch.Tensor,
+            dones: torch.Tensor,
+            *,
+            gamma: float,
+        ) -> torch.Tensor:
+            del actions, next_obs, dones, gamma
+            return torch.tensor([-15.0, -10.0, -20.0], dtype=torch.float32, device=obs.device)
+
+    cfg = PSGAILConfig(
+        discriminator_loss="wgan_gp",
+        normalize_gail_reward=True,
+        allow_wgan_reward_normalization=False,
+        gail_reward_clip=5.0,
+        final_reward_clip=0.0,
+    )
+    rollout = _minimal_rollout(
+        observations=np.zeros((3, 2), dtype=np.float32),
+        actions=np.zeros((3, 2), dtype=np.float32),
+        old_log_probs=np.zeros(3, dtype=np.float32),
+        old_values=np.zeros(3, dtype=np.float32),
+        returns=np.zeros(3, dtype=np.float32),
+        advantages=np.zeros(3, dtype=np.float32),
+    )
+
+    refreshed = refresh_airl_rewards(rollout, FixedReward(), cfg, torch.device("cpu"))
+
+    np.testing.assert_allclose(refreshed.gail_rewards_raw, [-15.0, -10.0, -20.0], rtol=1e-6)
+    np.testing.assert_allclose(refreshed.gail_rewards_normalized, [-15.0, -10.0, -20.0], rtol=1e-6)
+    np.testing.assert_allclose(refreshed.rewards, [-15.0, -10.0, -20.0], rtol=1e-6)
 
 
 def test_wgan_gp_discriminator_update_returns_critic_metrics():

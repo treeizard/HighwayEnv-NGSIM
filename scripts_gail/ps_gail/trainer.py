@@ -494,6 +494,20 @@ def action_conditioned_features(policy_observations: np.ndarray, actions: np.nda
     return np.concatenate([policy_observations, actions], axis=1).astype(np.float32, copy=False)
 
 
+def should_normalize_gail_reward(cfg: PSGAILConfig) -> bool:
+    if not bool(getattr(cfg, "normalize_gail_reward", False)):
+        return False
+    if str(getattr(cfg, "discriminator_loss", "bce")).lower() == "wgan_gp":
+        return bool(getattr(cfg, "allow_wgan_reward_normalization", False))
+    return True
+
+
+def should_apply_gail_reward_clip(cfg: PSGAILConfig) -> bool:
+    if float(getattr(cfg, "gail_reward_clip", 0.0)) <= 0.0:
+        return False
+    return str(getattr(cfg, "discriminator_loss", "bce")).lower() != "wgan_gp"
+
+
 def shape_rollout_rewards(
     raw_gail_rewards: np.ndarray,
     env_penalties: np.ndarray,
@@ -514,9 +528,9 @@ def shape_rollout_rewards(
         wgan_clip = float(getattr(cfg, "wgan_reward_clip", 0.0))
         if wgan_clip > 0:
             shaped_gail = np.clip(shaped_gail, -wgan_clip, wgan_clip)
-    if bool(cfg.normalize_gail_reward) and shaped_gail.size > 1:
+    if should_normalize_gail_reward(cfg) and shaped_gail.size > 1:
         shaped_gail = (shaped_gail - shaped_gail.mean()) / (shaped_gail.std() + 1e-8)
-    if float(cfg.gail_reward_clip) > 0:
+    if should_apply_gail_reward_clip(cfg):
         clip = float(cfg.gail_reward_clip)
         shaped_gail = np.clip(shaped_gail, -clip, clip)
 
@@ -1541,6 +1555,8 @@ def update_discriminator(
     gen_accs: list[torch.Tensor] = []
     expert_centered_accs: list[torch.Tensor] = []
     gen_centered_accs: list[torch.Tensor] = []
+    expert_positive_fracs: list[torch.Tensor] = []
+    gen_negative_fracs: list[torch.Tensor] = []
     cgail_k = max(0.0, float(getattr(cfg, "cgail_k", 0.0)))
     loss_type = str(getattr(cfg, "discriminator_loss", "bce")).lower()
     batch_size = max(1, int(cfg.disc_batch_size))
@@ -1580,14 +1596,14 @@ def update_discriminator(
                     expert_score_means.append(expert_scores.mean().detach())
                     gen_score_means.append(gen_scores.mean().detach())
                     critic_gaps.append((expert_scores.mean() - gen_scores.mean()).detach())
-                    expert_accs.append((expert_scores > 0.0).float().mean().detach())
-                    gen_accs.append((gen_scores < 0.0).float().mean().detach())
-                    expert_centered_accs.append(
-                        (expert_scores > centered_threshold).float().mean().detach()
-                    )
-                    gen_centered_accs.append(
-                        (gen_scores < centered_threshold).float().mean().detach()
-                    )
+                    expert_positive_fracs.append((expert_scores > 0.0).float().mean().detach())
+                    gen_negative_fracs.append((gen_scores < 0.0).float().mean().detach())
+                    expert_centered = (expert_scores > centered_threshold).float().mean().detach()
+                    gen_centered = (gen_scores < centered_threshold).float().mean().detach()
+                    expert_accs.append(expert_centered)
+                    gen_accs.append(gen_centered)
+                    expert_centered_accs.append(expert_centered)
+                    gen_centered_accs.append(gen_centered)
                 losses.append(loss.detach())
                 wgan_losses.append(wgan_loss.detach())
                 gradient_penalties.append(gradient_penalty.detach())
@@ -1661,6 +1677,8 @@ def update_discriminator(
         "gen_acc": mean_or_nan(gen_accs),
         "expert_centered_acc": mean_or_nan(expert_centered_accs),
         "gen_centered_acc": mean_or_nan(gen_centered_accs),
+        "expert_positive_frac": mean_or_nan(expert_positive_fracs),
+        "gen_negative_frac": mean_or_nan(gen_negative_fracs),
     }
 
 
