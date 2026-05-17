@@ -419,30 +419,67 @@ def config_for_round(cfg: PSGAILConfig, round_idx: int) -> PSGAILConfig:
         int(round_idx),
         percentage_controlled_vehicles,
     )
+    learning_rate = _scheduled_float_or_default(
+        cfg,
+        round_idx,
+        schedule_attr="learning_rate_schedule",
+        name="learning_rate_schedule",
+        default=float(cfg.learning_rate),
+    )
+    disc_learning_rate = _scheduled_float_or_default(
+        cfg,
+        round_idx,
+        schedule_attr="disc_learning_rate_schedule",
+        name="disc_learning_rate_schedule",
+        default=float(cfg.disc_learning_rate),
+    )
+    entropy_coef = _scheduled_float_or_default(
+        cfg,
+        round_idx,
+        schedule_attr="entropy_coef_schedule",
+        name="entropy_coef_schedule",
+        default=float(cfg.entropy_coef),
+    )
+    clip_range = _scheduled_float_or_default(
+        cfg,
+        round_idx,
+        schedule_attr="clip_range_schedule",
+        name="clip_range_schedule",
+        default=float(cfg.clip_range),
+    )
+    disc_updates_per_round = _scheduled_int_or_default(
+        cfg,
+        round_idx,
+        schedule_attr="disc_updates_per_round_schedule",
+        name="disc_updates_per_round_schedule",
+        default=int(cfg.disc_updates_per_round),
+        minimum=1,
+    )
+
     learning_rate = _apply_warmup(
         start=float(getattr(cfg, "warmup_learning_rate", 0.0)),
-        end=float(cfg.learning_rate),
+        end=learning_rate,
         warmup_round_idx=warmup_round_idx,
         warmup_rounds=warmup_rounds,
         enabled=float(getattr(cfg, "warmup_learning_rate", 0.0)) > 0.0,
     )
     disc_learning_rate = _apply_warmup(
         start=float(getattr(cfg, "warmup_disc_learning_rate", 0.0)),
-        end=float(cfg.disc_learning_rate),
+        end=disc_learning_rate,
         warmup_round_idx=warmup_round_idx,
         warmup_rounds=warmup_rounds,
         enabled=float(getattr(cfg, "warmup_disc_learning_rate", 0.0)) > 0.0,
     )
     entropy_coef = _apply_warmup(
         start=float(getattr(cfg, "warmup_entropy_coef", -1.0)),
-        end=float(cfg.entropy_coef),
+        end=entropy_coef,
         warmup_round_idx=warmup_round_idx,
         warmup_rounds=warmup_rounds,
         enabled=float(getattr(cfg, "warmup_entropy_coef", -1.0)) >= 0.0,
     )
     clip_range = _apply_warmup(
         start=float(getattr(cfg, "warmup_clip_range", 0.0)),
-        end=float(cfg.clip_range),
+        end=clip_range,
         warmup_round_idx=warmup_round_idx,
         warmup_rounds=warmup_rounds,
         enabled=float(getattr(cfg, "warmup_clip_range", 0.0)) > 0.0,
@@ -461,7 +498,6 @@ def config_for_round(cfg: PSGAILConfig, round_idx: int) -> PSGAILConfig:
         warmup_rounds=warmup_rounds,
         enabled=float(getattr(cfg, "warmup_final_reward_clip", 0.0)) > 0.0,
     )
-    disc_updates_per_round = int(cfg.disc_updates_per_round)
     warmup_disc_updates = int(getattr(cfg, "warmup_disc_updates_per_round", 0))
     if warmup_disc_updates > 0:
         disc_updates_per_round = max(
@@ -470,50 +506,13 @@ def config_for_round(cfg: PSGAILConfig, round_idx: int) -> PSGAILConfig:
                 round(
                     _scheduled_warmup_value(
                         start=float(warmup_disc_updates),
-                        end=float(cfg.disc_updates_per_round),
+                        end=float(disc_updates_per_round),
                         round_idx=warmup_round_idx,
                         warmup_rounds=warmup_rounds,
                     )
                 )
             ),
         )
-
-    learning_rate = _scheduled_float_or_default(
-        cfg,
-        round_idx,
-        schedule_attr="learning_rate_schedule",
-        name="learning_rate_schedule",
-        default=learning_rate,
-    )
-    disc_learning_rate = _scheduled_float_or_default(
-        cfg,
-        round_idx,
-        schedule_attr="disc_learning_rate_schedule",
-        name="disc_learning_rate_schedule",
-        default=disc_learning_rate,
-    )
-    entropy_coef = _scheduled_float_or_default(
-        cfg,
-        round_idx,
-        schedule_attr="entropy_coef_schedule",
-        name="entropy_coef_schedule",
-        default=entropy_coef,
-    )
-    clip_range = _scheduled_float_or_default(
-        cfg,
-        round_idx,
-        schedule_attr="clip_range_schedule",
-        name="clip_range_schedule",
-        default=clip_range,
-    )
-    disc_updates_per_round = _scheduled_int_or_default(
-        cfg,
-        round_idx,
-        schedule_attr="disc_updates_per_round_schedule",
-        name="disc_updates_per_round_schedule",
-        default=disc_updates_per_round,
-        minimum=1,
-    )
 
     return replace(
         cfg,
