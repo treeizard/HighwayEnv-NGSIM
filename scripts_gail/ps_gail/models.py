@@ -147,7 +147,7 @@ class TransformerActorCritic(nn.Module):
         continuous_action_dim: int = 2,
         num_layers: int = 2,
         num_heads: int = 4,
-        dropout: float = 0.0,
+        dropout: float = 0.1,
         centralized_critic: bool = False,
         critic_obs_dim: int | None = None,
     ) -> None:
@@ -255,7 +255,7 @@ def make_actor_critic(
     continuous_action_dim: int = 2,
     transformer_layers: int = 2,
     transformer_heads: int = 4,
-    transformer_dropout: float = 0.0,
+    transformer_dropout: float = 0.1,
     centralized_critic: bool = False,
     critic_obs_dim: int | None = None,
 ) -> nn.Module:

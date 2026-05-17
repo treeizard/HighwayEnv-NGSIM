@@ -66,7 +66,7 @@ class PSGAILConfig:
     hidden_size: int = 256
     transformer_layers: int = 2
     transformer_heads: int = 4
-    transformer_dropout: float = 0.0
+    transformer_dropout: float = 0.1
     centralized_critic: bool = False
     central_critic_max_vehicles: int = 64
     central_critic_include_local_obs: bool = False
@@ -122,7 +122,7 @@ class PSGAILConfig:
     sequence_stride: int = 1
     sequence_reward_coef: float = 1.0
     sequence_reward_assignment: str = "last"
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.015
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     normalize_gail_reward: bool = True
