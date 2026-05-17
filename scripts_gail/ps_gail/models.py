@@ -6,7 +6,7 @@ import torch.nn as nn
 
 NUM_DISCRETE_META_ACTIONS = 5
 DEFAULT_CRITIC_HIDDEN_SIZES = (128, 128, 64)
-DEFAULT_CRITIC_DROPOUT = 0.2
+DEFAULT_CRITIC_DROPOUT = 0.0
 
 
 def parse_hidden_sizes(hidden_sizes: str | int | tuple[int, ...] | list[int] | None) -> tuple[int, ...]:
@@ -147,7 +147,7 @@ class TransformerActorCritic(nn.Module):
         continuous_action_dim: int = 2,
         num_layers: int = 2,
         num_heads: int = 4,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
         centralized_critic: bool = False,
         critic_obs_dim: int | None = None,
     ) -> None:
@@ -255,7 +255,7 @@ def make_actor_critic(
     continuous_action_dim: int = 2,
     transformer_layers: int = 2,
     transformer_heads: int = 4,
-    transformer_dropout: float = 0.1,
+    transformer_dropout: float = 0.0,
     centralized_critic: bool = False,
     critic_obs_dim: int | None = None,
 ) -> nn.Module:

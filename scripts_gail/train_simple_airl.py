@@ -52,7 +52,7 @@ class AIRLReward(nn.Module):
         hidden_size: int | None = None,
         *,
         hidden_sizes: str | int | tuple[int, ...] | list[int] | None = None,
-        dropout: float = 0.2,
+        dropout: float = 0.0,
         spectral_norm: bool = False,
     ) -> None:
         super().__init__()
