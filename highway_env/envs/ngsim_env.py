@@ -31,6 +31,7 @@ from highway_env.road.road import Road
 
 from highway_env.ngsim_utils.core.config import (
     deep_update,
+    interaction_metric_targets_from_idm,
     normalize_action_mode,
     resolve_idm_parameters,
 )
@@ -160,6 +161,12 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 "controlled_vehicle_min_occupancy": 0.8,
                 "scene_collection_min_occupancy_steps": None,
                 "idm_parameters": None,
+                "enable_interaction_metrics": False,
+                "interaction_ttc_target": 0.0,
+                "interaction_ttc_margin": 0.75,
+                "interaction_ttc_floor": 0.0,
+                "interaction_gap_target": 0.0,
+                "interaction_gap_floor": 0.0,
                 "debug_idm_handover": False,
                 "debug_idm_handover_ids": None,
             }
@@ -1031,6 +1038,108 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
     # -------------------------------------------------------------------------
     # INFO / REWARDS / TERMINATION
     # -------------------------------------------------------------------------
+    @staticmethod
+    def _vehicle_length_for_metrics(vehicle: object | None) -> float:
+        if vehicle is None:
+            return 0.0
+        for name in ("LENGTH", "length"):
+            if hasattr(vehicle, name):
+                try:
+                    value = float(getattr(vehicle, name))
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(value) and value > 0.0:
+                    return value
+        return 0.0
+
+    @staticmethod
+    def _vehicle_id_for_metrics(vehicle: object | None) -> int:
+        if vehicle is None:
+            return -1
+        try:
+            return int(getattr(vehicle, "vehicle_ID", -1))
+        except (TypeError, ValueError):
+            return -1
+
+    def _interaction_metric_targets(self, vehicle: EgoVehicle) -> tuple[float, float, float, float]:
+        return interaction_metric_targets_from_idm(
+            self.idm_parameters,
+            self.config,
+            speed=float(getattr(vehicle, "speed", 0.0)),
+        )
+
+    def _bumper_gap_and_ttc(
+        self,
+        vehicle: EgoVehicle,
+        other: object | None,
+        *,
+        rear: bool,
+    ) -> tuple[float, float]:
+        if other is None:
+            return float("inf"), float("inf")
+        try:
+            center_gap = float(abs(vehicle.lane_distance_to(other)))
+        except Exception:
+            return float("inf"), float("inf")
+        if not np.isfinite(center_gap):
+            return float("inf"), float("inf")
+        bumper_gap = center_gap - 0.5 * (
+            self._vehicle_length_for_metrics(vehicle) + self._vehicle_length_for_metrics(other)
+        )
+        ego_speed = max(float(getattr(vehicle, "speed", 0.0)), 0.0)
+        other_speed = max(float(getattr(other, "speed", 0.0)), 0.0)
+        closing_speed = (other_speed - ego_speed) if rear else (ego_speed - other_speed)
+        if closing_speed > 1.0e-6:
+            ttc = max(float(bumper_gap), 0.0) / float(closing_speed)
+        else:
+            ttc = float("inf")
+        return float(bumper_gap), float(ttc)
+
+    def controlled_vehicle_interaction_metrics(self) -> list[dict[str, float | int | bool | str]]:
+        if self.road is None:
+            return []
+        metrics: list[dict[str, float | int | bool | str]] = []
+        crash_flags = [bool(getattr(vehicle, "crashed", False)) for vehicle in self.controlled_vehicles]
+        offroad_flags = [
+            (not bool(getattr(vehicle, "completed", False)))
+            and (not bool(getattr(vehicle, "on_road", True)))
+            for vehicle in self.controlled_vehicles
+        ]
+        for idx, vehicle in enumerate(self.controlled_vehicles):
+            try:
+                front_vehicle, rear_vehicle = self.road.neighbour_vehicles(vehicle)
+            except Exception:
+                front_vehicle, rear_vehicle = None, None
+            front_gap, front_ttc = self._bumper_gap_and_ttc(vehicle, front_vehicle, rear=False)
+            rear_gap, rear_ttc = self._bumper_gap_and_ttc(vehicle, rear_vehicle, rear=True)
+            finite_gaps = [gap for gap in (front_gap, rear_gap) if np.isfinite(gap)]
+            finite_ttcs = [ttc for ttc in (front_ttc, rear_ttc) if np.isfinite(ttc)]
+            min_gap = min(finite_gaps) if finite_gaps else float("inf")
+            min_ttc = min(finite_ttcs) if finite_ttcs else float("inf")
+            ttc_target, ttc_floor, gap_target, gap_floor = self._interaction_metric_targets(vehicle)
+            metrics.append(
+                {
+                    "vehicle_id": self._vehicle_id_for_metrics(vehicle),
+                    "front_vehicle_id": self._vehicle_id_for_metrics(front_vehicle),
+                    "rear_vehicle_id": self._vehicle_id_for_metrics(rear_vehicle),
+                    "front_gap": float(front_gap),
+                    "rear_gap": float(rear_gap),
+                    "front_ttc": float(front_ttc),
+                    "rear_ttc": float(rear_ttc),
+                    "min_gap": float(min_gap),
+                    "min_ttc": float(min_ttc),
+                    "ttc_target": float(ttc_target),
+                    "ttc_floor": float(ttc_floor),
+                    "gap_target": float(gap_target),
+                    "gap_floor": float(gap_floor),
+                    "speed": float(getattr(vehicle, "speed", 0.0)),
+                    "lane_index": str(getattr(vehicle, "lane_index", "")),
+                    "crashed": bool(crash_flags[idx]) if idx < len(crash_flags) else False,
+                    "offroad": bool(offroad_flags[idx]) if idx < len(offroad_flags) else False,
+                }
+            )
+        return metrics
+
     def _info(self, obs: Any, action: Action | None = None) -> dict[str, Any]:
         info = super()._info(obs, action)
         policy_vehicles = self._policy_controlled_vehicles()
@@ -1075,6 +1184,8 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             and (not bool(getattr(vehicle, "on_road", True)))
             for vehicle in self.controlled_vehicles
         ]
+        if bool(self.config.get("enable_interaction_metrics", False)):
+            info["controlled_vehicle_interaction_metrics"] = self.controlled_vehicle_interaction_metrics()
         info["scene_dataset_collection_mode"] = self.scene_dataset_collection_mode
         return info
 

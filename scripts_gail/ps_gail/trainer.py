@@ -4,6 +4,7 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
+from dataclasses import field
 from dataclasses import replace
 
 import gymnasium as gym
@@ -30,6 +31,7 @@ from .observations import flatten_agent_observations, policy_observations_from_f
 
 @dataclass
 class AgentTransition:
+    vehicle_id: int
     policy_observation: np.ndarray
     next_policy_observation: np.ndarray
     critic_observation: np.ndarray
@@ -44,6 +46,12 @@ class AgentTransition:
     env_penalty: float
     crashed: bool
     offroad: bool
+    challenge_pressure: float
+    challenge_payoff: float
+    challenge_crash_rate_ema: float
+    challenge_offroad_rate_ema: float
+    challenge_ttc_target: float
+    challenge_gap_target: float
     done: bool
 
 
@@ -73,6 +81,14 @@ class RolloutBatch:
     sequence_transition_indices: np.ndarray
     num_env_steps: int
     num_agent_steps: int
+    vehicle_ids: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.int64))
+    challenge_pressures: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
+    challenge_payoffs: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
+    challenge_bonuses: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
+    challenge_crash_rate_ema: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
+    challenge_offroad_rate_ema: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
+    challenge_ttc_targets: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
+    challenge_gap_targets: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
     num_episodes: int = 0
     num_terminated: int = 0
     num_truncated: int = 0
@@ -516,6 +532,129 @@ def discriminator_input_mode(cfg: PSGAILConfig) -> str:
     return mode
 
 
+def _transition_array(values: np.ndarray, n: int, *, dtype: np.dtype, fill: float = 0.0) -> np.ndarray:
+    n = max(0, int(n))
+    arr = np.asarray(values, dtype=dtype)
+    if arr.shape == (n,):
+        return arr.astype(dtype, copy=False)
+    return np.full(n, fill, dtype=dtype)
+
+
+def _metric_float(metric: dict[str, object], key: str, default: float) -> float:
+    try:
+        value = float(metric.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+    return value if np.isfinite(value) else float(default)
+
+
+def player_challenge_pressure_from_metric(
+    metric: dict[str, object] | None,
+    cfg: PSGAILConfig,
+) -> tuple[float, float, float]:
+    if metric is None:
+        return 0.0, 0.0, 0.0
+    ttc_target = _metric_float(metric, "ttc_target", 0.0)
+    ttc_floor = _metric_float(metric, "ttc_floor", 0.0)
+    gap_target = _metric_float(metric, "gap_target", 0.0)
+    gap_floor = _metric_float(metric, "gap_floor", 0.0)
+    min_ttc = _metric_float(metric, "min_ttc", float("inf"))
+    min_gap = _metric_float(metric, "min_gap", float("inf"))
+    if bool(metric.get("crashed", False)) or bool(metric.get("offroad", False)):
+        return 0.0, float(ttc_target), float(gap_target)
+    if min_ttc < ttc_floor or min_gap < gap_floor:
+        return 0.0, float(ttc_target), float(gap_target)
+
+    if np.isfinite(min_ttc) and ttc_target > ttc_floor:
+        ttc_pressure = np.clip((ttc_target - min_ttc) / (ttc_target - ttc_floor), 0.0, 1.0)
+    else:
+        ttc_pressure = 0.0
+    if np.isfinite(min_gap) and gap_target > gap_floor:
+        gap_pressure = np.clip((gap_target - min_gap) / (gap_target - gap_floor), 0.0, 1.0)
+    else:
+        gap_pressure = 0.0
+
+    ttc_weight = max(0.0, float(getattr(cfg, "challenge_ttc_weight", 0.6)))
+    gap_weight = max(0.0, float(getattr(cfg, "challenge_gap_weight", 0.4)))
+    weight_sum = ttc_weight + gap_weight
+    if weight_sum <= 0.0:
+        return 0.0, float(ttc_target), float(gap_target)
+    pressure = (ttc_weight * float(ttc_pressure) + gap_weight * float(gap_pressure)) / weight_sum
+    return float(np.clip(pressure, 0.0, 1.0)), float(ttc_target), float(gap_target)
+
+
+def player_challenge_payoff(
+    pressure: float,
+    *,
+    crash_rate_ema: float,
+    offroad_rate_ema: float,
+    cfg: PSGAILConfig,
+) -> float:
+    if pressure <= 0.0:
+        return 0.0
+    risk = (
+        1.0
+        + max(0.0, float(getattr(cfg, "challenge_crash_weight", 4.0))) * max(0.0, float(crash_rate_ema))
+        + max(0.0, float(getattr(cfg, "challenge_offroad_weight", 2.0))) * max(0.0, float(offroad_rate_ema))
+    )
+    return float(max(0.0, pressure) / max(1.0e-6, risk))
+
+
+def player_challenge_bonus(
+    payoffs: np.ndarray,
+    primary_rewards: np.ndarray,
+    cfg: PSGAILConfig,
+) -> np.ndarray:
+    primary = np.asarray(primary_rewards, dtype=np.float32)
+    if not bool(getattr(cfg, "enable_player_challenge_reward", False)) or primary.size == 0:
+        return np.zeros_like(primary, dtype=np.float32)
+    payoff_arr = _transition_array(payoffs, len(primary), dtype=np.float32, fill=0.0)
+    payoff_arr = np.where(np.isfinite(payoff_arr), np.maximum(payoff_arr, 0.0), 0.0)
+
+    quantile = float(getattr(cfg, "challenge_expert_like_quantile", 0.25))
+    if 0.0 < quantile < 1.0 and primary.size > 1:
+        threshold = float(np.quantile(primary, quantile))
+        payoff_arr = np.where(primary >= threshold, payoff_arr, 0.0)
+
+    bonus = float(getattr(cfg, "challenge_reward_coef", 0.2)) * payoff_arr
+    absolute_clip = float(getattr(cfg, "challenge_reward_clip", 0.25))
+    if absolute_clip > 0.0:
+        bonus = np.clip(bonus, 0.0, absolute_clip)
+
+    fraction = max(0.0, float(getattr(cfg, "challenge_max_primary_reward_fraction", 0.10)))
+    if fraction <= 0.0:
+        return np.zeros_like(primary, dtype=np.float32)
+    mean_abs_primary = float(np.mean(np.abs(primary))) if primary.size else 0.0
+    if mean_abs_primary <= 1.0e-8:
+        return np.zeros_like(primary, dtype=np.float32)
+    cap_scale = np.maximum(np.abs(primary), mean_abs_primary)
+    bonus = np.minimum(bonus, fraction * cap_scale)
+    return bonus.astype(np.float32, copy=False)
+
+
+def combine_primary_env_challenge_rewards(
+    primary_rewards: np.ndarray,
+    env_penalties: np.ndarray,
+    cfg: PSGAILConfig,
+    *,
+    challenge_payoffs: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    primary = np.asarray(primary_rewards, dtype=np.float32)
+    penalties = np.asarray(env_penalties, dtype=np.float32)
+    if primary.shape != penalties.shape:
+        raise ValueError(f"Reward/penalty shape mismatch: {primary.shape} != {penalties.shape}")
+    bonus = player_challenge_bonus(
+        np.zeros_like(primary, dtype=np.float32) if challenge_payoffs is None else challenge_payoffs,
+        primary,
+        cfg,
+    )
+    rewards = primary + penalties + bonus
+    if float(cfg.final_reward_clip) > 0:
+        clip = float(cfg.final_reward_clip)
+        rewards = np.clip(rewards, -clip, clip)
+    return rewards.astype(np.float32, copy=False), bonus.astype(np.float32, copy=False)
+
+
 def sequence_rewards_to_transition_rewards(
     sequence_rewards: np.ndarray,
     *,
@@ -622,16 +761,8 @@ def safe_normalize_adversarial_rewards(rewards: np.ndarray, cfg: PSGAILConfig) -
     return normalized.astype(np.float32, copy=False)
 
 
-def shape_rollout_rewards(
-    raw_gail_rewards: np.ndarray,
-    env_penalties: np.ndarray,
-    cfg: PSGAILConfig,
-) -> tuple[np.ndarray, np.ndarray]:
+def shape_adversarial_rewards(raw_gail_rewards: np.ndarray, cfg: PSGAILConfig) -> np.ndarray:
     raw = np.asarray(raw_gail_rewards, dtype=np.float32)
-    penalties = np.asarray(env_penalties, dtype=np.float32)
-    if raw.shape != penalties.shape:
-        raise ValueError(f"Reward/penalty shape mismatch: {raw.shape} != {penalties.shape}")
-
     shaped_gail = raw.astype(np.float32, copy=True)
     if str(getattr(cfg, "discriminator_loss", "bce")).lower() == "wgan_gp":
         if bool(getattr(cfg, "wgan_reward_center", False)) and shaped_gail.size > 1:
@@ -647,12 +778,23 @@ def shape_rollout_rewards(
     if should_apply_gail_reward_clip(cfg):
         clip = float(cfg.gail_reward_clip)
         shaped_gail = np.clip(shaped_gail, -clip, clip)
+    return shaped_gail.astype(np.float32, copy=False)
 
-    rewards = shaped_gail + penalties
-    if float(cfg.final_reward_clip) > 0:
-        clip = float(cfg.final_reward_clip)
-        rewards = np.clip(rewards, -clip, clip)
+
+def shape_rollout_rewards(
+    raw_gail_rewards: np.ndarray,
+    env_penalties: np.ndarray,
+    cfg: PSGAILConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    shaped_gail = shape_adversarial_rewards(raw_gail_rewards, cfg)
+    rewards, _challenge_bonus = combine_primary_env_challenge_rewards(
+        shaped_gail,
+        env_penalties,
+        cfg,
+        challenge_payoffs=None,
+    )
     return rewards.astype(np.float32), shaped_gail.astype(np.float32)
+
 
 
 def _target_rollout_episodes(cfg: PSGAILConfig) -> int:
@@ -754,10 +896,12 @@ def refresh_rollout_rewards(
             sequence_transition_indices=rollout.sequence_transition_indices,
             assignment=str(getattr(cfg, "sequence_reward_assignment", "last")),
         )
-    rewards, normalized_gail_rewards = shape_rollout_rewards(
-        combined_raw_gail_rewards,
+    normalized_gail_rewards = shape_adversarial_rewards(combined_raw_gail_rewards, cfg)
+    rewards, challenge_bonuses = combine_primary_env_challenge_rewards(
+        normalized_gail_rewards,
         rollout.env_penalties,
         cfg,
+        challenge_payoffs=rollout.challenge_payoffs,
     )
     returns, advantages = compute_returns_and_advantages(
         rewards,
@@ -791,6 +935,14 @@ def refresh_rollout_rewards(
         sequence_transition_indices=rollout.sequence_transition_indices,
         num_env_steps=rollout.num_env_steps,
         num_agent_steps=rollout.num_agent_steps,
+        vehicle_ids=rollout.vehicle_ids,
+        challenge_pressures=rollout.challenge_pressures,
+        challenge_payoffs=rollout.challenge_payoffs,
+        challenge_bonuses=challenge_bonuses,
+        challenge_crash_rate_ema=rollout.challenge_crash_rate_ema,
+        challenge_offroad_rate_ema=rollout.challenge_offroad_rate_ema,
+        challenge_ttc_targets=rollout.challenge_ttc_targets,
+        challenge_gap_targets=rollout.challenge_gap_targets,
         num_episodes=rollout.num_episodes,
         num_terminated=rollout.num_terminated,
         num_truncated=rollout.num_truncated,
@@ -870,6 +1022,9 @@ def collect_rollout(
     episode_had_offroad = False
     psro_current_decisions = 0
     psro_archive_decisions = 0
+    challenge_enabled = bool(getattr(cfg, "enable_player_challenge_reward", False))
+    challenge_risk_state: dict[tuple[int, int], tuple[float, float]] = {}
+    challenge_beta = min(0.999, max(0.0, float(getattr(cfg, "challenge_risk_ema_beta", 0.95))))
 
     collect_full_episodes = bool(getattr(cfg, "rollout_full_episodes", True))
     forced_reset_cap = 0 if collect_full_episodes else int(cfg.rollout_max_episode_steps)
@@ -974,12 +1129,18 @@ def collect_rollout(
         done = bool(terminated or truncated or force_rollout_reset)
         crash_flags = info.get("controlled_vehicle_crashes", [])
         offroad_flags = info.get("controlled_vehicle_offroad", [])
+        interaction_metrics = (
+            list(info.get("controlled_vehicle_interaction_metrics", []) or [])
+            if challenge_enabled
+            else []
+        )
         episode_had_crash = bool(episode_had_crash or any(bool(flag) for flag in crash_flags))
         episode_had_offroad = bool(episode_had_offroad or any(bool(flag) for flag in offroad_flags))
 
         for i, key in enumerate(keys):
             if int(policy_sources[i]) != 0:
                 continue
+            vehicle_id = int(vehicle_ids[i]) if i < len(vehicle_ids) else -1
             crashed = bool(crash_flags[i]) if i < len(crash_flags) else False
             offroad = bool(offroad_flags[i]) if i < len(offroad_flags) else False
             env_penalty = 0.0
@@ -987,8 +1148,24 @@ def collect_rollout(
                 env_penalty -= float(cfg.collision_penalty)
             if offroad:
                 env_penalty -= float(cfg.offroad_penalty)
+            prev_crash_ema, prev_offroad_ema = challenge_risk_state.get(key, (0.0, 0.0))
+            crash_ema = challenge_beta * prev_crash_ema + (1.0 - challenge_beta) * float(crashed)
+            offroad_ema = challenge_beta * prev_offroad_ema + (1.0 - challenge_beta) * float(offroad)
+            challenge_risk_state[key] = (float(crash_ema), float(offroad_ema))
+            if challenge_enabled:
+                metric = interaction_metrics[i] if i < len(interaction_metrics) else None
+                pressure, ttc_target, gap_target = player_challenge_pressure_from_metric(metric, cfg)
+                payoff = player_challenge_payoff(
+                    pressure,
+                    crash_rate_ema=float(crash_ema),
+                    offroad_rate_ema=float(offroad_ema),
+                    cfg=cfg,
+                )
+            else:
+                pressure = payoff = ttc_target = gap_target = 0.0
             transitions.append(
                 AgentTransition(
+                    vehicle_id=vehicle_id,
                     policy_observation=obs_agents[i].copy(),
                     next_policy_observation=next_obs_agents[i].copy(),
                     critic_observation=critic_obs_agents[i].copy(),
@@ -1007,6 +1184,12 @@ def collect_rollout(
                     env_penalty=float(env_penalty),
                     crashed=crashed,
                     offroad=offroad,
+                    challenge_pressure=float(pressure),
+                    challenge_payoff=float(payoff),
+                    challenge_crash_rate_ema=float(crash_ema),
+                    challenge_offroad_rate_ema=float(offroad_ema),
+                    challenge_ttc_target=float(ttc_target),
+                    challenge_gap_target=float(gap_target),
                     done=done,
                 )
             )
@@ -1049,6 +1232,19 @@ def collect_rollout(
     transition_scene_indices = np.asarray([tr.scene_index for tr in transitions], dtype=np.int64)
     crashed = np.asarray([tr.crashed for tr in transitions], dtype=bool)
     offroad = np.asarray([tr.offroad for tr in transitions], dtype=bool)
+    rollout_vehicle_ids = np.asarray([tr.vehicle_id for tr in transitions], dtype=np.int64)
+    challenge_pressures = np.asarray([tr.challenge_pressure for tr in transitions], dtype=np.float32)
+    challenge_payoffs = np.asarray([tr.challenge_payoff for tr in transitions], dtype=np.float32)
+    challenge_crash_rate_ema = np.asarray(
+        [tr.challenge_crash_rate_ema for tr in transitions],
+        dtype=np.float32,
+    )
+    challenge_offroad_rate_ema = np.asarray(
+        [tr.challenge_offroad_rate_ema for tr in transitions],
+        dtype=np.float32,
+    )
+    challenge_ttc_targets = np.asarray([tr.challenge_ttc_target for tr in transitions], dtype=np.float32)
+    challenge_gap_targets = np.asarray([tr.challenge_gap_target for tr in transitions], dtype=np.float32)
     trajectory_ids = np.asarray([tr.trajectory_id for tr in transitions], dtype=np.int32)
     trajectory_states = normalize_trajectory_frame(
         trajectory_states,
@@ -1102,6 +1298,14 @@ def collect_rollout(
         sequence_transition_indices=sequence_transition_indices,
         num_env_steps=env_steps,
         num_agent_steps=len(transitions),
+        vehicle_ids=rollout_vehicle_ids,
+        challenge_pressures=challenge_pressures,
+        challenge_payoffs=challenge_payoffs,
+        challenge_bonuses=np.zeros(len(transitions), dtype=np.float32),
+        challenge_crash_rate_ema=challenge_crash_rate_ema,
+        challenge_offroad_rate_ema=challenge_offroad_rate_ema,
+        challenge_ttc_targets=challenge_ttc_targets,
+        challenge_gap_targets=challenge_gap_targets,
         num_episodes=len(episode_lengths),
         num_terminated=terminated_count,
         num_truncated=truncated_count,
@@ -1220,6 +1424,59 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
         sequence_transition_indices=np.concatenate(sequence_transition_indices, axis=0).astype(np.int64),
         num_env_steps=sum(batch.num_env_steps for batch in batches),
         num_agent_steps=sum(batch.num_agent_steps for batch in batches),
+        vehicle_ids=np.concatenate(
+            [_transition_array(batch.vehicle_ids, batch.num_agent_steps, dtype=np.int64, fill=-1) for batch in batches],
+            axis=0,
+        ).astype(np.int64),
+        challenge_pressures=np.concatenate(
+            [
+                _transition_array(batch.challenge_pressures, batch.num_agent_steps, dtype=np.float32)
+                for batch in batches
+            ],
+            axis=0,
+        ).astype(np.float32),
+        challenge_payoffs=np.concatenate(
+            [
+                _transition_array(batch.challenge_payoffs, batch.num_agent_steps, dtype=np.float32)
+                for batch in batches
+            ],
+            axis=0,
+        ).astype(np.float32),
+        challenge_bonuses=np.concatenate(
+            [
+                _transition_array(batch.challenge_bonuses, batch.num_agent_steps, dtype=np.float32)
+                for batch in batches
+            ],
+            axis=0,
+        ).astype(np.float32),
+        challenge_crash_rate_ema=np.concatenate(
+            [
+                _transition_array(batch.challenge_crash_rate_ema, batch.num_agent_steps, dtype=np.float32)
+                for batch in batches
+            ],
+            axis=0,
+        ).astype(np.float32),
+        challenge_offroad_rate_ema=np.concatenate(
+            [
+                _transition_array(batch.challenge_offroad_rate_ema, batch.num_agent_steps, dtype=np.float32)
+                for batch in batches
+            ],
+            axis=0,
+        ).astype(np.float32),
+        challenge_ttc_targets=np.concatenate(
+            [
+                _transition_array(batch.challenge_ttc_targets, batch.num_agent_steps, dtype=np.float32)
+                for batch in batches
+            ],
+            axis=0,
+        ).astype(np.float32),
+        challenge_gap_targets=np.concatenate(
+            [
+                _transition_array(batch.challenge_gap_targets, batch.num_agent_steps, dtype=np.float32)
+                for batch in batches
+            ],
+            axis=0,
+        ).astype(np.float32),
         num_episodes=sum(batch.num_episodes for batch in batches),
         num_terminated=sum(batch.num_terminated for batch in batches),
         num_truncated=sum(batch.num_truncated for batch in batches),
@@ -1478,6 +1735,47 @@ def subsample_rollout_for_training(
         sequence_transition_indices=sequence_transition_indices,
         num_env_steps=rollout.num_env_steps,
         num_agent_steps=int(selected_indices.size),
+        vehicle_ids=_transition_array(
+            rollout.vehicle_ids,
+            rollout.num_agent_steps,
+            dtype=np.int64,
+            fill=-1,
+        )[selected_indices].astype(np.int64, copy=False),
+        challenge_pressures=_transition_array(
+            rollout.challenge_pressures,
+            rollout.num_agent_steps,
+            dtype=np.float32,
+        )[selected_indices].astype(np.float32, copy=False),
+        challenge_payoffs=_transition_array(
+            rollout.challenge_payoffs,
+            rollout.num_agent_steps,
+            dtype=np.float32,
+        )[selected_indices].astype(np.float32, copy=False),
+        challenge_bonuses=_transition_array(
+            rollout.challenge_bonuses,
+            rollout.num_agent_steps,
+            dtype=np.float32,
+        )[selected_indices].astype(np.float32, copy=False),
+        challenge_crash_rate_ema=_transition_array(
+            rollout.challenge_crash_rate_ema,
+            rollout.num_agent_steps,
+            dtype=np.float32,
+        )[selected_indices].astype(np.float32, copy=False),
+        challenge_offroad_rate_ema=_transition_array(
+            rollout.challenge_offroad_rate_ema,
+            rollout.num_agent_steps,
+            dtype=np.float32,
+        )[selected_indices].astype(np.float32, copy=False),
+        challenge_ttc_targets=_transition_array(
+            rollout.challenge_ttc_targets,
+            rollout.num_agent_steps,
+            dtype=np.float32,
+        )[selected_indices].astype(np.float32, copy=False),
+        challenge_gap_targets=_transition_array(
+            rollout.challenge_gap_targets,
+            rollout.num_agent_steps,
+            dtype=np.float32,
+        )[selected_indices].astype(np.float32, copy=False),
         num_episodes=rollout.num_episodes,
         num_terminated=rollout.num_terminated,
         num_truncated=rollout.num_truncated,
@@ -1738,6 +2036,170 @@ def _wgan_gradient_penalty(
     return float(gp_lambda) * torch.square(gradient_norm - 1.0).mean()
 
 
+def _sample_array_indices(
+    n: int,
+    size: int,
+    *,
+    replace: bool,
+) -> np.ndarray:
+    n = int(n)
+    size = max(0, int(size))
+    if n <= 0 or size <= 0:
+        return np.zeros((0,), dtype=np.int64)
+    return np.random.choice(n, size=size, replace=bool(replace)).astype(np.int64)
+
+
+def _score_discriminator_candidates(
+    discriminator: nn.Module,
+    features: np.ndarray,
+    device: torch.device,
+) -> np.ndarray:
+    was_training = discriminator.training
+    discriminator.eval()
+    try:
+        with torch.no_grad():
+            scores = discriminator(
+                _as_device_tensor(features.astype(np.float32, copy=False), dtype=torch.float32, device=device)
+            )
+    finally:
+        if was_training:
+            discriminator.train()
+    return scores.detach().cpu().numpy().astype(np.float32).reshape(-1)
+
+
+def _soft_hard_indices(
+    hardness: np.ndarray,
+    *,
+    selected_count: int,
+    selected_fraction: float,
+    uniform_mix: float,
+    temperature: float,
+) -> np.ndarray:
+    hardness = np.asarray(hardness, dtype=np.float64).reshape(-1)
+    n = int(hardness.size)
+    selected_count = min(n, max(1, int(selected_count)))
+    if n <= selected_count:
+        return np.arange(n, dtype=np.int64)
+    uniform_count = int(round(selected_count * min(1.0, max(0.0, float(uniform_mix)))))
+    uniform_count = min(selected_count, max(0, uniform_count))
+    hard_count = selected_count - uniform_count
+    chosen: list[np.ndarray] = []
+    if hard_count > 0:
+        top_pool_count = min(n, max(hard_count, int(np.ceil(max(0.0, min(1.0, selected_fraction)) * n))))
+        top_pool = np.argpartition(-hardness, top_pool_count - 1)[:top_pool_count]
+        pool_hardness = hardness[top_pool]
+        temp = max(1.0e-6, float(temperature))
+        logits = (pool_hardness - float(pool_hardness.max())) / temp
+        weights = np.exp(logits)
+        weight_sum = float(weights.sum())
+        probs = None if weight_sum <= 0.0 or not np.isfinite(weight_sum) else weights / weight_sum
+        chosen.append(
+            np.random.choice(top_pool, size=hard_count, replace=False, p=probs).astype(np.int64)
+        )
+    if uniform_count > 0:
+        excluded = np.concatenate(chosen, axis=0) if chosen else np.zeros((0,), dtype=np.int64)
+        available = np.setdiff1d(np.arange(n, dtype=np.int64), excluded, assume_unique=False)
+        if available.size < uniform_count:
+            available = np.arange(n, dtype=np.int64)
+        chosen.append(
+            np.random.choice(available, size=uniform_count, replace=False).astype(np.int64)
+        )
+    return np.concatenate(chosen, axis=0).astype(np.int64)
+
+
+def select_hard_discriminator_examples(
+    discriminator: nn.Module,
+    expert_features: np.ndarray,
+    generator_features: np.ndarray,
+    cfg: PSGAILConfig,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    if not bool(getattr(cfg, "enable_hard_example_selection", False)):
+        expert_idx = np.random.choice(
+            len(expert_features),
+            size=len(generator_features),
+            replace=len(expert_features) < len(generator_features),
+        )
+        return (
+            expert_features[expert_idx],
+            generator_features,
+            {
+                "hard_selector_enabled": 0.0,
+                "hard_selector_candidate_samples": float(len(generator_features)),
+                "hard_selector_selected_samples": float(len(generator_features)),
+                "hard_selector_selected_fraction": 1.0,
+                "hard_selector_expert_full_score_mean": float("nan"),
+                "hard_selector_gen_full_score_mean": float("nan"),
+                "hard_selector_expert_selected_score_mean": float("nan"),
+                "hard_selector_gen_selected_score_mean": float("nan"),
+            },
+        )
+
+    candidate_cap = max(1, int(getattr(cfg, "hard_example_candidate_samples", 65_536)))
+    candidate_count = min(candidate_cap, max(1, int(len(generator_features))))
+    expert_candidate_idx = _sample_array_indices(
+        len(expert_features),
+        candidate_count,
+        replace=len(expert_features) < candidate_count,
+    )
+    generator_candidate_idx = _sample_array_indices(
+        len(generator_features),
+        candidate_count,
+        replace=len(generator_features) < candidate_count,
+    )
+    expert_candidates = expert_features[expert_candidate_idx].astype(np.float32, copy=False)
+    generator_candidates = generator_features[generator_candidate_idx].astype(np.float32, copy=False)
+    expert_scores = _score_discriminator_candidates(discriminator, expert_candidates, device)
+    generator_scores = _score_discriminator_candidates(discriminator, generator_candidates, device)
+
+    selected_fraction = min(1.0, max(0.0, float(getattr(cfg, "hard_example_selected_fraction", 0.35))))
+    min_samples = max(1, int(getattr(cfg, "hard_example_min_samples", 4_096)))
+    selected_count = min(candidate_count, max(min_samples, int(np.ceil(selected_fraction * candidate_count))))
+    if selected_fraction < 1.0 and candidate_count > 1:
+        selected_count = min(selected_count, candidate_count - 1)
+    loss_type = str(getattr(cfg, "discriminator_loss", "bce")).lower()
+    expert_hardness = -expert_scores
+    generator_hardness = generator_scores
+    if loss_type != "wgan_gp":
+        expert_hardness = -expert_scores
+        generator_hardness = generator_scores
+    expert_selected_idx = _soft_hard_indices(
+        expert_hardness,
+        selected_count=selected_count,
+        selected_fraction=selected_fraction,
+        uniform_mix=float(getattr(cfg, "hard_example_uniform_mix", 0.25)),
+        temperature=float(getattr(cfg, "hard_example_temperature", 1.0)),
+    )
+    generator_selected_idx = _soft_hard_indices(
+        generator_hardness,
+        selected_count=selected_count,
+        selected_fraction=selected_fraction,
+        uniform_mix=float(getattr(cfg, "hard_example_uniform_mix", 0.25)),
+        temperature=float(getattr(cfg, "hard_example_temperature", 1.0)),
+    )
+    selected_count = min(len(expert_selected_idx), len(generator_selected_idx))
+    expert_selected_idx = expert_selected_idx[:selected_count]
+    generator_selected_idx = generator_selected_idx[:selected_count]
+    return (
+        expert_candidates[expert_selected_idx],
+        generator_candidates[generator_selected_idx],
+        {
+            "hard_selector_enabled": 1.0,
+            "hard_selector_candidate_samples": float(candidate_count),
+            "hard_selector_selected_samples": float(selected_count),
+            "hard_selector_selected_fraction": float(selected_count) / float(max(1, candidate_count)),
+            "hard_selector_expert_full_score_mean": float(expert_scores.mean()) if expert_scores.size else float("nan"),
+            "hard_selector_gen_full_score_mean": float(generator_scores.mean()) if generator_scores.size else float("nan"),
+            "hard_selector_expert_selected_score_mean": (
+                float(expert_scores[expert_selected_idx].mean()) if selected_count else float("nan")
+            ),
+            "hard_selector_gen_selected_score_mean": (
+                float(generator_scores[generator_selected_idx].mean()) if selected_count else float("nan")
+            ),
+        },
+    )
+
+
 def update_discriminator(
     discriminator: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -1746,15 +2208,16 @@ def update_discriminator(
     cfg: PSGAILConfig,
     device: torch.device,
 ) -> dict[str, float]:
-    expert_idx = np.random.choice(
-        len(expert_features),
-        size=len(generator_features),
-        replace=len(expert_features) < len(generator_features),
+    expert, generator_train_features, selector_stats = select_hard_discriminator_examples(
+        discriminator,
+        expert_features,
+        generator_features,
+        cfg,
+        device,
     )
-    expert = expert_features[expert_idx]
     expert_tensor = _as_device_tensor(expert.astype(np.float32, copy=False), dtype=torch.float32, device=device)
     generator_tensor = _as_device_tensor(
-        generator_features.astype(np.float32, copy=False),
+        generator_train_features.astype(np.float32, copy=False),
         dtype=torch.float32,
         device=device,
     )
@@ -1899,6 +2362,7 @@ def update_discriminator(
         "gen_centered_acc": mean_or_nan(gen_centered_accs),
         "expert_positive_frac": mean_or_nan(expert_positive_fracs),
         "gen_negative_frac": mean_or_nan(gen_negative_fracs),
+        **selector_stats,
     }
 
 

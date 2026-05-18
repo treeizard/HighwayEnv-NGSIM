@@ -147,6 +147,21 @@ def concat_array_replay(
     return combined.astype(np.float32, copy=False)
 
 
+def mean_bonus_to_primary_ratio(bonuses: np.ndarray, primary_rewards: np.ndarray) -> float:
+    bonus_arr = np.asarray(bonuses, dtype=np.float32).reshape(-1)
+    primary = np.asarray(primary_rewards, dtype=np.float32).reshape(-1)
+    n = min(int(bonus_arr.size), int(primary.size))
+    if n <= 0:
+        return 0.0
+    bonus_arr = bonus_arr[:n]
+    primary = primary[:n]
+    mean_abs_primary = float(np.mean(np.abs(primary))) if primary.size else 0.0
+    if mean_abs_primary <= 1.0e-8:
+        return 0.0
+    scale = np.maximum(np.abs(primary), mean_abs_primary)
+    return float(np.mean(np.abs(bonus_arr) / scale))
+
+
 def checkpoint_expert_metadata(metadata: dict[str, object]) -> dict[str, object]:
     return {
         "source_path": metadata.get("source_path"),
@@ -1101,6 +1116,13 @@ def main() -> None:
                 f"env_penalty={rollout.mean_env_penalty:.4f} "
                 f"reward={float(rollout.rewards.mean()):.4f} "
                 f"reward_std={float(rollout.rewards.std()):.4f}"
+                + (
+                    f" challenge_bonus={float(rollout.challenge_bonuses.mean()):.4f} "
+                    f"challenge_ratio={mean_bonus_to_primary_ratio(rollout.challenge_bonuses, rollout.gail_rewards_normalized):.4f}"
+                    if bool(getattr(round_cfg, "enable_player_challenge_reward", False))
+                    and rollout.challenge_bonuses.size
+                    else ""
+                )
                 )
                 )
             )
@@ -1154,6 +1176,38 @@ def main() -> None:
                 "rollout/reward_std": float(rollout.rewards.std()),
                 "rollout/raw_gail_reward_std": float(rollout.gail_rewards_raw.std()),
                 "rollout/normalized_gail_reward_std": float(rollout.gail_rewards_normalized.std()),
+                "challenge/pressure_mean": (
+                    float(rollout.challenge_pressures.mean()) if rollout.challenge_pressures.size else 0.0
+                ),
+                "challenge/payoff_mean": (
+                    float(rollout.challenge_payoffs.mean()) if rollout.challenge_payoffs.size else 0.0
+                ),
+                "challenge/bonus_mean": (
+                    float(rollout.challenge_bonuses.mean()) if rollout.challenge_bonuses.size else 0.0
+                ),
+                "challenge/bonus_max": (
+                    float(rollout.challenge_bonuses.max()) if rollout.challenge_bonuses.size else 0.0
+                ),
+                "challenge/bonus_to_primary_ratio": mean_bonus_to_primary_ratio(
+                    rollout.challenge_bonuses,
+                    rollout.gail_rewards_normalized,
+                ),
+                "challenge/crash_rate_ema_mean": (
+                    float(rollout.challenge_crash_rate_ema.mean())
+                    if rollout.challenge_crash_rate_ema.size
+                    else 0.0
+                ),
+                "challenge/offroad_rate_ema_mean": (
+                    float(rollout.challenge_offroad_rate_ema.mean())
+                    if rollout.challenge_offroad_rate_ema.size
+                    else 0.0
+                ),
+                "challenge/ttc_target_mean": (
+                    float(rollout.challenge_ttc_targets.mean()) if rollout.challenge_ttc_targets.size else 0.0
+                ),
+                "challenge/gap_target_mean": (
+                    float(rollout.challenge_gap_targets.mean()) if rollout.challenge_gap_targets.size else 0.0
+                ),
                 "rollout/action_mean": float(rollout.actions.mean()),
                 "rollout/action_std": float(rollout.actions.std()),
                 "rollout/selected_action_valid_fraction": selected_action_valid,
@@ -1176,6 +1230,28 @@ def main() -> None:
                 "discriminator/gen_centered_acc": disc_stats["gen_centered_acc"],
                 "discriminator/expert_positive_frac": disc_stats["expert_positive_frac"],
                 "discriminator/gen_negative_frac": disc_stats["gen_negative_frac"],
+                "discriminator/hard_selector_enabled": disc_stats["hard_selector_enabled"],
+                "discriminator/hard_selector_candidate_samples": disc_stats[
+                    "hard_selector_candidate_samples"
+                ],
+                "discriminator/hard_selector_selected_samples": disc_stats[
+                    "hard_selector_selected_samples"
+                ],
+                "discriminator/hard_selector_selected_fraction": disc_stats[
+                    "hard_selector_selected_fraction"
+                ],
+                "discriminator/hard_selector_expert_full_score_mean": disc_stats[
+                    "hard_selector_expert_full_score_mean"
+                ],
+                "discriminator/hard_selector_gen_full_score_mean": disc_stats[
+                    "hard_selector_gen_full_score_mean"
+                ],
+                "discriminator/hard_selector_expert_selected_score_mean": disc_stats[
+                    "hard_selector_expert_selected_score_mean"
+                ],
+                "discriminator/hard_selector_gen_selected_score_mean": disc_stats[
+                    "hard_selector_gen_selected_score_mean"
+                ],
                 "discriminator/replay_rounds": int(len(primary_discriminator_replay)),
                 "discriminator/current_generator_samples": int(len(current_primary_generator_features)),
                 "discriminator/train_generator_samples": int(len(replay_primary_generator_features)),
@@ -1206,6 +1282,15 @@ def main() -> None:
                 "train/disc_feature_norm": int(bool(cfg.normalize_discriminator_features)),
                 "train/disc_feature_clip": float(cfg.discriminator_feature_clip),
                 "train/discriminator_spectral_norm": int(bool(round_cfg.discriminator_spectral_norm)),
+                "train/enable_hard_example_selection": int(
+                    bool(getattr(round_cfg, "enable_hard_example_selection", False))
+                ),
+                "train/enable_player_challenge_reward": int(
+                    bool(getattr(round_cfg, "enable_player_challenge_reward", False))
+                ),
+                "train/challenge_max_primary_reward_fraction": float(
+                    getattr(round_cfg, "challenge_max_primary_reward_fraction", 0.10)
+                ),
                 "train/action_masking": int(bool(cfg.enable_action_masking)),
                 "train/discriminator_loss_type_wgan_gp": int(str(cfg.discriminator_loss).lower() == "wgan_gp"),
                 "train/wgan_gp_lambda": float(cfg.wgan_gp_lambda),

@@ -28,6 +28,7 @@ from scripts_gail.ps_gail.schedule import config_for_round
 from scripts_gail.ps_gail.trainer import (
     RolloutBatch,
     collect_round_rollouts,
+    combine_primary_env_challenge_rewards,
     compute_returns_and_advantages,
     infer_continuous_action_dim,
     infer_critic_obs_dim,
@@ -382,9 +383,12 @@ def refresh_airl_rewards(
         shaped = safe_normalize_adversarial_rewards(shaped, cfg)
     if should_apply_gail_reward_clip(cfg):
         shaped = np.clip(shaped, -float(cfg.gail_reward_clip), float(cfg.gail_reward_clip))
-    rewards = shaped + rollout.env_penalties
-    if float(cfg.final_reward_clip) > 0.0:
-        rewards = np.clip(rewards, -float(cfg.final_reward_clip), float(cfg.final_reward_clip))
+    rewards, challenge_bonuses = combine_primary_env_challenge_rewards(
+        shaped,
+        rollout.env_penalties,
+        cfg,
+        challenge_payoffs=rollout.challenge_payoffs,
+    )
     returns, advantages = compute_returns_and_advantages(
         rewards.astype(np.float32),
         rollout.old_values,
@@ -397,6 +401,7 @@ def refresh_airl_rewards(
         rewards=rewards.astype(np.float32),
         gail_rewards_raw=shaped_logits if str(getattr(cfg, "discriminator_loss", "airl_bce")).lower() == "wgan_gp" else raw,
         gail_rewards_normalized=shaped.astype(np.float32),
+        challenge_bonuses=challenge_bonuses,
         returns=returns,
         advantages=advantages,
         mean_raw_gail_reward=(

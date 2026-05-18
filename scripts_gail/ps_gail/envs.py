@@ -52,6 +52,12 @@ def make_training_env(cfg: PSGAILConfig, *, render_mode: str | None = None) -> g
     )
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
     env_cfg["crash_controlled_vehicles_offroad"] = True
+    env_cfg["enable_interaction_metrics"] = bool(getattr(cfg, "enable_player_challenge_reward", False))
+    env_cfg["interaction_ttc_target"] = float(getattr(cfg, "challenge_ttc_target", 0.0))
+    env_cfg["interaction_ttc_margin"] = float(getattr(cfg, "challenge_ttc_margin", 0.75))
+    env_cfg["interaction_ttc_floor"] = float(getattr(cfg, "challenge_ttc_floor", 0.0))
+    env_cfg["interaction_gap_target"] = float(getattr(cfg, "challenge_gap_target", 0.0))
+    env_cfg["interaction_gap_floor"] = float(getattr(cfg, "challenge_gap_floor", 0.0))
     action_cfg = env_cfg.get("action", {})
     if str(cfg.action_mode).lower() == "discrete":
         nested_action_cfg = (

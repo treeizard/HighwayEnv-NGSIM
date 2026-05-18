@@ -99,9 +99,14 @@ from scripts_gail.ps_gail.trainer import (
     RolloutBatch,
     central_critic_observation_dim,
     central_critic_observations,
+    combine_primary_env_challenge_rewards,
     policy_distribution_and_values,
+    player_challenge_bonus,
+    player_challenge_payoff,
+    player_challenge_pressure_from_metric,
     refresh_rollout_rewards,
     sequence_rewards_to_transition_rewards,
+    select_hard_discriminator_examples,
     shape_rollout_rewards,
     subsample_rollout_for_training,
     update_discriminator,
@@ -836,6 +841,269 @@ def test_bce_gail_reward_clip_still_applies_to_logistic_rewards():
     np.testing.assert_allclose(shaped_gail, [-5.0, -5.0, 5.0], rtol=1e-6)
 
 
+def test_player_challenge_disabled_defaults_leave_rewards_unchanged():
+    cfg = PSGAILConfig(final_reward_clip=0.0)
+    primary = np.asarray([1.0, -2.0, 0.5], dtype=np.float32)
+    penalties = np.asarray([0.0, -0.25, 0.25], dtype=np.float32)
+
+    rewards, bonuses = combine_primary_env_challenge_rewards(
+        primary,
+        penalties,
+        cfg,
+        challenge_payoffs=np.full(3, 100.0, dtype=np.float32),
+    )
+
+    assert cfg.enable_hard_example_selection is False
+    assert cfg.enable_player_challenge_reward is False
+    np.testing.assert_allclose(bonuses, np.zeros(3, dtype=np.float32), rtol=1e-6)
+    np.testing.assert_allclose(rewards, primary + penalties, rtol=1e-6)
+
+
+def test_player_challenge_pressure_uses_pressure_over_risk():
+    cfg = PSGAILConfig(
+        challenge_ttc_weight=0.5,
+        challenge_gap_weight=0.5,
+        challenge_crash_weight=4.0,
+        challenge_offroad_weight=2.0,
+    )
+    metric = {
+        "min_ttc": 2.0,
+        "ttc_target": 3.0,
+        "ttc_floor": 1.0,
+        "min_gap": 8.0,
+        "gap_target": 12.0,
+        "gap_floor": 4.0,
+        "crashed": False,
+        "offroad": False,
+    }
+
+    pressure, _ttc_target, _gap_target = player_challenge_pressure_from_metric(metric, cfg)
+    safe_payoff = player_challenge_payoff(pressure, crash_rate_ema=0.0, offroad_rate_ema=0.0, cfg=cfg)
+    risky_payoff = player_challenge_payoff(pressure, crash_rate_ema=0.5, offroad_rate_ema=0.5, cfg=cfg)
+    unsafe_pressure, _ttc_target, _gap_target = player_challenge_pressure_from_metric(
+        {**metric, "min_ttc": 0.25},
+        cfg,
+    )
+
+    assert pressure == pytest.approx(0.5)
+    assert 0.0 < risky_payoff < safe_payoff
+    assert unsafe_pressure == 0.0
+
+
+def test_player_challenge_bonus_is_capped_by_primary_reward_scale():
+    cfg = PSGAILConfig(
+        enable_player_challenge_reward=True,
+        challenge_reward_coef=100.0,
+        challenge_reward_clip=100.0,
+        challenge_max_primary_reward_fraction=0.10,
+        challenge_expert_like_quantile=0.0,
+    )
+    primary = np.asarray([1.0, 2.0, 0.5], dtype=np.float32)
+    payoffs = np.full(3, 10.0, dtype=np.float32)
+
+    bonuses = player_challenge_bonus(payoffs, primary, cfg)
+
+    caps = 0.10 * np.maximum(np.abs(primary), float(np.mean(np.abs(primary))))
+    assert np.all(bonuses >= 0.0)
+    assert np.all(bonuses <= caps + 1.0e-6)
+    np.testing.assert_allclose(bonuses, caps, rtol=1e-6)
+
+
+def test_player_challenge_targets_follow_scene_idm_presets():
+    import importlib.util
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for package_name in (
+        "highway_env",
+        "highway_env.ngsim_utils",
+        "highway_env.ngsim_utils.core",
+    ):
+        sys.modules.setdefault(package_name, types.ModuleType(package_name))
+    constants_name = "highway_env.ngsim_utils.core.constants"
+    constants_spec = importlib.util.spec_from_file_location(
+        constants_name,
+        root / "highway_env" / "ngsim_utils" / "core" / "constants.py",
+    )
+    constants_module = importlib.util.module_from_spec(constants_spec)
+    sys.modules[constants_name] = constants_module
+    assert constants_spec.loader is not None
+    constants_spec.loader.exec_module(constants_module)
+    config_name = "highway_env.ngsim_utils.core.config"
+    config_spec = importlib.util.spec_from_file_location(
+        config_name,
+        root / "highway_env" / "ngsim_utils" / "core" / "config.py",
+    )
+    config_module = importlib.util.module_from_spec(config_spec)
+    sys.modules[config_name] = config_module
+    assert config_spec.loader is not None
+    config_spec.loader.exec_module(config_module)
+
+    targets = {}
+    for scene in ("us-101", "japanese"):
+        idm_parameters = config_module.resolve_idm_parameters(scene, {})
+        cfg = {
+            "interaction_ttc_target": 0.0,
+            "interaction_ttc_margin": 0.75,
+            "interaction_ttc_floor": 0.0,
+            "interaction_gap_target": 0.0,
+            "interaction_gap_floor": 0.0,
+        }
+        speed = 12.5
+        targets[scene] = config_module.interaction_metric_targets_from_idm(
+            idm_parameters,
+            cfg,
+            speed=speed,
+        )
+        idm = idm_parameters["idm"]
+        np.testing.assert_allclose(
+            targets[scene],
+            [
+                float(idm["time_headway"]) + 0.75,
+                max(1.0, 0.5 * float(idm["time_headway"])),
+                float(idm["min_gap"]) + speed * float(idm["time_headway"]),
+                float(idm["min_gap"]),
+            ],
+            rtol=1e-6,
+        )
+
+    assert targets["us-101"] != targets["japanese"]
+
+
+def test_hard_selector_feeds_only_selected_partial_subset_to_discriminator():
+    class CountingDiscriminator(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 1)
+            self.train_forward_sizes: list[int] = []
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            flat = x.reshape(x.shape[0], -1)
+            if self.training and torch.is_grad_enabled():
+                self.train_forward_sizes.append(int(flat.shape[0]))
+            return self.linear(flat).reshape(-1)
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+    cfg = PSGAILConfig(
+        enable_hard_example_selection=True,
+        hard_example_candidate_samples=40,
+        hard_example_selected_fraction=0.25,
+        hard_example_uniform_mix=0.0,
+        hard_example_min_samples=1,
+        discriminator_loss="wgan_gp",
+        disc_updates_per_round=1,
+        disc_batch_size=128,
+        wgan_gp_lambda=0.0,
+    )
+    discriminator = CountingDiscriminator()
+    optimizer = torch.optim.Adam(discriminator.parameters(), lr=1e-3)
+    expert = np.stack([np.linspace(-1.0, 1.0, 80), np.zeros(80)], axis=1).astype(np.float32)
+    generator = np.stack([np.linspace(1.0, -1.0, 80), np.ones(80)], axis=1).astype(np.float32)
+
+    stats = update_discriminator(discriminator, optimizer, expert, generator, cfg, torch.device("cpu"))
+
+    assert stats["hard_selector_enabled"] == 1.0
+    assert stats["hard_selector_candidate_samples"] == 40.0
+    assert stats["hard_selector_selected_samples"] == 10.0
+    assert stats["hard_selector_selected_samples"] < stats["hard_selector_candidate_samples"]
+    assert discriminator.train_forward_sizes
+    assert max(discriminator.train_forward_sizes) == int(stats["hard_selector_selected_samples"])
+
+
+def test_select_hard_discriminator_examples_returns_partial_candidate_subset():
+    class FirstFeatureDiscriminator(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x.reshape(x.shape[0], -1)[:, 0]
+
+    np.random.seed(1)
+    cfg = PSGAILConfig(
+        enable_hard_example_selection=True,
+        hard_example_candidate_samples=50,
+        hard_example_selected_fraction=0.20,
+        hard_example_uniform_mix=0.0,
+        hard_example_min_samples=1,
+    )
+    expert = np.arange(200, dtype=np.float32).reshape(100, 2)
+    generator = -expert.copy()
+
+    selected_expert, selected_generator, stats = select_hard_discriminator_examples(
+        FirstFeatureDiscriminator(),
+        expert,
+        generator,
+        cfg,
+        torch.device("cpu"),
+    )
+
+    assert selected_expert.shape == (10, 2)
+    assert selected_generator.shape == (10, 2)
+    assert stats["hard_selector_selected_samples"] == 10.0
+    assert stats["hard_selector_selected_samples"] < stats["hard_selector_candidate_samples"]
+    assert len(selected_expert) < len(expert)
+
+
+def test_one_round_gail_challenge_smoke_path_refreshes_rewards_and_selector():
+    class FirstFeatureDiscriminator(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            flat = x.reshape(x.shape[0], -1)
+            return flat[:, 0]
+
+    cfg = PSGAILConfig(
+        enable_player_challenge_reward=True,
+        enable_hard_example_selection=True,
+        challenge_reward_coef=10.0,
+        challenge_reward_clip=10.0,
+        challenge_max_primary_reward_fraction=0.10,
+        challenge_expert_like_quantile=0.0,
+        normalize_gail_reward=False,
+        gail_reward_clip=0.0,
+        final_reward_clip=0.0,
+        hard_example_candidate_samples=12,
+        hard_example_selected_fraction=0.50,
+        hard_example_min_samples=1,
+        hard_example_uniform_mix=0.0,
+        discriminator_loss="bce",
+        disc_updates_per_round=1,
+        disc_batch_size=16,
+    )
+    rollout = _minimal_rollout(
+        observations=np.ones((12, 2), dtype=np.float32),
+        actions=np.zeros((12, 2), dtype=np.float32),
+        old_log_probs=np.zeros(12, dtype=np.float32),
+        old_values=np.zeros(12, dtype=np.float32),
+        returns=np.zeros(12, dtype=np.float32),
+        advantages=np.zeros(12, dtype=np.float32),
+        generator_features=np.ones((12, 2), dtype=np.float32),
+    )
+    rollout.challenge_payoffs = np.full(12, 1.0, dtype=np.float32)
+
+    refreshed = refresh_rollout_rewards(rollout, FirstFeatureDiscriminator(), cfg, torch.device("cpu"))
+
+    assert np.any(refreshed.challenge_bonuses > 0.0)
+    assert np.all(
+        refreshed.challenge_bonuses
+        <= 0.10
+        * np.maximum(
+            np.abs(refreshed.gail_rewards_normalized),
+            float(np.mean(np.abs(refreshed.gail_rewards_normalized))),
+        )
+        + 1.0e-6
+    )
+    discriminator = torch.nn.Sequential(torch.nn.Linear(2, 1), torch.nn.Flatten(0))
+    optimizer = torch.optim.Adam(discriminator.parameters(), lr=1e-3)
+    stats = update_discriminator(
+        discriminator,
+        optimizer,
+        np.zeros((24, 2), dtype=np.float32),
+        refreshed.generator_features,
+        cfg,
+        torch.device("cpu"),
+    )
+
+    assert stats["hard_selector_enabled"] == 1.0
+    assert stats["hard_selector_selected_samples"] < stats["hard_selector_candidate_samples"]
+
+
 def test_airl_wgan_uses_shaped_logits_without_rollout_normalization_or_generic_clip():
     class FixedReward(torch.nn.Module):
         def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -876,6 +1144,52 @@ def test_airl_wgan_uses_shaped_logits_without_rollout_normalization_or_generic_c
     np.testing.assert_allclose(refreshed.rewards, [-15.0, -10.0, -20.0], rtol=1e-6)
 
 
+def test_airl_player_challenge_bonus_uses_same_primary_reward_cap():
+    class FixedReward(torch.nn.Module):
+        def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+            return torch.zeros((obs.shape[0],), dtype=torch.float32, device=obs.device)
+
+        def shaped_logits(
+            self,
+            obs: torch.Tensor,
+            actions: torch.Tensor,
+            next_obs: torch.Tensor,
+            dones: torch.Tensor,
+            *,
+            gamma: float,
+        ) -> torch.Tensor:
+            del actions, next_obs, dones, gamma
+            return torch.tensor([1.0, 2.0, 0.5], dtype=torch.float32, device=obs.device)
+
+    cfg = PSGAILConfig(
+        discriminator_loss="airl_bce",
+        enable_player_challenge_reward=True,
+        challenge_reward_coef=100.0,
+        challenge_reward_clip=100.0,
+        challenge_max_primary_reward_fraction=0.10,
+        challenge_expert_like_quantile=0.0,
+        normalize_gail_reward=False,
+        gail_reward_clip=0.0,
+        final_reward_clip=0.0,
+    )
+    rollout = _minimal_rollout(
+        observations=np.zeros((3, 2), dtype=np.float32),
+        actions=np.zeros((3, 2), dtype=np.float32),
+        old_log_probs=np.zeros(3, dtype=np.float32),
+        old_values=np.zeros(3, dtype=np.float32),
+        returns=np.zeros(3, dtype=np.float32),
+        advantages=np.zeros(3, dtype=np.float32),
+    )
+    rollout.challenge_payoffs = np.full(3, 10.0, dtype=np.float32)
+
+    refreshed = refresh_airl_rewards(rollout, FixedReward(), cfg, torch.device("cpu"))
+
+    primary = np.asarray([1.0, 2.0, 0.5], dtype=np.float32)
+    caps = 0.10 * np.maximum(np.abs(primary), float(np.mean(np.abs(primary))))
+    np.testing.assert_allclose(refreshed.challenge_bonuses, caps, rtol=1e-6)
+    np.testing.assert_allclose(refreshed.rewards, primary + caps, rtol=1e-6)
+
+
 def test_wgan_gp_discriminator_update_returns_critic_metrics():
     torch.manual_seed(0)
     np.random.seed(0)
@@ -901,6 +1215,8 @@ def test_wgan_gp_discriminator_update_returns_critic_metrics():
     assert np.isfinite(stats["wgan_loss"])
     assert np.isfinite(stats["gradient_penalty"])
     assert "critic_gap" in stats
+    assert stats["hard_selector_enabled"] == 0.0
+    assert stats["hard_selector_selected_samples"] == float(len(generator))
 
 
 def test_wgan_gp_supports_sequence_discriminator_inputs():

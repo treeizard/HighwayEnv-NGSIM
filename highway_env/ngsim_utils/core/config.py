@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 
 from highway_env.ngsim_utils.core.constants import (
@@ -46,6 +47,47 @@ def resolve_idm_parameters(scene: str, cfg: dict) -> dict:
     if configured:
         return deep_update(deepcopy(preset), configured)
     return deepcopy(preset)
+
+
+def _finite_float(value: object, default: float) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return result if math.isfinite(result) else float(default)
+
+
+def interaction_metric_targets_from_idm(
+    idm_parameters: dict | None,
+    cfg: dict | None,
+    *,
+    speed: float,
+) -> tuple[float, float, float, float]:
+    """Return TTC/gap target and floor values aligned with the scene IDM preset."""
+    cfg = cfg or {}
+    idm_cfg = (idm_parameters or {}).get("idm", {})
+    time_headway = _finite_float(idm_cfg.get("time_headway", 1.2), 1.2)
+    min_gap = _finite_float(idm_cfg.get("min_gap", 2.0), 2.0)
+    speed = max(_finite_float(speed, 0.0), 0.0)
+
+    ttc_target = _finite_float(cfg.get("interaction_ttc_target", 0.0), 0.0)
+    if ttc_target <= 0.0:
+        ttc_target = time_headway + _finite_float(cfg.get("interaction_ttc_margin", 0.75), 0.75)
+    ttc_floor = _finite_float(cfg.get("interaction_ttc_floor", 0.0), 0.0)
+    if ttc_floor <= 0.0:
+        ttc_floor = max(1.0, 0.5 * time_headway)
+    gap_target = _finite_float(cfg.get("interaction_gap_target", 0.0), 0.0)
+    if gap_target <= 0.0:
+        gap_target = min_gap + speed * time_headway
+    gap_floor = _finite_float(cfg.get("interaction_gap_floor", 0.0), 0.0)
+    if gap_floor <= 0.0:
+        gap_floor = min_gap
+    return (
+        max(float(ttc_target), float(ttc_floor) + 1.0e-6),
+        max(float(ttc_floor), 0.0),
+        max(float(gap_target), float(gap_floor) + 1.0e-6),
+        max(float(gap_floor), 0.0),
+    )
 
 
 def normalize_action_mode(cfg: dict, raw_config: dict | None = None) -> str:
