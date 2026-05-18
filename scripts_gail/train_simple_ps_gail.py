@@ -69,6 +69,20 @@ def env_signature(cfg: PSGAILConfig) -> tuple[object, ...]:
     )
 
 
+def policy_archive_snapshot(policy: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {key: value.detach().cpu().clone() for key, value in policy.state_dict().items()}
+
+
+def append_policy_archive(
+    archive: list[dict[str, torch.Tensor]],
+    policy: torch.nn.Module,
+    cfg: PSGAILConfig,
+) -> None:
+    archive.append(policy_archive_snapshot(policy))
+    max_size = max(1, int(getattr(cfg, "psro_archive_size", 1)))
+    del archive[:-max_size]
+
+
 def fit_optional_discriminator_normalizer(
     features: np.ndarray,
     cfg: PSGAILConfig,
@@ -92,6 +106,45 @@ def apply_optional_discriminator_normalizer(
         std,
         clip=float(getattr(cfg, "discriminator_feature_clip", 0.0)),
     )
+
+
+def append_array_replay(
+    replay: list[np.ndarray],
+    features: np.ndarray,
+    cfg: PSGAILConfig,
+) -> None:
+    replay_rounds = max(0, int(getattr(cfg, "discriminator_replay_rounds", 0)))
+    if replay_rounds <= 0:
+        replay.clear()
+        return
+    features = np.asarray(features, dtype=np.float32)
+    if features.size == 0:
+        return
+    replay.append(features.copy())
+    del replay[:-replay_rounds]
+
+
+def concat_array_replay(
+    current: np.ndarray,
+    replay: list[np.ndarray],
+    cfg: PSGAILConfig,
+    *,
+    seed: int,
+) -> np.ndarray:
+    current = np.asarray(current, dtype=np.float32)
+    replay_rounds = max(0, int(getattr(cfg, "discriminator_replay_rounds", 0)))
+    if replay_rounds <= 0 or not replay:
+        return current
+    arrays = [np.asarray(array, dtype=np.float32) for array in replay[-replay_rounds:] if np.asarray(array).size]
+    if not arrays:
+        return current
+    combined = np.concatenate([*arrays, current], axis=0).astype(np.float32, copy=False)
+    max_samples = max(0, int(getattr(cfg, "discriminator_replay_max_samples", 0)))
+    if max_samples > 0 and len(combined) > max_samples:
+        rng = np.random.default_rng(int(seed))
+        indices = rng.choice(len(combined), size=max_samples, replace=False)
+        combined = combined[indices]
+    return combined.astype(np.float32, copy=False)
 
 
 def checkpoint_expert_metadata(metadata: dict[str, object]) -> dict[str, object]:
@@ -577,8 +630,14 @@ def main() -> None:
             transformer_layers=int(cfg.transformer_layers),
             transformer_heads=int(cfg.transformer_heads),
             transformer_dropout=float(cfg.transformer_dropout),
+            transformer_temporal_module=bool(getattr(cfg, "transformer_temporal_module", False)),
+            transformer_temporal_kernel_size=int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
+            transformer_temporal_layers=int(getattr(cfg, "transformer_temporal_layers", 1)),
             centralized_critic=bool(cfg.centralized_critic),
             critic_obs_dim=critic_obs_dim,
+            central_critic_pooling=str(cfg.central_critic_pooling),
+            central_critic_max_vehicles=int(cfg.central_critic_max_vehicles),
+            central_critic_attention_heads=int(cfg.central_critic_attention_heads),
         ).to(device)
         if sequence_only_discriminator:
             if expert_sequence_features is None:
@@ -663,6 +722,8 @@ def main() -> None:
             f"centralized_critic={cfg.centralized_critic} "
             f"central_critic_max_vehicles={cfg.central_critic_max_vehicles} "
             f"central_critic_include_local_obs={cfg.central_critic_include_local_obs} "
+            f"central_critic_pooling={cfg.central_critic_pooling} "
+            f"central_critic_attention_heads={cfg.central_critic_attention_heads} "
             f"disc_feature_dim={feature_dim} "
             f"discriminator={discriminator_name} "
             f"discriminator_input={discriminator_input_mode(cfg)} "
@@ -813,9 +874,40 @@ def main() -> None:
         rollout_executor = make_rollout_executor(cfg)
         last_checkpoint_video_path = None
         last_checkpoint_video_round = 0
+        primary_discriminator_replay: list[np.ndarray] = []
+        scene_discriminator_replay: list[np.ndarray] = []
+        psro_policy_archive: list[dict[str, torch.Tensor]] = []
+        if bool(getattr(cfg, "psro_lite", False)):
+            append_policy_archive(psro_policy_archive, policy, cfg)
+            print(
+                "psro_lite="
+                f"enabled archive_every={cfg.psro_archive_every} "
+                f"archive_size={cfg.psro_archive_size} "
+                f"after_jump_rounds={cfg.psro_mixture_after_jump_rounds} "
+                f"current_fraction={cfg.psro_current_policy_fraction:.3f}"
+            )
+        previous_controlled_vehicles = None
+        last_vehicle_jump_round = None
 
         for round_idx in range(1, int(cfg.total_rounds) + 1):
             round_cfg = config_for_round(cfg, round_idx)
+            if previous_controlled_vehicles is not None and (
+                float(round_cfg.percentage_controlled_vehicles)
+                > float(previous_controlled_vehicles) + 1.0e-9
+            ):
+                last_vehicle_jump_round = int(round_idx)
+            previous_controlled_vehicles = float(round_cfg.percentage_controlled_vehicles)
+            psro_window = max(0, int(getattr(round_cfg, "psro_mixture_after_jump_rounds", 0)))
+            psro_archive_for_round = (
+                psro_policy_archive
+                if (
+                    bool(getattr(round_cfg, "psro_lite", False))
+                    and psro_policy_archive
+                    and last_vehicle_jump_round is not None
+                    and int(round_idx) - int(last_vehicle_jump_round) < psro_window
+                )
+                else None
+            )
             set_optimizer_lr(policy_optimizer, float(round_cfg.learning_rate))
             set_optimizer_lr(disc_optimizer, float(round_cfg.disc_learning_rate))
             if scene_disc_optimizer is not None:
@@ -836,6 +928,7 @@ def main() -> None:
                 critic_obs_dim,
                 round_idx=round_idx,
                 rollout_executor=rollout_executor,
+                archive_policy_state_dicts=psro_archive_for_round,
             )
             rollout = subsample_rollout_for_training(
                 collected_rollout,
@@ -848,15 +941,22 @@ def main() -> None:
                     "Sequence discriminator was enabled but rollout produced no sequence windows. "
                     "Lower --sequence-length or collect longer rollout episodes."
                 )
+            current_primary_generator_features = apply_optional_discriminator_normalizer(
+                rollout.sequence_features if sequence_only_discriminator else rollout.generator_features,
+                primary_discriminator_normalizer,
+                round_cfg,
+            )
+            replay_primary_generator_features = concat_array_replay(
+                current_primary_generator_features,
+                primary_discriminator_replay,
+                round_cfg,
+                seed=int(round_cfg.seed) + int(round_idx) * 65537,
+            )
             disc_stats = update_discriminator(
                 discriminator,
                 disc_optimizer,
                 discriminator_expert_features_train,
-                apply_optional_discriminator_normalizer(
-                    rollout.sequence_features if sequence_only_discriminator else rollout.generator_features,
-                    primary_discriminator_normalizer,
-                    round_cfg,
-                ),
+                replay_primary_generator_features,
                 round_cfg,
                 device,
             )
@@ -866,15 +966,22 @@ def main() -> None:
                     raise RuntimeError("Scene discriminator was enabled without optimizer/expert features.")
                 if not rollout.scene_features.size:
                     raise RuntimeError("Scene discriminator was enabled but rollout produced no scene features.")
+                current_scene_generator_features = apply_optional_discriminator_normalizer(
+                    rollout.scene_features,
+                    scene_discriminator_normalizer,
+                    round_cfg,
+                )
+                replay_scene_generator_features = concat_array_replay(
+                    current_scene_generator_features,
+                    scene_discriminator_replay,
+                    round_cfg,
+                    seed=int(round_cfg.seed) + int(round_idx) * 131071,
+                )
                 scene_disc_stats = update_discriminator(
                     scene_discriminator,
                     scene_disc_optimizer,
                     expert_scene_features_train,
-                    apply_optional_discriminator_normalizer(
-                        rollout.scene_features,
-                        scene_discriminator_normalizer,
-                        round_cfg,
-                    ),
+                    replay_scene_generator_features,
                     round_cfg,
                     device,
                 )
@@ -911,6 +1018,9 @@ def main() -> None:
                     else None
                 ),
             )
+            append_array_replay(primary_discriminator_replay, current_primary_generator_features, round_cfg)
+            if scene_discriminator is not None:
+                append_array_replay(scene_discriminator_replay, current_scene_generator_features, round_cfg)
 
             print(
                 f"[round {round_idx:04d}] "
@@ -925,7 +1035,15 @@ def main() -> None:
                 f"uniq_eps={collected_rollout.unique_episode_names} "
                 f"ctrl_frac={round_cfg.percentage_controlled_vehicles:.4f} "
                 f"veh={collected_rollout.mean_controlled_vehicles:.1f}/{collected_rollout.mean_road_vehicles:.1f} "
+                + (
+                    f"psro_current={collected_rollout.psro_current_fraction:.3f} "
+                    f"archive={len(psro_archive_for_round or [])} "
+                    if collected_rollout.psro_active
+                    else ""
+                )
+                + (
                 f"disc_loss={disc_stats['disc_loss']:.4f} "
+                )
                 + (
                     f"gap={disc_stats['critic_gap']:.4f} "
                     f"expert_score={disc_stats['expert_score_mean']:.4f} "
@@ -1020,6 +1138,13 @@ def main() -> None:
                 "rollout/controlled_vehicle_fraction": float(round_cfg.percentage_controlled_vehicles),
                 "rollout/mean_controlled_vehicles": collected_rollout.mean_controlled_vehicles,
                 "rollout/mean_road_vehicles": collected_rollout.mean_road_vehicles,
+                "psro/active": int(bool(collected_rollout.psro_active)),
+                "psro/archive_size": int(len(psro_policy_archive)),
+                "psro/archive_used": int(len(psro_archive_for_round or [])),
+                "psro/current_decisions": int(collected_rollout.psro_current_decisions),
+                "psro/archive_decisions": int(collected_rollout.psro_archive_decisions),
+                "psro/current_fraction": float(collected_rollout.psro_current_fraction),
+                "psro/last_vehicle_jump_round": int(last_vehicle_jump_round or 0),
                 "rollout/scene_samples": int(len(rollout.scene_features)),
                 "rollout/sequence_samples": int(len(rollout.sequence_features)),
                 "rollout/mean_gail_reward": float(rollout.rewards.mean()),
@@ -1051,6 +1176,9 @@ def main() -> None:
                 "discriminator/gen_centered_acc": disc_stats["gen_centered_acc"],
                 "discriminator/expert_positive_frac": disc_stats["expert_positive_frac"],
                 "discriminator/gen_negative_frac": disc_stats["gen_negative_frac"],
+                "discriminator/replay_rounds": int(len(primary_discriminator_replay)),
+                "discriminator/current_generator_samples": int(len(current_primary_generator_features)),
+                "discriminator/train_generator_samples": int(len(replay_primary_generator_features)),
                 "policy/loss": policy_stats["policy_loss"],
                 "policy/value_loss": policy_stats["value_loss"],
                 "policy/bc_regularization_loss": policy_stats["bc_regularization_loss"],
@@ -1064,6 +1192,10 @@ def main() -> None:
                 "train/policy_obs_dim": policy_obs_dim,
                 "train/critic_obs_dim": critic_obs_dim,
                 "train/centralized_critic": int(bool(round_cfg.centralized_critic)),
+                "train/central_critic_pooling_attention": int(
+                    str(round_cfg.central_critic_pooling).lower() in {"attention", "attn"}
+                ),
+                "train/central_critic_attention_heads": int(round_cfg.central_critic_attention_heads),
                 "train/disc_feature_dim": feature_dim,
                 "train/policy_learning_rate": float(round_cfg.learning_rate),
                 "train/disc_learning_rate": float(round_cfg.disc_learning_rate),
@@ -1080,6 +1212,8 @@ def main() -> None:
                 "train/wgan_reward_center": int(bool(cfg.wgan_reward_center)),
                 "train/wgan_reward_clip": float(cfg.wgan_reward_clip),
                 "train/wgan_reward_scale": float(cfg.wgan_reward_scale),
+                "train/wgan_reward_norm_min_std": float(getattr(cfg, "wgan_reward_norm_min_std", 1.0e-3)),
+                "train/wgan_reward_norm_clip": float(getattr(cfg, "wgan_reward_norm_clip", 0.0)),
                 "train/normalize_gail_reward_requested": int(bool(cfg.normalize_gail_reward)),
                 "train/allow_wgan_reward_normalization": int(
                     bool(getattr(cfg, "allow_wgan_reward_normalization", False))
@@ -1105,6 +1239,13 @@ def main() -> None:
                 ),
                 "train/rollout_workers": int(cfg.num_rollout_workers),
                 "train/rollout_worker_threads": int(cfg.rollout_worker_threads),
+                "train/discriminator_replay_rounds": int(getattr(round_cfg, "discriminator_replay_rounds", 0)),
+                "train/discriminator_replay_max_samples": int(
+                    getattr(round_cfg, "discriminator_replay_max_samples", 0)
+                ),
+                "train/transformer_temporal_module": int(
+                    bool(getattr(round_cfg, "transformer_temporal_module", False))
+                ),
             }
             if str(round_cfg.action_mode).lower() == "continuous" and rollout.actions.ndim == 2:
                 action_names = ("acceleration", "steering")
@@ -1225,6 +1366,12 @@ def main() -> None:
                         step=round_idx,
                         fps=int(round_cfg.policy_frequency),
                     )
+            if (
+                bool(getattr(cfg, "psro_lite", False))
+                and int(getattr(cfg, "psro_archive_every", 0)) > 0
+                and round_idx % int(cfg.psro_archive_every) == 0
+            ):
+                append_policy_archive(psro_policy_archive, policy, cfg)
 
         final_round = int(cfg.total_rounds)
         final_round_cfg = config_for_round(cfg, final_round)

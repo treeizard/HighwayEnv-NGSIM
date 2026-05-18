@@ -51,6 +51,11 @@ class PSGAILConfig:
     final_rollout_target_agent_steps: int = 0
     rollout_target_agent_steps_curriculum_rounds: int = 0
     rollout_target_agent_steps_schedule: str = ""
+    psro_lite: bool = False
+    psro_archive_every: int = 20
+    psro_archive_size: int = 5
+    psro_mixture_after_jump_rounds: int = 20
+    psro_current_policy_fraction: float = 0.65
     enable_collision: bool = True
     terminate_when_all_controlled_crashed: bool = True
     allow_idm: bool = True
@@ -67,9 +72,14 @@ class PSGAILConfig:
     transformer_layers: int = 2
     transformer_heads: int = 4
     transformer_dropout: float = 0.1
+    transformer_temporal_module: bool = False
+    transformer_temporal_kernel_size: int = 5
+    transformer_temporal_layers: int = 1
     centralized_critic: bool = False
     central_critic_max_vehicles: int = 64
     central_critic_include_local_obs: bool = False
+    central_critic_pooling: str = "flat"
+    central_critic_attention_heads: int = 4
     learning_rate: float = 3e-4
     learning_rate_schedule: str = ""
     bc_pretrain_epochs: int = 0
@@ -101,6 +111,8 @@ class PSGAILConfig:
     disc_batch_size: int = 1024
     disc_updates_per_round: int = 4
     disc_updates_per_round_schedule: str = ""
+    discriminator_replay_rounds: int = 0
+    discriminator_replay_max_samples: int = 0
     disc_expert_label: float = 0.9
     disc_generator_label: float = 0.1
     discriminator_input: str = "auto"
@@ -112,6 +124,8 @@ class PSGAILConfig:
     wgan_reward_center: bool = False
     wgan_reward_clip: float = 0.0
     wgan_reward_scale: float = 1.0
+    wgan_reward_norm_min_std: float = 1.0e-3
+    wgan_reward_norm_clip: float = 5.0
     normalize_discriminator_features: bool = True
     discriminator_feature_clip: float = 10.0
     cgail_k: float = 0.0

@@ -414,6 +414,33 @@ def test_centralized_critic_uses_separate_observation_path():
     assert not torch.allclose(values_a, values_b)
 
 
+def test_attention_centralized_critic_pools_vehicle_set_without_changing_actor():
+    torch.manual_seed(0)
+    policy = make_actor_critic(
+        "mlp",
+        obs_dim=3,
+        hidden_size=16,
+        centralized_critic=True,
+        critic_obs_dim=2 * 5 + 4,
+        central_critic_pooling="attention",
+        central_critic_max_vehicles=2,
+        central_critic_attention_heads=4,
+    )
+    policy.eval()
+    obs = torch.randn(4, 3)
+    vehicle_a = torch.tensor([1.0, 2.0, 0.0, 3.0, 0.0])
+    vehicle_b = torch.tensor([1.0, -1.0, 1.0, 0.0, 2.0])
+    context = torch.tensor([8.0, 0.1, 2.0, 4.5])
+    critic_a = torch.cat([vehicle_a, vehicle_b, context]).repeat(4, 1)
+    critic_b = torch.cat([vehicle_b, vehicle_a, context]).repeat(4, 1)
+
+    logits_a, values_a = policy(obs, critic_a)
+    logits_b, values_b = policy(obs, critic_b)
+
+    torch.testing.assert_close(logits_a, logits_b)
+    torch.testing.assert_close(values_a, values_b, atol=1e-6, rtol=1e-6)
+
+
 def test_update_policy_trains_centralized_critic_values():
     torch.manual_seed(0)
     np.random.seed(0)

@@ -7,6 +7,8 @@ import torch.nn as nn
 NUM_DISCRETE_META_ACTIONS = 5
 DEFAULT_CRITIC_HIDDEN_SIZES = (128, 128, 64)
 DEFAULT_CRITIC_DROPOUT = 0.0
+CENTRAL_CRITIC_VEHICLE_FEATURE_DIM = 5
+CENTRAL_CRITIC_CONTEXT_DIM = 4
 
 
 def parse_hidden_sizes(hidden_sizes: str | int | tuple[int, ...] | list[int] | None) -> tuple[int, ...]:
@@ -48,6 +50,113 @@ def make_relu_mlp(
     return nn.Sequential(*layers)
 
 
+class AttentionCriticEncoder(nn.Module):
+    """Attention-pool fixed-slot vehicle features for a centralized traffic critic."""
+
+    def __init__(
+        self,
+        critic_obs_dim: int,
+        hidden_size: int,
+        *,
+        max_vehicles: int,
+        vehicle_feature_dim: int = CENTRAL_CRITIC_VEHICLE_FEATURE_DIM,
+        attention_heads: int = 4,
+    ) -> None:
+        super().__init__()
+        self.critic_obs_dim = int(critic_obs_dim)
+        self.max_vehicles = max(1, int(max_vehicles))
+        self.vehicle_feature_dim = max(1, int(vehicle_feature_dim))
+        self.scene_dim = self.max_vehicles * self.vehicle_feature_dim
+        if self.critic_obs_dim < self.scene_dim:
+            raise ValueError(
+                "Attention critic expects critic_obs_dim to include "
+                f"{self.scene_dim} scene features, got {self.critic_obs_dim}."
+            )
+        self.tail_dim = max(1, self.critic_obs_dim - self.scene_dim)
+        attention_heads = max(1, int(attention_heads))
+        if int(hidden_size) % attention_heads != 0:
+            raise ValueError(
+                f"hidden_size={hidden_size} must be divisible by central_critic_attention_heads={attention_heads}."
+            )
+        self.vehicle_proj = nn.Sequential(
+            nn.Linear(self.vehicle_feature_dim, hidden_size),
+            nn.Tanh(),
+        )
+        self.query_proj = nn.Sequential(
+            nn.Linear(self.tail_dim, hidden_size),
+            nn.Tanh(),
+        )
+        self.attention = nn.MultiheadAttention(
+            embed_dim=int(hidden_size),
+            num_heads=attention_heads,
+            batch_first=True,
+        )
+        self.norm = nn.LayerNorm(int(hidden_size))
+        self.out = nn.Sequential(
+            nn.Linear(int(hidden_size) * 2, int(hidden_size)),
+            nn.Tanh(),
+            nn.Linear(int(hidden_size), int(hidden_size)),
+            nn.Tanh(),
+        )
+
+    def forward(self, critic_obs: torch.Tensor) -> torch.Tensor:
+        if critic_obs.ndim != 2 or critic_obs.shape[1] != self.critic_obs_dim:
+            raise ValueError(
+                f"Attention critic expected shape [B, {self.critic_obs_dim}], got {tuple(critic_obs.shape)}."
+            )
+        scene = critic_obs[:, : self.scene_dim].reshape(
+            critic_obs.shape[0],
+            self.max_vehicles,
+            self.vehicle_feature_dim,
+        )
+        tail = critic_obs[:, self.scene_dim :]
+        if tail.shape[1] == 0:
+            tail = torch.zeros((critic_obs.shape[0], self.tail_dim), dtype=critic_obs.dtype, device=critic_obs.device)
+        vehicle_tokens = self.vehicle_proj(scene)
+        query = self.query_proj(tail).unsqueeze(1)
+        key_padding_mask = scene[:, :, 0] <= 0.5
+        if key_padding_mask.any():
+            all_padded = key_padding_mask.all(dim=1)
+            if all_padded.any():
+                key_padding_mask = key_padding_mask.clone()
+                key_padding_mask[all_padded, 0] = False
+        pooled, _weights = self.attention(
+            query,
+            vehicle_tokens,
+            vehicle_tokens,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        pooled = self.norm(query + pooled).squeeze(1)
+        return self.out(torch.cat([query.squeeze(1), pooled], dim=-1))
+
+
+def make_centralized_critic_encoder(
+    critic_obs_dim: int,
+    hidden_size: int,
+    *,
+    pooling: str = "flat",
+    max_vehicles: int = 64,
+    attention_heads: int = 4,
+) -> nn.Module:
+    pooling = str(pooling).lower()
+    if pooling in {"flat", "mlp"}:
+        return nn.Sequential(
+            nn.Linear(int(critic_obs_dim), int(hidden_size)),
+            nn.Tanh(),
+            nn.Linear(int(hidden_size), int(hidden_size)),
+            nn.Tanh(),
+        )
+    if pooling in {"attention", "attn"}:
+        return AttentionCriticEncoder(
+            int(critic_obs_dim),
+            int(hidden_size),
+            max_vehicles=int(max_vehicles),
+            attention_heads=int(attention_heads),
+        )
+    raise ValueError(f"Unsupported central_critic_pooling={pooling!r}. Expected 'flat' or 'attention'.")
+
+
 class SharedActorCritic(nn.Module):
     def __init__(
         self,
@@ -59,6 +168,9 @@ class SharedActorCritic(nn.Module):
         continuous_action_dim: int = 2,
         centralized_critic: bool = False,
         critic_obs_dim: int | None = None,
+        central_critic_pooling: str = "flat",
+        central_critic_max_vehicles: int = 64,
+        central_critic_attention_heads: int = 4,
     ) -> None:
         super().__init__()
         self.action_mode = str(action_mode).lower()
@@ -80,11 +192,12 @@ class SharedActorCritic(nn.Module):
         else:
             raise ValueError(f"Unsupported action_mode={action_mode!r}.")
         self.critic_encoder = (
-            nn.Sequential(
-                nn.Linear(self.critic_obs_dim, hidden_size),
-                nn.Tanh(),
-                nn.Linear(hidden_size, hidden_size),
-                nn.Tanh(),
+            make_centralized_critic_encoder(
+                self.critic_obs_dim,
+                hidden_size,
+                pooling=central_critic_pooling,
+                max_vehicles=central_critic_max_vehicles,
+                attention_heads=central_critic_attention_heads,
             )
             if self.centralized_critic
             else None
@@ -148,8 +261,14 @@ class TransformerActorCritic(nn.Module):
         num_layers: int = 2,
         num_heads: int = 4,
         dropout: float = 0.1,
+        temporal_module: bool = False,
+        temporal_kernel_size: int = 5,
+        temporal_layers: int = 1,
         centralized_critic: bool = False,
         critic_obs_dim: int | None = None,
+        central_critic_pooling: str = "flat",
+        central_critic_max_vehicles: int = 64,
+        central_critic_attention_heads: int = 4,
     ) -> None:
         super().__init__()
         self.action_mode = str(action_mode).lower()
@@ -179,6 +298,27 @@ class TransformerActorCritic(nn.Module):
             num_layers=max(1, int(num_layers)),
             norm=nn.LayerNorm(hidden_size),
         )
+        temporal_blocks: list[nn.Module] = []
+        if bool(temporal_module):
+            kernel_size = max(1, int(temporal_kernel_size))
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+            for _ in range(max(1, int(temporal_layers))):
+                temporal_blocks.extend(
+                    [
+                        nn.Conv1d(
+                            hidden_size,
+                            hidden_size,
+                            kernel_size=kernel_size,
+                            padding=kernel_size // 2,
+                            groups=hidden_size,
+                        ),
+                        nn.GELU(),
+                        nn.Conv1d(hidden_size, hidden_size, kernel_size=1),
+                        nn.Dropout(p=float(dropout)),
+                    ]
+                )
+        self.temporal_mixer = nn.Sequential(*temporal_blocks) if temporal_blocks else None
         if self.action_mode == "continuous":
             self.policy_head = nn.Linear(hidden_size, self.continuous_action_dim)
             self.log_std = nn.Parameter(torch.full((self.continuous_action_dim,), -0.5))
@@ -188,11 +328,12 @@ class TransformerActorCritic(nn.Module):
         else:
             raise ValueError(f"Unsupported action_mode={action_mode!r}.")
         self.critic_encoder = (
-            nn.Sequential(
-                nn.Linear(self.critic_obs_dim, hidden_size),
-                nn.Tanh(),
-                nn.Linear(hidden_size, hidden_size),
-                nn.Tanh(),
+            make_centralized_critic_encoder(
+                self.critic_obs_dim,
+                hidden_size,
+                pooling=central_critic_pooling,
+                max_vehicles=central_critic_max_vehicles,
+                attention_heads=central_critic_attention_heads,
             )
             if self.centralized_critic
             else None
@@ -201,6 +342,9 @@ class TransformerActorCritic(nn.Module):
 
     def _encode_actor(self, obs: torch.Tensor) -> torch.Tensor:
         tokens = self.input_proj(obs.unsqueeze(-1))
+        if self.temporal_mixer is not None:
+            mixed = self.temporal_mixer(tokens.transpose(1, 2)).transpose(1, 2)
+            tokens = tokens + mixed
         cls = self.cls_token.expand(obs.shape[0], -1, -1)
         tokens = torch.cat([cls, tokens], dim=1)
         tokens = tokens + self.pos_embedding[:, : tokens.shape[1]]
@@ -256,8 +400,14 @@ def make_actor_critic(
     transformer_layers: int = 2,
     transformer_heads: int = 4,
     transformer_dropout: float = 0.1,
+    transformer_temporal_module: bool = False,
+    transformer_temporal_kernel_size: int = 5,
+    transformer_temporal_layers: int = 1,
     centralized_critic: bool = False,
     critic_obs_dim: int | None = None,
+    central_critic_pooling: str = "flat",
+    central_critic_max_vehicles: int = 64,
+    central_critic_attention_heads: int = 4,
 ) -> nn.Module:
     model_name = str(policy_model).lower()
     if model_name == "mlp":
@@ -268,6 +418,9 @@ def make_actor_critic(
             continuous_action_dim=continuous_action_dim,
             centralized_critic=centralized_critic,
             critic_obs_dim=critic_obs_dim,
+            central_critic_pooling=central_critic_pooling,
+            central_critic_max_vehicles=central_critic_max_vehicles,
+            central_critic_attention_heads=central_critic_attention_heads,
         )
     if model_name == "transformer":
         return TransformerActorCritic(
@@ -278,8 +431,14 @@ def make_actor_critic(
             num_layers=transformer_layers,
             num_heads=transformer_heads,
             dropout=transformer_dropout,
+            temporal_module=transformer_temporal_module,
+            temporal_kernel_size=transformer_temporal_kernel_size,
+            temporal_layers=transformer_temporal_layers,
             centralized_critic=centralized_critic,
             critic_obs_dim=critic_obs_dim,
+            central_critic_pooling=central_critic_pooling,
+            central_critic_max_vehicles=central_critic_max_vehicles,
+            central_critic_attention_heads=central_critic_attention_heads,
         )
     raise ValueError(f"Unsupported policy_model={policy_model!r}. Expected 'mlp' or 'transformer'.")
 

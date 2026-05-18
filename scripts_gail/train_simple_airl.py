@@ -35,6 +35,7 @@ from scripts_gail.ps_gail.trainer import (
     make_rollout_executor,
     policy_distribution_and_values,
     resolve_device,
+    safe_normalize_adversarial_rewards,
     set_optimizer_lr,
     should_apply_gail_reward_clip,
     should_normalize_gail_reward,
@@ -42,8 +43,10 @@ from scripts_gail.ps_gail.trainer import (
     update_policy,
 )
 from scripts_gail.train_simple_ps_gail import (
+    append_policy_archive,
     behavior_clone_pretrain,
     evaluate_policy_survival,
+    policy_archive_snapshot,
     training_risk_warnings,
 )
 
@@ -94,6 +97,62 @@ class AIRLReward(nn.Module):
         current_potential = self.potential(obs).squeeze(-1)
         next_potential = self.potential(next_obs).squeeze(-1)
         return reward + float(gamma) * (1.0 - dones.float()) * next_potential - current_potential
+
+
+def append_airl_replay(
+    replay: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    rollout: RolloutBatch,
+    cfg: PSGAILConfig,
+) -> None:
+    replay_rounds = max(0, int(getattr(cfg, "discriminator_replay_rounds", 0)))
+    if replay_rounds <= 0:
+        replay.clear()
+        return
+    if int(rollout.num_agent_steps) <= 0:
+        return
+    replay.append(
+        (
+            np.asarray(rollout.policy_observations, dtype=np.float32).copy(),
+            np.asarray(rollout.actions, dtype=np.float32).copy(),
+            np.asarray(rollout.next_policy_observations, dtype=np.float32).copy(),
+            np.asarray(rollout.dones, dtype=bool).copy(),
+        )
+    )
+    del replay[:-replay_rounds]
+
+
+def concat_airl_replay(
+    rollout: RolloutBatch,
+    replay: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    cfg: PSGAILConfig,
+    *,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    current = (
+        np.asarray(rollout.policy_observations, dtype=np.float32),
+        np.asarray(rollout.actions, dtype=np.float32),
+        np.asarray(rollout.next_policy_observations, dtype=np.float32),
+        np.asarray(rollout.dones, dtype=bool),
+    )
+    replay_rounds = max(0, int(getattr(cfg, "discriminator_replay_rounds", 0)))
+    if replay_rounds <= 0 or not replay:
+        return current
+    entries = [entry for entry in replay[-replay_rounds:] if len(entry[0]) > 0]
+    if not entries:
+        return current
+    obs = np.concatenate([*(entry[0] for entry in entries), current[0]], axis=0).astype(np.float32, copy=False)
+    actions = np.concatenate([*(entry[1] for entry in entries), current[1]], axis=0).astype(np.float32, copy=False)
+    next_obs = np.concatenate([*(entry[2] for entry in entries), current[2]], axis=0).astype(np.float32, copy=False)
+    dones = np.concatenate([*(entry[3] for entry in entries), current[3]], axis=0).astype(bool, copy=False)
+    max_samples = max(0, int(getattr(cfg, "discriminator_replay_max_samples", 0)))
+    if max_samples > 0 and len(obs) > max_samples:
+        rng = np.random.default_rng(int(seed))
+        indices = rng.choice(len(obs), size=max_samples, replace=False)
+        obs = obs[indices]
+        actions = actions[indices]
+        next_obs = next_obs[indices]
+        dones = dones[indices]
+    return obs, actions, next_obs, dones
 
 
 def _as_tensor(array: np.ndarray, *, device: torch.device) -> torch.Tensor:
@@ -320,7 +379,7 @@ def refresh_airl_rewards(
         # f(s,a,s') - log pi(a|s) for D = exp(f)/(exp(f) + pi(a|s)).
         shaped = (shaped_logits - rollout.old_log_probs).astype(np.float32, copy=True)
     if should_normalize_gail_reward(cfg) and shaped.size > 1:
-        shaped = (shaped - shaped.mean()) / (shaped.std() + 1e-8)
+        shaped = safe_normalize_adversarial_rewards(shaped, cfg)
     if should_apply_gail_reward_clip(cfg):
         shaped = np.clip(shaped, -float(cfg.gail_reward_clip), float(cfg.gail_reward_clip))
     rewards = shaped + rollout.env_penalties
@@ -413,8 +472,13 @@ def parse_args() -> tuple[PSGAILConfig, int]:
         batch_size=4096,
         disc_batch_size=4096,
         discriminator_loss="wgan_gp",
-        disc_learning_rate=5e-5,
+        disc_learning_rate=4e-4,
         disc_updates_per_round=2,
+        discriminator_replay_rounds=3,
+        discriminator_replay_max_samples=120_000,
+        normalize_gail_reward=True,
+        allow_wgan_reward_normalization=True,
+        transformer_temporal_module=True,
         disc_expert_label=0.8,
         disc_generator_label=0.2,
     )
@@ -442,6 +506,16 @@ def main() -> None:
         raise ValueError(
             "train_simple_airl.py supports canonical BCE AIRL and WGAN-GP AIRL-style training. "
             f"Received discriminator_loss={cfg.discriminator_loss!r}."
+        )
+    if bool(getattr(cfg, "enable_scene_discriminator", False)):
+        raise ValueError(
+            "AIRL does not implement the auxiliary scene discriminator. "
+            "Disable --enable-scene-discriminator for AIRL runs."
+        )
+    if bool(getattr(cfg, "enable_sequence_discriminator", False)):
+        raise ValueError(
+            "AIRL does not implement the auxiliary sequence discriminator. "
+            "Disable --enable-sequence-discriminator for AIRL runs."
         )
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -478,8 +552,14 @@ def main() -> None:
             transformer_layers=int(cfg.transformer_layers),
             transformer_heads=int(cfg.transformer_heads),
             transformer_dropout=float(cfg.transformer_dropout),
+            transformer_temporal_module=bool(getattr(cfg, "transformer_temporal_module", False)),
+            transformer_temporal_kernel_size=int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
+            transformer_temporal_layers=int(getattr(cfg, "transformer_temporal_layers", 1)),
             centralized_critic=bool(cfg.centralized_critic),
             critic_obs_dim=critic_obs_dim,
+            central_critic_pooling=str(cfg.central_critic_pooling),
+            central_critic_max_vehicles=int(cfg.central_critic_max_vehicles),
+            central_critic_attention_heads=int(cfg.central_critic_attention_heads),
         ).to(device)
         reward_model = AIRLReward(
             policy_obs_dim,
@@ -501,6 +581,8 @@ def main() -> None:
             f"centralized_critic={cfg.centralized_critic} "
             f"central_critic_max_vehicles={cfg.central_critic_max_vehicles} "
             f"central_critic_include_local_obs={cfg.central_critic_include_local_obs} "
+            f"central_critic_pooling={cfg.central_critic_pooling} "
+            f"central_critic_attention_heads={cfg.central_critic_attention_heads} "
             f"action_dim={cfg.continuous_action_dim} device={device} "
             f"policy_model={cfg.policy_model} transformer_layers={cfg.transformer_layers} "
             f"transformer_heads={cfg.transformer_heads} transformer_dropout={cfg.transformer_dropout} "
@@ -627,9 +709,39 @@ def main() -> None:
 
         last_checkpoint_video_path = None
         last_checkpoint_video_round = 0
+        airl_replay: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        psro_policy_archive: list[dict[str, torch.Tensor]] = []
+        if bool(getattr(cfg, "psro_lite", False)):
+            append_policy_archive(psro_policy_archive, policy, cfg)
+            print(
+                "psro_lite="
+                f"enabled archive_every={cfg.psro_archive_every} "
+                f"archive_size={cfg.psro_archive_size} "
+                f"after_jump_rounds={cfg.psro_mixture_after_jump_rounds} "
+                f"current_fraction={cfg.psro_current_policy_fraction:.3f}"
+            )
+        previous_controlled_vehicles = None
+        last_vehicle_jump_round = None
         for round_idx in range(1, int(cfg.total_rounds) + 1):
             round_cfg = config_for_round(cfg, round_idx)
             round_cfg.continuous_action_dim = cfg.continuous_action_dim
+            if previous_controlled_vehicles is not None and (
+                float(round_cfg.percentage_controlled_vehicles)
+                > float(previous_controlled_vehicles) + 1.0e-9
+            ):
+                last_vehicle_jump_round = int(round_idx)
+            previous_controlled_vehicles = float(round_cfg.percentage_controlled_vehicles)
+            psro_window = max(0, int(getattr(round_cfg, "psro_mixture_after_jump_rounds", 0)))
+            psro_archive_for_round = (
+                psro_policy_archive
+                if (
+                    bool(getattr(round_cfg, "psro_lite", False))
+                    and psro_policy_archive
+                    and last_vehicle_jump_round is not None
+                    and int(round_idx) - int(last_vehicle_jump_round) < psro_window
+                )
+                else None
+            )
             set_optimizer_lr(policy_optimizer, float(round_cfg.learning_rate))
             set_optimizer_lr(reward_optimizer, float(round_cfg.disc_learning_rate))
             if env_signature(round_cfg) != current_env_signature:
@@ -645,6 +757,7 @@ def main() -> None:
                 critic_obs_dim,
                 round_idx=round_idx,
                 rollout_executor=rollout_executor,
+                archive_policy_state_dicts=psro_archive_for_round,
             )
             rollout = subsample_rollout_for_training(
                 collected_rollout,
@@ -652,6 +765,17 @@ def main() -> None:
                 seed=int(round_cfg.seed) + int(round_idx) * 104729,
             )
             rollout_was_subsampled = int(rollout.num_agent_steps) != int(collected_rollout.num_agent_steps)
+            (
+                reward_generator_obs,
+                reward_generator_actions,
+                reward_generator_next_obs,
+                reward_generator_dones,
+            ) = concat_airl_replay(
+                rollout,
+                airl_replay,
+                round_cfg,
+                seed=int(round_cfg.seed) + int(round_idx) * 65537,
+            )
             reward_stats = update_reward_model(
                 reward_model,
                 reward_optimizer,
@@ -660,10 +784,10 @@ def main() -> None:
                 expert.actions_continuous_env,
                 expert.next_policy_observations,
                 expert.dones,
-                rollout.policy_observations,
-                rollout.actions.astype(np.float32, copy=False),
-                rollout.next_policy_observations,
-                rollout.dones,
+                reward_generator_obs,
+                reward_generator_actions,
+                reward_generator_next_obs,
+                reward_generator_dones,
                 round_cfg,
                 device,
                 reward_batch_size=reward_batch_size,
@@ -678,6 +802,7 @@ def main() -> None:
                 expert_policy_observations=expert.policy_observations,
                 expert_actions=expert.actions_continuous_env,
             )
+            append_airl_replay(airl_replay, rollout, round_cfg)
             print(
                 f"[round {round_idx:04d}] env_steps={collected_rollout.num_env_steps} "
                 f"agent_steps={collected_rollout.num_agent_steps} "
@@ -688,7 +813,15 @@ def main() -> None:
                 f"crash/offroad={collected_rollout.num_crash_events}/{collected_rollout.num_offroad_events} "
                 f"ctrl_frac={round_cfg.percentage_controlled_vehicles:.4f} "
                 f"veh={collected_rollout.mean_controlled_vehicles:.1f}/{collected_rollout.mean_road_vehicles:.1f} "
+                + (
+                    f"psro_current={collected_rollout.psro_current_fraction:.3f} "
+                    f"archive={len(psro_archive_for_round or [])} "
+                    if collected_rollout.psro_active
+                    else ""
+                )
+                + (
                 f"reward_loss={reward_stats['reward_loss']:.4f} "
+                )
                 + (
                     f"gap={reward_stats['critic_gap']:.4f} "
                     f"wgan_loss={reward_stats['wgan_loss']:.4f} "
@@ -750,6 +883,13 @@ def main() -> None:
                 "rollout/controlled_vehicle_fraction": float(round_cfg.percentage_controlled_vehicles),
                 "rollout/mean_controlled_vehicles": collected_rollout.mean_controlled_vehicles,
                 "rollout/mean_road_vehicles": collected_rollout.mean_road_vehicles,
+                "psro/active": int(bool(collected_rollout.psro_active)),
+                "psro/archive_size": int(len(psro_policy_archive)),
+                "psro/archive_used": int(len(psro_archive_for_round or [])),
+                "psro/current_decisions": int(collected_rollout.psro_current_decisions),
+                "psro/archive_decisions": int(collected_rollout.psro_archive_decisions),
+                "psro/current_fraction": float(collected_rollout.psro_current_fraction),
+                "psro/last_vehicle_jump_round": int(last_vehicle_jump_round or 0),
                 "rollout/scene_samples": int(len(rollout.scene_features)),
                 "rollout/sequence_samples": int(len(rollout.sequence_features)),
                 "rollout/mean_reward": float(rollout.rewards.mean()),
@@ -787,6 +927,9 @@ def main() -> None:
                 "discriminator/gen_acc": reward_stats["gen_acc"],
                 "discriminator/expert_reward": reward_stats["expert_reward"],
                 "discriminator/gen_reward": reward_stats["gen_reward"],
+                "discriminator/replay_rounds": int(len(airl_replay)),
+                "discriminator/current_generator_samples": int(rollout.num_agent_steps),
+                "discriminator/train_generator_samples": int(len(reward_generator_obs)),
                 "train/discriminator_loss_type_wgan_gp": int(
                     str(round_cfg.discriminator_loss).lower() == "wgan_gp"
                 ),
@@ -796,9 +939,15 @@ def main() -> None:
                 "train/policy_obs_dim": policy_obs_dim,
                 "train/critic_obs_dim": critic_obs_dim,
                 "train/centralized_critic": int(bool(round_cfg.centralized_critic)),
+                "train/central_critic_pooling_attention": int(
+                    str(round_cfg.central_critic_pooling).lower() in {"attention", "attn"}
+                ),
+                "train/central_critic_attention_heads": int(round_cfg.central_critic_attention_heads),
                 "train/wgan_reward_center": int(bool(round_cfg.wgan_reward_center)),
                 "train/wgan_reward_clip": float(round_cfg.wgan_reward_clip),
                 "train/wgan_reward_scale": float(round_cfg.wgan_reward_scale),
+                "train/wgan_reward_norm_min_std": float(getattr(round_cfg, "wgan_reward_norm_min_std", 1.0e-3)),
+                "train/wgan_reward_norm_clip": float(getattr(round_cfg, "wgan_reward_norm_clip", 0.0)),
                 "train/normalize_gail_reward_requested": int(bool(round_cfg.normalize_gail_reward)),
                 "train/allow_wgan_reward_normalization": int(
                     bool(getattr(round_cfg, "allow_wgan_reward_normalization", False))
@@ -827,6 +976,13 @@ def main() -> None:
                 "train/reward_batch_size": int(reward_batch_size),
                 "train/rollout_workers": int(round_cfg.num_rollout_workers),
                 "train/rollout_worker_threads": int(round_cfg.rollout_worker_threads),
+                "train/discriminator_replay_rounds": int(getattr(round_cfg, "discriminator_replay_rounds", 0)),
+                "train/discriminator_replay_max_samples": int(
+                    getattr(round_cfg, "discriminator_replay_max_samples", 0)
+                ),
+                "train/transformer_temporal_module": int(
+                    bool(getattr(round_cfg, "transformer_temporal_module", False))
+                ),
             }
             monitor.log(metrics, step=round_idx)
             if cfg.checkpoint_every > 0 and round_idx % int(cfg.checkpoint_every) == 0:
@@ -849,6 +1005,12 @@ def main() -> None:
                     last_checkpoint_video_path = video_path
                     last_checkpoint_video_round = round_idx
                     monitor.log_video("checkpoint/policy_video", video_path, step=round_idx, fps=int(round_cfg.policy_frequency))
+            if (
+                bool(getattr(cfg, "psro_lite", False))
+                and int(getattr(cfg, "psro_archive_every", 0)) > 0
+                and round_idx % int(cfg.psro_archive_every) == 0
+            ):
+                append_policy_archive(psro_policy_archive, policy, cfg)
 
         final_round = int(cfg.total_rounds)
         final_round_cfg = config_for_round(cfg, final_round)

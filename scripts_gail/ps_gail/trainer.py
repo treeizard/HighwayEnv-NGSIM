@@ -90,6 +90,10 @@ class RolloutBatch:
     episode_names: tuple[str, ...] = ()
     mean_controlled_vehicles: float = 0.0
     mean_road_vehicles: float = 0.0
+    psro_active: bool = False
+    psro_current_decisions: int = 0
+    psro_archive_decisions: int = 0
+    psro_current_fraction: float = 1.0
 
 
 class SquashedNormal:
@@ -353,6 +357,102 @@ def _actions_to_rollout_array(transitions: list[AgentTransition], cfg: PSGAILCon
     return np.asarray([tr.action for tr in transitions], dtype=np.int64)
 
 
+def _make_policy_from_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    cfg: PSGAILConfig,
+    policy_obs_dim: int,
+    critic_obs_dim: int,
+    device: torch.device,
+) -> nn.Module:
+    policy = make_actor_critic(
+        cfg.policy_model,
+        int(policy_obs_dim),
+        int(cfg.hidden_size),
+        action_mode=str(cfg.action_mode),
+        continuous_action_dim=int(cfg.continuous_action_dim),
+        transformer_layers=int(cfg.transformer_layers),
+        transformer_heads=int(cfg.transformer_heads),
+        transformer_dropout=float(cfg.transformer_dropout),
+        transformer_temporal_module=bool(getattr(cfg, "transformer_temporal_module", False)),
+        transformer_temporal_kernel_size=int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
+        transformer_temporal_layers=int(getattr(cfg, "transformer_temporal_layers", 1)),
+        centralized_critic=centralized_critic_enabled(cfg),
+        critic_obs_dim=int(critic_obs_dim),
+        central_critic_pooling=str(getattr(cfg, "central_critic_pooling", "flat")),
+        central_critic_max_vehicles=int(getattr(cfg, "central_critic_max_vehicles", 64)),
+        central_critic_attention_heads=int(getattr(cfg, "central_critic_attention_heads", 4)),
+    )
+    policy.load_state_dict(state_dict)
+    policy.to(device)
+    policy.eval()
+    return policy
+
+
+def _assign_psro_sources(
+    num_agents: int,
+    *,
+    num_archive_policies: int,
+    current_fraction: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    num_agents = int(num_agents)
+    if num_agents <= 0 or int(num_archive_policies) <= 0:
+        return np.zeros(max(0, num_agents), dtype=np.int16)
+    current_fraction = min(1.0, max(0.0, float(current_fraction)))
+    current_count = int(round(current_fraction * num_agents))
+    current_count = min(num_agents, max(1, current_count))
+    sources = np.zeros(num_agents, dtype=np.int16)
+    if current_count >= num_agents:
+        return sources
+    archived_indices = rng.choice(num_agents, size=num_agents - current_count, replace=False)
+    sources[archived_indices] = rng.integers(
+        1,
+        int(num_archive_policies) + 1,
+        size=len(archived_indices),
+        dtype=np.int16,
+    )
+    return sources
+
+
+def _mixed_policy_actions(
+    current_policy: nn.Module,
+    archive_policies: list[nn.Module],
+    source_ids: np.ndarray,
+    obs_tensor: torch.Tensor,
+    critic_obs_tensor: torch.Tensor,
+    action_mask_tensor: torch.Tensor | None,
+    cfg: PSGAILConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    current_dist, current_values = policy_distribution_and_values(
+        current_policy,
+        obs_tensor,
+        cfg,
+        action_mask_tensor,
+        critic_obs_tensor=critic_obs_tensor,
+    )
+    actions, log_probs = _sample_policy_actions(current_dist, cfg)
+    if not archive_policies:
+        return actions, log_probs, current_values
+
+    source_tensor = torch.as_tensor(source_ids, dtype=torch.long, device=obs_tensor.device)
+    for archive_idx, archive_policy in enumerate(archive_policies, start=1):
+        mask = source_tensor == int(archive_idx)
+        if not bool(mask.any()):
+            continue
+        archive_masks = action_mask_tensor[mask] if action_mask_tensor is not None else None
+        archive_dist, _archive_values = policy_distribution_and_values(
+            archive_policy,
+            obs_tensor[mask],
+            cfg,
+            archive_masks,
+            critic_obs_tensor=critic_obs_tensor[mask],
+        )
+        archive_actions, _archive_log_probs = _sample_policy_actions(archive_dist, cfg)
+        actions = actions.clone()
+        actions[mask] = archive_actions
+    return actions, log_probs, current_values
+
+
 def compute_returns_and_advantages(
     rewards: np.ndarray,
     values: np.ndarray,
@@ -508,6 +608,20 @@ def should_apply_gail_reward_clip(cfg: PSGAILConfig) -> bool:
     return str(getattr(cfg, "discriminator_loss", "bce")).lower() != "wgan_gp"
 
 
+def safe_normalize_adversarial_rewards(rewards: np.ndarray, cfg: PSGAILConfig) -> np.ndarray:
+    shaped = np.asarray(rewards, dtype=np.float32)
+    if shaped.size <= 1:
+        return shaped.astype(np.float32, copy=True)
+    centered = shaped - float(shaped.mean())
+    std = float(shaped.std())
+    min_std = max(1.0e-8, float(getattr(cfg, "wgan_reward_norm_min_std", 1.0e-3)))
+    normalized = centered / max(std, min_std)
+    clip = float(getattr(cfg, "wgan_reward_norm_clip", 0.0))
+    if clip > 0.0:
+        normalized = np.clip(normalized, -clip, clip)
+    return normalized.astype(np.float32, copy=False)
+
+
 def shape_rollout_rewards(
     raw_gail_rewards: np.ndarray,
     env_penalties: np.ndarray,
@@ -529,7 +643,7 @@ def shape_rollout_rewards(
         if wgan_clip > 0:
             shaped_gail = np.clip(shaped_gail, -wgan_clip, wgan_clip)
     if should_normalize_gail_reward(cfg) and shaped_gail.size > 1:
-        shaped_gail = (shaped_gail - shaped_gail.mean()) / (shaped_gail.std() + 1e-8)
+        shaped_gail = safe_normalize_adversarial_rewards(shaped_gail, cfg)
     if should_apply_gail_reward_clip(cfg):
         clip = float(cfg.gail_reward_clip)
         shaped_gail = np.clip(shaped_gail, -clip, clip)
@@ -703,14 +817,44 @@ def collect_rollout(
     cfg: PSGAILConfig,
     device: torch.device,
     seed: int | None = None,
+    archive_policy_state_dicts: list[dict[str, torch.Tensor]] | None = None,
+    policy_obs_dim: int | None = None,
+    critic_obs_dim: int | None = None,
 ) -> RolloutBatch:
     policy.eval()
-    obs, _ = env.reset(seed=int(cfg.seed if seed is None else seed))
+    rollout_seed = int(cfg.seed if seed is None else seed)
+    rng = np.random.default_rng(rollout_seed + 7919)
+    obs, _ = env.reset(seed=rollout_seed)
     obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
+    if policy_obs_dim is None:
+        policy_obs_dim = int(obs_agents.shape[1])
+    if critic_obs_dim is None:
+        critic_obs_dim = central_critic_observation_dim(int(policy_obs_dim), cfg)
+    psro_enabled = bool(getattr(cfg, "psro_lite", False))
+    archive_policy_state_dicts = list(archive_policy_state_dicts or [])
+    archive_policies = (
+        [
+            _make_policy_from_state_dict(
+                state_dict,
+                cfg,
+                int(policy_obs_dim),
+                int(critic_obs_dim),
+                device,
+            )
+            for state_dict in archive_policy_state_dicts
+        ]
+        if psro_enabled and archive_policy_state_dicts
+        else []
+    )
+    psro_current_fraction_target = min(
+        1.0,
+        max(0.0, float(getattr(cfg, "psro_current_policy_fraction", 1.0))),
+    )
     transitions: list[AgentTransition] = []
     scene_features: list[np.ndarray] = []
     collect_scene_features = bool(getattr(cfg, "enable_scene_discriminator", False))
     key_to_trajectory_id: dict[tuple[int, int], int] = {}
+    key_to_policy_source: dict[tuple[int, int], int] = {}
     episode_counter = 0
     env_steps = 0
     episode_steps = 0
@@ -724,6 +868,8 @@ def collect_rollout(
     offroad_event_count = 0
     episode_had_crash = False
     episode_had_offroad = False
+    psro_current_decisions = 0
+    psro_archive_decisions = 0
 
     collect_full_episodes = bool(getattr(cfg, "rollout_full_episodes", True))
     forced_reset_cap = 0 if collect_full_episodes else int(cfg.rollout_max_episode_steps)
@@ -764,8 +910,24 @@ def collect_rollout(
                 f"Observation/vehicle mismatch: obs_agents={len(obs_agents)} vehicles={len(vehicle_ids)}"
             )
         keys = [(episode_counter, vehicle_id) for vehicle_id in vehicle_ids]
-        for key in keys:
-            if key not in key_to_trajectory_id:
+        missing_source_indices = [idx for idx, key in enumerate(keys) if key not in key_to_policy_source]
+        if missing_source_indices:
+            source_ids = _assign_psro_sources(
+                len(missing_source_indices),
+                num_archive_policies=len(archive_policies),
+                current_fraction=psro_current_fraction_target,
+                rng=rng,
+            )
+            for local_idx, source_id in zip(missing_source_indices, source_ids):
+                key_to_policy_source[keys[local_idx]] = int(source_id)
+        policy_sources = np.asarray(
+            [key_to_policy_source.get(key, 0) for key in keys],
+            dtype=np.int16,
+        )
+        psro_current_decisions += int(np.sum(policy_sources == 0))
+        psro_archive_decisions += int(np.sum(policy_sources > 0))
+        for key, source_id in zip(keys, policy_sources):
+            if int(source_id) == 0 and key not in key_to_trajectory_id:
                 key_to_trajectory_id[key] = len(key_to_trajectory_id)
 
         critic_obs_agents = central_critic_observations(env, cfg, obs_agents)
@@ -787,14 +949,15 @@ def collect_rollout(
                 if not _is_continuous(cfg)
                 else None
             )
-            dist, values = policy_distribution_and_values(
+            actions, log_probs, values = _mixed_policy_actions(
                 policy,
+                archive_policies,
+                policy_sources,
                 obs_tensor,
-                cfg,
+                critic_obs_tensor,
                 action_mask_tensor,
-                critic_obs_tensor=critic_obs_tensor,
+                cfg,
             )
-            actions, log_probs = _sample_policy_actions(dist, cfg)
 
         action_tuple = _actions_to_env_tuple(actions, cfg)
         next_obs, _env_reward, terminated, truncated, info = env.step(action_tuple)
@@ -815,6 +978,8 @@ def collect_rollout(
         episode_had_offroad = bool(episode_had_offroad or any(bool(flag) for flag in offroad_flags))
 
         for i, key in enumerate(keys):
+            if int(policy_sources[i]) != 0:
+                continue
             crashed = bool(crash_flags[i]) if i < len(crash_flags) else False
             offroad = bool(offroad_flags[i]) if i < len(offroad_flags) else False
             env_penalty = 0.0
@@ -867,6 +1032,8 @@ def collect_rollout(
         episode_lengths.append(int(episode_steps))
         crash_event_count += int(episode_had_crash)
         offroad_event_count += int(episode_had_offroad)
+    if not transitions:
+        raise RuntimeError("Rollout produced no trainable current-policy transitions.")
 
     policy_obs = np.stack([tr.policy_observation for tr in transitions], axis=0).astype(np.float32)
     next_policy_obs = np.stack([tr.next_policy_observation for tr in transitions], axis=0).astype(np.float32)
@@ -950,6 +1117,13 @@ def collect_rollout(
         episode_names=tuple(sorted(name for name in episode_names if name)),
         mean_controlled_vehicles=float(np.mean(controlled_counts)) if controlled_counts else 0.0,
         mean_road_vehicles=float(np.mean(road_vehicle_counts)) if road_vehicle_counts else 0.0,
+        psro_active=bool(archive_policies and psro_archive_decisions > 0),
+        psro_current_decisions=int(psro_current_decisions),
+        psro_archive_decisions=int(psro_archive_decisions),
+        psro_current_fraction=(
+            float(psro_current_decisions)
+            / float(max(1, psro_current_decisions + psro_archive_decisions))
+        ),
     )
 
 
@@ -1099,6 +1273,21 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
         ),
         mean_controlled_vehicles=float(np.mean([batch.mean_controlled_vehicles for batch in batches])),
         mean_road_vehicles=float(np.mean([batch.mean_road_vehicles for batch in batches])),
+        psro_active=any(bool(batch.psro_active) for batch in batches),
+        psro_current_decisions=sum(int(batch.psro_current_decisions) for batch in batches),
+        psro_archive_decisions=sum(int(batch.psro_archive_decisions) for batch in batches),
+        psro_current_fraction=(
+            float(sum(int(batch.psro_current_decisions) for batch in batches))
+            / float(
+                max(
+                    1,
+                    sum(
+                        int(batch.psro_current_decisions) + int(batch.psro_archive_decisions)
+                        for batch in batches
+                    ),
+                )
+            )
+        ),
     )
 
 
@@ -1308,6 +1497,10 @@ def subsample_rollout_for_training(
         episode_names=rollout.episode_names,
         mean_controlled_vehicles=rollout.mean_controlled_vehicles,
         mean_road_vehicles=rollout.mean_road_vehicles,
+        psro_active=rollout.psro_active,
+        psro_current_decisions=rollout.psro_current_decisions,
+        psro_archive_decisions=rollout.psro_archive_decisions,
+        psro_current_fraction=rollout.psro_current_fraction,
     )
 
 
@@ -1321,6 +1514,7 @@ def collect_round_rollouts(
     *,
     round_idx: int,
     rollout_executor,
+    archive_policy_state_dicts: list[dict[str, torch.Tensor]] | None = None,
 ) -> RolloutBatch:
     target_agent_steps = max(0, int(getattr(cfg, "rollout_target_agent_steps", 0)))
     worker_stride = max(1, int(cfg.num_rollout_workers))
@@ -1354,6 +1548,7 @@ def collect_round_rollouts(
             critic_obs_dim=critic_obs_dim,
             seed_offset=seed_offset,
             executor=rollout_executor,
+            archive_policy_state_dicts=archive_policy_state_dicts,
         )
         batches.append(batch)
         agent_steps = sum(int(item.num_agent_steps) for item in batches)
@@ -1370,6 +1565,7 @@ def collect_round_rollouts(
 def _rollout_worker(
     cfg: PSGAILConfig,
     policy_state_dict: dict[str, torch.Tensor],
+    archive_policy_state_dicts: list[dict[str, torch.Tensor]] | None,
     policy_obs_dim: int,
     critic_obs_dim: int,
     worker_id: int,
@@ -1398,8 +1594,14 @@ def _rollout_worker(
         transformer_layers=int(cfg.transformer_layers),
         transformer_heads=int(cfg.transformer_heads),
         transformer_dropout=float(cfg.transformer_dropout),
+        transformer_temporal_module=bool(getattr(cfg, "transformer_temporal_module", False)),
+        transformer_temporal_kernel_size=int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
+        transformer_temporal_layers=int(getattr(cfg, "transformer_temporal_layers", 1)),
         centralized_critic=centralized_critic_enabled(cfg),
         critic_obs_dim=int(critic_obs_dim),
+        central_critic_pooling=str(getattr(cfg, "central_critic_pooling", "flat")),
+        central_critic_max_vehicles=int(getattr(cfg, "central_critic_max_vehicles", 64)),
+        central_critic_attention_heads=int(getattr(cfg, "central_critic_attention_heads", 4)),
     )
     policy.load_state_dict(policy_state_dict)
     policy.to(torch.device("cpu"))
@@ -1412,6 +1614,9 @@ def _rollout_worker(
             worker_cfg,
             torch.device("cpu"),
             seed=int(worker_cfg.seed),
+            archive_policy_state_dicts=archive_policy_state_dicts,
+            policy_obs_dim=int(policy_obs_dim),
+            critic_obs_dim=int(critic_obs_dim),
         )
     finally:
         env.close()
@@ -1426,12 +1631,26 @@ def collect_rollouts(
     critic_obs_dim: int | None = None,
     seed_offset: int = 0,
     executor: ProcessPoolExecutor | None = None,
+    archive_policy_state_dicts: list[dict[str, torch.Tensor]] | None = None,
 ) -> RolloutBatch:
     num_workers = max(1, int(cfg.num_rollout_workers))
     total_steps = max(1, int(cfg.rollout_steps))
     rollout_seed = int(cfg.seed) + int(seed_offset)
     if num_workers == 1:
-        return collect_rollout(env, policy, cfg, device, seed=rollout_seed)
+        return collect_rollout(
+            env,
+            policy,
+            cfg,
+            device,
+            seed=rollout_seed,
+            archive_policy_state_dicts=archive_policy_state_dicts,
+            policy_obs_dim=int(policy_obs_dim),
+            critic_obs_dim=(
+                int(critic_obs_dim)
+                if critic_obs_dim is not None
+                else central_critic_observation_dim(int(policy_obs_dim), cfg)
+            ),
+        )
     critic_obs_dim = int(
         critic_obs_dim
         if critic_obs_dim is not None
@@ -1475,6 +1694,7 @@ def collect_rollouts(
                 _rollout_worker,
                 cfg,
                 cpu_state_dict,
+                archive_policy_state_dicts,
                 int(policy_obs_dim),
                 int(critic_obs_dim),
                 int(seed_offset) + worker_id,

@@ -367,6 +367,9 @@ def main() -> None:
         transformer_dropout=float(cfg.transformer_dropout),
         centralized_critic=bool(cfg.centralized_critic),
         critic_obs_dim=critic_obs_dim,
+        central_critic_pooling=str(getattr(cfg, "central_critic_pooling", "flat")),
+        central_critic_max_vehicles=int(getattr(cfg, "central_critic_max_vehicles", 64)),
+        central_critic_attention_heads=int(getattr(cfg, "central_critic_attention_heads", 4)),
     ).to(device)
     policy.load_state_dict(checkpoint["policy_state_dict"])
     policy.eval()
