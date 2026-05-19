@@ -186,6 +186,8 @@ def _policy_log_probs(
 
 def _airl_wgan_gradient_penalty(
     reward_model: AIRLReward,
+    policy: nn.Module,
+    cfg: PSGAILConfig,
     expert_obs: torch.Tensor,
     expert_actions: torch.Tensor,
     expert_next_obs: torch.Tensor,
@@ -204,6 +206,7 @@ def _airl_wgan_gradient_penalty(
     next_obs = (alpha * expert_next_obs + (1.0 - alpha) * gen_next_obs).requires_grad_(True)
     dones = (alpha.squeeze(-1) * expert_dones + (1.0 - alpha.squeeze(-1)) * gen_dones).requires_grad_(True)
     scores = reward_model.shaped_logits(obs, actions, next_obs, dones, gamma=gamma)
+    scores = scores - _policy_log_probs(policy, cfg, obs, actions)
     gradients = torch.autograd.grad(
         outputs=scores,
         inputs=(obs, actions, next_obs, dones),
@@ -261,6 +264,11 @@ def update_reward_model(
     if loss_type not in {"airl", "airl_bce", "bce", "wgan_gp"}:
         raise ValueError(f"Unsupported AIRL discriminator_loss={loss_type!r}.")
 
+    policy_params = list(policy.parameters())
+    policy_requires_grad = [param.requires_grad for param in policy_params]
+    for param in policy_params:
+        param.requires_grad_(False)
+
     for _ in range(max(1, int(cfg.disc_updates_per_round))):
         permutation = torch.randperm(n, device=device)
         for start in range(0, n, batch_size):
@@ -277,10 +285,17 @@ def update_reward_model(
             gen_shaped = reward_model.shaped_logits(go, ga, gno, gd, gamma=float(cfg.gamma))
             expert_reward = reward_model(eo, ea)
             gen_reward = reward_model(go, ga)
+            with torch.no_grad():
+                expert_log_pi = _policy_log_probs(policy, cfg, eo, ea)
+                gen_log_pi = _policy_log_probs(policy, cfg, go, ga)
+            expert_logits = expert_shaped - expert_log_pi
+            gen_logits = gen_shaped - gen_log_pi
             if loss_type == "wgan_gp":
-                wgan_loss = gen_shaped.mean() - expert_shaped.mean()
+                wgan_loss = gen_logits.mean() - expert_logits.mean()
                 gradient_penalty = _airl_wgan_gradient_penalty(
                     reward_model,
+                    policy,
+                    cfg,
                     eo,
                     ea,
                     eno,
@@ -294,11 +309,6 @@ def update_reward_model(
                 )
                 loss = wgan_loss + gradient_penalty
             else:
-                with torch.no_grad():
-                    expert_log_pi = _policy_log_probs(policy, cfg, eo, ea)
-                    gen_log_pi = _policy_log_probs(policy, cfg, go, ga)
-                expert_logits = expert_shaped - expert_log_pi
-                gen_logits = gen_shaped - gen_log_pi
                 logits = torch.cat([expert_logits, gen_logits], dim=0)
                 labels = torch.cat(
                     [
@@ -315,12 +325,12 @@ def update_reward_model(
             optimizer.step()
             with torch.no_grad():
                 if loss_type == "wgan_gp":
-                    centered_threshold = 0.5 * (expert_shaped.mean() + gen_shaped.mean())
-                    expert_accs.append((expert_shaped > centered_threshold).float().mean())
-                    gen_accs.append((gen_shaped < centered_threshold).float().mean())
+                    centered_threshold = 0.5 * (expert_logits.mean() + gen_logits.mean())
+                    expert_accs.append((expert_logits > centered_threshold).float().mean())
+                    gen_accs.append((gen_logits < centered_threshold).float().mean())
                     wgan_losses.append(wgan_loss.detach())
                     gradient_penalties.append(gradient_penalty.detach())
-                    critic_gaps.append((expert_shaped.mean() - gen_shaped.mean()).detach())
+                    critic_gaps.append((expert_logits.mean() - gen_logits.mean()).detach())
                 else:
                     expert_accs.append((expert_logits > 0.0).float().mean())
                     gen_accs.append((gen_logits < 0.0).float().mean())
@@ -329,6 +339,9 @@ def update_reward_model(
                 expert_rewards.append(expert_reward.mean())
                 gen_rewards.append(gen_reward.mean())
             losses.append(loss.detach())
+
+    for param, requires_grad in zip(policy_params, policy_requires_grad):
+        param.requires_grad_(requires_grad)
 
     def mean(values: list[torch.Tensor]) -> float:
         return float(torch.stack(values).mean().detach().cpu().item()) if values else float("nan")
@@ -348,6 +361,7 @@ def update_reward_model(
 
 def refresh_airl_rewards(
     rollout: RolloutBatch,
+    _policy: nn.Module,
     reward_model: AIRLReward,
     cfg: PSGAILConfig,
     device: torch.device,
@@ -365,8 +379,9 @@ def refresh_airl_rewards(
             _as_tensor(rollout.dones.astype(np.float32), device=device),
             gamma=float(cfg.gamma),
         ).detach().cpu().numpy().astype(np.float32)
+    corrected_logits = (shaped_logits - rollout.old_log_probs).astype(np.float32, copy=True)
     if str(getattr(cfg, "discriminator_loss", "airl_bce")).lower() == "wgan_gp":
-        shaped = shaped_logits.astype(np.float32, copy=True)
+        shaped = corrected_logits
         if bool(getattr(cfg, "wgan_reward_center", False)) and shaped.size > 1:
             shaped = shaped - shaped.mean()
         reward_scale = float(getattr(cfg, "wgan_reward_scale", 1.0))
@@ -378,7 +393,7 @@ def refresh_airl_rewards(
     else:
         # Canonical AIRL trains the policy on log D - log(1-D), which simplifies to
         # f(s,a,s') - log pi(a|s) for D = exp(f)/(exp(f) + pi(a|s)).
-        shaped = (shaped_logits - rollout.old_log_probs).astype(np.float32, copy=True)
+        shaped = corrected_logits
     if should_normalize_gail_reward(cfg) and shaped.size > 1:
         shaped = safe_normalize_adversarial_rewards(shaped, cfg)
     if should_apply_gail_reward_clip(cfg):
@@ -399,14 +414,18 @@ def refresh_airl_rewards(
     return replace(
         rollout,
         rewards=rewards.astype(np.float32),
-        gail_rewards_raw=shaped_logits if str(getattr(cfg, "discriminator_loss", "airl_bce")).lower() == "wgan_gp" else raw,
+        gail_rewards_raw=(
+            corrected_logits
+            if str(getattr(cfg, "discriminator_loss", "airl_bce")).lower() == "wgan_gp"
+            else raw
+        ),
         gail_rewards_normalized=shaped.astype(np.float32),
         challenge_bonuses=challenge_bonuses,
         returns=returns,
         advantages=advantages,
         mean_raw_gail_reward=(
-            float(shaped_logits.mean())
-            if str(getattr(cfg, "discriminator_loss", "airl_bce")).lower() == "wgan_gp" and shaped_logits.size
+            float(corrected_logits.mean())
+            if str(getattr(cfg, "discriminator_loss", "airl_bce")).lower() == "wgan_gp" and corrected_logits.size
             else float(raw.mean()) if raw.size else 0.0
         ),
         mean_normalized_gail_reward=float(shaped.mean()) if shaped.size else 0.0,
@@ -797,7 +816,7 @@ def main() -> None:
                 device,
                 reward_batch_size=reward_batch_size,
             )
-            rollout = refresh_airl_rewards(rollout, reward_model, round_cfg, device)
+            rollout = refresh_airl_rewards(rollout, policy, reward_model, round_cfg, device)
             policy_stats = update_policy(
                 policy,
                 policy_optimizer,
@@ -846,6 +865,7 @@ def main() -> None:
                 + (
                 f"lr={round_cfg.learning_rate:.2e}/{round_cfg.disc_learning_rate:.2e} "
                 f"kl={policy_stats['approx_kl']:.5f} entropy={policy_stats['entropy']:.4f} "
+                f"post_kl={policy_stats['post_update_approx_kl']:.5f} "
                 f"clip={policy_stats['clip_fraction']:.3f} "
                 f"airl_reward={reward_stats['expert_reward']:.3f}/{reward_stats['gen_reward']:.3f} "
                 f"reward={float(rollout.rewards.mean()):.4f}"
@@ -966,9 +986,14 @@ def main() -> None:
                 "policy/bc_regularization_coef": policy_stats["bc_regularization_coef"],
                 "policy/entropy": policy_stats["entropy"],
                 "policy/approx_kl": policy_stats["approx_kl"],
+                "policy/post_update_approx_kl": policy_stats["post_update_approx_kl"],
                 "policy/clip_fraction": policy_stats["clip_fraction"],
                 "policy/ratio_mean": policy_stats["ratio_mean"],
                 "policy/ratio_std": policy_stats["ratio_std"],
+                "policy/post_update_ratio_mean": policy_stats["post_update_ratio_mean"],
+                "policy/post_update_ratio_std": policy_stats["post_update_ratio_std"],
+                "policy/advantage_mean": policy_stats["advantage_mean"],
+                "policy/advantage_std": policy_stats["advantage_std"],
                 "policy/ppo_micro_batch_size": policy_stats["ppo_micro_batch_size"],
                 "train/policy_learning_rate": float(round_cfg.learning_rate),
                 "train/reward_learning_rate": float(round_cfg.disc_learning_rate),

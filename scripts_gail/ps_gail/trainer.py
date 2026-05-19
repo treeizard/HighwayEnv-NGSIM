@@ -2433,6 +2433,9 @@ def update_policy(
     ratio_means: list[float] = []
     ratio_stds: list[float] = []
     bc_losses: list[float] = []
+    post_update_approx_kl = float("nan")
+    post_update_ratio_mean = float("nan")
+    post_update_ratio_std = float("nan")
     batch_size = max(1, int(cfg.batch_size))
     num_samples = int(obs_tensor.shape[0])
 
@@ -2534,6 +2537,42 @@ def update_policy(
                 clip_fractions.append(weighted_clip_fraction)
                 ratio_means.append(weighted_ratio_mean)
                 ratio_stds.append(weighted_ratio_std)
+
+        diagnostic_count = min(num_samples, max(batch_size, 4096))
+        if diagnostic_count > 0:
+            diagnostic_idx = torch.randperm(num_samples)[:diagnostic_count]
+            weighted_post_kl = 0.0
+            weighted_post_ratio_mean = 0.0
+            weighted_post_ratio_std = 0.0
+            total_count = int(diagnostic_idx.numel())
+            with torch.no_grad():
+                for micro_start in range(0, total_count, micro_batch_size):
+                    micro_idx = diagnostic_idx[micro_start : micro_start + micro_batch_size]
+                    micro_count = int(micro_idx.numel())
+                    micro_weight = float(micro_count) / float(total_count)
+                    obs = device_batch(obs_tensor, micro_idx)
+                    actions = device_batch(action_tensor, micro_idx)
+                    old_log_probs = device_batch(old_log_probs_tensor, micro_idx)
+                    critic_obs = device_batch(critic_obs_tensor, micro_idx)
+                    masks = device_batch(action_mask_tensor, micro_idx) if action_mask_tensor is not None else None
+                    dist, _values = policy_distribution_and_values(
+                        policy,
+                        obs,
+                        cfg,
+                        masks,
+                        critic_obs_tensor=critic_obs,
+                    )
+                    log_ratio = dist.log_prob(actions) - old_log_probs
+                    ratio = torch.exp(log_ratio)
+                    approx_kl = ((ratio - 1.0) - log_ratio).mean()
+                    weighted_post_kl += micro_weight * float(approx_kl.detach().cpu().item())
+                    weighted_post_ratio_mean += micro_weight * float(ratio.mean().detach().cpu().item())
+                    weighted_post_ratio_std += micro_weight * float(
+                        ratio.std(unbiased=False).detach().cpu().item()
+                    )
+            post_update_approx_kl = weighted_post_kl
+            post_update_ratio_mean = weighted_post_ratio_mean
+            post_update_ratio_std = weighted_post_ratio_std
     finally:
         if was_training:
             policy.train()
@@ -2543,9 +2582,14 @@ def update_policy(
         "value_loss": float(np.mean(value_losses)),
         "entropy": float(np.mean(entropies)),
         "approx_kl": float(np.mean(approx_kls)),
+        "post_update_approx_kl": float(post_update_approx_kl),
         "clip_fraction": float(np.mean(clip_fractions)),
         "ratio_mean": float(np.mean(ratio_means)),
         "ratio_std": float(np.mean(ratio_stds)),
+        "post_update_ratio_mean": float(post_update_ratio_mean),
+        "post_update_ratio_std": float(post_update_ratio_std),
+        "advantage_mean": float(np.mean(rollout.advantages)) if rollout.advantages.size else 0.0,
+        "advantage_std": float(np.std(rollout.advantages)) if rollout.advantages.size else 0.0,
         "bc_regularization_loss": float(np.mean(bc_losses)) if bc_losses else 0.0,
         "bc_regularization_coef": float(bc_coef),
         "ppo_micro_batch_size": float(micro_batch_size),
