@@ -186,8 +186,6 @@ def _policy_log_probs(
 
 def _airl_wgan_gradient_penalty(
     reward_model: AIRLReward,
-    policy: nn.Module,
-    cfg: PSGAILConfig,
     expert_obs: torch.Tensor,
     expert_actions: torch.Tensor,
     expert_next_obs: torch.Tensor,
@@ -205,8 +203,9 @@ def _airl_wgan_gradient_penalty(
     actions = (alpha * expert_actions + (1.0 - alpha) * gen_actions).requires_grad_(True)
     next_obs = (alpha * expert_next_obs + (1.0 - alpha) * gen_next_obs).requires_grad_(True)
     dones = (alpha.squeeze(-1) * expert_dones + (1.0 - alpha.squeeze(-1)) * gen_dones).requires_grad_(True)
+    # Keep the policy correction in the WGAN critic loss, but do not double-backward
+    # through the policy network for GP; transformer policies make that graph huge.
     scores = reward_model.shaped_logits(obs, actions, next_obs, dones, gamma=gamma)
-    scores = scores - _policy_log_probs(policy, cfg, obs, actions)
     gradients = torch.autograd.grad(
         outputs=scores,
         inputs=(obs, actions, next_obs, dones),
@@ -269,79 +268,78 @@ def update_reward_model(
     for param in policy_params:
         param.requires_grad_(False)
 
-    for _ in range(max(1, int(cfg.disc_updates_per_round))):
-        permutation = torch.randperm(n, device=device)
-        for start in range(0, n, batch_size):
-            idx = permutation[start : start + batch_size]
-            eo = expert_obs_t[idx]
-            ea = expert_actions_t[idx]
-            eno = expert_next_obs_t[idx]
-            ed = expert_dones_t[idx]
-            go = gen_obs_t[idx]
-            ga = gen_actions_t[idx]
-            gno = gen_next_obs_t[idx]
-            gd = gen_dones_t[idx]
-            expert_shaped = reward_model.shaped_logits(eo, ea, eno, ed, gamma=float(cfg.gamma))
-            gen_shaped = reward_model.shaped_logits(go, ga, gno, gd, gamma=float(cfg.gamma))
-            expert_reward = reward_model(eo, ea)
-            gen_reward = reward_model(go, ga)
-            with torch.no_grad():
-                expert_log_pi = _policy_log_probs(policy, cfg, eo, ea)
-                gen_log_pi = _policy_log_probs(policy, cfg, go, ga)
-            expert_logits = expert_shaped - expert_log_pi
-            gen_logits = gen_shaped - gen_log_pi
-            if loss_type == "wgan_gp":
-                wgan_loss = gen_logits.mean() - expert_logits.mean()
-                gradient_penalty = _airl_wgan_gradient_penalty(
-                    reward_model,
-                    policy,
-                    cfg,
-                    eo,
-                    ea,
-                    eno,
-                    ed,
-                    go,
-                    ga,
-                    gno,
-                    gd,
-                    gamma=float(cfg.gamma),
-                    gp_lambda=float(getattr(cfg, "wgan_gp_lambda", 2.0)),
-                )
-                loss = wgan_loss + gradient_penalty
-            else:
-                logits = torch.cat([expert_logits, gen_logits], dim=0)
-                labels = torch.cat(
-                    [
-                        torch.full_like(expert_logits, float(cfg.disc_expert_label)),
-                        torch.full_like(gen_logits, float(cfg.disc_generator_label)),
-                    ],
-                    dim=0,
-                )
-                bce_loss = F.binary_cross_entropy_with_logits(logits, labels)
-                loss = bce_loss
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(reward_model.parameters(), float(cfg.max_grad_norm))
-            optimizer.step()
-            with torch.no_grad():
+    try:
+        for _ in range(max(1, int(cfg.disc_updates_per_round))):
+            permutation = torch.randperm(n, device=device)
+            for start in range(0, n, batch_size):
+                idx = permutation[start : start + batch_size]
+                eo = expert_obs_t[idx]
+                ea = expert_actions_t[idx]
+                eno = expert_next_obs_t[idx]
+                ed = expert_dones_t[idx]
+                go = gen_obs_t[idx]
+                ga = gen_actions_t[idx]
+                gno = gen_next_obs_t[idx]
+                gd = gen_dones_t[idx]
+                expert_shaped = reward_model.shaped_logits(eo, ea, eno, ed, gamma=float(cfg.gamma))
+                gen_shaped = reward_model.shaped_logits(go, ga, gno, gd, gamma=float(cfg.gamma))
+                expert_reward = reward_model(eo, ea)
+                gen_reward = reward_model(go, ga)
+                with torch.no_grad():
+                    expert_log_pi = _policy_log_probs(policy, cfg, eo, ea)
+                    gen_log_pi = _policy_log_probs(policy, cfg, go, ga)
+                expert_logits = expert_shaped - expert_log_pi
+                gen_logits = gen_shaped - gen_log_pi
                 if loss_type == "wgan_gp":
-                    centered_threshold = 0.5 * (expert_logits.mean() + gen_logits.mean())
-                    expert_accs.append((expert_logits > centered_threshold).float().mean())
-                    gen_accs.append((gen_logits < centered_threshold).float().mean())
-                    wgan_losses.append(wgan_loss.detach())
-                    gradient_penalties.append(gradient_penalty.detach())
-                    critic_gaps.append((expert_logits.mean() - gen_logits.mean()).detach())
+                    wgan_loss = gen_logits.mean() - expert_logits.mean()
+                    gradient_penalty = _airl_wgan_gradient_penalty(
+                        reward_model,
+                        eo,
+                        ea,
+                        eno,
+                        ed,
+                        go,
+                        ga,
+                        gno,
+                        gd,
+                        gamma=float(cfg.gamma),
+                        gp_lambda=float(getattr(cfg, "wgan_gp_lambda", 2.0)),
+                    )
+                    loss = wgan_loss + gradient_penalty
                 else:
-                    expert_accs.append((expert_logits > 0.0).float().mean())
-                    gen_accs.append((gen_logits < 0.0).float().mean())
-                    bce_losses.append(bce_loss.detach())
-                    critic_gaps.append((expert_logits.mean() - gen_logits.mean()).detach())
-                expert_rewards.append(expert_reward.mean())
-                gen_rewards.append(gen_reward.mean())
-            losses.append(loss.detach())
-
-    for param, requires_grad in zip(policy_params, policy_requires_grad):
-        param.requires_grad_(requires_grad)
+                    logits = torch.cat([expert_logits, gen_logits], dim=0)
+                    labels = torch.cat(
+                        [
+                            torch.full_like(expert_logits, float(cfg.disc_expert_label)),
+                            torch.full_like(gen_logits, float(cfg.disc_generator_label)),
+                        ],
+                        dim=0,
+                    )
+                    bce_loss = F.binary_cross_entropy_with_logits(logits, labels)
+                    loss = bce_loss
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(reward_model.parameters(), float(cfg.max_grad_norm))
+                optimizer.step()
+                with torch.no_grad():
+                    if loss_type == "wgan_gp":
+                        centered_threshold = 0.5 * (expert_logits.mean() + gen_logits.mean())
+                        expert_accs.append((expert_logits > centered_threshold).float().mean())
+                        gen_accs.append((gen_logits < centered_threshold).float().mean())
+                        wgan_losses.append(wgan_loss.detach())
+                        gradient_penalties.append(gradient_penalty.detach())
+                        critic_gaps.append((expert_logits.mean() - gen_logits.mean()).detach())
+                    else:
+                        expert_accs.append((expert_logits > 0.0).float().mean())
+                        gen_accs.append((gen_logits < 0.0).float().mean())
+                        bce_losses.append(bce_loss.detach())
+                        critic_gaps.append((expert_logits.mean() - gen_logits.mean()).detach())
+                    expert_rewards.append(expert_reward.mean())
+                    gen_rewards.append(gen_reward.mean())
+                losses.append(loss.detach())
+    finally:
+        for param, requires_grad in zip(policy_params, policy_requires_grad):
+            param.requires_grad_(requires_grad)
 
     def mean(values: list[torch.Tensor]) -> float:
         return float(torch.stack(values).mean().detach().cpu().item()) if values else float("nan")
@@ -361,7 +359,6 @@ def update_reward_model(
 
 def refresh_airl_rewards(
     rollout: RolloutBatch,
-    _policy: nn.Module,
     reward_model: AIRLReward,
     cfg: PSGAILConfig,
     device: torch.device,
@@ -816,7 +813,7 @@ def main() -> None:
                 device,
                 reward_batch_size=reward_batch_size,
             )
-            rollout = refresh_airl_rewards(rollout, policy, reward_model, round_cfg, device)
+            rollout = refresh_airl_rewards(rollout, reward_model, round_cfg, device)
             policy_stats = update_policy(
                 policy,
                 policy_optimizer,

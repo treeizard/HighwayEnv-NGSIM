@@ -114,8 +114,11 @@ from scripts_gail.ps_gail.trainer import (
 )
 from scripts_gail.train_simple_ps_gail import behavior_clone_pretrain
 from scripts_gail.train_simple_ps_gail import config_for_round as ps_gail_config_for_round
+from scripts_gail.train_simple_airl import AIRLReward
+from scripts_gail.train_simple_airl import _airl_wgan_gradient_penalty
 from scripts_gail.train_simple_airl import config_for_round as airl_config_for_round
 from scripts_gail.train_simple_airl import refresh_airl_rewards
+from scripts_gail.train_simple_airl import update_reward_model
 from scripts_gail.train_simple_iq_learn import convergence_reached, convergence_score
 
 
@@ -1142,6 +1145,93 @@ def test_airl_wgan_uses_shaped_logits_without_rollout_normalization_or_generic_c
     np.testing.assert_allclose(refreshed.gail_rewards_raw, [-15.0, -10.0, -20.0], rtol=1e-6)
     np.testing.assert_allclose(refreshed.gail_rewards_normalized, [-15.0, -10.0, -20.0], rtol=1e-6)
     np.testing.assert_allclose(refreshed.rewards, [-15.0, -10.0, -20.0], rtol=1e-6)
+
+
+def test_airl_wgan_gradient_penalty_backprops_through_reward_model_only():
+    torch.manual_seed(0)
+    reward_model = AIRLReward(obs_dim=3, action_dim=2, hidden_sizes=(8,))
+    expert_obs = torch.randn(4, 3)
+    expert_actions = torch.randn(4, 2)
+    expert_next_obs = torch.randn(4, 3)
+    expert_dones = torch.zeros(4)
+    gen_obs = torch.randn(4, 3)
+    gen_actions = torch.randn(4, 2)
+    gen_next_obs = torch.randn(4, 3)
+    gen_dones = torch.ones(4)
+
+    gradient_penalty = _airl_wgan_gradient_penalty(
+        reward_model,
+        expert_obs,
+        expert_actions,
+        expert_next_obs,
+        expert_dones,
+        gen_obs,
+        gen_actions,
+        gen_next_obs,
+        gen_dones,
+        gamma=0.99,
+        gp_lambda=2.0,
+    )
+    gradient_penalty.backward()
+
+    assert torch.isfinite(gradient_penalty)
+    assert any(param.grad is not None for param in reward_model.parameters())
+
+
+def test_airl_wgan_reward_update_with_transformer_policy_keeps_policy_out_of_backward():
+    torch.manual_seed(0)
+    np.random.seed(0)
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        continuous_action_dim=2,
+        discriminator_loss="wgan_gp",
+        disc_updates_per_round=1,
+        max_grad_norm=0.5,
+        gamma=0.99,
+        wgan_gp_lambda=2.0,
+    )
+    policy = make_actor_critic(
+        "transformer",
+        obs_dim=6,
+        hidden_size=8,
+        action_mode="continuous",
+        continuous_action_dim=2,
+        transformer_layers=1,
+        transformer_heads=2,
+        transformer_dropout=0.0,
+    )
+    reward_model = AIRLReward(obs_dim=6, action_dim=2, hidden_sizes=(8,))
+    optimizer = torch.optim.Adam(reward_model.parameters(), lr=1.0e-3)
+    expert_obs = np.random.randn(8, 6).astype(np.float32)
+    expert_actions = np.tanh(np.random.randn(8, 2)).astype(np.float32)
+    expert_next_obs = np.random.randn(8, 6).astype(np.float32)
+    expert_dones = np.zeros(8, dtype=bool)
+    gen_obs = np.random.randn(8, 6).astype(np.float32)
+    gen_actions = np.tanh(np.random.randn(8, 2)).astype(np.float32)
+    gen_next_obs = np.random.randn(8, 6).astype(np.float32)
+    gen_dones = np.zeros(8, dtype=bool)
+
+    stats = update_reward_model(
+        reward_model,
+        optimizer,
+        policy,
+        expert_obs,
+        expert_actions,
+        expert_next_obs,
+        expert_dones,
+        gen_obs,
+        gen_actions,
+        gen_next_obs,
+        gen_dones,
+        cfg,
+        torch.device("cpu"),
+        reward_batch_size=4,
+    )
+
+    assert np.isfinite(stats["reward_loss"])
+    assert np.isfinite(stats["gradient_penalty"])
+    assert all(param.requires_grad for param in policy.parameters())
+    assert all(param.grad is None for param in policy.parameters())
 
 
 def test_airl_player_challenge_bonus_uses_same_primary_reward_cap():
