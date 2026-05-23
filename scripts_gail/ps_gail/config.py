@@ -93,6 +93,13 @@ class PSGAILConfig:
     transformer_temporal_module: bool = False
     transformer_temporal_kernel_size: int = 5
     transformer_temporal_layers: int = 1
+    transformer_memory_tokens: int = 8
+    transformer_memory_context_length: int = 32
+    transformer_recurrent_sequence_length: int = 32
+    transformer_recurrent_sequences_per_batch: int = 32
+    transformer_recurrent_micro_batch_sequences: int = 8
+    transformer_memory_storage_dtype: str = "float16"
+    transformer_use_causal_attention: bool = True
     centralized_critic: bool = False
     central_critic_max_vehicles: int = 64
     central_critic_include_local_obs: bool = False

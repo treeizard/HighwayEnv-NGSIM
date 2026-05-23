@@ -90,6 +90,7 @@ class AgentTransition:
     challenge_ttc_target: float
     challenge_gap_target: float
     done: bool
+    policy_step_memory: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=np.float16))
 
 
 @dataclass
@@ -119,6 +120,7 @@ class RolloutBatch:
     num_env_steps: int
     num_agent_steps: int
     vehicle_ids: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.int64))
+    policy_step_memories: np.ndarray = field(default_factory=lambda: np.zeros((0, 0, 0), dtype=np.float16))
     challenge_pressures: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
     challenge_payoffs: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
     challenge_bonuses: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
@@ -372,13 +374,15 @@ def policy_distribution_and_values(
     action_masks: torch.Tensor | None = None,
     critic_obs_tensor: torch.Tensor | None = None,
 ) -> tuple[Categorical | SquashedNormal, torch.Tensor]:
-    policy_out, values = policy(obs_tensor, critic_obs_tensor)
-    if _is_continuous(cfg):
-        if policy.log_std is None:
-            raise RuntimeError("Continuous action mode requires policy.log_std.")
-        std = torch.exp(policy.log_std).expand_as(policy_out)
-        return SquashedNormal(policy_out, std), values
-    return Categorical(logits=_masked_discrete_logits(policy_out, action_masks)), values
+    dist, values, _memory = policy_distribution_values_memory(
+        policy,
+        obs_tensor,
+        cfg,
+        action_masks,
+        critic_obs_tensor=critic_obs_tensor,
+        return_memory=False,
+    )
+    return dist, values
 
 
 def _sample_policy_actions(
@@ -399,6 +403,145 @@ def _actions_to_env_tuple(actions: torch.Tensor, cfg: PSGAILConfig) -> tuple[obj
         actions_np = np.clip(actions_np, -1.0, 1.0)
         return tuple(action.copy() for action in actions_np)
     return tuple(int(action) for action in actions_np.tolist())
+
+
+def recurrent_policy_enabled(policy: nn.Module) -> bool:
+    return bool(getattr(policy, "supports_recurrent_memory", False))
+
+
+def _memory_storage_dtype(cfg: PSGAILConfig) -> np.dtype:
+    name = str(getattr(cfg, "transformer_memory_storage_dtype", "float16")).lower()
+    if name in {"float32", "fp32"}:
+        return np.dtype(np.float32)
+    if name in {"float16", "fp16", "half"}:
+        return np.dtype(np.float16)
+    raise ValueError(
+        "transformer_memory_storage_dtype must be 'float16' or 'float32', "
+        f"got {getattr(cfg, 'transformer_memory_storage_dtype', None)!r}."
+    )
+
+
+def _empty_step_memory(policy: nn.Module, cfg: PSGAILConfig) -> np.ndarray:
+    tokens = int(getattr(policy, "memory_tokens", max(1, int(getattr(cfg, "transformer_memory_tokens", 8)))))
+    hidden = int(getattr(policy, "hidden_size", int(getattr(cfg, "hidden_size", 256))))
+    return np.zeros((tokens, hidden), dtype=_memory_storage_dtype(cfg))
+
+
+def _memory_cache_from_state(
+    policy: nn.Module,
+    cfg: PSGAILConfig,
+    keys: list[tuple[int, int]],
+    memory_state: dict[tuple[int, int], list[np.ndarray]],
+    device: torch.device,
+) -> torch.Tensor | None:
+    if not recurrent_policy_enabled(policy):
+        return None
+    context = int(getattr(policy, "memory_context_length", int(getattr(cfg, "transformer_memory_context_length", 32))))
+    empty = _empty_step_memory(policy, cfg)
+    rows: list[np.ndarray] = []
+    for key in keys:
+        history = list(memory_state.get(key, []))[-context:]
+        if len(history) < context:
+            history = [empty] * (context - len(history)) + history
+        rows.append(np.stack(history, axis=0).astype(np.float32, copy=False))
+    if not rows:
+        return None
+    return torch.as_tensor(np.stack(rows, axis=0), dtype=torch.float32, device=device)
+
+
+def _step_memory_to_numpy(step_memory: torch.Tensor, cfg: PSGAILConfig) -> np.ndarray:
+    return step_memory.detach().to(device="cpu", dtype=torch.float32).numpy().astype(
+        _memory_storage_dtype(cfg),
+        copy=False,
+    )
+
+
+def _update_memory_state(
+    policy: nn.Module,
+    cfg: PSGAILConfig,
+    keys: list[tuple[int, int]],
+    memory_state: dict[tuple[int, int], list[np.ndarray]],
+    step_memory: torch.Tensor | None,
+) -> np.ndarray:
+    if not recurrent_policy_enabled(policy) or step_memory is None or not keys:
+        return np.zeros((len(keys), 0, 0), dtype=_memory_storage_dtype(cfg))
+    step_np = _step_memory_to_numpy(step_memory, cfg)
+    context = int(getattr(policy, "memory_context_length", int(getattr(cfg, "transformer_memory_context_length", 32))))
+    for i, key in enumerate(keys):
+        history = memory_state.setdefault(key, [])
+        history.append(step_np[i].copy())
+        if len(history) > context:
+            del history[: len(history) - context]
+    return step_np
+
+
+def _recurrent_memory_cache_from_prior_steps(
+    policy: nn.Module,
+    cfg: PSGAILConfig,
+    rollout: RolloutBatch,
+    trajectory_indices: np.ndarray,
+    chunk_start: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if not recurrent_policy_enabled(policy):
+        return None
+    context = int(getattr(policy, "memory_context_length", int(getattr(cfg, "transformer_memory_context_length", 32))))
+    prior = np.asarray(trajectory_indices[max(0, int(chunk_start) - context) : int(chunk_start)], dtype=np.int64)
+    empty = _empty_step_memory(policy, cfg)
+    if prior.size:
+        history = [
+            np.asarray(rollout.policy_step_memories[int(idx)], dtype=np.float32)
+            for idx in prior
+        ]
+    else:
+        history = []
+    if len(history) < context:
+        history = [empty.astype(np.float32, copy=False)] * (context - len(history)) + history
+    memory = np.stack(history[-context:], axis=0).astype(np.float32, copy=False)
+    return torch.as_tensor(memory[None, ...], dtype=torch.float32, device=device)
+
+
+def _shift_recurrent_memory(memory: torch.Tensor, step_memory: torch.Tensor) -> torch.Tensor:
+    return torch.cat([memory[:, 1:], step_memory.unsqueeze(1)], dim=1)
+
+
+def recurrent_memory_stats(rollout: RolloutBatch) -> dict[str, float]:
+    memories = getattr(rollout, "policy_step_memories", None)
+    if memories is None or not isinstance(memories, np.ndarray) or memories.size == 0:
+        return {"perf/recurrent_memory_mb": 0.0, "perf/recurrent_memory_tokens": 0.0}
+    return {
+        "perf/recurrent_memory_mb": float(memories.nbytes / (1024.0 * 1024.0)),
+        "perf/recurrent_memory_tokens": float(memories.shape[0] * memories.shape[1]),
+    }
+
+
+def policy_distribution_values_memory(
+    policy: nn.Module,
+    obs_tensor: torch.Tensor,
+    cfg: PSGAILConfig,
+    action_masks: torch.Tensor | None = None,
+    critic_obs_tensor: torch.Tensor | None = None,
+    memory: torch.Tensor | None = None,
+    *,
+    return_memory: bool = False,
+) -> tuple[Categorical | SquashedNormal, torch.Tensor, torch.Tensor | None]:
+    if recurrent_policy_enabled(policy):
+        policy_out, values, new_memory = policy(
+            obs_tensor,
+            critic_obs_tensor,
+            memory=memory,
+            return_memory=True,
+        )
+    else:
+        policy_out, values = policy(obs_tensor, critic_obs_tensor)
+        new_memory = None
+    if _is_continuous(cfg):
+        if policy.log_std is None:
+            raise RuntimeError("Continuous action mode requires policy.log_std.")
+        std = torch.exp(policy.log_std).expand_as(policy_out)
+        return SquashedNormal(policy_out, std), values, new_memory if return_memory else None
+    dist = Categorical(logits=_masked_discrete_logits(policy_out, action_masks))
+    return dist, values, new_memory if return_memory else None
 
 
 def _parse_evaluation_horizons(cfg: PSGAILConfig) -> list[int]:
@@ -479,15 +622,28 @@ def _deterministic_policy_action_tuple(
     obs: object,
     cfg: PSGAILConfig,
     device: torch.device,
-) -> tuple[object, ...]:
+    *,
+    memory: torch.Tensor | None = None,
+    return_memory: bool = False,
+) -> tuple[object, ...] | tuple[tuple[object, ...], torch.Tensor | None]:
     obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
     critic_obs_agents = central_critic_observations(env, cfg, obs_agents)
     with torch.no_grad():
         obs_tensor = torch.as_tensor(obs_agents, dtype=torch.float32, device=device)
         critic_obs_tensor = torch.as_tensor(critic_obs_agents, dtype=torch.float32, device=device)
-        policy_out, _values = policy(obs_tensor, critic_obs_tensor)
+        if recurrent_policy_enabled(policy):
+            policy_out, _values, new_memory = policy(
+                obs_tensor,
+                critic_obs_tensor,
+                memory=memory,
+                return_memory=True,
+            )
+        else:
+            policy_out, _values = policy(obs_tensor, critic_obs_tensor)
+            new_memory = None
         if _is_continuous(cfg):
-            return _actions_to_env_tuple(torch.clamp(policy_out, -1.0, 1.0), cfg)
+            actions = _actions_to_env_tuple(torch.clamp(policy_out, -1.0, 1.0), cfg)
+            return (actions, new_memory) if return_memory else actions
         masks = discrete_action_masks_from_env(
             env,
             num_agents=len(obs_agents),
@@ -496,7 +652,8 @@ def _deterministic_policy_action_tuple(
         )
         mask_tensor = torch.as_tensor(masks, dtype=torch.bool, device=device)
         logits = _masked_discrete_logits(policy_out, mask_tensor)
-        return _actions_to_env_tuple(torch.argmax(logits, dim=-1), cfg)
+        actions = _actions_to_env_tuple(torch.argmax(logits, dim=-1), cfg)
+        return (actions, new_memory) if return_memory else actions
 
 
 def _lane_offset_for_position(env: gym.Env, position: np.ndarray, vehicle: object | None = None) -> float:
@@ -582,6 +739,11 @@ def evaluate_policy_matched_trajectories(
                 pred_lane_offset: list[float] = []
                 expert_lane_offset: list[float] = []
                 length = 0
+                eval_memory = (
+                    policy.initial_memory(1, device=device, dtype=torch.float32)
+                    if recurrent_policy_enabled(policy)
+                    else None
+                )
                 for _step in range(max_steps):
                     vehicle = _first_controlled_vehicle(env)
                     if vehicle is None:
@@ -592,7 +754,18 @@ def evaluate_policy_matched_trajectories(
                     pred_lane_offset.append(_lane_offset_for_position(env, position, vehicle))
                     expert_idx = min(length, ref_xy.shape[0] - 1)
                     expert_lane_offset.append(_lane_offset_for_position(env, ref_xy[expert_idx, :2]))
-                    action_tuple = _deterministic_policy_action_tuple(policy, env, obs, cfg, device)
+                    if recurrent_policy_enabled(policy):
+                        action_tuple, eval_memory = _deterministic_policy_action_tuple(
+                            policy,
+                            env,
+                            obs,
+                            cfg,
+                            device,
+                            memory=eval_memory,
+                            return_memory=True,
+                        )
+                    else:
+                        action_tuple = _deterministic_policy_action_tuple(policy, env, obs, cfg, device)
                     accel = _physical_accel_from_action(action_tuple, cfg)
                     if np.isfinite(accel) and accel < float(cfg.hard_brake_accel_threshold):
                         hard_brake_steps += 1
@@ -672,6 +845,9 @@ def _make_policy_from_state_dict(
         transformer_temporal_module=bool(getattr(cfg, "transformer_temporal_module", False)),
         transformer_temporal_kernel_size=int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
         transformer_temporal_layers=int(getattr(cfg, "transformer_temporal_layers", 1)),
+        transformer_memory_tokens=int(getattr(cfg, "transformer_memory_tokens", 8)),
+        transformer_memory_context_length=int(getattr(cfg, "transformer_memory_context_length", 32)),
+        transformer_use_causal_attention=bool(getattr(cfg, "transformer_use_causal_attention", True)),
         centralized_critic=centralized_critic_enabled(cfg),
         critic_obs_dim=int(critic_obs_dim),
         central_critic_pooling=str(getattr(cfg, "central_critic_pooling", "flat")),
@@ -718,35 +894,67 @@ def _mixed_policy_actions(
     critic_obs_tensor: torch.Tensor,
     action_mask_tensor: torch.Tensor | None,
     cfg: PSGAILConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    current_dist, current_values = policy_distribution_and_values(
+    *,
+    agent_keys: list[tuple[int, int]] | None = None,
+    current_memory: torch.Tensor | None = None,
+    archive_memory_states: list[dict[tuple[int, int], list[np.ndarray]]] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    current_dist, current_values, current_step_memory = policy_distribution_values_memory(
         current_policy,
         obs_tensor,
         cfg,
         action_mask_tensor,
         critic_obs_tensor=critic_obs_tensor,
+        memory=current_memory,
+        return_memory=True,
     )
     actions, log_probs = _sample_policy_actions(current_dist, cfg)
     if not archive_policies:
-        return actions, log_probs, current_values
+        return actions, log_probs, current_values, current_step_memory
 
     source_tensor = torch.as_tensor(source_ids, dtype=torch.long, device=obs_tensor.device)
+    archive_memory_states = archive_memory_states if archive_memory_states is not None else []
+    agent_keys = list(agent_keys or [])
     for archive_idx, archive_policy in enumerate(archive_policies, start=1):
         mask = source_tensor == int(archive_idx)
         if not bool(mask.any()):
             continue
         archive_masks = action_mask_tensor[mask] if action_mask_tensor is not None else None
-        archive_dist, _archive_values = policy_distribution_and_values(
+        archive_memory = None
+        selected_keys: list[tuple[int, int]] = []
+        if agent_keys and recurrent_policy_enabled(archive_policy):
+            selected_indices = torch.nonzero(mask, as_tuple=False).reshape(-1).detach().cpu().numpy()
+            selected_keys = [agent_keys[int(index)] for index in selected_indices.tolist()]
+            while len(archive_memory_states) < archive_idx:
+                archive_memory_states.append({})
+            archive_memory = _memory_cache_from_state(
+                archive_policy,
+                cfg,
+                selected_keys,
+                archive_memory_states[archive_idx - 1],
+                obs_tensor.device,
+            )
+        archive_dist, _archive_values, archive_step_memory = policy_distribution_values_memory(
             archive_policy,
             obs_tensor[mask],
             cfg,
             archive_masks,
             critic_obs_tensor=critic_obs_tensor[mask],
+            memory=archive_memory,
+            return_memory=True,
         )
         archive_actions, _archive_log_probs = _sample_policy_actions(archive_dist, cfg)
         actions = actions.clone()
         actions[mask] = archive_actions
-    return actions, log_probs, current_values
+        if selected_keys and archive_step_memory is not None:
+            _update_memory_state(
+                archive_policy,
+                cfg,
+                selected_keys,
+                archive_memory_states[archive_idx - 1],
+                archive_step_memory,
+            )
+    return actions, log_probs, current_values, current_step_memory
 
 
 def compute_returns_and_advantages(
@@ -1216,6 +1424,7 @@ def refresh_rollout_rewards(
         num_env_steps=rollout.num_env_steps,
         num_agent_steps=rollout.num_agent_steps,
         vehicle_ids=rollout.vehicle_ids,
+        policy_step_memories=rollout.policy_step_memories,
         challenge_pressures=rollout.challenge_pressures,
         challenge_payoffs=rollout.challenge_payoffs,
         challenge_bonuses=challenge_bonuses,
@@ -1289,6 +1498,10 @@ def collect_rollout(
     collect_scene_features = bool(getattr(cfg, "enable_scene_discriminator", False))
     key_to_trajectory_id: dict[tuple[int, int], int] = {}
     key_to_policy_source: dict[tuple[int, int], int] = {}
+    current_memory_state: dict[tuple[int, int], list[np.ndarray]] = {}
+    archive_memory_states: list[dict[tuple[int, int], list[np.ndarray]]] = [
+        {} for _ in archive_policies
+    ]
     episode_counter = 0
     env_steps = 0
     episode_steps = 0
@@ -1387,7 +1600,14 @@ def collect_rollout(
                 if not _is_continuous(cfg)
                 else None
             )
-            actions, log_probs, values = _mixed_policy_actions(
+            current_memory = _memory_cache_from_state(
+                policy,
+                cfg,
+                keys,
+                current_memory_state,
+                device,
+            )
+            actions, log_probs, values, current_step_memory = _mixed_policy_actions(
                 policy,
                 archive_policies,
                 policy_sources,
@@ -1395,6 +1615,16 @@ def collect_rollout(
                 critic_obs_tensor,
                 action_mask_tensor,
                 cfg,
+                agent_keys=keys,
+                current_memory=current_memory,
+                archive_memory_states=archive_memory_states,
+            )
+            current_step_memory_np = _update_memory_state(
+                policy,
+                cfg,
+                keys,
+                current_memory_state,
+                current_step_memory,
             )
         _RolloutPerfProfiler.record("policy_inference", time.perf_counter() - started)
 
@@ -1477,6 +1707,11 @@ def collect_rollout(
                     challenge_ttc_target=float(ttc_target),
                     challenge_gap_target=float(gap_target),
                     done=done,
+                    policy_step_memory=(
+                        current_step_memory_np[i].copy()
+                        if current_step_memory_np.size
+                        else np.zeros((0, 0), dtype=_memory_storage_dtype(cfg))
+                    ),
                 )
             )
 
@@ -1487,6 +1722,14 @@ def collect_rollout(
             truncated_count += int(bool(truncated or force_rollout_reset))
             crash_event_count += int(episode_had_crash)
             offroad_event_count += int(episode_had_offroad)
+            old_episode_counter = int(episode_counter)
+            current_memory_state = {
+                key: value for key, value in current_memory_state.items() if key[0] != old_episode_counter
+            }
+            for archive_state in archive_memory_states:
+                stale_keys = [key for key in archive_state if key[0] == old_episode_counter]
+                for key in stale_keys:
+                    del archive_state[key]
             episode_counter += 1
             episode_steps = 0
             episode_had_crash = False
@@ -1513,6 +1756,10 @@ def collect_rollout(
     action_masks = np.stack([tr.action_mask for tr in transitions], axis=0).astype(bool)
     old_log_probs = np.asarray([tr.log_prob for tr in transitions], dtype=np.float32)
     old_values = np.asarray([tr.value for tr in transitions], dtype=np.float32)
+    policy_step_memories = np.stack([tr.policy_step_memory for tr in transitions], axis=0).astype(
+        _memory_storage_dtype(cfg),
+        copy=False,
+    )
     dones = np.asarray([tr.done for tr in transitions], dtype=bool)
     env_penalties = np.asarray([tr.env_penalty for tr in transitions], dtype=np.float32)
     transition_scene_indices = np.asarray([tr.scene_index for tr in transitions], dtype=np.int64)
@@ -1585,6 +1832,7 @@ def collect_rollout(
         num_env_steps=env_steps,
         num_agent_steps=len(transitions),
         vehicle_ids=rollout_vehicle_ids,
+        policy_step_memories=policy_step_memories,
         challenge_pressures=challenge_pressures,
         challenge_payoffs=challenge_payoffs,
         challenge_bonuses=np.zeros(len(transitions), dtype=np.float32),
@@ -1714,6 +1962,10 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
             [_transition_array(batch.vehicle_ids, batch.num_agent_steps, dtype=np.int64, fill=-1) for batch in batches],
             axis=0,
         ).astype(np.int64),
+        policy_step_memories=np.concatenate(
+            [batch.policy_step_memories for batch in batches],
+            axis=0,
+        ).astype(_memory_storage_dtype(cfg), copy=False),
         challenge_pressures=np.concatenate(
             [
                 _transition_array(batch.challenge_pressures, batch.num_agent_steps, dtype=np.float32)
@@ -2027,6 +2279,10 @@ def subsample_rollout_for_training(
             dtype=np.int64,
             fill=-1,
         )[selected_indices].astype(np.int64, copy=False),
+        policy_step_memories=rollout.policy_step_memories[selected_indices].astype(
+            _memory_storage_dtype(cfg),
+            copy=False,
+        ),
         challenge_pressures=_transition_array(
             rollout.challenge_pressures,
             rollout.num_agent_steps,
@@ -2181,6 +2437,9 @@ def _rollout_worker(
         transformer_temporal_module=bool(getattr(cfg, "transformer_temporal_module", False)),
         transformer_temporal_kernel_size=int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
         transformer_temporal_layers=int(getattr(cfg, "transformer_temporal_layers", 1)),
+        transformer_memory_tokens=int(getattr(cfg, "transformer_memory_tokens", 8)),
+        transformer_memory_context_length=int(getattr(cfg, "transformer_memory_context_length", 32)),
+        transformer_use_causal_attention=bool(getattr(cfg, "transformer_use_causal_attention", True)),
         centralized_critic=centralized_critic_enabled(cfg),
         critic_obs_dim=int(critic_obs_dim),
         central_critic_pooling=str(getattr(cfg, "central_critic_pooling", "flat")),
@@ -2652,6 +2911,328 @@ def update_discriminator(
     }
 
 
+def _recurrent_rollout_chunks(
+    rollout: RolloutBatch,
+    *,
+    sequence_length: int,
+) -> list[tuple[np.ndarray, int, int]]:
+    chunks: list[tuple[np.ndarray, int, int]] = []
+    seq_len = max(1, int(sequence_length))
+    for trajectory_id in np.unique(rollout.trajectory_ids):
+        indices = np.nonzero(rollout.trajectory_ids == int(trajectory_id))[0].astype(np.int64)
+        if indices.size == 0:
+            continue
+        for start in range(0, int(indices.size), seq_len):
+            end = min(int(indices.size), start + seq_len)
+            if end > start:
+                chunks.append((indices, start, end))
+    return chunks
+
+
+def _update_recurrent_policy(
+    policy: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    rollout: RolloutBatch,
+    cfg: PSGAILConfig,
+    device: torch.device,
+    *,
+    expert_policy_observations: np.ndarray | None = None,
+    expert_actions: np.ndarray | None = None,
+) -> dict[str, float]:
+    was_training = policy.training
+    policy.eval()
+    cpu_device = torch.device("cpu")
+    action_tensor = (
+        torch.as_tensor(rollout.actions, dtype=torch.float32, device=cpu_device)
+        if _is_continuous(cfg)
+        else torch.as_tensor(rollout.actions, dtype=torch.long, device=cpu_device)
+    )
+    obs_tensor = torch.as_tensor(rollout.policy_observations, dtype=torch.float32, device=cpu_device)
+    critic_obs_tensor = torch.as_tensor(rollout.critic_observations, dtype=torch.float32, device=cpu_device)
+    action_mask_tensor = (
+        torch.as_tensor(rollout.action_masks, dtype=torch.bool, device=cpu_device)
+        if not _is_continuous(cfg)
+        and bool(getattr(cfg, "enable_action_masking", True))
+        and rollout.action_masks.size
+        else None
+    )
+    old_log_probs_tensor = torch.as_tensor(rollout.old_log_probs, dtype=torch.float32, device=cpu_device)
+    returns_tensor = torch.as_tensor(rollout.returns, dtype=torch.float32, device=cpu_device)
+    advantages_tensor = torch.as_tensor(rollout.advantages, dtype=torch.float32, device=cpu_device)
+    bc_coef = max(0.0, float(getattr(cfg, "policy_bc_regularization_coef", 0.0)))
+    if bc_coef > 0.0:
+        if not _is_continuous(cfg):
+            raise ValueError("policy_bc_regularization_coef currently requires continuous action mode.")
+        if expert_policy_observations is None or expert_actions is None:
+            raise ValueError("policy_bc_regularization_coef requires expert policy observations and actions.")
+        expert_obs_tensor = torch.as_tensor(
+            np.asarray(expert_policy_observations, dtype=np.float32),
+            dtype=torch.float32,
+            device=cpu_device,
+        )
+        expert_action_tensor = torch.as_tensor(
+            np.clip(np.asarray(expert_actions, dtype=np.float32), -1.0, 1.0),
+            dtype=torch.float32,
+            device=cpu_device,
+        )
+    else:
+        expert_obs_tensor = None
+        expert_action_tensor = None
+
+    chunks = _recurrent_rollout_chunks(
+        rollout,
+        sequence_length=int(getattr(cfg, "transformer_recurrent_sequence_length", 32)),
+    )
+    if not chunks:
+        raise RuntimeError("Recurrent PPO received no trajectory chunks.")
+
+    seqs_per_batch = max(1, int(getattr(cfg, "transformer_recurrent_sequences_per_batch", 32)))
+    micro_sequences = max(
+        1,
+        min(seqs_per_batch, int(getattr(cfg, "transformer_recurrent_micro_batch_sequences", 8))),
+    )
+    rng = np.random.default_rng(int(getattr(cfg, "seed", 0)) + int(rollout.num_agent_steps))
+    policy_losses: list[float] = []
+    value_losses: list[float] = []
+    entropies: list[float] = []
+    approx_kls: list[float] = []
+    clip_fractions: list[float] = []
+    ratio_means: list[float] = []
+    ratio_stds: list[float] = []
+    bc_losses: list[float] = []
+    post_update_approx_kl = float("nan")
+    post_update_ratio_mean = float("nan")
+    post_update_ratio_std = float("nan")
+
+    def cpu_to_device(tensor: torch.Tensor) -> torch.Tensor:
+        if device.type == "cuda":
+            return tensor.pin_memory().to(device=device, non_blocking=True)
+        return tensor.to(device=device)
+
+    def make_micro_indices(micro_chunks: list[tuple[np.ndarray, int, int]]) -> tuple[np.ndarray, np.ndarray]:
+        max_len = max(end - start for _indices, start, end in micro_chunks)
+        indices = np.full((len(micro_chunks), max_len), -1, dtype=np.int64)
+        valid = np.zeros((len(micro_chunks), max_len), dtype=bool)
+        for row, (trajectory_indices, start, end) in enumerate(micro_chunks):
+            values = trajectory_indices[start:end]
+            indices[row, : len(values)] = values
+            valid[row, : len(values)] = True
+        return indices, valid
+
+    def make_initial_memory(micro_chunks: list[tuple[np.ndarray, int, int]]) -> torch.Tensor:
+        memories = [
+            _recurrent_memory_cache_from_prior_steps(
+                policy,
+                cfg,
+                rollout,
+                trajectory_indices,
+                start,
+                device,
+            )
+            for trajectory_indices, start, _end in micro_chunks
+        ]
+        return torch.cat([memory for memory in memories if memory is not None], dim=0)
+
+    def recurrent_micro_forward(
+        micro_chunks: list[tuple[np.ndarray, int, int]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        index_matrix, valid_matrix = make_micro_indices(micro_chunks)
+        batch_count, max_len = index_matrix.shape
+        memory = make_initial_memory(micro_chunks)
+        policy_terms: list[torch.Tensor] = []
+        value_terms: list[torch.Tensor] = []
+        entropy_terms: list[torch.Tensor] = []
+        approx_kl_terms: list[torch.Tensor] = []
+        ratios: list[torch.Tensor] = []
+        valid_count = 0
+        for step in range(max_len):
+            step_indices = index_matrix[:, step]
+            active_np = valid_matrix[:, step]
+            active = torch.as_tensor(active_np, dtype=torch.bool, device=device)
+            if not bool(active.any()):
+                continue
+            safe_indices = np.where(active_np, step_indices, step_indices[active_np][0])
+            safe_index_tensor = torch.as_tensor(safe_indices, dtype=torch.long, device=cpu_device)
+            obs = cpu_to_device(obs_tensor[safe_index_tensor])
+            critic_obs = cpu_to_device(critic_obs_tensor[safe_index_tensor])
+            actions = cpu_to_device(action_tensor[safe_index_tensor])
+            old_log_probs = cpu_to_device(old_log_probs_tensor[safe_index_tensor])
+            returns = cpu_to_device(returns_tensor[safe_index_tensor])
+            advantages = cpu_to_device(advantages_tensor[safe_index_tensor])
+            masks = (
+                cpu_to_device(action_mask_tensor[safe_index_tensor])
+                if action_mask_tensor is not None
+                else None
+            )
+            dist, values, step_memory = policy_distribution_values_memory(
+                policy,
+                obs,
+                cfg,
+                masks,
+                critic_obs_tensor=critic_obs,
+                memory=memory,
+                return_memory=True,
+            )
+            if step_memory is None:
+                raise RuntimeError("Recurrent policy did not return step memory.")
+            log_probs = dist.log_prob(actions)
+            active_log_probs = log_probs[active]
+            active_old_log_probs = old_log_probs[active]
+            active_advantages = advantages[active]
+            active_returns = returns[active]
+            active_values = values[active]
+            log_ratio = active_log_probs - active_old_log_probs
+            ratio = torch.exp(log_ratio)
+            clipped_ratio = torch.clamp(ratio, 1.0 - cfg.clip_range, 1.0 + cfg.clip_range)
+            policy_terms.append(-torch.min(ratio * active_advantages, clipped_ratio * active_advantages))
+            value_terms.append(torch.square(active_values - active_returns))
+            entropy_terms.append(dist.entropy()[active])
+            approx_kl_terms.append((ratio - 1.0) - log_ratio)
+            ratios.append(ratio)
+            valid_count += int(active_np.sum())
+            shifted = _shift_recurrent_memory(memory, step_memory)
+            memory = torch.where(active[:, None, None, None], shifted, memory)
+        if valid_count <= 0:
+            raise RuntimeError("Recurrent PPO micro-batch had no valid transitions.")
+        policy_values = torch.cat(policy_terms, dim=0)
+        value_values = torch.cat(value_terms, dim=0)
+        entropy_values = torch.cat(entropy_terms, dim=0)
+        approx_kl_values = torch.cat(approx_kl_terms, dim=0)
+        ratio_values = torch.cat(ratios, dim=0)
+        return (
+            policy_values.mean(),
+            value_values.mean(),
+            entropy_values.mean(),
+            approx_kl_values.mean(),
+            ratio_values,
+            valid_count,
+        )
+
+    try:
+        for _epoch in range(int(cfg.ppo_epochs)):
+            order = rng.permutation(len(chunks))
+            shuffled = [chunks[int(index)] for index in order]
+            for start in range(0, len(shuffled), seqs_per_batch):
+                batch_chunks = shuffled[start : start + seqs_per_batch]
+                batch_transition_count = sum(end - chunk_start for _indices, chunk_start, end in batch_chunks)
+                optimizer.zero_grad(set_to_none=True)
+                weighted_policy_loss = 0.0
+                weighted_value_loss = 0.0
+                weighted_entropy = 0.0
+                weighted_approx_kl = 0.0
+                weighted_clip_fraction = 0.0
+                weighted_ratio_mean = 0.0
+                weighted_ratio_std = 0.0
+                for micro_start in range(0, len(batch_chunks), micro_sequences):
+                    micro_chunks = batch_chunks[micro_start : micro_start + micro_sequences]
+                    (
+                        policy_loss,
+                        value_loss,
+                        entropy,
+                        approx_kl,
+                        ratio,
+                        valid_count,
+                    ) = recurrent_micro_forward(micro_chunks)
+                    micro_weight = float(valid_count) / float(max(1, batch_transition_count))
+                    loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
+                    bc_loss = None
+                    if bc_coef > 0.0 and expert_obs_tensor is not None and expert_action_tensor is not None:
+                        expert_idx = torch.randint(
+                            0,
+                            int(expert_obs_tensor.shape[0]),
+                            (valid_count,),
+                            device=cpu_device,
+                        )
+                        expert_obs = cpu_to_device(expert_obs_tensor[expert_idx])
+                        expert_actions_for_bc = cpu_to_device(expert_action_tensor[expert_idx])
+                        expert_memory = policy.initial_memory(
+                            int(expert_obs.shape[0]),
+                            device=device,
+                            dtype=expert_obs.dtype,
+                        )
+                        pred_expert_actions, _values, _memory = policy(
+                            expert_obs,
+                            memory=expert_memory,
+                            return_memory=True,
+                        )
+                        bc_loss = F.mse_loss(pred_expert_actions, expert_actions_for_bc)
+                        loss = loss + bc_coef * bc_loss
+                    (loss * micro_weight).backward()
+                    with torch.no_grad():
+                        clip_fraction = (
+                            (torch.abs(ratio - 1.0) > float(cfg.clip_range)).float().mean()
+                        )
+                        weighted_policy_loss += micro_weight * float(policy_loss.detach().cpu().item())
+                        weighted_value_loss += micro_weight * float(value_loss.detach().cpu().item())
+                        weighted_entropy += micro_weight * float(entropy.detach().cpu().item())
+                        weighted_approx_kl += micro_weight * float(approx_kl.detach().cpu().item())
+                        weighted_clip_fraction += micro_weight * float(clip_fraction.detach().cpu().item())
+                        weighted_ratio_mean += micro_weight * float(ratio.mean().detach().cpu().item())
+                        weighted_ratio_std += micro_weight * float(
+                            ratio.std(unbiased=False).detach().cpu().item()
+                        )
+                        if bc_loss is not None:
+                            bc_losses.append(float(bc_loss.detach().cpu().item()))
+                nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+                optimizer.step()
+                policy_losses.append(weighted_policy_loss)
+                value_losses.append(weighted_value_loss)
+                entropies.append(weighted_entropy)
+                approx_kls.append(weighted_approx_kl)
+                clip_fractions.append(weighted_clip_fraction)
+                ratio_means.append(weighted_ratio_mean)
+                ratio_stds.append(weighted_ratio_std)
+
+        diagnostic_chunks = chunks[: min(len(chunks), max(1, seqs_per_batch))]
+        if diagnostic_chunks:
+            diagnostic_transition_count = sum(end - start for _indices, start, end in diagnostic_chunks)
+            weighted_post_kl = 0.0
+            weighted_post_ratio_mean = 0.0
+            weighted_post_ratio_std = 0.0
+            with torch.no_grad():
+                for micro_start in range(0, len(diagnostic_chunks), micro_sequences):
+                    micro_chunks = diagnostic_chunks[micro_start : micro_start + micro_sequences]
+                    _pl, _vl, _ent, approx_kl, ratio, valid_count = recurrent_micro_forward(micro_chunks)
+                    micro_weight = float(valid_count) / float(max(1, diagnostic_transition_count))
+                    weighted_post_kl += micro_weight * float(approx_kl.detach().cpu().item())
+                    weighted_post_ratio_mean += micro_weight * float(ratio.mean().detach().cpu().item())
+                    weighted_post_ratio_std += micro_weight * float(
+                        ratio.std(unbiased=False).detach().cpu().item()
+                    )
+            post_update_approx_kl = weighted_post_kl
+            post_update_ratio_mean = weighted_post_ratio_mean
+            post_update_ratio_std = weighted_post_ratio_std
+    finally:
+        if was_training:
+            policy.train()
+
+    stats = {
+        "policy_loss": float(np.mean(policy_losses)),
+        "value_loss": float(np.mean(value_losses)),
+        "entropy": float(np.mean(entropies)),
+        "approx_kl": float(np.mean(approx_kls)),
+        "post_update_approx_kl": float(post_update_approx_kl),
+        "clip_fraction": float(np.mean(clip_fractions)),
+        "ratio_mean": float(np.mean(ratio_means)),
+        "ratio_std": float(np.mean(ratio_stds)),
+        "post_update_ratio_mean": float(post_update_ratio_mean),
+        "post_update_ratio_std": float(post_update_ratio_std),
+        "advantage_mean": float(np.mean(rollout.advantages)) if rollout.advantages.size else 0.0,
+        "advantage_std": float(np.std(rollout.advantages)) if rollout.advantages.size else 0.0,
+        "bc_regularization_loss": float(np.mean(bc_losses)) if bc_losses else 0.0,
+        "bc_regularization_coef": float(bc_coef),
+        "ppo_micro_batch_size": float(micro_sequences),
+        "transformer_recurrent_chunks": float(len(chunks)),
+        "transformer_recurrent_sequence_length": float(
+            int(getattr(cfg, "transformer_recurrent_sequence_length", 32))
+        ),
+    }
+    stats.update(recurrent_memory_stats(rollout))
+    if device.type == "cuda":
+        stats["perf/cuda_max_memory_mb"] = float(torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0))
+    return stats
+
+
 def update_policy(
     policy: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -2662,6 +3243,16 @@ def update_policy(
     expert_policy_observations: np.ndarray | None = None,
     expert_actions: np.ndarray | None = None,
 ) -> dict[str, float]:
+    if recurrent_policy_enabled(policy):
+        return _update_recurrent_policy(
+            policy,
+            optimizer,
+            rollout,
+            cfg,
+            device,
+            expert_policy_observations=expert_policy_observations,
+            expert_actions=expert_actions,
+        )
     was_training = policy.training
     # Rollout log-probabilities are collected with policy.eval(). Keeping PPO
     # forwards in eval mode prevents dropout from corrupting the likelihood
@@ -2728,7 +3319,7 @@ def update_policy(
     configured_micro_batch_size = int(getattr(cfg, "ppo_micro_batch_size", 0))
     if configured_micro_batch_size > 0:
         micro_batch_size = max(1, min(batch_size, configured_micro_batch_size))
-    elif str(getattr(cfg, "policy_model", "")).lower() == "transformer":
+    elif str(getattr(cfg, "policy_model", "")).lower() in {"transformer", "recurrent_transformer"}:
         micro_batch_size = min(batch_size, 128)
     else:
         micro_batch_size = batch_size

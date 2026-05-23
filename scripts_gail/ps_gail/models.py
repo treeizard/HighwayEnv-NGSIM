@@ -390,6 +390,318 @@ class TransformerActorCritic(nn.Module):
         return policy_out, self.value(obs, critic_obs, encoded_actor=encoded)
 
 
+class RecurrentTransformerActorCritic(nn.Module):
+    """Attention policy over current sensor tokens plus bounded per-agent memory.
+
+    The memory interface intentionally stores multiple transformer tokens rather
+    than one recurrent hidden vector. Rollout code owns the per-vehicle cache and
+    passes it back into the model on the next decision.
+    """
+
+    supports_recurrent_memory = True
+
+    def __init__(
+        self,
+        obs_dim: int,
+        hidden_size: int,
+        num_actions: int = NUM_DISCRETE_META_ACTIONS,
+        *,
+        action_mode: str = "discrete",
+        continuous_action_dim: int = 2,
+        num_layers: int = 2,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        memory_tokens: int = 8,
+        memory_context_length: int = 32,
+        use_causal_attention: bool = True,
+        centralized_critic: bool = False,
+        critic_obs_dim: int | None = None,
+        central_critic_pooling: str = "flat",
+        central_critic_max_vehicles: int = 64,
+        central_critic_attention_heads: int = 4,
+    ) -> None:
+        super().__init__()
+        self.action_mode = str(action_mode).lower()
+        self.continuous_action_dim = int(continuous_action_dim)
+        self.obs_dim = int(obs_dim)
+        self.hidden_size = int(hidden_size)
+        self.memory_tokens = max(1, int(memory_tokens))
+        self.memory_context_length = max(1, int(memory_context_length))
+        self.use_causal_attention = bool(use_causal_attention)
+        self.centralized_critic = bool(centralized_critic)
+        self.critic_obs_dim = int(critic_obs_dim if critic_obs_dim is not None else obs_dim)
+
+        num_heads = max(1, int(num_heads))
+        if self.hidden_size % num_heads != 0:
+            raise ValueError(
+                f"hidden_size={hidden_size} must be divisible by transformer_heads={num_heads}."
+            )
+
+        self.ego_dim = 3
+        self.lane_camera_cells = 21
+        self.lane_feature_dim = 3
+        lane_flat_dim = self.lane_camera_cells * self.lane_feature_dim
+        sensor_dim = self.obs_dim - self.ego_dim
+        lidar_flat_dim = sensor_dim - lane_flat_dim
+        self.semantic_tokenization = sensor_dim > lane_flat_dim and lidar_flat_dim > 0 and lidar_flat_dim % 2 == 0
+        if self.semantic_tokenization:
+            self.lidar_feature_dim = 2
+            self.lidar_cells = lidar_flat_dim // self.lidar_feature_dim
+            self.lane_flat_dim = lane_flat_dim
+            self.lidar_flat_dim = lidar_flat_dim
+            self.max_current_tokens = 1 + self.ego_dim + self.lidar_cells + self.lane_camera_cells
+        else:
+            self.lidar_feature_dim = 0
+            self.lidar_cells = 0
+            self.lane_flat_dim = 0
+            self.lidar_flat_dim = 0
+            self.max_current_tokens = 1 + self.obs_dim
+
+        self.policy_token = nn.Parameter(torch.zeros(1, 1, self.hidden_size))
+        self.type_embedding = nn.Embedding(5, self.hidden_size)
+        self.current_position_embedding = nn.Parameter(
+            torch.zeros(1, self.max_current_tokens, self.hidden_size)
+        )
+        self.memory_position_embedding = nn.Parameter(
+            torch.zeros(1, self.memory_context_length, 1, self.hidden_size)
+        )
+        self.memory_slot_embedding = nn.Parameter(
+            torch.zeros(1, 1, self.memory_tokens, self.hidden_size)
+        )
+        self.scalar_proj = nn.Linear(1, self.hidden_size)
+        self.ego_proj = nn.Linear(1, self.hidden_size)
+        self.lidar_proj = nn.Linear(2, self.hidden_size)
+        self.lane_proj = nn.Linear(3, self.hidden_size)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_size,
+            nhead=num_heads,
+            dim_feedforward=self.hidden_size * 4,
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=max(1, int(num_layers)),
+            norm=nn.LayerNorm(self.hidden_size),
+        )
+        self.memory_query = nn.Parameter(torch.zeros(1, self.memory_tokens, self.hidden_size))
+        self.memory_pool = nn.MultiheadAttention(
+            embed_dim=self.hidden_size,
+            num_heads=num_heads,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.memory_norm = nn.LayerNorm(self.hidden_size)
+
+        if self.action_mode == "continuous":
+            self.policy_head = nn.Linear(self.hidden_size, self.continuous_action_dim)
+            self.log_std = nn.Parameter(torch.full((self.continuous_action_dim,), -0.5))
+        elif self.action_mode == "discrete":
+            self.policy_head = nn.Linear(self.hidden_size, num_actions)
+            self.log_std = None
+        else:
+            raise ValueError(f"Unsupported action_mode={action_mode!r}.")
+        self.critic_encoder = (
+            make_centralized_critic_encoder(
+                self.critic_obs_dim,
+                self.hidden_size,
+                pooling=central_critic_pooling,
+                max_vehicles=central_critic_max_vehicles,
+                attention_heads=central_critic_attention_heads,
+            )
+            if self.centralized_critic
+            else None
+        )
+        self.value_head = nn.Linear(self.hidden_size, 1)
+
+        nn.init.normal_(self.policy_token, std=0.02)
+        nn.init.normal_(self.current_position_embedding, std=0.02)
+        nn.init.normal_(self.memory_position_embedding, std=0.02)
+        nn.init.normal_(self.memory_slot_embedding, std=0.02)
+        nn.init.normal_(self.memory_query, std=0.02)
+
+    def initial_memory(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        return torch.zeros(
+            (
+                int(batch_size),
+                self.memory_context_length,
+                self.memory_tokens,
+                self.hidden_size,
+            ),
+            dtype=dtype or self.policy_token.dtype,
+            device=device or self.policy_token.device,
+        )
+
+    def _type_tokens(self, token_type: int, batch_size: int, count: int, device: torch.device) -> torch.Tensor:
+        ids = torch.full((int(batch_size), int(count)), int(token_type), dtype=torch.long, device=device)
+        return self.type_embedding(ids)
+
+    def _build_current_tokens(self, obs: torch.Tensor) -> torch.Tensor:
+        batch_size = int(obs.shape[0])
+        policy = self.policy_token.expand(batch_size, -1, -1)
+        policy = policy + self._type_tokens(0, batch_size, 1, obs.device)
+        if self.semantic_tokenization:
+            lidar = obs[:, : self.lidar_flat_dim].reshape(batch_size, self.lidar_cells, 2)
+            lane_start = self.lidar_flat_dim
+            lane_end = lane_start + self.lane_flat_dim
+            lane = obs[:, lane_start:lane_end].reshape(batch_size, self.lane_camera_cells, 3)
+            ego = obs[:, -self.ego_dim :].reshape(batch_size, self.ego_dim, 1)
+            tokens = torch.cat(
+                [
+                    policy,
+                    self.ego_proj(ego) + self._type_tokens(1, batch_size, self.ego_dim, obs.device),
+                    self.lidar_proj(lidar) + self._type_tokens(2, batch_size, self.lidar_cells, obs.device),
+                    self.lane_proj(lane) + self._type_tokens(3, batch_size, self.lane_camera_cells, obs.device),
+                ],
+                dim=1,
+            )
+        else:
+            scalar_tokens = self.scalar_proj(obs.unsqueeze(-1))
+            scalar_tokens = scalar_tokens + self._type_tokens(4, batch_size, self.obs_dim, obs.device)
+            tokens = torch.cat([policy, scalar_tokens], dim=1)
+        return tokens + self.current_position_embedding[:, : tokens.shape[1]]
+
+    def _prepare_memory(self, obs: torch.Tensor, memory: torch.Tensor | None) -> torch.Tensor:
+        batch_size = int(obs.shape[0])
+        if memory is None:
+            memory = self.initial_memory(batch_size, device=obs.device, dtype=obs.dtype)
+        else:
+            memory = memory.to(device=obs.device, dtype=obs.dtype)
+            if memory.ndim == 3:
+                memory = memory.unsqueeze(1)
+            if memory.ndim != 4:
+                raise ValueError(
+                    "Recurrent transformer memory must have shape "
+                    f"[B, T, M, H] or [B, M, H], got {tuple(memory.shape)}."
+                )
+            if memory.shape[0] != batch_size:
+                raise ValueError(f"Memory batch mismatch: {memory.shape[0]} != {batch_size}.")
+            if memory.shape[2] != self.memory_tokens or memory.shape[3] != self.hidden_size:
+                raise ValueError(
+                    "Memory token shape mismatch: expected "
+                    f"[*, *, {self.memory_tokens}, {self.hidden_size}], got {tuple(memory.shape)}."
+                )
+            if memory.shape[1] > self.memory_context_length:
+                memory = memory[:, -self.memory_context_length :]
+        if memory.shape[1] < self.memory_context_length:
+            pad = torch.zeros(
+                (
+                    batch_size,
+                    self.memory_context_length - int(memory.shape[1]),
+                    self.memory_tokens,
+                    self.hidden_size,
+                ),
+                dtype=memory.dtype,
+                device=memory.device,
+            )
+            memory = torch.cat([pad, memory], dim=1)
+        positions = self.memory_position_embedding[:, -int(memory.shape[1]) :]
+        slots = self.memory_slot_embedding[:, :, : self.memory_tokens]
+        memory = memory + positions + slots
+        memory = memory + self.type_embedding(
+            torch.full(
+                memory.shape[:-1],
+                4,
+                dtype=torch.long,
+                device=memory.device,
+            )
+        )
+        return memory.reshape(batch_size, -1, self.hidden_size)
+
+    def _attention_mask(self, memory_token_count: int, current_token_count: int, device: torch.device) -> torch.Tensor | None:
+        if not self.use_causal_attention or memory_token_count <= 0:
+            return None
+        total = int(memory_token_count) + int(current_token_count)
+        mask = torch.zeros((total, total), dtype=torch.bool, device=device)
+        mask[:memory_token_count, memory_token_count:] = True
+        return mask
+
+    def _encode_actor(
+        self,
+        obs: torch.Tensor,
+        memory: torch.Tensor | None = None,
+        *,
+        return_memory: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        current_tokens = self._build_current_tokens(obs)
+        memory_tokens = self._prepare_memory(obs, memory)
+        tokens = torch.cat([memory_tokens, current_tokens], dim=1)
+        attention_mask = self._attention_mask(memory_tokens.shape[1], current_tokens.shape[1], obs.device)
+        encoded = self.encoder(tokens, mask=attention_mask)
+        current_encoded = encoded[:, memory_tokens.shape[1] :]
+        actor_encoded = current_encoded[:, 0]
+        if not return_memory:
+            return actor_encoded
+        queries = self.memory_query.expand(obs.shape[0], -1, -1)
+        pooled, _weights = self.memory_pool(queries, current_encoded, current_encoded, need_weights=False)
+        new_memory = self.memory_norm(queries + pooled)
+        return actor_encoded, new_memory
+
+    def actor(self, obs: torch.Tensor, memory: torch.Tensor | None = None) -> torch.Tensor:
+        encoded = self._encode_actor(obs, memory)
+        if isinstance(encoded, tuple):
+            encoded = encoded[0]
+        policy_out = self.policy_head(encoded)
+        if self.action_mode == "continuous":
+            policy_out = torch.tanh(policy_out)
+        return policy_out
+
+    def value(
+        self,
+        obs: torch.Tensor,
+        critic_obs: torch.Tensor | None = None,
+        *,
+        encoded_actor: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.centralized_critic:
+            if critic_obs is None:
+                critic_obs = torch.zeros(
+                    (obs.shape[0], self.critic_obs_dim),
+                    dtype=obs.dtype,
+                    device=obs.device,
+                )
+            if self.critic_encoder is None:
+                raise RuntimeError("Centralized critic is enabled without a critic encoder.")
+            encoded = self.critic_encoder(critic_obs)
+        else:
+            encoded = encoded_actor if encoded_actor is not None else self._encode_actor(obs)
+            if isinstance(encoded, tuple):
+                encoded = encoded[0]
+        return self.value_head(encoded).squeeze(-1)
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        critic_obs: torch.Tensor | None = None,
+        *,
+        memory: torch.Tensor | None = None,
+        return_memory: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        encoded = self._encode_actor(obs, memory, return_memory=return_memory)
+        if return_memory:
+            actor_encoded, new_memory = encoded
+        else:
+            actor_encoded = encoded
+            new_memory = None
+        policy_out = self.policy_head(actor_encoded)
+        if self.action_mode == "continuous":
+            policy_out = torch.tanh(policy_out)
+        values = self.value(obs, critic_obs, encoded_actor=actor_encoded)
+        if return_memory:
+            if new_memory is None:
+                raise RuntimeError("Recurrent transformer did not produce memory.")
+            return policy_out, values, new_memory
+        return policy_out, values
+
+
 def make_actor_critic(
     policy_model: str,
     obs_dim: int,
@@ -403,6 +715,9 @@ def make_actor_critic(
     transformer_temporal_module: bool = False,
     transformer_temporal_kernel_size: int = 5,
     transformer_temporal_layers: int = 1,
+    transformer_memory_tokens: int = 8,
+    transformer_memory_context_length: int = 32,
+    transformer_use_causal_attention: bool = True,
     centralized_critic: bool = False,
     critic_obs_dim: int | None = None,
     central_critic_pooling: str = "flat",
@@ -440,7 +755,28 @@ def make_actor_critic(
             central_critic_max_vehicles=central_critic_max_vehicles,
             central_critic_attention_heads=central_critic_attention_heads,
         )
-    raise ValueError(f"Unsupported policy_model={policy_model!r}. Expected 'mlp' or 'transformer'.")
+    if model_name == "recurrent_transformer":
+        return RecurrentTransformerActorCritic(
+            obs_dim,
+            hidden_size,
+            action_mode=action_mode,
+            continuous_action_dim=continuous_action_dim,
+            num_layers=transformer_layers,
+            num_heads=transformer_heads,
+            dropout=transformer_dropout,
+            memory_tokens=transformer_memory_tokens,
+            memory_context_length=transformer_memory_context_length,
+            use_causal_attention=transformer_use_causal_attention,
+            centralized_critic=centralized_critic,
+            critic_obs_dim=critic_obs_dim,
+            central_critic_pooling=central_critic_pooling,
+            central_critic_max_vehicles=central_critic_max_vehicles,
+            central_critic_attention_heads=central_critic_attention_heads,
+        )
+    raise ValueError(
+        f"Unsupported policy_model={policy_model!r}. "
+        "Expected 'mlp', 'transformer', or 'recurrent_transformer'."
+    )
 
 
 class TrajectoryDiscriminator(nn.Module):

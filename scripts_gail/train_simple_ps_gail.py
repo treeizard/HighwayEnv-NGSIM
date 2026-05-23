@@ -47,6 +47,7 @@ from scripts_gail.ps_gail.trainer import (
     infer_policy_obs_dim,
     make_rollout_executor,
     policy_action_dim,
+    recurrent_policy_enabled,
     refresh_rollout_rewards,
     resolve_device,
     set_optimizer_lr,
@@ -229,11 +230,19 @@ def _policy_action_tuple(
     device: torch.device,
     deterministic: bool,
     cfg: PSGAILConfig,
-) -> tuple[object, ...]:
+    memory: torch.Tensor | None = None,
+    return_memory: bool = False,
+) -> tuple[object, ...] | tuple[tuple[object, ...], torch.Tensor | None]:
     obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
     with torch.no_grad():
         obs_tensor = torch.as_tensor(obs_agents, dtype=torch.float32, device=device)
-        policy_out, _values = policy(obs_tensor)
+        if recurrent_policy_enabled(policy) and memory is not None and int(memory.shape[0]) != len(obs_agents):
+            memory = policy.initial_memory(len(obs_agents), device=device, dtype=torch.float32)
+        if recurrent_policy_enabled(policy):
+            policy_out, _values, new_memory = policy(obs_tensor, memory=memory, return_memory=True)
+        else:
+            policy_out, _values = policy(obs_tensor)
+            new_memory = None
         if str(policy.action_mode).lower() == "continuous":
             if deterministic:
                 actions = policy_out
@@ -243,7 +252,8 @@ def _policy_action_tuple(
                 std = torch.exp(policy.log_std).expand_as(policy_out)
                 actions = Independent(Normal(policy_out, std), 1).sample()
             actions_np = torch.clamp(actions, -1.0, 1.0).detach().cpu().numpy().astype(np.float32)
-            return tuple(action.copy() for action in actions_np)
+            action_tuple = tuple(action.copy() for action in actions_np)
+            return (action_tuple, new_memory) if return_memory else action_tuple
         if bool(getattr(cfg, "enable_action_masking", True)):
             masks = discrete_action_masks_from_env(
                 env,
@@ -257,7 +267,8 @@ def _policy_action_tuple(
             actions = torch.argmax(policy_out, dim=-1)
         else:
             actions = Categorical(logits=policy_out).sample()
-    return tuple(int(action) for action in actions.detach().cpu().numpy().tolist())
+    action_tuple = tuple(int(action) for action in actions.detach().cpu().numpy().tolist())
+    return (action_tuple, new_memory) if return_memory else action_tuple
 
 
 def save_checkpoint_video(
@@ -294,15 +305,36 @@ def save_checkpoint_video(
         frame = video_env.render()
         if frame is not None:
             frames.append(np.asarray(frame))
-        for _step in range(max(1, int(cfg.checkpoint_video_steps))):
-            action = _policy_action_tuple(
-                policy,
-                obs,
-                video_env,
+        video_memory = (
+            policy.initial_memory(
+                len(policy_observations_from_flat(flatten_agent_observations(obs))),
                 device=device,
-                deterministic=bool(cfg.checkpoint_video_deterministic),
-                cfg=cfg,
+                dtype=torch.float32,
             )
+            if recurrent_policy_enabled(policy)
+            else None
+        )
+        for _step in range(max(1, int(cfg.checkpoint_video_steps))):
+            if recurrent_policy_enabled(policy):
+                action, video_memory = _policy_action_tuple(
+                    policy,
+                    obs,
+                    video_env,
+                    device=device,
+                    deterministic=bool(cfg.checkpoint_video_deterministic),
+                    cfg=cfg,
+                    memory=video_memory,
+                    return_memory=True,
+                )
+            else:
+                action = _policy_action_tuple(
+                    policy,
+                    obs,
+                    video_env,
+                    device=device,
+                    deterministic=bool(cfg.checkpoint_video_deterministic),
+                    cfg=cfg,
+                )
             obs, _reward, terminated, truncated, _info = video_env.step(action)
             frame = video_env.render()
             if frame is not None:
@@ -362,7 +394,7 @@ def behavior_clone_pretrain(
     configured_micro_batch_size = int(getattr(cfg, "bc_pretrain_micro_batch_size", 0))
     if configured_micro_batch_size > 0:
         micro_batch_size = max(1, min(batch_size, configured_micro_batch_size))
-    elif str(getattr(cfg, "policy_model", "")).lower() == "transformer":
+    elif str(getattr(cfg, "policy_model", "")).lower() in {"transformer", "recurrent_transformer"}:
         micro_batch_size = min(batch_size, 128)
     else:
         micro_batch_size = batch_size
@@ -478,6 +510,15 @@ def evaluate_policy_survival(
     try:
         for episode_idx in range(eval_episodes):
             obs, _info = env.reset(seed=int(cfg.seed) + int(seed_offset) + episode_idx)
+            eval_memory = (
+                policy.initial_memory(
+                    len(policy_observations_from_flat(flatten_agent_observations(obs))),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                if recurrent_policy_enabled(policy)
+                else None
+            )
             episode_had_crash = False
             episode_had_offroad = False
             length = 0
@@ -487,14 +528,26 @@ def evaluate_policy_survival(
                 controlled = list(getattr(env.unwrapped, "controlled_vehicles", ()) or ())
                 controlled_counts.append(len(controlled))
                 road_counts.append(len(road_vehicles))
-                action = _policy_action_tuple(
-                    policy,
-                    obs,
-                    env,
-                    device=device,
-                    deterministic=bool(cfg.bc_pretrain_eval_deterministic),
-                    cfg=cfg,
-                )
+                if recurrent_policy_enabled(policy):
+                    action, eval_memory = _policy_action_tuple(
+                        policy,
+                        obs,
+                        env,
+                        device=device,
+                        deterministic=bool(cfg.bc_pretrain_eval_deterministic),
+                        cfg=cfg,
+                        memory=eval_memory,
+                        return_memory=True,
+                    )
+                else:
+                    action = _policy_action_tuple(
+                        policy,
+                        obs,
+                        env,
+                        device=device,
+                        deterministic=bool(cfg.bc_pretrain_eval_deterministic),
+                        cfg=cfg,
+                    )
                 obs, _reward, terminated, truncated, info = env.step(action)
                 length += 1
                 crash_flags = info.get("controlled_vehicle_crashes", [])
@@ -649,6 +702,9 @@ def main() -> None:
             transformer_temporal_module=bool(getattr(cfg, "transformer_temporal_module", False)),
             transformer_temporal_kernel_size=int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
             transformer_temporal_layers=int(getattr(cfg, "transformer_temporal_layers", 1)),
+            transformer_memory_tokens=int(getattr(cfg, "transformer_memory_tokens", 8)),
+            transformer_memory_context_length=int(getattr(cfg, "transformer_memory_context_length", 32)),
+            transformer_use_causal_attention=bool(getattr(cfg, "transformer_use_causal_attention", True)),
             centralized_critic=bool(cfg.centralized_critic),
             critic_obs_dim=critic_obs_dim,
             central_critic_pooling=str(cfg.central_critic_pooling),
@@ -1367,6 +1423,11 @@ def main() -> None:
                     bool(getattr(round_cfg, "transformer_temporal_module", False))
                 ),
             }
+            for stat_key, stat_value in policy_stats.items():
+                if stat_key.startswith("perf/"):
+                    metrics[stat_key] = float(stat_value)
+                elif stat_key.startswith("transformer_"):
+                    metrics[f"policy/{stat_key}"] = float(stat_value)
             if str(round_cfg.action_mode).lower() == "continuous" and rollout.actions.ndim == 2:
                 action_names = ("acceleration", "steering")
                 for action_idx, action_name in enumerate(action_names[: rollout.actions.shape[1]]):
