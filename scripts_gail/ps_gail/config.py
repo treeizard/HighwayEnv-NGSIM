@@ -1,3 +1,10 @@
+"""Shared CLI-backed configuration for PS-GAIL/AIRL training.
+
+The training scripts auto-generate argparse flags from this dataclass, so fields
+should stay primitive and serializable. Empty strings and zeros are used as
+"disabled/default" sentinels for several schedule-like options.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,16 +12,20 @@ from dataclasses import dataclass
 
 @dataclass
 class PSGAILConfig:
-    expert_data: str = "expert_data/ngsim_ps_traj_expert_discrete_54902119"
+    # Dataset/env identity. These values define the observation/action contract;
+    # changing them can invalidate expert-data compatibility.
+    expert_data: str = "expert_data/ngsim_ps_traj_expert_discrete_54902119" # Define the path of the expert data. 
     run_name: str = "simple_ps_gail"
     resume_checkpoint: str = ""
     scene: str = "us-101"
     action_mode: str = "discrete"
-    continuous_action_dim: int = 2
+    continuous_action_dim: int = 2 # -> [acceleration, lane change]
     episode_root: str = "highway_env/data/processed_20s"
     prebuilt_split: str = "train"
     seed: int = 0
 
+    # Training/Roll out parameters. These values define the amount of simulated rollouts;
+    # changing them can modify how training is to be conducted
     total_rounds: int = 10
     rollout_steps: int = 128
     rollout_min_episodes: int = 1
@@ -25,14 +36,16 @@ class PSGAILConfig:
     rollout_target_episode_safety_factor: float = 1.25
     rollout_training_subsample: bool = True
     rollout_training_agent_steps: int = 0
-    num_rollout_workers: int = 1
-    rollout_worker_threads: int = 1
+
+    # Threads/Training parameters. These values define the training setup and optimization parameters;
+    num_rollout_workers: int = 1 # number of actives worker that will be rolling out trajectories in parallel.
+    rollout_worker_threads: int = 1 # number of active threads can be utilized by each rollout worker. 
     max_expert_samples: int = 100_000
-    trajectory_frame: str = "relative"
+    trajectory_frame: str = "relative" # Parameters that can be utilized for state-only GAIL
     max_surrounding: str | int = "all"
     control_all_vehicles: bool = False
-    percentage_controlled_vehicles: float = 0.2
-    controlled_vehicle_curriculum: bool = False
+    percentage_controlled_vehicles: float = 0.2 # percentage of vehicles controlled by policy. 
+    controlled_vehicle_curriculum: bool = False # Automatic increase of percentage of controlled vehicles. 
     initial_controlled_vehicles: float = 0.2
     final_controlled_vehicles: float = 1.0
     controlled_vehicle_curriculum_rounds: int = 100
@@ -52,7 +65,7 @@ class PSGAILConfig:
     final_rollout_target_agent_steps: int = 0
     rollout_target_agent_steps_curriculum_rounds: int = 0
     rollout_target_agent_steps_schedule: str = ""
-    psro_lite: bool = False
+    psro_lite: bool = False # the PRSO without nash equilibrium computation. 
     psro_archive_every: int = 20
     psro_archive_size: int = 5
     psro_mixture_after_jump_rounds: int = 20
@@ -61,6 +74,8 @@ class PSGAILConfig:
     terminate_when_all_controlled_crashed: bool = True
     allow_idm: bool = True
 
+    # Sensor Parameters. These values define the observation space and what information is available to the policy;
+    # changing them can modify the state representation and thus the learning problem itself.
     cells: int = 128
     maximum_range: float = 64.0
     simulation_frequency: int = 10
@@ -68,6 +83,8 @@ class PSGAILConfig:
     max_episode_steps: int = 200
     max_episode_steps_schedule: str = ""
 
+    # Policy/Discriminator architecture and optimization parameters. These values define the model architecture and optimization hyperparameters;
+    # changing them can significantly affect learning dynamics and performance. (Currently support transformer and MLP policy architectures, and MLP discriminators.)
     policy_model: str = "mlp"
     hidden_size: int = 256
     transformer_layers: int = 2
@@ -83,7 +100,7 @@ class PSGAILConfig:
     central_critic_attention_heads: int = 4
     learning_rate: float = 3e-4
     learning_rate_schedule: str = ""
-    bc_pretrain_epochs: int = 0
+    bc_pretrain_epochs: int = 0 # Behavior cloning pretraining epochs. Setting this to >0 will enable a BC pretraining phase before GAIL training. (Not utilized as of this moment)
     bc_pretrain_learning_rate: float = 3e-4
     bc_pretrain_batch_size: int = 4096
     bc_pretrain_micro_batch_size: int = 0
@@ -98,7 +115,7 @@ class PSGAILConfig:
     policy_bc_regularization_decay_rounds: int = 0
     disc_learning_rate: float = 3e-4
     disc_learning_rate_schedule: str = ""
-    gamma: float = 0.99
+    gamma: float = 0.99 # Discount factor for future rewards.
     initial_gamma: float = 0.0
     final_gamma: float = 0.0
     gamma_curriculum_rounds: int = 0
@@ -158,6 +175,7 @@ class PSGAILConfig:
     offroad_penalty: float = 2.0
     final_reward_clip: float = 10.0
     enable_player_challenge_reward: bool = False
+    # Challenge reward parameters (In development). These values define the additional reward shaping based on specific challenge metrics (like time-to-collision, gap, crashes, offroad events, etc.);
     challenge_reward_coef: float = 0.2
     challenge_reward_clip: float = 0.25
     challenge_max_primary_reward_fraction: float = 0.10
