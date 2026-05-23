@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
+import time
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -14,6 +17,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical, Normal
 
+from highway_env.imitation.expert_dataset import ENV_ID, build_env_config, register_ngsim_env
+from highway_env.ngsim_utils.core.constants import MAX_ACCEL
+from highway_env.ngsim_utils.data.prebuilt import load_prebuilt_data
+
 from .config import PSGAILConfig
 from .data import (
     SCENE_FEATURE_DIM_PER_VEHICLE,
@@ -24,9 +31,39 @@ from .data import (
     standardize_features,
     transform_sequence_features,
 )
-from .envs import controlled_vehicle_snapshot, make_training_env
+from .envs import controlled_vehicle_snapshot, make_training_env, observation_config
 from .models import NUM_DISCRETE_META_ACTIONS, make_actor_critic
 from .observations import flatten_agent_observations, policy_observations_from_flat
+
+
+class _RolloutPerfProfiler:
+    enabled = os.environ.get("HIGHWAY_ENV_OBS_PROFILE", "").lower() in {"1", "true", "yes", "on"}
+    report_every = max(1, int(os.environ.get("HIGHWAY_ENV_OBS_PROFILE_EVERY", "1000")))
+    counts: defaultdict[str, int] = defaultdict(int)
+    totals: defaultdict[str, float] = defaultdict(float)
+    events = 0
+
+    @classmethod
+    def record(cls, name: str, elapsed: float) -> None:
+        if not cls.enabled:
+            return
+        cls.counts[name] += 1
+        cls.totals[name] += float(elapsed)
+        if name == "policy_inference":
+            cls.events += 1
+            if cls.events % cls.report_every == 0:
+                cls.report()
+
+    @classmethod
+    def report(cls) -> None:
+        if not cls.enabled:
+            return
+        parts = []
+        for name in sorted(cls.totals):
+            count = max(1, int(cls.counts[name]))
+            total_ms = 1000.0 * float(cls.totals[name])
+            parts.append(f"{name}={total_ms / count:.3f}ms avg ({total_ms:.1f}ms/{count})")
+        print("[rollout_profile] " + " ".join(parts), flush=True)
 
 
 @dataclass
@@ -362,6 +399,249 @@ def _actions_to_env_tuple(actions: torch.Tensor, cfg: PSGAILConfig) -> tuple[obj
         actions_np = np.clip(actions_np, -1.0, 1.0)
         return tuple(action.copy() for action in actions_np)
     return tuple(int(action) for action in actions_np.tolist())
+
+
+def _parse_evaluation_horizons(cfg: PSGAILConfig) -> list[int]:
+    values: list[int] = []
+    for raw in str(getattr(cfg, "evaluation_horizons_seconds", "1,5,10,20")).replace(";", ",").split(","):
+        text = raw.strip()
+        if not text:
+            continue
+        horizon = int(round(float(text)))
+        if horizon > 0 and horizon not in values:
+            values.append(horizon)
+    return values or [1, 5, 10, 20]
+
+
+def _evaluation_scenarios(
+    cfg: PSGAILConfig,
+    *,
+    split: str,
+    episodes: int,
+) -> list[tuple[str, int]]:
+    if int(episodes) <= 0:
+        return []
+    _prebuilt_dir, valid_ids_by_episode, _traj_all_by_episode, episode_names = load_prebuilt_data(
+        cfg.episode_root,
+        cfg.scene,
+        str(split),
+        min_occupancy=0.8,
+        cache={},
+    )
+    scenarios: list[tuple[str, int]] = []
+    for episode_name in sorted(str(name) for name in episode_names):
+        for vehicle_id in sorted(int(value) for value in valid_ids_by_episode.get(episode_name, [])):
+            scenarios.append((episode_name, vehicle_id))
+    if not scenarios:
+        raise RuntimeError(f"No evaluation scenarios found for split={split!r}.")
+    rng = np.random.default_rng(int(cfg.seed) + (17_003 if str(split) == "val" else 31_337))
+    order = rng.permutation(len(scenarios))
+    return [scenarios[int(idx)] for idx in order[: min(int(episodes), len(scenarios))]]
+
+
+def _make_matched_eval_env(
+    cfg: PSGAILConfig,
+    *,
+    split: str,
+    episode_name: str,
+    vehicle_id: int,
+) -> gym.Env:
+    register_ngsim_env()
+    env_cfg = build_env_config(
+        scene=cfg.scene,
+        action_mode=str(cfg.action_mode),
+        episode_root=cfg.episode_root,
+        prebuilt_split=str(split),
+        percentage_controlled_vehicles=1.0,
+        control_all_vehicles=False,
+        max_surrounding=cfg.max_surrounding,
+        observation_config=observation_config(cfg),
+        simulation_frequency=cfg.simulation_frequency,
+        policy_frequency=cfg.policy_frequency,
+        max_episode_steps=cfg.max_episode_steps,
+        seed=None,
+        simulation_period={"episode_name": str(episode_name)},
+        ego_vehicle_id=[int(vehicle_id)],
+        scene_dataset_collection_mode=False,
+        allow_idm=cfg.allow_idm,
+    )
+    env_cfg["expert_test_mode"] = False
+    env_cfg["disable_controlled_vehicle_collisions"] = not bool(cfg.enable_collision)
+    env_cfg["terminate_when_all_controlled_crashed"] = bool(cfg.terminate_when_all_controlled_crashed)
+    env_cfg["allow_idm"] = bool(cfg.allow_idm)
+    env_cfg["crash_controlled_vehicles_offroad"] = True
+    return gym.make(ENV_ID, config=env_cfg)
+
+
+def _deterministic_policy_action_tuple(
+    policy: nn.Module,
+    env: gym.Env,
+    obs: object,
+    cfg: PSGAILConfig,
+    device: torch.device,
+) -> tuple[object, ...]:
+    obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
+    critic_obs_agents = central_critic_observations(env, cfg, obs_agents)
+    with torch.no_grad():
+        obs_tensor = torch.as_tensor(obs_agents, dtype=torch.float32, device=device)
+        critic_obs_tensor = torch.as_tensor(critic_obs_agents, dtype=torch.float32, device=device)
+        policy_out, _values = policy(obs_tensor, critic_obs_tensor)
+        if _is_continuous(cfg):
+            return _actions_to_env_tuple(torch.clamp(policy_out, -1.0, 1.0), cfg)
+        masks = discrete_action_masks_from_env(
+            env,
+            num_agents=len(obs_agents),
+            num_actions=policy_action_dim(policy),
+            enabled=bool(getattr(cfg, "enable_action_masking", True)),
+        )
+        mask_tensor = torch.as_tensor(masks, dtype=torch.bool, device=device)
+        logits = _masked_discrete_logits(policy_out, mask_tensor)
+        return _actions_to_env_tuple(torch.argmax(logits, dim=-1), cfg)
+
+
+def _lane_offset_for_position(env: gym.Env, position: np.ndarray, vehicle: object | None = None) -> float:
+    position = np.asarray(position, dtype=np.float32).reshape(-1)[:2]
+    lane = getattr(vehicle, "lane", None) if vehicle is not None else None
+    if lane is None:
+        road = getattr(env.unwrapped, "road", None)
+        network = getattr(road, "network", None)
+        if network is not None:
+            try:
+                lane = network.get_lane(network.get_closest_lane_index(position))
+            except Exception:
+                lane = None
+    if lane is None:
+        return float("nan")
+    try:
+        _longitudinal, lateral = lane.local_coordinates(position)
+        return float(lateral)
+    except Exception:
+        return float("nan")
+
+
+def _first_controlled_vehicle(env: gym.Env) -> object | None:
+    controlled = list(getattr(env.unwrapped, "controlled_vehicles", ()) or ())
+    return controlled[0] if controlled else None
+
+
+def _physical_accel_from_action(action_tuple: tuple[object, ...], cfg: PSGAILConfig) -> float:
+    if not _is_continuous(cfg) or not action_tuple:
+        return float("nan")
+    action = np.asarray(action_tuple[0], dtype=np.float32).reshape(-1)
+    if action.size < 1:
+        return float("nan")
+    return float(np.clip(float(action[0]), -1.0, 1.0) * float(MAX_ACCEL))
+
+
+def evaluate_policy_matched_trajectories(
+    policy: nn.Module,
+    cfg: PSGAILConfig,
+    device: torch.device,
+    *,
+    split: str,
+    episodes: int,
+    prefix: str,
+) -> dict[str, float]:
+    scenarios = _evaluation_scenarios(cfg, split=split, episodes=int(episodes))
+    if not scenarios:
+        return {}
+    horizons = _parse_evaluation_horizons(cfg)
+    max_steps = max(1, int(max(horizons) * int(cfg.policy_frequency)))
+    max_steps = min(max_steps, max(1, int(cfg.max_episode_steps)))
+    squared: dict[int, dict[str, list[float]]] = {
+        horizon: {"x": [], "y": [], "position": [], "speed": [], "lane_offset": []}
+        for horizon in horizons
+    }
+    collision_steps = 0
+    offroad_steps = 0
+    hard_brake_steps = 0
+    total_steps = 0
+    episode_lengths: list[int] = []
+    evaluated_episodes = 0
+    was_training = policy.training
+    policy.eval()
+    try:
+        for scenario_idx, (episode_name, vehicle_id) in enumerate(scenarios):
+            env = _make_matched_eval_env(
+                cfg,
+                split=split,
+                episode_name=episode_name,
+                vehicle_id=int(vehicle_id),
+            )
+            try:
+                obs, _info = env.reset(seed=int(cfg.seed) + 100_000 + scenario_idx)
+                expert_state = getattr(env.unwrapped, "_expert_state_by_vehicle_id", {}).get(int(vehicle_id))
+                if expert_state is None:
+                    continue
+                ref_xy = np.asarray(expert_state.get("ref_xy", []), dtype=np.float32)
+                ref_v = np.asarray(expert_state.get("ref_v", []), dtype=np.float32).reshape(-1)
+                if ref_xy.ndim != 2 or ref_xy.shape[1] < 2 or ref_v.size == 0:
+                    continue
+                pred_xy: list[np.ndarray] = []
+                pred_speed: list[float] = []
+                pred_lane_offset: list[float] = []
+                expert_lane_offset: list[float] = []
+                length = 0
+                for _step in range(max_steps):
+                    vehicle = _first_controlled_vehicle(env)
+                    if vehicle is None:
+                        break
+                    position = np.asarray(getattr(vehicle, "position", np.zeros(2)), dtype=np.float32).reshape(-1)[:2]
+                    pred_xy.append(position.copy())
+                    pred_speed.append(float(getattr(vehicle, "speed", 0.0)))
+                    pred_lane_offset.append(_lane_offset_for_position(env, position, vehicle))
+                    expert_idx = min(length, ref_xy.shape[0] - 1)
+                    expert_lane_offset.append(_lane_offset_for_position(env, ref_xy[expert_idx, :2]))
+                    action_tuple = _deterministic_policy_action_tuple(policy, env, obs, cfg, device)
+                    accel = _physical_accel_from_action(action_tuple, cfg)
+                    if np.isfinite(accel) and accel < float(cfg.hard_brake_accel_threshold):
+                        hard_brake_steps += 1
+                    obs, _reward, terminated, truncated, info = env.step(action_tuple)
+                    crash_flags = list(info.get("controlled_vehicle_crashes", []) or [])
+                    offroad_flags = list(info.get("controlled_vehicle_offroad", []) or [])
+                    collision_steps += int(any(bool(flag) for flag in crash_flags))
+                    offroad_steps += int(any(bool(flag) for flag in offroad_flags))
+                    total_steps += 1
+                    length += 1
+                    if terminated or truncated:
+                        break
+                if length <= 0:
+                    continue
+                evaluated_episodes += 1
+                episode_lengths.append(length)
+                for horizon in horizons:
+                    idx = int(horizon * int(cfg.policy_frequency)) - 1
+                    if idx < 0 or idx >= len(pred_xy) or idx >= ref_xy.shape[0] or idx >= ref_v.size:
+                        continue
+                    dx = float(pred_xy[idx][0] - ref_xy[idx, 0])
+                    dy = float(pred_xy[idx][1] - ref_xy[idx, 1])
+                    ds = float(pred_speed[idx] - ref_v[idx])
+                    dlat = float(pred_lane_offset[idx] - expert_lane_offset[idx])
+                    squared[horizon]["x"].append(dx * dx)
+                    squared[horizon]["y"].append(dy * dy)
+                    squared[horizon]["position"].append(dx * dx + dy * dy)
+                    squared[horizon]["speed"].append(ds * ds)
+                    if np.isfinite(dlat):
+                        squared[horizon]["lane_offset"].append(dlat * dlat)
+            finally:
+                env.close()
+    finally:
+        if was_training:
+            policy.train()
+
+    metrics: dict[str, float] = {
+        f"{prefix}/episodes": float(evaluated_episodes),
+        f"{prefix}/evaluated_steps": float(total_steps),
+        f"{prefix}/collision_rate": float(collision_steps / total_steps) if total_steps else 0.0,
+        f"{prefix}/offroad_duration_rate": float(offroad_steps / total_steps) if total_steps else 0.0,
+        f"{prefix}/hard_brake_rate": float(hard_brake_steps / total_steps) if total_steps else 0.0,
+        f"{prefix}/mean_episode_length": float(np.mean(episode_lengths)) if episode_lengths else 0.0,
+    }
+    for horizon in horizons:
+        for name, values in squared[horizon].items():
+            metric_name = f"{prefix}/rmse_{name}_{horizon}s"
+            metrics[metric_name] = float(np.sqrt(np.mean(values))) if values else float("nan")
+    return metrics
 
 
 def _actions_to_rollout_array(transitions: list[AgentTransition], cfg: PSGAILConfig) -> np.ndarray:
@@ -977,7 +1257,9 @@ def collect_rollout(
     rollout_seed = int(cfg.seed if seed is None else seed)
     rng = np.random.default_rng(rollout_seed + 7919)
     obs, _ = env.reset(seed=rollout_seed)
+    started = time.perf_counter()
     obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
+    _RolloutPerfProfiler.record("flatten_observation", time.perf_counter() - started)
     if policy_obs_dim is None:
         policy_obs_dim = int(obs_agents.shape[1])
     if critic_obs_dim is None:
@@ -1086,6 +1368,7 @@ def collect_rollout(
                 key_to_trajectory_id[key] = len(key_to_trajectory_id)
 
         critic_obs_agents = central_critic_observations(env, cfg, obs_agents)
+        started = time.perf_counter()
         with torch.no_grad():
             obs_tensor = torch.as_tensor(obs_agents, dtype=torch.float32, device=device)
             critic_obs_tensor = torch.as_tensor(critic_obs_agents, dtype=torch.float32, device=device)
@@ -1113,10 +1396,13 @@ def collect_rollout(
                 action_mask_tensor,
                 cfg,
             )
+        _RolloutPerfProfiler.record("policy_inference", time.perf_counter() - started)
 
         action_tuple = _actions_to_env_tuple(actions, cfg)
         next_obs, _env_reward, terminated, truncated, info = env.step(action_tuple)
+        started = time.perf_counter()
         next_obs_agents = policy_observations_from_flat(flatten_agent_observations(next_obs))
+        _RolloutPerfProfiler.record("flatten_observation", time.perf_counter() - started)
         if len(next_obs_agents) != len(obs_agents):
             next_obs_agents = obs_agents.copy()
             next_critic_obs_agents = critic_obs_agents.copy()

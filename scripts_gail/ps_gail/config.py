@@ -7,6 +7,7 @@ from dataclasses import dataclass
 class PSGAILConfig:
     expert_data: str = "expert_data/ngsim_ps_traj_expert_discrete_54902119"
     run_name: str = "simple_ps_gail"
+    resume_checkpoint: str = ""
     scene: str = "us-101"
     action_mode: str = "discrete"
     continuous_action_dim: int = 2
@@ -180,6 +181,13 @@ class PSGAILConfig:
     checkpoint_video_width: int = 1200
     checkpoint_video_height: int = 608
     checkpoint_video_scaling: float = 5.5
+    validation_every: int = 20
+    validation_episodes: int = 4
+    validation_prebuilt_split: str = "val"
+    test_episodes: int = 4
+    test_prebuilt_split: str = "test"
+    evaluation_horizons_seconds: str = "1,5,10,20"
+    hard_brake_accel_threshold: float = -3.0
     device: str = "auto"
 
     wandb_mode: str = "disabled"

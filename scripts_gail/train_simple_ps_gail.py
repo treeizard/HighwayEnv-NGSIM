@@ -41,6 +41,7 @@ from scripts_gail.ps_gail.trainer import (
     collect_round_rollouts,
     discrete_action_masks_from_env,
     discriminator_input_mode,
+    evaluate_policy_matched_trajectories,
     infer_continuous_action_dim,
     infer_critic_obs_dim,
     infer_policy_obs_dim,
@@ -699,6 +700,40 @@ def main() -> None:
             if expert_scene_features is not None
             else None
         )
+        resume_checkpoint = str(getattr(cfg, "resume_checkpoint", "") or "").strip()
+        if resume_checkpoint:
+            if not os.path.isfile(resume_checkpoint):
+                raise FileNotFoundError(f"resume_checkpoint does not exist: {resume_checkpoint}")
+            try:
+                checkpoint = torch.load(resume_checkpoint, map_location=device, weights_only=False)
+            except TypeError:
+                checkpoint = torch.load(resume_checkpoint, map_location=device)
+            if "policy_state_dict" not in checkpoint:
+                raise RuntimeError(f"Checkpoint is missing policy_state_dict: {resume_checkpoint}")
+            discriminator_state = checkpoint.get("discriminator_state_dict")
+            if discriminator_state is None and sequence_only_discriminator:
+                discriminator_state = checkpoint.get("sequence_discriminator_state_dict")
+            if discriminator_state is None:
+                raise RuntimeError(f"Checkpoint is missing discriminator state: {resume_checkpoint}")
+            try:
+                policy.load_state_dict(checkpoint["policy_state_dict"])
+                discriminator.load_state_dict(discriminator_state)
+                if scene_discriminator is not None and checkpoint.get("scene_discriminator_state_dict") is not None:
+                    scene_discriminator.load_state_dict(checkpoint["scene_discriminator_state_dict"])
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Failed to load GAIL resume checkpoint. Check that policy/discriminator "
+                    "architecture settings match the checkpoint."
+                ) from exc
+            if checkpoint.get("discriminator_feature_normalizer") is not None:
+                primary_discriminator_normalizer = checkpoint["discriminator_feature_normalizer"]
+            if checkpoint.get("scene_discriminator_feature_normalizer") is not None:
+                scene_discriminator_normalizer = checkpoint["scene_discriminator_feature_normalizer"]
+            print(
+                "resumed_checkpoint="
+                f"{os.path.abspath(resume_checkpoint)} "
+                f"round={checkpoint.get('round', 'unknown')}"
+            )
         expert_scene_features_train = (
             apply_optional_discriminator_normalizer(
                 expert_scene_features,
@@ -1410,6 +1445,25 @@ def main() -> None:
                 metrics,
                 step=round_idx,
             )
+            if int(getattr(cfg, "validation_every", 0)) > 0 and round_idx % int(cfg.validation_every) == 0:
+                val_metrics = evaluate_policy_matched_trajectories(
+                    policy,
+                    round_cfg,
+                    device,
+                    split=str(getattr(cfg, "validation_prebuilt_split", "val")),
+                    episodes=int(getattr(cfg, "validation_episodes", 0)),
+                    prefix="validation",
+                )
+                if val_metrics:
+                    monitor.log(val_metrics, step=round_idx)
+                    print(
+                        f"[validation {round_idx:04d}] "
+                        f"episodes={val_metrics.get('validation/episodes', 0):.0f} "
+                        f"rmse_pos_20s={val_metrics.get('validation/rmse_position_20s', float('nan')):.4f} "
+                        f"collision={val_metrics.get('validation/collision_rate', 0.0):.4f} "
+                        f"offroad={val_metrics.get('validation/offroad_duration_rate', 0.0):.4f} "
+                        f"hard_brake={val_metrics.get('validation/hard_brake_rate', 0.0):.4f}"
+                    )
 
             if cfg.checkpoint_every > 0 and round_idx % int(cfg.checkpoint_every) == 0:
                 checkpoint_path = os.path.join(ckpt_dir, f"round_{round_idx:04d}.pt")
@@ -1502,6 +1556,25 @@ def main() -> None:
                 step=final_round,
                 fps=int(cfg.policy_frequency),
             )
+        if int(getattr(cfg, "test_episodes", 0)) > 0:
+            test_metrics = evaluate_policy_matched_trajectories(
+                policy,
+                final_round_cfg,
+                device,
+                split=str(getattr(cfg, "test_prebuilt_split", "test")),
+                episodes=int(getattr(cfg, "test_episodes", 0)),
+                prefix="test",
+            )
+            if test_metrics:
+                monitor.log(test_metrics, step=final_round)
+                print(
+                    f"[test final] "
+                    f"episodes={test_metrics.get('test/episodes', 0):.0f} "
+                    f"rmse_pos_20s={test_metrics.get('test/rmse_position_20s', float('nan')):.4f} "
+                    f"collision={test_metrics.get('test/collision_rate', 0.0):.4f} "
+                    f"offroad={test_metrics.get('test/offroad_duration_rate', 0.0):.4f} "
+                    f"hard_brake={test_metrics.get('test/hard_brake_rate', 0.0):.4f}"
+                )
     finally:
         if rollout_executor is not None:
             rollout_executor.shutdown(wait=True, cancel_futures=True)

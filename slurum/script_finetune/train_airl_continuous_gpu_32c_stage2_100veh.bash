@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ps_airl_gpu_32c
+#SBATCH --job-name=ps_airl_stage2_100veh
 #SBATCH --account=bt60
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
@@ -7,8 +7,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
-#SBATCH --output=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_airl_gpu_32c_%j.out
-#SBATCH --error=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_airl_gpu_32c_%j.err
+#SBATCH --output=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_airl_stage2_100veh_%j.out
+#SBATCH --error=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/ps_airl_stage2_100veh_%j.err
 
 set -euo pipefail
 
@@ -50,12 +50,13 @@ conda activate ngsim_env
 
 EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_unified_expert_continuous_55145982}"
 AIRL_TRAIN_SCRIPT="${AIRL_TRAIN_SCRIPT:-${REPODIR}/scripts_gail/train_simple_airl.py}"
-RUN_NAME="${RUN_NAME:-ps_airl_unified_continuous_gpu_32c_${SLURM_JOB_ID}}"
+RUN_NAME="${RUN_NAME:-ps_airl_stage2_100veh_${SLURM_JOB_ID}}"
+RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 WANDB_MODE="${WANDB_MODE:-online}"
 
 # Training defaults: full-episode AIRL rounds. With --rollout-full-episodes,
 # active rollout workers are capped by ROLLOUT_MIN_EPISODES.
-TOTAL_ROUNDS="${TOTAL_ROUNDS:-800}"
+TOTAL_ROUNDS="${TOTAL_ROUNDS:-200}"
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-200}"
 ROLLOUT_MIN_EPISODES="${ROLLOUT_MIN_EPISODES:-2}"
 ROLLOUT_TARGET_AWARE_EPISODES="${ROLLOUT_TARGET_AWARE_EPISODES:-true}"
@@ -75,8 +76,8 @@ FINAL_CONTROLLED_VEHICLES="${FINAL_CONTROLLED_VEHICLES:-${FINAL_CONTROLLED_VEHIC
 CONTROLLED_VEHICLE_CURRICULUM_ROUNDS="${CONTROLLED_VEHICLE_CURRICULUM_ROUNDS:-${TOTAL_ROUNDS}}"
 CONTROLLED_VEHICLE_INCREMENT_ROUNDS="${CONTROLLED_VEHICLE_INCREMENT_ROUNDS:-0}"
 CONTROLLED_VEHICLE_SCHEDULE_PROFILE="${CONTROLLED_VEHICLE_SCHEDULE_PROFILE:-sudden}"
-CONTROLLED_VEHICLE_SCHEDULE_GRADUAL="${CONTROLLED_VEHICLE_SCHEDULE_GRADUAL:-0:100:10:20;100:200:20:30;200:300:30:40;300:400:40:50;400:500:50:50;500:600:50:100;600:800:100:100}"
-CONTROLLED_VEHICLE_SCHEDULE_SUDDEN="${CONTROLLED_VEHICLE_SCHEDULE_SUDDEN:-0:120:10:10;120:240:20:20;240:360:30:30;360:480:40:40;480:600:50:50;600:800:100:100}"
+CONTROLLED_VEHICLE_SCHEDULE_GRADUAL="${CONTROLLED_VEHICLE_SCHEDULE_GRADUAL:-0:200:100:100}"
+CONTROLLED_VEHICLE_SCHEDULE_SUDDEN="${CONTROLLED_VEHICLE_SCHEDULE_SUDDEN:-0:200:100:100}"
 if [ -z "${CONTROLLED_VEHICLE_SCHEDULE:-}" ]; then
     case "${CONTROLLED_VEHICLE_SCHEDULE_PROFILE}" in
         gradual)
@@ -101,11 +102,7 @@ WARMUP_DISC_UPDATES_PER_ROUND="${WARMUP_DISC_UPDATES_PER_ROUND:-0}"
 WARMUP_GAIL_REWARD_CLIP="${WARMUP_GAIL_REWARD_CLIP:-2.0}"
 WARMUP_FINAL_REWARD_CLIP="${WARMUP_FINAL_REWARD_CLIP:-5.0}"
 if [ -z "${VEHICLE_INCREASE_WARMUP_ROUNDS:-}" ]; then
-    if [ "${CONTROLLED_VEHICLE_SCHEDULE_PROFILE}" = "sudden" ]; then
-        VEHICLE_INCREASE_WARMUP_ROUNDS=20
-    else
-        VEHICLE_INCREASE_WARMUP_ROUNDS=0
-    fi
+    VEHICLE_INCREASE_WARMUP_ROUNDS=0
 fi
 ROLLOUT_TARGET_AGENT_STEPS="${ROLLOUT_TARGET_AGENT_STEPS:-0}"
 INITIAL_ROLLOUT_TARGET_AGENT_STEPS="${INITIAL_ROLLOUT_TARGET_AGENT_STEPS:-10000}"
@@ -184,6 +181,13 @@ CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-20}"
 SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-true}"
 CHECKPOINT_VIDEO_EVERY="${CHECKPOINT_VIDEO_EVERY:-50}"
 CHECKPOINT_VIDEO_STEPS="${CHECKPOINT_VIDEO_STEPS:-200}"
+VALIDATION_EVERY="${VALIDATION_EVERY:-20}"
+VALIDATION_EPISODES="${VALIDATION_EPISODES:-4}"
+VALIDATION_PREBUILT_SPLIT="${VALIDATION_PREBUILT_SPLIT:-val}"
+TEST_EPISODES="${TEST_EPISODES:-4}"
+TEST_PREBUILT_SPLIT="${TEST_PREBUILT_SPLIT:-test}"
+EVALUATION_HORIZONS_SECONDS="${EVALUATION_HORIZONS_SECONDS:-1,5,10,20}"
+HARD_BRAKE_ACCEL_THRESHOLD="${HARD_BRAKE_ACCEL_THRESHOLD:--3.0}"
 TERMINATE_WHEN_ALL_CONTROLLED_CRASHED="${TERMINATE_WHEN_ALL_CONTROLLED_CRASHED:-true}"
 if [ "${CONTROLLED_VEHICLE_CURRICULUM}" = "true" ]; then
     CONTROLLED_VEHICLE_CURRICULUM_ARG="--controlled-vehicle-curriculum"
@@ -308,11 +312,22 @@ echo "WGAN reward scale: ${WGAN_REWARD_SCALE}"
 echo "Checkpoint every: ${CHECKPOINT_EVERY}"
 echo "Save checkpoint video: ${SAVE_CHECKPOINT_VIDEO}"
 echo "Checkpoint video every: ${CHECKPOINT_VIDEO_EVERY}"
+echo "Validation: every=${VALIDATION_EVERY} episodes=${VALIDATION_EPISODES} split=${VALIDATION_PREBUILT_SPLIT} horizons=${EVALUATION_HORIZONS_SECONDS}"
+echo "Test: episodes=${TEST_EPISODES} split=${TEST_PREBUILT_SPLIT} hard_brake_threshold=${HARD_BRAKE_ACCEL_THRESHOLD}"
 echo "BC pretrain batch size: ${BC_PRETRAIN_BATCH_SIZE}"
 echo "BC pretrain micro-batch size: ${BC_PRETRAIN_MICRO_BATCH_SIZE}"
 echo "PyTorch CUDA alloc conf: ${PYTORCH_CUDA_ALLOC_CONF}"
 echo "CUDA devices: ${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi || true
+
+if [ -z "${RESUME_CHECKPOINT}" ]; then
+    echo "RESUME_CHECKPOINT must point to a stage-one final.pt or round_XXXX.pt checkpoint." >&2
+    exit 2
+fi
+if [ ! -f "${RESUME_CHECKPOINT}" ]; then
+    echo "RESUME_CHECKPOINT not found: ${RESUME_CHECKPOINT}" >&2
+    exit 2
+fi
 
 python - <<'PY'
 import os
@@ -347,10 +362,18 @@ fi
 
 python "${AIRL_TRAIN_SCRIPT}" \
     --expert-data "${EXPERT_DATA}" \
+    --resume-checkpoint "${RESUME_CHECKPOINT}" \
     --scene us-101 \
     --action-mode continuous \
     --episode-root "${REPODIR}/highway_env/data/processed_20s" \
     --prebuilt-split train \
+    --validation-every "${VALIDATION_EVERY}" \
+    --validation-episodes "${VALIDATION_EPISODES}" \
+    --validation-prebuilt-split "${VALIDATION_PREBUILT_SPLIT}" \
+    --test-episodes "${TEST_EPISODES}" \
+    --test-prebuilt-split "${TEST_PREBUILT_SPLIT}" \
+    --evaluation-horizons-seconds "${EVALUATION_HORIZONS_SECONDS}" \
+    --hard-brake-accel-threshold "${HARD_BRAKE_ACCEL_THRESHOLD}" \
     --no-control-all-vehicles \
     "${CONTROLLED_VEHICLE_CURRICULUM_ARG}" \
     --initial-controlled-vehicles "${INITIAL_CONTROLLED_VEHICLES}" \
