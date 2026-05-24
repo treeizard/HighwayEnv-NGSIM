@@ -1,9 +1,12 @@
+"""Standalone Ray-based NGSIM training experiment."""
+
 import os
 import sys
 from dataclasses import dataclass
-from typing import Dict, Any, Tuple
+from typing import Any, Dict, Tuple
 
 import numpy as np
+import pytest
 import random
 import torch
 import torch.nn as nn
@@ -11,9 +14,8 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 from torch.utils.data import Dataset, DataLoader
 
-import ray
+ray = pytest.importorskip("ray")
 import gymnasium as gym
-from gymnasium.envs.registration import register
 
 # ---------------------------------------------------------------------
 # Make sure the project root is importable (same as make_videos_multi.py)
@@ -21,12 +23,10 @@ from gymnasium.envs.registration import register
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, parent_dir)
 
-# Register your NGSim env (same ID as the video script)
-register(id="NGSim-US101", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Import your NGSIM trajectory tools
+from highway_env.imitation.expert_dataset import ENV_ID, register_ngsim_env
 from highway_env.ngsim_utils.data.trajectory_gen import (
     build_trajectory,
     process_raw_trajectory,
@@ -194,6 +194,7 @@ def build_expert_dataset_from_ngsim(
     ego_traj = process_raw_trajectory(ego_traj_raw)  # [s_m, r_m, v_mps, lane]
 
     # 2) Build env and configure it like in training
+    register_ngsim_env()
     env = gym.make(env_id)
     env.unwrapped.configure(base_cfg)
     obs, info = env.reset(seed=0)
@@ -266,6 +267,7 @@ class EnvWorker:
         self.worker_seed = worker_seed
 
         # Build and configure env
+        register_ngsim_env()
         self.env = gym.make(self.env_id)
         self.env.unwrapped.configure(self.base_cfg)
 
@@ -341,7 +343,7 @@ class EnvWorker:
 # ---------------------------------------------------------------------
 @dataclass
 class GAILConfig:
-    env_id: str = "NGSim-US101"
+    env_id: str = ENV_ID
 
     # Ray / rollout
     num_workers: int = 4
@@ -372,6 +374,7 @@ class GAILConfig:
 def main():
     cfg = GAILConfig()
     set_global_seed(cfg.seed)
+    register_ngsim_env()
 
     # ---- Base env config (mirrors make_videos_multi.py) ----
     base_cfg = {

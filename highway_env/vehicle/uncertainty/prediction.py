@@ -1,3 +1,5 @@
+"""Estimate and propagate uncertainty for vehicle state prediction."""
+
 from __future__ import annotations
 
 import copy
@@ -178,7 +180,8 @@ class IntervalVehicle(LinearVehicle):
                 self.theta_a_i[:, 0], self.target_speed - np.flip(v_i, 0)
             )
         dv_i += a_i
-        dv_i = np.clip(dv_i, -self.ACC_MAX, self.ACC_MAX)
+        acc_max = float(getattr(getattr(self, "params", None), "a_max", 10.0))
+        dv_i = np.clip(dv_i, -acc_max, acc_max)
         keep_stability = True
         if keep_stability:
             delta_psi = list(map(utils.wrap_to_pi, psi_i - lane_psi))

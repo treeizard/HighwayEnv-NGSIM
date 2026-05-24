@@ -1,3 +1,5 @@
+"""Prepare and transform NGSIM trajectory data for highway-env workflows."""
+
 import os
 import numpy as np
 import pandas as pd

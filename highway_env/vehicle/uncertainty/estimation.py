@@ -1,3 +1,5 @@
+"""Estimate and propagate uncertainty for vehicle state prediction."""
+
 from __future__ import annotations
 
 from typing import Callable

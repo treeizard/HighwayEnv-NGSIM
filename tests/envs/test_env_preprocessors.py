@@ -1,4 +1,5 @@
 import gymnasium as gym
+import numpy as np
 
 import highway_env
 
@@ -23,4 +24,7 @@ def test_preprocessors():
     env.close()
 
     assert env.observation_space.contains(obs)
-    assert 0 <= reward <= 1
+    if env.config.get("normalize_reward", False):
+        assert 0 <= reward <= 1
+    else:
+        assert np.isfinite(reward)

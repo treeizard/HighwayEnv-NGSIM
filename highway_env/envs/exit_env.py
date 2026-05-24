@@ -1,3 +1,5 @@
+"""Define the exit env driving environment."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -45,6 +47,7 @@ class ExitEnv(HighwayEnv):
     def _reset(self) -> None:
         self._create_road()
         self._create_vehicles()
+        self._reset_reward_state()
 
     def step(self, action) -> tuple[np.ndarray, float, bool, bool, dict]:
         obs, reward, terminated, truncated, info = super().step(action)

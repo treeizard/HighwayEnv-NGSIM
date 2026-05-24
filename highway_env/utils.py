@@ -1,3 +1,5 @@
+"""Provide shared math, class-loading, and geometry utilities."""
+
 from __future__ import annotations
 
 import copy

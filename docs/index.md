@@ -34,6 +34,7 @@ quickstart
 user_guide
 faq
 README_expert_dataset
+code_review_refactor_map
 bibliography/index
 ```
 

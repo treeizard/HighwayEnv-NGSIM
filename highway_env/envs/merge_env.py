@@ -1,3 +1,5 @@
+"""Define the merge env driving environment."""
+
 from __future__ import annotations
 
 import numpy as np

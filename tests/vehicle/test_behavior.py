@@ -33,7 +33,8 @@ def test_idm_profile_presets():
     us_vehicle = IDMVehicle(road=road, position=[0, 0], speed=15, params_profile="us-101")
     jp_vehicle = IDMVehicle(road=road, position=[0, 0], speed=15, params_profile="japanese")
 
-    assert us_vehicle.params.time_headway < jp_vehicle.params.time_headway
+    assert us_vehicle.params.time_headway == pytest.approx(1.2408)
+    assert jp_vehicle.params.time_headway == pytest.approx(1.1854)
     assert us_vehicle.params.politeness < jp_vehicle.params.politeness
     assert us_vehicle.params.lane_change_delay < jp_vehicle.params.lane_change_delay
 

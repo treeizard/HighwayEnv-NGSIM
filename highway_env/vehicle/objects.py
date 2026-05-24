@@ -1,3 +1,5 @@
+"""Model vehicle dynamics, behavior, control, and rendering."""
+
 from __future__ import annotations
 
 from abc import ABC

@@ -1,3 +1,5 @@
+"""Define shared constants and configuration for NGSIM integration."""
+
 # Modified by: Yide Tao (yide.tao@monash.edu)
 # Reference: @article{huang2021driving,
 #   title={Driving Behavior Modeling Using Naturalistic Human Driving Data With Inverse Reinforcement Learning},

@@ -1,3 +1,5 @@
+"""Provide shared environment graphics utilities for highway-env tasks."""
+
 from __future__ import annotations
 
 import os

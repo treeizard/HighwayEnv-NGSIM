@@ -1,3 +1,5 @@
+"""Prepare and transform NGSIM trajectory data for highway-env workflows."""
+
 from __future__ import annotations
 
 import numpy as np

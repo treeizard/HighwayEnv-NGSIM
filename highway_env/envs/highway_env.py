@@ -1,3 +1,5 @@
+"""Define the highway env driving environment."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -80,7 +82,10 @@ class HighwayEnv(AbstractEnv):
     def _reset(self) -> None:
         self._create_road()
         self._create_vehicles()
+        self._reset_reward_state()
 
+    def _reset_reward_state(self) -> None:
+        """Reset bookkeeping used by smoothness and lane-keeping rewards."""
         # For angular acceleration penalty (ego only)
         self._prev_heading: float | None = None
         self._yaw_rate: float = 0.0

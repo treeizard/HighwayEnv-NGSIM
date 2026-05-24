@@ -1,3 +1,5 @@
+"""Prepare and transform NGSIM trajectory data for highway-env workflows."""
+
 import numpy as np
 from scipy import signal
 import matplotlib.pyplot as plt

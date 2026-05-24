@@ -1,3 +1,5 @@
+"""Prepare and transform NGSIM trajectory data for highway-env workflows."""
+
 # Written by: Huy Nguyen （hngu0143@student.monash.edu）
 # Modified by: Yide Tao (yide.tao@monash.edu)
 # Reference: @article{huang2021driving,

@@ -1,3 +1,5 @@
+"""Represent and render road networks, lanes, and traffic rules."""
+
 from __future__ import annotations
 
 from abc import ABCMeta, abstractmethod

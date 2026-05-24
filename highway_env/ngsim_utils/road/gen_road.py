@@ -1,3 +1,5 @@
+"""Build and query NGSIM road topology mappings."""
+
 # Modified by: Yide Tao (yide.tao@monash.edu)
 # Reference: @article{huang2021driving,
 #   title={Driving Behavior Modeling Using Naturalistic Human Driving Data With Inverse Reinforcement Learning},

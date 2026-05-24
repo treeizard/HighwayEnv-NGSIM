@@ -1,3 +1,5 @@
+"""Load, select, and prepare prebuilt NGSIM episode data."""
+
 # Modified by: Yide Tao (yide.tao@monash.edu)
 # Reference: @article{huang2021driving,
 #   title={Driving Behavior Modeling Using Naturalistic Human Driving Data With Inverse Reinforcement Learning},

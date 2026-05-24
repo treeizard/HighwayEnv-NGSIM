@@ -1,3 +1,5 @@
+"""Prepare and transform NGSIM trajectory data for highway-env workflows."""
+
 import datetime
 
 NUM_COLS = 25

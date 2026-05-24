@@ -1,3 +1,5 @@
+"""Represent and render road networks, lanes, and traffic rules."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple, Union

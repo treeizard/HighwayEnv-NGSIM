@@ -1,3 +1,5 @@
+"""Register highway-env environments with Gymnasium."""
+
 import os
 import sys
 

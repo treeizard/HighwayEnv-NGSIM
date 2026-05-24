@@ -1,3 +1,5 @@
+"""Represent interval arithmetic helpers for uncertain dynamics."""
+
 from __future__ import annotations
 
 import itertools

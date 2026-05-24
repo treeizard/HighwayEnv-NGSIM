@@ -1,3 +1,5 @@
+"""Support PS-GAIL imitation-learning experiments on NGSIM environments."""
+
 from __future__ import annotations
 
 from dataclasses import replace

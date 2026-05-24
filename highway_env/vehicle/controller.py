@@ -1,3 +1,5 @@
+"""Model vehicle dynamics, behavior, control, and rendering."""
+
 import copy
 from typing import List, Optional, Tuple, Union
 
