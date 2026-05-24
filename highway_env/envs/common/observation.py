@@ -4,6 +4,7 @@ import os
 import time
 from collections import OrderedDict
 from collections import defaultdict
+from dataclasses import dataclass
 from itertools import product
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,42 @@ except Exception:  # pragma: no cover - scipy is optional at runtime
 
 if TYPE_CHECKING:
     from highway_env.envs.common.abstract import AbstractEnv
+
+
+@dataclass(frozen=True)
+class _ObstacleEntry:
+    obstacle: object
+    position: np.ndarray
+    velocity: np.ndarray
+    width: float
+    corners: np.ndarray
+    axis_u: np.ndarray
+    axis_v: np.ndarray
+
+
+@dataclass(frozen=True)
+class _LaneGeometry:
+    lane: AbstractLane
+    kind: str
+    start: np.ndarray | None = None
+    direction: np.ndarray | None = None
+    direction_lateral: np.ndarray | None = None
+    width: float = 0.0
+    length: float = 0.0
+    vehicle_length: float = 0.0
+    amplitude: float = 0.0
+    pulsation: float = 0.0
+    phase: float = 0.0
+
+
+@dataclass(frozen=True)
+class _LaneBounds:
+    lane: AbstractLane
+    min_x: float = -np.inf
+    max_x: float = np.inf
+    min_y: float = -np.inf
+    max_y: float = np.inf
+    always_required: bool = True
 
 
 class _ObservationProfiler:
@@ -56,17 +93,23 @@ class _ObservationProfiler:
             parts.append(f"{name}={total_ms / count:.3f}ms avg ({total_ms:.1f}ms/{count})")
         print("[observation_profile] " + " ".join(parts), flush=True)
 
+    @classmethod
+    def reset(cls) -> None:
+        cls.counts.clear()
+        cls.totals.clear()
+        cls.events = 0
+
 
 class _ObstacleSpatialIndex:
     def __init__(
         self,
-        entries: list[tuple[object, np.ndarray, np.ndarray, float, np.ndarray]],
+        entries: list[_ObstacleEntry],
     ) -> None:
         self.entries = entries
         self.tree = None
         if cKDTree is None or not entries:
             return
-        positions = np.asarray([entry[1] for entry in entries], dtype=float)
+        positions = np.asarray([entry.position for entry in entries], dtype=float)
         if positions.ndim == 2 and positions.shape[1] == 2 and np.all(np.isfinite(positions)):
             self.tree = cKDTree(positions)
 
@@ -74,11 +117,22 @@ class _ObstacleSpatialIndex:
         self,
         origin: np.ndarray,
         radius: float,
-    ) -> list[tuple[object, np.ndarray, np.ndarray, float, np.ndarray]]:
+    ) -> list[_ObstacleEntry]:
         if self.tree is None:
             return self.entries
         indices = self.tree.query_ball_point(np.asarray(origin, dtype=float), float(radius))
         return [self.entries[int(index)] for index in sorted(indices)]
+
+    def query_many(
+        self,
+        origins: np.ndarray,
+        radius: float,
+    ) -> list[list[_ObstacleEntry]]:
+        origins = np.asarray(origins, dtype=float)
+        if origins.ndim != 2 or origins.shape[1] != 2 or self.tree is None:
+            return [self.entries for _ in range(len(origins))]
+        all_indices = self.tree.query_ball_point(origins, float(radius))
+        return [[self.entries[int(index)] for index in sorted(indices)] for indices in all_indices]
 
 
 class ObservationType:
@@ -718,18 +772,26 @@ class SharedMultiAgentLidarCameraObservations(ObservationType):
 
     def observe(self) -> tuple:
         started = time.perf_counter()
+        collect_started = time.perf_counter()
         obstacle_entries = self.lidar_observation.collect_obstacle_entries()
+        _ObservationProfiler.record("shared_collect_obstacles", time.perf_counter() - collect_started)
+        index_started = time.perf_counter()
         obstacle_index = _ObstacleSpatialIndex(obstacle_entries)
+        _ObservationProfiler.record("shared_obstacle_index_build", time.perf_counter() - index_started)
+        vehicles = list(self.env.controlled_vehicles)
+        query_started = time.perf_counter()
+        origins = np.asarray([vehicle.position for vehicle in vehicles], dtype=float)
+        candidate_entries = obstacle_index.query_many(origins, self.lidar_observation.maximum_range)
+        _ObservationProfiler.record("shared_obstacle_candidate_query", time.perf_counter() - query_started)
         observations = []
-        for vehicle in self.env.controlled_vehicles:
+        for vehicle, vehicle_obstacle_entries in zip(vehicles, candidate_entries):
             self.lidar_observation.observer_vehicle = vehicle
             self.camera_observation.observer_vehicle = vehicle
             ego_state = self._build_ego_state(vehicle)
             observations.append(
                 (
                     self.lidar_observation.observe(
-                        obstacle_entries=obstacle_entries,
-                        obstacle_index=obstacle_index,
+                        obstacle_entries=vehicle_obstacle_entries,
                     ),
                     self.camera_observation.observe(),
                     ego_state,
@@ -863,6 +925,13 @@ class LidarObservation(ObservationType):
 
         # Cache lanes for faster on-road checks (safe for typical static road networks)
         self._lanes_cache = self._collect_lanes()
+        self._lane_geometry_cache: dict[int, _LaneGeometry | None] = {}
+        self._lane_bounds_cache: list[_LaneBounds] | None = self._collect_lane_bounds()
+        self._on_road_many_reference_compare = os.environ.get(
+            "HIGHWAY_ENV_ON_ROAD_MANY_COMPARE",
+            "",
+        ).lower() in {"1", "true", "yes", "on"}
+        self._on_road_many_mismatch: dict | None = None
         self._edge_lane_cache = self._collect_edge_lanes()
         self._edge_bounds_cache = self._collect_edge_bounds()
 
@@ -881,27 +950,30 @@ class LidarObservation(ObservationType):
 
     def observe(
         self,
-        obstacle_entries: list[tuple[object, np.ndarray, np.ndarray, float, np.ndarray]] | None = None,
+        obstacle_entries: list[_ObstacleEntry] | None = None,
         obstacle_index: _ObstacleSpatialIndex | None = None,
     ) -> np.ndarray:
-        obs = self.trace(
+        traced = self.trace(
             self.observer_vehicle.position,
             self.observer_vehicle.velocity,
             obstacle_entries=obstacle_entries,
             obstacle_index=obstacle_index,
-        ).copy()
+        )
+        started = time.perf_counter()
+        obs = traced.copy()
         if self.normalize:
             obs /= self.maximum_range
+        _ObservationProfiler.record("lidar_normalize_copy", time.perf_counter() - started)
         return obs
 
     # ----------------- Core LiDAR logic -----------------
 
-    def collect_obstacle_entries(self) -> list[tuple[object, np.ndarray, np.ndarray, float, np.ndarray]]:
+    def collect_obstacle_entries(self) -> list[_ObstacleEntry]:
         road = getattr(self.env, "road", None)
         if road is None:
             return []
 
-        entries: list[tuple[object, np.ndarray, np.ndarray, float, np.ndarray]] = []
+        entries: list[_ObstacleEntry] = []
         for obstacle in list(road.vehicles) + list(road.objects):
             if not getattr(obstacle, "solid", True):
                 continue
@@ -931,14 +1003,25 @@ class LidarObservation(ObservationType):
                 utils.rect_corners(obstacle_pos, length, width, heading),
                 dtype=float,
             )
-            entries.append((obstacle, obstacle_pos, obs_vel, width, corners))
+            axis_u, axis_v = self._rect_axes(corners)
+            entries.append(
+                _ObstacleEntry(
+                    obstacle=obstacle,
+                    position=obstacle_pos,
+                    velocity=obs_vel,
+                    width=width,
+                    corners=corners,
+                    axis_u=axis_u,
+                    axis_v=axis_v,
+                )
+            )
         return entries
 
     def trace(
         self,
         origin: np.ndarray,
         origin_velocity: np.ndarray,
-        obstacle_entries: list[tuple[object, np.ndarray, np.ndarray, float, np.ndarray]] | None = None,
+        obstacle_entries: list[_ObstacleEntry] | None = None,
         obstacle_index: _ObstacleSpatialIndex | None = None,
     ) -> np.ndarray:
         self.origin = np.array(origin, dtype=float).copy()
@@ -954,9 +1037,13 @@ class LidarObservation(ObservationType):
             self._lanes_cache = self._collect_lanes()
 
         if obstacle_entries is None:
+            started = time.perf_counter()
             obstacle_entries = self.collect_obstacle_entries()
+            _ObservationProfiler.record("lidar_collect_obstacles", time.perf_counter() - started)
         if obstacle_index is not None:
+            started = time.perf_counter()
             obstacle_entries = obstacle_index.query(self.origin, self.maximum_range)
+            _ObservationProfiler.record("lidar_obstacle_candidate_query", time.perf_counter() - started)
 
         # Precompute per-ray road edge distance
         started = time.perf_counter()
@@ -979,23 +1066,34 @@ class LidarObservation(ObservationType):
 
         # Iterate over road vehicles + static objects
         started = time.perf_counter()
-        for obstacle, obstacle_pos, obs_vel, width, corners in obstacle_entries:
-            if obstacle is self.observer_vehicle:
+        obstacle_entries = obstacle_entries or []
+        mask_started = time.perf_counter()
+        if obstacle_entries:
+            positions = np.asarray([entry.position for entry in obstacle_entries], dtype=float)
+            center_vectors = positions - self.origin.reshape(1, 2)
+            center_distances = np.linalg.norm(center_vectors, axis=1)
+            candidate_indices = np.flatnonzero(
+                np.isfinite(center_distances) & (center_distances <= self.maximum_range)
+            )
+        else:
+            center_distances = np.zeros((0,), dtype=float)
+            candidate_indices = np.zeros((0,), dtype=np.int64)
+        _ObservationProfiler.record("lidar_obstacle_mask_prep", time.perf_counter() - mask_started)
+        for obstacle_entry_index in candidate_indices:
+            entry = obstacle_entries[int(obstacle_entry_index)]
+            if entry.obstacle is self.observer_vehicle:
                 continue
-            center_vec = obstacle_pos - self.origin
-            center_distance = float(np.linalg.norm(center_vec))
-            if (not np.isfinite(center_distance)) or (center_distance > self.maximum_range):
-                continue
+            center_distance = float(center_distances[int(obstacle_entry_index)])
 
             # Approximate center ray bin
-            center_angle = self.position_to_angle(obstacle_pos, self.origin)
+            center_angle = self.position_to_angle(entry.position, self.origin)
             center_index = self.angle_to_index(center_angle)
 
             # Quick cull: if obstacle center beyond the road edge for its bin plus its half width, likely irrelevant
-            if center_distance > float(edge_dists[center_index]) + 0.5 * width:
+            if center_distance > float(edge_dists[center_index]) + 0.5 * entry.width:
                 # Still might intersect another bin, but this removes many far obstacles cheaply
                 pass  # keep conservative; do not continue
-            angles = [self.position_to_angle(corner, self.origin) for corner in corners]
+            angles = [self.position_to_angle(corner, self.origin) for corner in entry.corners]
             angles = [a for a in angles if np.isfinite(a)]
             if len(angles) == 0:
                 continue
@@ -1010,30 +1108,34 @@ class LidarObservation(ObservationType):
             end = self.angle_to_index(max_angle)
 
             if start <= end:
-                indexes = np.arange(start, end + 1)
+                index_ranges = (range(start, end + 1),)
             else:
-                indexes = np.hstack([np.arange(start, self.cells), np.arange(0, end + 1)])
+                index_ranges = (range(start, self.cells), range(0, end + 1))
 
             # Exact ray-rectangle distance per LiDAR cell, with road-edge clamping
-            for index in indexes:
-                max_t = float(edge_dists[index])
-                if max_t <= 0.0:
-                    continue
+            for indexes in index_ranges:
+                for index in indexes:
+                    max_t = float(edge_dists[index])
+                    if max_t <= 0.0:
+                        continue
 
-                direction = self._directions[int(index)]
+                    direction = self._directions[int(index)]
 
-                # IMPORTANT: clamp ray segment to road edge
-                ray = [self.origin, self.origin + max_t * direction]
-                dist = utils.distance_to_rect(ray, corners)
+                    dist = self._distance_to_rect_precomputed(
+                        origin=self.origin,
+                        direction=direction,
+                        max_t=max_t,
+                        entry=entry,
+                    )
 
-                if not np.isfinite(dist):
-                    continue
+                    if not np.isfinite(dist):
+                        continue
 
-                dist = float(np.clip(dist, 0.0, max_t))
+                    dist = float(np.clip(dist, 0.0, max_t))
 
-                if dist <= float(self.grid[int(index), self.DISTANCE]):
-                    rel_vel = float((obs_vel - origin_velocity).dot(direction))
-                    self.grid[int(index), :] = [dist, rel_vel]
+                    if dist <= float(self.grid[int(index), self.DISTANCE]):
+                        rel_vel = float((entry.velocity - origin_velocity).dot(direction))
+                        self.grid[int(index), :] = [dist, rel_vel]
 
         # If we are NOT returning edge as return, still ensure beams do not exceed edge
         if not self.edge_as_return:
@@ -1041,6 +1143,42 @@ class LidarObservation(ObservationType):
 
         _ObservationProfiler.record("lidar_obstacles", time.perf_counter() - started)
         return self.grid
+
+    @staticmethod
+    def _rect_axes(corners: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        a, b, _c, d = corners
+        u = b - a
+        v = d - a
+        return u / np.linalg.norm(u), v / np.linalg.norm(v)
+
+    @staticmethod
+    def _distance_to_rect_precomputed(
+        *,
+        origin: np.ndarray,
+        direction: np.ndarray,
+        max_t: float,
+        entry: _ObstacleEntry,
+    ) -> float:
+        eps = 1e-6
+        a = entry.corners[0]
+        b = entry.corners[1]
+        d = entry.corners[3]
+        q_minus_r = float(max_t) * direction
+        rqu = q_minus_r @ entry.axis_u + eps
+        rqv = q_minus_r @ entry.axis_v + eps
+        interval_1 = [(a - origin) @ entry.axis_u / rqu, (b - origin) @ entry.axis_u / rqu]
+        interval_2 = [(a - origin) @ entry.axis_v / rqv, (d - origin) @ entry.axis_v / rqv]
+        if rqu < 0:
+            interval_1 = list(reversed(interval_1))
+        if rqv < 0:
+            interval_2 = list(reversed(interval_2))
+        if (
+            utils.interval_distance(*interval_1, *interval_2) <= 0
+            and utils.interval_distance(0, 1, *interval_1) <= 0
+            and utils.interval_distance(0, 1, *interval_2) <= 0
+        ):
+            return float(max(interval_1[0], interval_2[0]) * np.linalg.norm(q_minus_r))
+        return float(np.inf)
 
     # ----------------- Road boundary helpers -----------------
 
@@ -1076,6 +1214,48 @@ class LidarObservation(ObservationType):
         except Exception:
             return None
         return edge_lanes if edge_lanes else None
+
+    def _collect_lane_bounds(self) -> list[_LaneBounds] | None:
+        if self._lanes_cache is None:
+            return None
+        bounds: list[_LaneBounds] = []
+        for lane in self._lanes_cache:
+            bounds.append(self._trusted_lane_bounds(lane))
+        return bounds
+
+    def _trusted_lane_bounds(self, lane: AbstractLane) -> _LaneBounds:
+        if not isinstance(lane, StraightLane) or isinstance(lane, SineLane):
+            return _LaneBounds(lane=lane, always_required=True)
+        try:
+            geometry = self._lane_geometry(lane)
+            if geometry is None:
+                return _LaneBounds(lane=lane, always_required=True)
+            longitudinal_min = -geometry.vehicle_length
+            longitudinal_max = geometry.length + geometry.vehicle_length
+            lateral = 0.5 * geometry.width
+            corners = np.asarray(
+                [
+                    geometry.start + longitudinal_min * geometry.direction - lateral * geometry.direction_lateral,
+                    geometry.start + longitudinal_min * geometry.direction + lateral * geometry.direction_lateral,
+                    geometry.start + longitudinal_max * geometry.direction - lateral * geometry.direction_lateral,
+                    geometry.start + longitudinal_max * geometry.direction + lateral * geometry.direction_lateral,
+                ],
+                dtype=float,
+            )
+            if corners.shape != (4, 2) or not np.all(np.isfinite(corners)):
+                return _LaneBounds(lane=lane, always_required=True)
+            # Expand slightly beyond the exact on_lane support so the bbox can only add candidates, never remove them.
+            margin = max(1.0e-9, 1.0e-9 * max(1.0, self.maximum_range, geometry.length))
+            return _LaneBounds(
+                lane=lane,
+                min_x=float(np.min(corners[:, 0]) - margin),
+                max_x=float(np.max(corners[:, 0]) + margin),
+                min_y=float(np.min(corners[:, 1]) - margin),
+                max_y=float(np.max(corners[:, 1]) + margin),
+                always_required=False,
+            )
+        except Exception:
+            return _LaneBounds(lane=lane, always_required=True)
 
     def _lane_bounds(self, lane: AbstractLane) -> tuple[float, float, float, float] | None:
         try:
@@ -1205,29 +1385,67 @@ class LidarObservation(ObservationType):
 
     def _lane_on_points_vectorized(self, lane: AbstractLane, points: np.ndarray) -> np.ndarray | None:
         points = np.asarray(points, dtype=float)
-        if isinstance(lane, SineLane):
-            delta = points - np.asarray(lane.start, dtype=float)
-            longitudinal = delta @ np.asarray(lane.direction, dtype=float)
-            lateral = delta @ np.asarray(lane.direction_lateral, dtype=float)
-            lateral = lateral - float(lane.amplitude) * np.sin(
-                float(lane.pulsation) * longitudinal + float(lane.phase)
+        geometry = self._lane_geometry(lane)
+        if geometry is None:
+            return None
+        if geometry.kind == "sine":
+            delta = points - geometry.start
+            longitudinal = delta @ geometry.direction
+            lateral = delta @ geometry.direction_lateral
+            lateral = lateral - geometry.amplitude * np.sin(
+                geometry.pulsation * longitudinal + geometry.phase
             )
-            width = float(lane.width)
-        elif isinstance(lane, StraightLane):
-            delta = points - np.asarray(lane.start, dtype=float)
-            longitudinal = delta @ np.asarray(lane.direction, dtype=float)
-            lateral = delta @ np.asarray(lane.direction_lateral, dtype=float)
-            width = float(lane.width)
+            width = geometry.width
+        elif geometry.kind == "straight":
+            delta = points - geometry.start
+            longitudinal = delta @ geometry.direction
+            lateral = delta @ geometry.direction_lateral
+            width = geometry.width
         else:
             return None
 
         return (
             np.abs(lateral) <= width / 2.0
         ) & (
-            -float(lane.VEHICLE_LENGTH) <= longitudinal
+            -geometry.vehicle_length <= longitudinal
         ) & (
-            longitudinal < float(lane.length) + float(lane.VEHICLE_LENGTH)
+            longitudinal < geometry.length + geometry.vehicle_length
         )
+
+    def _lane_geometry(self, lane: AbstractLane) -> _LaneGeometry | None:
+        key = id(lane)
+        if key in self._lane_geometry_cache:
+            return self._lane_geometry_cache[key]
+        geometry: _LaneGeometry | None
+        if isinstance(lane, SineLane):
+            geometry = _LaneGeometry(
+                lane=lane,
+                kind="sine",
+                start=np.asarray(lane.start, dtype=float),
+                direction=np.asarray(lane.direction, dtype=float),
+                direction_lateral=np.asarray(lane.direction_lateral, dtype=float),
+                width=float(lane.width),
+                length=float(lane.length),
+                vehicle_length=float(lane.VEHICLE_LENGTH),
+                amplitude=float(lane.amplitude),
+                pulsation=float(lane.pulsation),
+                phase=float(lane.phase),
+            )
+        elif isinstance(lane, StraightLane):
+            geometry = _LaneGeometry(
+                lane=lane,
+                kind="straight",
+                start=np.asarray(lane.start, dtype=float),
+                direction=np.asarray(lane.direction, dtype=float),
+                direction_lateral=np.asarray(lane.direction_lateral, dtype=float),
+                width=float(lane.width),
+                length=float(lane.length),
+                vehicle_length=float(lane.VEHICLE_LENGTH),
+            )
+        else:
+            geometry = None
+        self._lane_geometry_cache[key] = geometry
+        return geometry
 
     def _on_road_many(self, points: np.ndarray) -> np.ndarray:
         """
@@ -1236,12 +1454,35 @@ class LidarObservation(ObservationType):
         StraightLane and SineLane are handled analytically. Any unsupported lane
         type falls back to its scalar on_lane method, preserving semantics.
         """
+        started = time.perf_counter()
         points = np.asarray(points, dtype=float).reshape(-1, 2)
         if self._lanes_cache is None:
             self._lanes_cache = self._collect_lanes()
             if self._lanes_cache is None:
                 return np.ones((points.shape[0],), dtype=bool)
+            self._lane_bounds_cache = self._collect_lane_bounds()
 
+        result = self._on_road_many_bounded(points)
+        if self._on_road_many_reference_compare:
+            compare_started = time.perf_counter()
+            reference = self._on_road_many_full_scan(points)
+            _ObservationProfiler.record("_on_road_many_reference_compare", time.perf_counter() - compare_started)
+            if not np.array_equal(result, reference):
+                mismatch_indices = np.flatnonzero(result != reference)
+                mismatch_index = int(mismatch_indices[0]) if mismatch_indices.size else -1
+                self._on_road_many_mismatch = {
+                    "point_index": mismatch_index,
+                    "point": points[mismatch_index].tolist() if mismatch_index >= 0 else None,
+                    "optimized": bool(result[mismatch_index]) if mismatch_index >= 0 else None,
+                    "reference": bool(reference[mismatch_index]) if mismatch_index >= 0 else None,
+                    "points": int(points.shape[0]),
+                    "lanes": int(len(self._lanes_cache or [])),
+                }
+                raise AssertionError(f"_on_road_many mismatch: {self._on_road_many_mismatch}")
+        _ObservationProfiler.record("_on_road_many_total", time.perf_counter() - started)
+        return result
+
+    def _on_road_many_full_scan(self, points: np.ndarray) -> np.ndarray:
         result = np.zeros((points.shape[0],), dtype=bool)
         for lane in self._lanes_cache:
             try:
@@ -1259,6 +1500,60 @@ class LidarObservation(ObservationType):
             result |= lane_mask
             if bool(result.all()):
                 break
+        return result
+
+    def _on_road_many_bounded(self, points: np.ndarray) -> np.ndarray:
+        if self._lane_bounds_cache is None or len(self._lane_bounds_cache) != len(self._lanes_cache):
+            self._lane_bounds_cache = self._collect_lane_bounds()
+        if self._lane_bounds_cache is None:
+            return self._on_road_many_full_scan(points)
+
+        result = np.zeros((points.shape[0],), dtype=bool)
+        point_indices = np.arange(points.shape[0], dtype=np.int64)
+        for lane_bounds in self._lane_bounds_cache:
+            remaining = ~result
+            if not bool(np.any(remaining)):
+                break
+
+            bbox_started = time.perf_counter()
+            if lane_bounds.always_required:
+                candidate_mask = remaining
+            else:
+                candidate_mask = (
+                    remaining
+                    & (points[:, 0] >= lane_bounds.min_x)
+                    & (points[:, 0] <= lane_bounds.max_x)
+                    & (points[:, 1] >= lane_bounds.min_y)
+                    & (points[:, 1] <= lane_bounds.max_y)
+                )
+            candidate_indices = point_indices[candidate_mask]
+            _ObservationProfiler.record("_on_road_many_bbox_filter", time.perf_counter() - bbox_started)
+            if candidate_indices.size == 0:
+                continue
+
+            candidate_points = points[candidate_indices]
+            lane_eval_started = time.perf_counter()
+            try:
+                lane_mask = self._lane_on_points_vectorized(lane_bounds.lane, candidate_points)
+            except Exception:
+                lane_mask = None
+
+            if lane_mask is None:
+                _ObservationProfiler.record("_on_road_many_lane_eval", time.perf_counter() - lane_eval_started)
+                fallback_started = time.perf_counter()
+                lane_mask = np.asarray(
+                    [
+                        self._safe_lane_on_point(lane_bounds.lane, point)
+                        for point in candidate_points
+                    ],
+                    dtype=bool,
+                )
+                _ObservationProfiler.record("_on_road_many_fallback_eval", time.perf_counter() - fallback_started)
+            else:
+                _ObservationProfiler.record("_on_road_many_lane_eval", time.perf_counter() - lane_eval_started)
+
+            if np.any(lane_mask):
+                result[candidate_indices[lane_mask]] = True
         return result
 
     @staticmethod
@@ -1455,9 +1750,12 @@ class LaneCameraObservation(LidarObservation):
     def observe(self) -> np.ndarray:
         vehicle = self.observer_vehicle
         heading = float(getattr(vehicle, "heading", 0.0))
-        obs = self.trace_topology(vehicle.position, heading).copy()
+        traced = self.trace_topology(vehicle.position, heading)
+        started = time.perf_counter()
+        obs = traced.copy()
         if self.normalize:
             obs[:, 1:] /= self.maximum_range
+        _ObservationProfiler.record("lane_camera_normalize_copy", time.perf_counter() - started)
         return obs
 
     def trace_topology(self, origin: np.ndarray, heading: float) -> np.ndarray:
@@ -1477,12 +1775,15 @@ class LaneCameraObservation(LidarObservation):
 
         boundary_points = self._boundary_points_cache
         if self._boundary_points_tree is not None:
+            query_started = time.perf_counter()
             indices = self._boundary_points_tree.query_ball_point(self.origin, self.maximum_range)
+            _ObservationProfiler.record("lane_camera_query", time.perf_counter() - query_started)
             if not indices:
                 _ObservationProfiler.record("lane_camera", time.perf_counter() - started)
                 return self.grid
             boundary_points = self._boundary_points_cache[np.asarray(sorted(indices), dtype=np.int64)]
 
+        transform_started = time.perf_counter()
         relative_points = boundary_points - self.origin
         cos_h = np.cos(heading)
         sin_h = np.sin(heading)
@@ -1500,20 +1801,29 @@ class LaneCameraObservation(LidarObservation):
             & (np.abs(angles) <= self.field_of_view / 2.0)
         )
         if not np.any(valid):
+            _ObservationProfiler.record("lane_camera_transform_filter", time.perf_counter() - transform_started)
             _ObservationProfiler.record("lane_camera", time.perf_counter() - started)
             return self.grid
 
         ego_points = ego_points[valid]
         distances = distances[valid]
         angles = angles[valid]
+        _ObservationProfiler.record("lane_camera_transform_filter", time.perf_counter() - transform_started)
 
+        bin_started = time.perf_counter()
         bin_indices = np.digitize(angles, self._bin_edges[1:-1], right=False)
-        for index in range(self.cells):
-            matches = np.where(bin_indices == index)[0]
-            if matches.size == 0:
-                continue
-            nearest = matches[np.argmin(distances[matches])]
-            self.grid[index, :] = [1.0, ego_points[nearest, 0], ego_points[nearest, 1]]
+        original_order = np.arange(bin_indices.shape[0], dtype=np.int64)
+        order = np.lexsort((original_order, distances, bin_indices))
+        sorted_bins = bin_indices[order]
+        first_in_bin = np.empty(sorted_bins.shape[0], dtype=bool)
+        first_in_bin[0] = True
+        first_in_bin[1:] = sorted_bins[1:] != sorted_bins[:-1]
+        nearest = order[first_in_bin]
+        nearest_bins = bin_indices[nearest]
+        self.grid[nearest_bins, self.PRESENCE] = 1.0
+        self.grid[nearest_bins, self.X] = ego_points[nearest, 0]
+        self.grid[nearest_bins, self.Y] = ego_points[nearest, 1]
+        _ObservationProfiler.record("lane_camera_binning", time.perf_counter() - bin_started)
 
         _ObservationProfiler.record("lane_camera", time.perf_counter() - started)
         return self.grid

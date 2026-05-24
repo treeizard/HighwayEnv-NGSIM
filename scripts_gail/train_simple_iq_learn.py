@@ -2,15 +2,24 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import os
 import sys
-from dataclasses import dataclass, fields
+import time
+from collections import OrderedDict
+from contextlib import nullcontext
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, fields, replace
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Independent, Normal
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - tqdm is optional for lean local envs.
+    tqdm = None
 
 PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PARENT_DIR not in sys.path:
@@ -24,8 +33,11 @@ from scripts_gail.ps_gail.models import make_actor_critic
 from scripts_gail.ps_gail.observations import flatten_agent_observations, policy_observations_from_flat
 from scripts_gail.ps_gail.schedule import config_for_round
 from scripts_gail.ps_gail.trainer import (
+    evaluation_thread_context,
+    evaluate_policy_matched_trajectories,
     infer_continuous_action_dim,
     infer_policy_obs_dim,
+    make_evaluation_executor,
     resolve_device,
     set_optimizer_lr,
 )
@@ -212,6 +224,57 @@ def _cuda_peak_mb(device: torch.device) -> float:
     return float(torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0))
 
 
+def _policy_input_dim(policy: nn.Module) -> int:
+    obs_dim = getattr(policy, "obs_dim", None)
+    if obs_dim is not None:
+        return int(obs_dim)
+    encoder = getattr(policy, "encoder", None)
+    first = encoder[0] if isinstance(encoder, nn.Sequential) and len(encoder) else None
+    in_features = getattr(first, "in_features", None)
+    if in_features is None:
+        raise RuntimeError("Cannot infer IQ-Learn policy observation dimension for parallel evaluation.")
+    return int(in_features)
+
+
+def _cpu_state_dict(policy: nn.Module) -> dict[str, torch.Tensor]:
+    return {key: value.detach().cpu().clone() for key, value in policy.state_dict().items()}
+
+
+def _chunk_episode_indices(episodes: int, workers: int) -> list[list[int]]:
+    indices = list(range(max(1, int(episodes))))
+    active = min(max(1, int(workers)), len(indices))
+    return [indices[start::active] for start in range(active) if indices[start::active]]
+
+
+def _metric_or_nan(metrics: dict[str, float], key: str) -> float:
+    return float(metrics.get(key, float("nan")))
+
+
+def _print_matched_eval(prefix: str, step_label: str, metrics: dict[str, float]) -> None:
+    if not metrics:
+        return
+    horizon_parts = []
+    for horizon in (1, 5, 10, 20):
+        value = _metric_or_nan(metrics, f"{prefix}/rmse_position_{horizon}s")
+        horizon_parts.append(f"rmse_pos_{horizon}s={value:.4f}")
+    print(
+        f"[{prefix} {step_label}] "
+        f"episodes={metrics.get(f'{prefix}/episodes', 0):.0f}/"
+        f"{metrics.get(f'{prefix}/attempted_episodes', metrics.get(f'{prefix}/episodes', 0)):.0f} "
+        f"mean_len={metrics.get(f'{prefix}/mean_episode_length', 0.0):.1f} "
+        f"terminated={metrics.get(f'{prefix}/terminated_episodes', 0):.0f} "
+        f"truncated={metrics.get(f'{prefix}/truncated_episodes', 0):.0f} "
+        f"{' '.join(horizon_parts)} "
+        f"rmse_pos_final={_metric_or_nan(metrics, f'{prefix}/rmse_position_final'):.4f} "
+        f"collision={metrics.get(f'{prefix}/vehicle_crash_rate', metrics.get(f'{prefix}/collision_rate', 0.0)):.4f} "
+        f"offroad={metrics.get(f'{prefix}/vehicle_offroad_rate', metrics.get(f'{prefix}/offroad_duration_rate', 0.0)):.4f} "
+        f"collision_dur={metrics.get(f'{prefix}/collision_duration_rate', metrics.get(f'{prefix}/collision_rate', 0.0)):.4f} "
+        f"offroad_dur={metrics.get(f'{prefix}/offroad_duration_rate', 0.0):.4f} "
+        f"hard_brake={metrics.get(f'{prefix}/hard_brake_rate', 0.0):.4f} "
+        f"skipped_missing_expert={metrics.get(f'{prefix}/skipped_missing_expert', 0):.0f}"
+    )
+
+
 def _set_matmul_precision(precision: str) -> None:
     precision = str(precision).lower()
     if precision in {"", "default"}:
@@ -240,6 +303,201 @@ def _sample_policy(
     raw_action = dist.rsample()
     action = torch.clamp(raw_action, -1.0, 1.0)
     return action, dist.log_prob(raw_action), mean
+
+
+def _make_iq_eval_policy(
+    state_dict: dict[str, torch.Tensor],
+    cfg: PSGAILConfig,
+    policy_obs_dim: int,
+) -> nn.Module:
+    policy = make_actor_critic(
+        cfg.policy_model,
+        int(policy_obs_dim),
+        int(cfg.hidden_size),
+        action_mode="continuous",
+        continuous_action_dim=int(cfg.continuous_action_dim),
+        transformer_layers=int(cfg.transformer_layers),
+        transformer_heads=int(cfg.transformer_heads),
+        transformer_dropout=float(cfg.transformer_dropout),
+        transformer_temporal_module=bool(getattr(cfg, "transformer_temporal_module", False)),
+        transformer_temporal_kernel_size=int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
+        transformer_temporal_layers=int(getattr(cfg, "transformer_temporal_layers", 1)),
+        transformer_memory_tokens=int(getattr(cfg, "transformer_memory_tokens", 8)),
+        transformer_memory_context_length=int(getattr(cfg, "transformer_memory_context_length", 32)),
+        transformer_use_causal_attention=bool(getattr(cfg, "transformer_use_causal_attention", True)),
+    )
+    policy.load_state_dict(state_dict)
+    policy.to(torch.device("cpu"))
+    policy.eval()
+    return policy
+
+
+_IQ_EVAL_POLICY_CACHE: dict[tuple[object, ...], nn.Module] = {}
+_IQ_EVAL_ENV_CACHE: OrderedDict[tuple[object, ...], object] = OrderedDict()
+_IQ_EVAL_ENV_CACHE_HITS = 0
+_IQ_EVAL_ENV_CACHE_MISSES = 0
+
+
+def _iq_eval_policy_cache_key(cfg: PSGAILConfig, policy_obs_dim: int) -> tuple[object, ...]:
+    return (
+        str(cfg.policy_model),
+        int(policy_obs_dim),
+        int(cfg.hidden_size),
+        int(cfg.continuous_action_dim),
+        int(cfg.transformer_layers),
+        int(cfg.transformer_heads),
+        float(cfg.transformer_dropout),
+        bool(getattr(cfg, "transformer_temporal_module", False)),
+        int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
+        int(getattr(cfg, "transformer_temporal_layers", 1)),
+        int(getattr(cfg, "transformer_memory_tokens", 8)),
+        int(getattr(cfg, "transformer_memory_context_length", 32)),
+        bool(getattr(cfg, "transformer_use_causal_attention", True)),
+    )
+
+
+def _cached_iq_eval_policy(
+    state_dict: dict[str, torch.Tensor],
+    cfg: PSGAILConfig,
+    policy_obs_dim: int,
+) -> nn.Module:
+    key = _iq_eval_policy_cache_key(cfg, int(policy_obs_dim))
+    policy = _IQ_EVAL_POLICY_CACHE.get(key)
+    if policy is None:
+        policy = _make_iq_eval_policy(state_dict, cfg, int(policy_obs_dim))
+        _IQ_EVAL_POLICY_CACHE[key] = policy
+    else:
+        policy.load_state_dict(state_dict)
+        policy.to(torch.device("cpu"))
+        policy.eval()
+    return policy
+
+
+def _iq_eval_env_cache_key(cfg: PSGAILConfig) -> tuple[object, ...]:
+    return (
+        str(getattr(cfg, "env_id", "")),
+        str(getattr(cfg, "scene", "")),
+        os.path.abspath(str(getattr(cfg, "episode_root", ""))),
+        str(getattr(cfg, "prebuilt_split", "")),
+        str(getattr(cfg, "trajectory_frame", "")),
+        str(cfg.action_mode),
+        int(cfg.continuous_action_dim),
+        bool(cfg.control_all_vehicles),
+        float(cfg.percentage_controlled_vehicles),
+        str(cfg.max_surrounding),
+        int(getattr(cfg, "cells", 0)),
+        float(getattr(cfg, "maximum_range", 0.0)),
+        int(cfg.max_episode_steps),
+        bool(cfg.enable_collision),
+        bool(cfg.terminate_when_all_controlled_crashed),
+        bool(cfg.allow_idm),
+        int(cfg.policy_frequency),
+        int(cfg.simulation_frequency),
+    )
+
+
+def _get_iq_eval_env(cfg: PSGAILConfig):
+    global _IQ_EVAL_ENV_CACHE_HITS, _IQ_EVAL_ENV_CACHE_MISSES
+    if not bool(getattr(cfg, "evaluation_cache_envs", True)):
+        _IQ_EVAL_ENV_CACHE_MISSES += 1
+        return make_training_env(cfg), False
+    key = _iq_eval_env_cache_key(cfg)
+    env = _IQ_EVAL_ENV_CACHE.get(key)
+    if env is not None:
+        _IQ_EVAL_ENV_CACHE.move_to_end(key)
+        _IQ_EVAL_ENV_CACHE_HITS += 1
+        return env, True
+    env = make_training_env(cfg)
+    _IQ_EVAL_ENV_CACHE[key] = env
+    _IQ_EVAL_ENV_CACHE_MISSES += 1
+    max_cached = max(0, int(getattr(cfg, "evaluation_max_cached_envs_per_worker", 0)))
+    while max_cached > 0 and len(_IQ_EVAL_ENV_CACHE) > max_cached:
+        _old_key, old_env = _IQ_EVAL_ENV_CACHE.popitem(last=False)
+        old_env.close()
+    return env, True
+
+
+def _evaluate_policy_worker(
+    cfg: PSGAILConfig,
+    policy_state_dict: dict[str, torch.Tensor],
+    policy_obs_dim: int,
+    episode_indices: list[int],
+) -> dict[str, object]:
+    global _IQ_EVAL_ENV_CACHE_HITS, _IQ_EVAL_ENV_CACHE_MISSES
+    threads = max(1, int(getattr(cfg, "evaluation_worker_threads", 2)))
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[name] = str(threads)
+    torch.set_num_threads(threads)
+    np.random.seed(int(cfg.seed) + 900_000 + min(episode_indices or [0]))
+    torch.manual_seed(int(cfg.seed) + 900_000 + min(episode_indices or [0]))
+    worker_cfg = replace(cfg, device="cpu", evaluation_num_workers=1)
+    hit_start = _IQ_EVAL_ENV_CACHE_HITS
+    miss_start = _IQ_EVAL_ENV_CACHE_MISSES
+    policy_load_started = time.perf_counter()
+    policy = _cached_iq_eval_policy(policy_state_dict, worker_cfg, int(policy_obs_dim))
+    policy_load_seconds = time.perf_counter() - policy_load_started
+    env, env_cached = _get_iq_eval_env(worker_cfg)
+    lengths: list[int] = []
+    rewards: list[float] = []
+    crashes = 0
+    reset_seconds = 0.0
+    policy_forward_seconds = 0.0
+    env_step_seconds = 0.0
+    try:
+        for ep_idx in episode_indices:
+            reset_started = time.perf_counter()
+            obs, _info = env.reset(seed=int(worker_cfg.seed) + 100_000 + int(ep_idx))
+            reset_seconds += time.perf_counter() - reset_started
+            obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
+            eval_memory = (
+                policy.initial_memory(len(obs_agents), device=torch.device("cpu"), dtype=torch.float32)
+                if bool(getattr(policy, "supports_recurrent_memory", False))
+                else None
+            )
+            total_reward = 0.0
+            length = 0
+            for _ in range(max(1, int(worker_cfg.max_episode_steps))):
+                obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
+                with torch.no_grad():
+                    obs_tensor = torch.as_tensor(obs_agents, dtype=torch.float32)
+                    policy_started = time.perf_counter()
+                    if bool(getattr(policy, "supports_recurrent_memory", False)):
+                        mean, _values, eval_memory = policy(
+                            obs_tensor,
+                            memory=eval_memory,
+                            return_memory=True,
+                        )
+                    else:
+                        mean, _values = policy(obs_tensor)
+                    policy_forward_seconds += time.perf_counter() - policy_started
+                    action_arr = torch.clamp(mean, -1.0, 1.0).detach().numpy().astype(np.float32)
+                action = tuple(row.copy() for row in action_arr.reshape(-1, int(worker_cfg.continuous_action_dim)))
+                step_started = time.perf_counter()
+                obs, reward, terminated, truncated, info = env.step(action)
+                env_step_seconds += time.perf_counter() - step_started
+                total_reward += float(np.asarray(reward, dtype=np.float32).mean())
+                length += 1
+                if bool(info.get("crashed", False)) if isinstance(info, dict) else False:
+                    crashes += 1
+                if terminated or truncated:
+                    break
+            lengths.append(length)
+            rewards.append(total_reward)
+    finally:
+        if not env_cached:
+            env.close()
+    return {
+        "lengths": tuple(lengths),
+        "rewards": tuple(rewards),
+        "crashes": float(crashes),
+        "policy_load_seconds": float(policy_load_seconds),
+        "policy_forward_seconds": float(policy_forward_seconds),
+        "env_step_seconds": float(env_step_seconds),
+        "env_reset_seconds": float(reset_seconds),
+        "env_cache_hits": float(_IQ_EVAL_ENV_CACHE_HITS - hit_start),
+        "env_cache_misses": float(_IQ_EVAL_ENV_CACHE_MISSES - miss_start),
+    }
+
 
 
 def _clip_symmetric(values: torch.Tensor, limit: float) -> torch.Tensor:
@@ -386,34 +644,114 @@ def update_iq_learn(
     }
 
 
-def evaluate_policy(policy: nn.Module, cfg: PSGAILConfig, device: torch.device, *, episodes: int) -> dict[str, float]:
-    env = make_training_env(cfg)
+def evaluate_policy(
+    policy: nn.Module,
+    cfg: PSGAILConfig,
+    device: torch.device,
+    *,
+    episodes: int,
+    evaluation_executor: ProcessPoolExecutor | None = None,
+) -> dict[str, float]:
+    requested_workers = max(1, int(getattr(cfg, "evaluation_num_workers", 1)))
+    episode_chunks = _chunk_episode_indices(int(episodes), requested_workers)
+    if len(episode_chunks) > 1 or evaluation_executor is not None:
+        policy_obs_dim = _policy_input_dim(policy)
+        policy_state_dict = _cpu_state_dict(policy)
+        print(
+            f"[eval] parallel evaluation workers={len(episode_chunks)} "
+            f"worker_threads={max(1, int(getattr(cfg, 'evaluation_worker_threads', 2)))} "
+            f"episodes={max(1, int(episodes))}",
+            flush=True,
+        )
+        executor_context = (
+            nullcontext(evaluation_executor)
+            if evaluation_executor is not None
+            else ProcessPoolExecutor(max_workers=len(episode_chunks), mp_context=mp.get_context("spawn"))
+        )
+        with executor_context as executor:
+            futures = [
+                executor.submit(_evaluate_policy_worker, cfg, policy_state_dict, policy_obs_dim, chunk)
+                for chunk in episode_chunks
+            ]
+            parts = [future.result() for future in futures]
+        lengths = [int(value) for part in parts for value in part.get("lengths", ())]
+        rewards = [float(value) for part in parts for value in part.get("rewards", ())]
+        crashes = float(sum(float(part.get("crashes", 0.0)) for part in parts))
+        policy_load_seconds = float(sum(float(part.get("policy_load_seconds", 0.0)) for part in parts))
+        policy_forward_seconds = float(sum(float(part.get("policy_forward_seconds", 0.0)) for part in parts))
+        env_step_seconds = float(sum(float(part.get("env_step_seconds", 0.0)) for part in parts))
+        env_reset_seconds = float(sum(float(part.get("env_reset_seconds", 0.0)) for part in parts))
+        env_cache_hits = float(sum(float(part.get("env_cache_hits", 0.0)) for part in parts))
+        env_cache_misses = float(sum(float(part.get("env_cache_misses", 0.0)) for part in parts))
+        print(
+            f"[eval] eval_timing "
+            f"policy_load={policy_load_seconds:.3f}s "
+            f"reset={env_reset_seconds:.3f}s "
+            f"policy={policy_forward_seconds:.3f}s "
+            f"env_step={env_step_seconds:.3f}s "
+            f"cache_hits={env_cache_hits:.0f} "
+            f"cache_misses={env_cache_misses:.0f}",
+            flush=True,
+        )
+        return {
+            "eval/episodes": float(len(lengths)),
+            "eval/mean_length": float(np.mean(lengths)) if lengths else 0.0,
+            "eval/mean_reward": float(np.mean(rewards)) if rewards else 0.0,
+            "eval/crashes": float(crashes),
+            "eval/policy_load_seconds": policy_load_seconds,
+            "eval/policy_forward_seconds": policy_forward_seconds,
+            "eval/env_step_seconds": env_step_seconds,
+            "eval/env_reset_seconds": env_reset_seconds,
+            "eval/env_cache_hits": env_cache_hits,
+            "eval/env_cache_misses": env_cache_misses,
+        }
+    env = None
     lengths: list[int] = []
     rewards: list[float] = []
     crashes = 0
+    was_training = policy.training
+    policy.eval()
     try:
-        for ep_idx in range(max(1, int(episodes))):
-            obs, _info = env.reset(seed=int(cfg.seed) + 100_000 + ep_idx)
-            total_reward = 0.0
-            length = 0
-            for _ in range(max(1, int(cfg.max_episode_steps))):
+        with evaluation_thread_context(cfg):
+            env = make_training_env(cfg)
+            for ep_idx in range(max(1, int(episodes))):
+                obs, _info = env.reset(seed=int(cfg.seed) + 100_000 + ep_idx)
                 obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
-                with torch.no_grad():
-                    obs_tensor = torch.as_tensor(obs_agents, dtype=torch.float32, device=device)
-                    mean, _values = policy(obs_tensor)
-                    action_arr = torch.clamp(mean, -1.0, 1.0).detach().cpu().numpy().astype(np.float32)
-                action = tuple(row.copy() for row in action_arr.reshape(-1, int(cfg.continuous_action_dim)))
-                obs, reward, terminated, truncated, info = env.step(action)
-                total_reward += float(np.asarray(reward, dtype=np.float32).mean())
-                length += 1
-                if bool(info.get("crashed", False)) if isinstance(info, dict) else False:
-                    crashes += 1
-                if terminated or truncated:
-                    break
-            lengths.append(length)
-            rewards.append(total_reward)
+                eval_memory = (
+                    policy.initial_memory(len(obs_agents), device=device, dtype=torch.float32)
+                    if bool(getattr(policy, "supports_recurrent_memory", False))
+                    else None
+                )
+                total_reward = 0.0
+                length = 0
+                for _ in range(max(1, int(cfg.max_episode_steps))):
+                    obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
+                    with torch.no_grad():
+                        obs_tensor = torch.as_tensor(obs_agents, dtype=torch.float32, device=device)
+                        if bool(getattr(policy, "supports_recurrent_memory", False)):
+                            mean, _values, eval_memory = policy(
+                                obs_tensor,
+                                memory=eval_memory,
+                                return_memory=True,
+                            )
+                        else:
+                            mean, _values = policy(obs_tensor)
+                        action_arr = torch.clamp(mean, -1.0, 1.0).detach().cpu().numpy().astype(np.float32)
+                    action = tuple(row.copy() for row in action_arr.reshape(-1, int(cfg.continuous_action_dim)))
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    total_reward += float(np.asarray(reward, dtype=np.float32).mean())
+                    length += 1
+                    if bool(info.get("crashed", False)) if isinstance(info, dict) else False:
+                        crashes += 1
+                    if terminated or truncated:
+                        break
+                lengths.append(length)
+                rewards.append(total_reward)
     finally:
-        env.close()
+        if was_training:
+            policy.train()
+        if env is not None:
+            env.close()
     return {
         "eval/episodes": float(len(lengths)),
         "eval/mean_length": float(np.mean(lengths)) if lengths else 0.0,
@@ -529,6 +867,7 @@ def main() -> None:
     monitor.start()
 
     env = None
+    evaluation_executor = None
     try:
         expert = load_expert_transition_data(
             cfg.expert_data,
@@ -561,6 +900,12 @@ def main() -> None:
             transformer_layers=int(cfg.transformer_layers),
             transformer_heads=int(cfg.transformer_heads),
             transformer_dropout=float(cfg.transformer_dropout),
+            transformer_temporal_module=bool(getattr(cfg, "transformer_temporal_module", False)),
+            transformer_temporal_kernel_size=int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
+            transformer_temporal_layers=int(getattr(cfg, "transformer_temporal_layers", 1)),
+            transformer_memory_tokens=int(getattr(cfg, "transformer_memory_tokens", 8)),
+            transformer_memory_context_length=int(getattr(cfg, "transformer_memory_context_length", 32)),
+            transformer_use_causal_attention=bool(getattr(cfg, "transformer_use_causal_attention", True)),
         ).to(device)
         q_net = SoftQNetwork(policy_obs_dim, int(cfg.continuous_action_dim), cfg.hidden_size).to(device)
         target_q_net = SoftQNetwork(policy_obs_dim, int(cfg.continuous_action_dim), cfg.hidden_size).to(device)
@@ -568,6 +913,7 @@ def main() -> None:
         policy_optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.learning_rate)
         q_optimizer = torch.optim.Adam(q_net.parameters(), lr=cfg.disc_learning_rate)
         monitor.watch(policy, q_net)
+        evaluation_executor = make_evaluation_executor(cfg)
 
         print(f"Loaded expert folder: {os.path.abspath(cfg.expert_data)}")
         print(f"expert_obs={expert.policy_observations.shape} expert_actions={expert.actions_continuous_env.shape}")
@@ -577,18 +923,41 @@ def main() -> None:
             f"replay_mb={_replay_size_mb(replay):.1f} "
             f"batch_size={cfg.batch_size} matmul_precision={extras.torch_matmul_precision}"
         )
+        print(
+            "policy="
+            f"{cfg.policy_model} hidden={cfg.hidden_size} "
+            f"layers={cfg.transformer_layers} heads={cfg.transformer_heads} "
+            f"dropout={cfg.transformer_dropout} temporal={cfg.transformer_temporal_module} "
+            f"kernel={cfg.transformer_temporal_kernel_size} temporal_layers={cfg.transformer_temporal_layers}"
+        )
+        print(
+            "evaluation="
+            f"workers={cfg.evaluation_num_workers} "
+            f"worker_threads={cfg.evaluation_worker_threads} "
+            f"validation_all_vehicles={cfg.validation_control_all_vehicles}"
+        )
 
         latest_stats: dict[str, float] = {}
         convergence = ConvergenceTracker()
         best_path = os.path.join(run_dir, "best.pt")
         completed_update = 0
-        for update_idx in range(1, int(extras.total_updates) + 1):
+        update_iter = range(1, int(extras.total_updates) + 1)
+        progress = (
+            tqdm(update_iter, total=int(extras.total_updates), dynamic_ncols=True, desc="IQ-Learn")
+            if tqdm is not None
+            else update_iter
+        )
+        for update_idx in progress:
             completed_update = int(update_idx)
             round_cfg = config_for_round(cfg, update_idx)
             round_cfg.continuous_action_dim = cfg.continuous_action_dim
             set_optimizer_lr(policy_optimizer, float(round_cfg.learning_rate))
             set_optimizer_lr(q_optimizer, float(round_cfg.disc_learning_rate))
-            should_log = update_idx == 1 or update_idx % max(1, int(extras.eval_every)) == 0
+            validation_due = (
+                int(getattr(cfg, "validation_every", 0)) > 0
+                and update_idx % int(cfg.validation_every) == 0
+            )
+            should_log = update_idx == 1 or update_idx % max(1, int(extras.eval_every)) == 0 or validation_due
             update_stats = update_iq_learn(
                 policy,
                 q_net,
@@ -633,11 +1002,33 @@ def main() -> None:
                         "Lower --learning-rate/--disc-learning-rate or increase Q regularization."
                     )
                 metrics = {"update": update_idx, **{f"iq/{k}": v for k, v in latest_stats.items()}}
-                eval_stats = evaluate_policy(policy, round_cfg, device, episodes=int(extras.eval_episodes))
+                eval_stats = evaluate_policy(
+                    policy,
+                    round_cfg,
+                    device,
+                    episodes=int(extras.eval_episodes),
+                    evaluation_executor=evaluation_executor,
+                )
                 metrics.update(eval_stats)
                 metrics["train/gamma"] = float(round_cfg.gamma)
                 metrics["train/policy_learning_rate"] = float(round_cfg.learning_rate)
                 metrics["train/q_learning_rate"] = float(round_cfg.disc_learning_rate)
+                if validation_due:
+                    val_cfg = config_for_round(cfg, update_idx)
+                    val_cfg.continuous_action_dim = cfg.continuous_action_dim
+                    val_metrics = evaluate_policy_matched_trajectories(
+                        policy,
+                        val_cfg,
+                        device,
+                        split=str(getattr(cfg, "validation_prebuilt_split", "val")),
+                        episodes=int(getattr(cfg, "validation_episodes", 0)),
+                        prefix="validation",
+                        evaluation_executor=evaluation_executor,
+                    )
+                    if val_metrics:
+                        metrics.update(val_metrics)
+                        monitor.log(val_metrics, step=update_idx)
+                        _print_matched_eval("validation", f"{update_idx:06d}", val_metrics)
                 score = convergence_score(
                     latest_stats,
                     eval_stats,
@@ -678,6 +1069,13 @@ def main() -> None:
                     }
                 )
                 monitor.log(metrics, step=update_idx)
+                if tqdm is not None:
+                    progress.set_postfix(
+                        q=f"{latest_stats['q_loss']:.3f}",
+                        bc=f"{latest_stats['bc_loss']:.4f}",
+                        eval_len=f"{eval_stats['eval/mean_length']:.1f}",
+                        score=f"{score:.2f}",
+                    )
                 print(
                     f"[update {update_idx:06d}] q_loss={latest_stats['q_loss']:.4f} "
                     f"policy_loss={latest_stats['policy_loss']:.4f} "
@@ -756,7 +1154,22 @@ def main() -> None:
         final_video_path = save_checkpoint_video(policy, final_cfg, run_dir=run_dir, round_idx=int(completed_update), device=device)
         if final_video_path is not None:
             monitor.log_video("checkpoint/final_policy_video", final_video_path, step=int(completed_update), fps=int(final_cfg.policy_frequency))
+        if int(getattr(cfg, "test_episodes", 0)) > 0:
+            test_metrics = evaluate_policy_matched_trajectories(
+                policy,
+                final_cfg,
+                device,
+                split=str(getattr(cfg, "test_prebuilt_split", "test")),
+                episodes=int(getattr(cfg, "test_episodes", 0)),
+                prefix="test",
+                evaluation_executor=evaluation_executor,
+            )
+            if test_metrics:
+                monitor.log(test_metrics, step=int(completed_update))
+                _print_matched_eval("test", "final", test_metrics)
     finally:
+        if evaluation_executor is not None:
+            evaluation_executor.shutdown(wait=True, cancel_futures=True)
         if env is not None:
             env.close()
         monitor.finish()

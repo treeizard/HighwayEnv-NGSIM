@@ -1166,7 +1166,11 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             for vehicle in self.controlled_vehicles
             if vehicle not in policy_vehicles
         ]
-        info["controlled_vehicle_ids"] = list(self.ego_ids)
+        info["requested_controlled_vehicle_ids"] = list(self.ego_ids)
+        info["controlled_vehicle_ids"] = [
+            int(getattr(vehicle, "vehicle_ID", -1))
+            for vehicle in self.controlled_vehicles
+        ]
         info["controlled_vehicle_crashes"] = [
             bool(vehicle.crashed) for vehicle in self.controlled_vehicles
         ]

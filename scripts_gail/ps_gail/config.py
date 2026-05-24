@@ -40,6 +40,10 @@ class PSGAILConfig:
     # Threads/Training parameters. These values define the training setup and optimization parameters;
     num_rollout_workers: int = 1 # number of actives worker that will be rolling out trajectories in parallel.
     rollout_worker_threads: int = 1 # number of active threads can be utilized by each rollout worker. 
+    evaluation_num_workers: int = 1 # persistent evaluation workers; 0 keeps old main-process serial eval.
+    evaluation_worker_threads: int = 2 # native CPU threads available inside each evaluation worker.
+    evaluation_cache_envs: bool = True # keep evaluation envs alive inside persistent eval workers.
+    evaluation_max_cached_envs_per_worker: int = 0 # 0 means unlimited per-worker eval env cache.
     max_expert_samples: int = 100_000
     trajectory_frame: str = "relative" # Parameters that can be utilized for state-only GAIL
     max_surrounding: str | int = "all"
@@ -209,8 +213,10 @@ class PSGAILConfig:
     validation_every: int = 20
     validation_episodes: int = 4
     validation_prebuilt_split: str = "val"
+    validation_control_all_vehicles: bool = False
     test_episodes: int = 4
     test_prebuilt_split: str = "test"
+    test_control_all_vehicles: bool = False
     evaluation_horizons_seconds: str = "1,5,10,20"
     hard_brake_accel_threshold: float = -3.0
     device: str = "auto"

@@ -20,12 +20,22 @@ export PYTHONPATH="${REPODIR}:${PYTHONPATH:-}"
 SLURM_CPUS="${SLURM_CPUS_PER_TASK:-32}"
 ROLLOUT_WORKER_THREADS="${ROLLOUT_WORKER_THREADS:-2}"
 ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-16}"
+EVALUATION_WORKER_THREADS="${EVALUATION_WORKER_THREADS:-2}"
+EVALUATION_WORKERS="${EVALUATION_WORKERS:-$((SLURM_CPUS / EVALUATION_WORKER_THREADS))}"
 if [ "${ROLLOUT_WORKERS}" -lt 1 ]; then
     ROLLOUT_WORKERS=1
+fi
+if [ "${EVALUATION_WORKERS}" -lt 1 ]; then
+    EVALUATION_WORKERS=1
 fi
 REQUESTED_ROLLOUT_CPUS=$((ROLLOUT_WORKERS * ROLLOUT_WORKER_THREADS))
 if [ "${REQUESTED_ROLLOUT_CPUS}" -gt "${SLURM_CPUS}" ]; then
     echo "Requested rollout CPU use (${REQUESTED_ROLLOUT_CPUS}) exceeds SLURM_CPUS_PER_TASK (${SLURM_CPUS})." >&2
+    exit 1
+fi
+REQUESTED_EVALUATION_CPUS=$((EVALUATION_WORKERS * EVALUATION_WORKER_THREADS))
+if [ "${REQUESTED_EVALUATION_CPUS}" -gt "${SLURM_CPUS}" ]; then
+    echo "Requested evaluation CPU use (${REQUESTED_EVALUATION_CPUS}) exceeds SLURM_CPUS_PER_TASK (${SLURM_CPUS})." >&2
     exit 1
 fi
 
@@ -269,6 +279,7 @@ echo "Rollout target-aware episodes: ${ROLLOUT_TARGET_AWARE_EPISODES} min=${ROLL
 echo "Rollout training subsample: ${ROLLOUT_TRAINING_SUBSAMPLE} cap=${ROLLOUT_TRAINING_AGENT_STEPS:-0} (0 follows rollout target)"
 echo "CPUs per task: ${SLURM_CPUS}"
 echo "Rollout workers: ${ROLLOUT_WORKERS}"
+echo "Evaluation workers: ${EVALUATION_WORKERS}"
 echo "Rollout worker threads: ${ROLLOUT_WORKER_THREADS}"
 echo "Requested rollout CPUs: ${REQUESTED_ROLLOUT_CPUS}"
 echo "Controlled-vehicle schedule endpoints: ${INITIAL_CONTROLLED_VEHICLES}->${FINAL_CONTROLLED_VEHICLES}/${CONTROLLED_VEHICLE_CURRICULUM_ROUNDS} rounds increment_rounds=${CONTROLLED_VEHICLE_INCREMENT_ROUNDS}"
@@ -429,6 +440,8 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --trajectory-frame "${TRAJECTORY_FRAME}" \
     --num-rollout-workers "${ROLLOUT_WORKERS}" \
     --rollout-worker-threads "${ROLLOUT_WORKER_THREADS}" \
+    --evaluation-num-workers "${EVALUATION_WORKERS}" \
+    --evaluation-worker-threads "${EVALUATION_WORKER_THREADS}" \
     --max-expert-samples "${MAX_EXPERT_SAMPLES}" \
     --policy-model "${POLICY_MODEL}" \
     --hidden-size "${HIDDEN_SIZE}" \

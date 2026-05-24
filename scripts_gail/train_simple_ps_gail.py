@@ -41,10 +41,12 @@ from scripts_gail.ps_gail.trainer import (
     collect_round_rollouts,
     discrete_action_masks_from_env,
     discriminator_input_mode,
+    evaluation_thread_context,
     evaluate_policy_matched_trajectories,
     infer_continuous_action_dim,
     infer_critic_obs_dim,
     infer_policy_obs_dim,
+    make_evaluation_executor,
     make_rollout_executor,
     policy_action_dim,
     recurrent_policy_enabled,
@@ -499,7 +501,7 @@ def evaluate_policy_survival(
     eval_episodes = max(0, int(episodes))
     if eval_episodes <= 0:
         return {}
-    env = make_training_env(cfg)
+    env = None
     lengths: list[int] = []
     crash_episodes = 0
     offroad_episodes = 0
@@ -508,59 +510,62 @@ def evaluate_policy_survival(
     was_training = policy.training
     policy.eval()
     try:
-        for episode_idx in range(eval_episodes):
-            obs, _info = env.reset(seed=int(cfg.seed) + int(seed_offset) + episode_idx)
-            eval_memory = (
-                policy.initial_memory(
-                    len(policy_observations_from_flat(flatten_agent_observations(obs))),
-                    device=device,
-                    dtype=torch.float32,
+        with evaluation_thread_context(cfg):
+            env = make_training_env(cfg)
+            for episode_idx in range(eval_episodes):
+                obs, _info = env.reset(seed=int(cfg.seed) + int(seed_offset) + episode_idx)
+                eval_memory = (
+                    policy.initial_memory(
+                        len(policy_observations_from_flat(flatten_agent_observations(obs))),
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    if recurrent_policy_enabled(policy)
+                    else None
                 )
-                if recurrent_policy_enabled(policy)
-                else None
-            )
-            episode_had_crash = False
-            episode_had_offroad = False
-            length = 0
-            for _step in range(max(1, int(cfg.max_episode_steps))):
-                road = getattr(env.unwrapped, "road", None)
-                road_vehicles = list(getattr(road, "vehicles", ())) if road is not None else []
-                controlled = list(getattr(env.unwrapped, "controlled_vehicles", ()) or ())
-                controlled_counts.append(len(controlled))
-                road_counts.append(len(road_vehicles))
-                if recurrent_policy_enabled(policy):
-                    action, eval_memory = _policy_action_tuple(
-                        policy,
-                        obs,
-                        env,
-                        device=device,
-                        deterministic=bool(cfg.bc_pretrain_eval_deterministic),
-                        cfg=cfg,
-                        memory=eval_memory,
-                        return_memory=True,
-                    )
-                else:
-                    action = _policy_action_tuple(
-                        policy,
-                        obs,
-                        env,
-                        device=device,
-                        deterministic=bool(cfg.bc_pretrain_eval_deterministic),
-                        cfg=cfg,
-                    )
-                obs, _reward, terminated, truncated, info = env.step(action)
-                length += 1
-                crash_flags = info.get("controlled_vehicle_crashes", [])
-                offroad_flags = info.get("controlled_vehicle_offroad", [])
-                episode_had_crash = bool(episode_had_crash or any(bool(flag) for flag in crash_flags))
-                episode_had_offroad = bool(episode_had_offroad or any(bool(flag) for flag in offroad_flags))
-                if terminated or truncated:
-                    break
-            lengths.append(length)
-            crash_episodes += int(episode_had_crash)
-            offroad_episodes += int(episode_had_offroad)
+                episode_had_crash = False
+                episode_had_offroad = False
+                length = 0
+                for _step in range(max(1, int(cfg.max_episode_steps))):
+                    road = getattr(env.unwrapped, "road", None)
+                    road_vehicles = list(getattr(road, "vehicles", ())) if road is not None else []
+                    controlled = list(getattr(env.unwrapped, "controlled_vehicles", ()) or ())
+                    controlled_counts.append(len(controlled))
+                    road_counts.append(len(road_vehicles))
+                    if recurrent_policy_enabled(policy):
+                        action, eval_memory = _policy_action_tuple(
+                            policy,
+                            obs,
+                            env,
+                            device=device,
+                            deterministic=bool(cfg.bc_pretrain_eval_deterministic),
+                            cfg=cfg,
+                            memory=eval_memory,
+                            return_memory=True,
+                        )
+                    else:
+                        action = _policy_action_tuple(
+                            policy,
+                            obs,
+                            env,
+                            device=device,
+                            deterministic=bool(cfg.bc_pretrain_eval_deterministic),
+                            cfg=cfg,
+                        )
+                    obs, _reward, terminated, truncated, info = env.step(action)
+                    length += 1
+                    crash_flags = info.get("controlled_vehicle_crashes", [])
+                    offroad_flags = info.get("controlled_vehicle_offroad", [])
+                    episode_had_crash = bool(episode_had_crash or any(bool(flag) for flag in crash_flags))
+                    episode_had_offroad = bool(episode_had_offroad or any(bool(flag) for flag in offroad_flags))
+                    if terminated or truncated:
+                        break
+                lengths.append(length)
+                crash_episodes += int(episode_had_crash)
+                offroad_episodes += int(episode_had_offroad)
     finally:
-        env.close()
+        if env is not None:
+            env.close()
         if was_training:
             policy.train()
     return {
@@ -619,6 +624,7 @@ def main() -> None:
 
     env = None
     rollout_executor = None
+    evaluation_executor = None
     try:
         sequence_only_discriminator = bool(cfg.enable_sequence_discriminator)
         expert_transitions = None
@@ -847,7 +853,9 @@ def main() -> None:
             f"sequence_reward_assignment={cfg.sequence_reward_assignment} "
             f"cgail_k={cfg.cgail_k} "
             f"rollout_workers={cfg.num_rollout_workers} "
-            f"rollout_worker_threads={cfg.rollout_worker_threads}"
+            f"rollout_worker_threads={cfg.rollout_worker_threads} "
+            f"evaluation_workers={cfg.evaluation_num_workers} "
+            f"evaluation_worker_threads={cfg.evaluation_worker_threads}"
         )
         if int(cfg.bc_pretrain_epochs) > 0:
             print(
@@ -978,6 +986,7 @@ def main() -> None:
             )
             monitor.save(bc_path)
         rollout_executor = make_rollout_executor(cfg)
+        evaluation_executor = make_evaluation_executor(cfg)
         last_checkpoint_video_path = None
         last_checkpoint_video_round = 0
         primary_discriminator_replay: list[np.ndarray] = []
@@ -1415,6 +1424,8 @@ def main() -> None:
                 ),
                 "train/rollout_workers": int(cfg.num_rollout_workers),
                 "train/rollout_worker_threads": int(cfg.rollout_worker_threads),
+                "train/evaluation_workers": int(round_cfg.evaluation_num_workers),
+                "train/evaluation_worker_threads": int(round_cfg.evaluation_worker_threads),
                 "train/discriminator_replay_rounds": int(getattr(round_cfg, "discriminator_replay_rounds", 0)),
                 "train/discriminator_replay_max_samples": int(
                     getattr(round_cfg, "discriminator_replay_max_samples", 0)
@@ -1514,15 +1525,20 @@ def main() -> None:
                     split=str(getattr(cfg, "validation_prebuilt_split", "val")),
                     episodes=int(getattr(cfg, "validation_episodes", 0)),
                     prefix="validation",
+                    evaluation_executor=evaluation_executor,
                 )
                 if val_metrics:
                     monitor.log(val_metrics, step=round_idx)
                     print(
                         f"[validation {round_idx:04d}] "
                         f"episodes={val_metrics.get('validation/episodes', 0):.0f} "
+                        f"terminated={val_metrics.get('validation/terminated_episodes', 0):.0f} "
+                        f"truncated={val_metrics.get('validation/truncated_episodes', 0):.0f} "
                         f"rmse_pos_20s={val_metrics.get('validation/rmse_position_20s', float('nan')):.4f} "
-                        f"collision={val_metrics.get('validation/collision_rate', 0.0):.4f} "
-                        f"offroad={val_metrics.get('validation/offroad_duration_rate', 0.0):.4f} "
+                        f"collision={val_metrics.get('validation/vehicle_crash_rate', val_metrics.get('validation/collision_rate', 0.0)):.4f} "
+                        f"offroad={val_metrics.get('validation/vehicle_offroad_rate', val_metrics.get('validation/offroad_duration_rate', 0.0)):.4f} "
+                        f"collision_dur={val_metrics.get('validation/collision_duration_rate', val_metrics.get('validation/collision_rate', 0.0)):.4f} "
+                        f"offroad_dur={val_metrics.get('validation/offroad_duration_rate', 0.0):.4f} "
                         f"hard_brake={val_metrics.get('validation/hard_brake_rate', 0.0):.4f}"
                     )
 
@@ -1625,6 +1641,7 @@ def main() -> None:
                 split=str(getattr(cfg, "test_prebuilt_split", "test")),
                 episodes=int(getattr(cfg, "test_episodes", 0)),
                 prefix="test",
+                evaluation_executor=evaluation_executor,
             )
             if test_metrics:
                 monitor.log(test_metrics, step=final_round)
@@ -1632,13 +1649,15 @@ def main() -> None:
                     f"[test final] "
                     f"episodes={test_metrics.get('test/episodes', 0):.0f} "
                     f"rmse_pos_20s={test_metrics.get('test/rmse_position_20s', float('nan')):.4f} "
-                    f"collision={test_metrics.get('test/collision_rate', 0.0):.4f} "
-                    f"offroad={test_metrics.get('test/offroad_duration_rate', 0.0):.4f} "
+                    f"collision={test_metrics.get('test/vehicle_crash_rate', test_metrics.get('test/collision_rate', 0.0)):.4f} "
+                    f"offroad={test_metrics.get('test/vehicle_offroad_rate', test_metrics.get('test/offroad_duration_rate', 0.0)):.4f} "
                     f"hard_brake={test_metrics.get('test/hard_brake_rate', 0.0):.4f}"
                 )
     finally:
         if rollout_executor is not None:
             rollout_executor.shutdown(wait=True, cancel_futures=True)
+        if evaluation_executor is not None:
+            evaluation_executor.shutdown(wait=True, cancel_futures=True)
         if env is not None:
             env.close()
         monitor.finish()
