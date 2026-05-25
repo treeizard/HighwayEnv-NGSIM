@@ -49,9 +49,12 @@ from highway_env.ngsim_utils.data.trajectory_gen import (
     trajectory_has_min_continuous_occupancy,
     trajectory_smoothing,
 )
+from highway_env.ngsim_utils.road.gen_road import create_japanese_road
+from highway_env.ngsim_utils.road.lane_mapping import target_lane_index_from_lane_id
 
 
 MORINOMIYA_START_JST = pd.Timestamp("2020-01-01 09:00:00", tz="Asia/Tokyo")
+JST_TIMEZONE = "Asia/Tokyo"
 
 
 def parse_args() -> argparse.Namespace:
@@ -123,6 +126,13 @@ def parse_args() -> argparse.Namespace:
         help="Lane ids used to estimate the centerline for curvature remapping.",
     )
     parser.add_argument(
+        "--allowed_lane_ids",
+        type=int,
+        nargs="+",
+        default=[1, 2, 3],
+        help="Road-supported Japanese lane ids to keep before building trajectories.",
+    )
+    parser.add_argument(
         "--bin_size_m",
         type=float,
         default=5.0,
@@ -132,13 +142,27 @@ def parse_args() -> argparse.Namespace:
         "--curved_flatten_bin_size_m",
         type=float,
         default=10.0,
-        help="Bin size used to suppress residual end-of-road curvature in y_curved.",
+        help="Longitudinal bin size used for lane-aware lateral recentering.",
     )
     parser.add_argument(
         "--curved_flatten_sample_step",
         type=int,
         default=25,
-        help="Use every Nth remapped row to estimate the residual y_curved drift profile.",
+        help="Use every Nth remapped row to estimate lane-center correction profiles.",
+    )
+    parser.add_argument(
+        "--max_lane_lateral_m",
+        type=float,
+        default=1.65,
+        help=(
+            "Clip each vehicle center to this absolute lateral offset from its "
+            "mapped lane center after recentering. Use a negative value to disable."
+        ),
+    )
+    parser.add_argument(
+        "--disable_lane_center_alignment",
+        action="store_true",
+        help="Skip lane-aware recentering and keep the raw Frenet lateral offsets.",
     )
     parser.add_argument(
         "--start_clock",
@@ -149,6 +173,24 @@ def parse_args() -> argparse.Namespace:
         "--end_clock",
         default="13:00:00",
         help="End clock time in JST for filtering rows, format HH:MM[:SS].",
+    )
+    parser.add_argument(
+        "--min_episode_count",
+        type=int,
+        default=0,
+        help=(
+            "Fail before saving if fewer than this many episode windows are built. "
+            "Use this to avoid accidentally overwriting a full cache with a small subset."
+        ),
+    )
+    parser.add_argument(
+        "--require_episode",
+        nargs="*",
+        default=[],
+        help=(
+            "Episode names that must be present before saving, e.g. "
+            "t1577843200000."
+        ),
     )
     return parser.parse_args()
 
@@ -210,6 +252,45 @@ def filter_by_jst_clock(
     return out.loc[time_mask].copy()
 
 
+def parse_datetime_jst(values) -> pd.Series:
+    """Parse possibly mixed-offset timestamps and normalize them to JST."""
+    parsed = pd.to_datetime(
+        pd.Series(values, copy=False),
+        errors="coerce",
+        utc=True,
+    )
+    return parsed.dt.tz_convert(JST_TIMEZONE)
+
+
+def parse_morinomiya_clock_datetime(values) -> pd.Series:
+    """Parse Morinomiya HHMMSSmmm numeric timestamps into JST datetimes."""
+    numeric = pd.to_numeric(pd.Series(values, copy=False), errors="coerce").astype("Int64")
+    text = numeric.astype("string").str.zfill(9)
+    valid = numeric.notna() & text.str.match(r"^\d{9}$", na=False)
+
+    hours = pd.to_numeric(text.str.slice(0, 2), errors="coerce")
+    minutes = pd.to_numeric(text.str.slice(2, 4), errors="coerce")
+    seconds = pd.to_numeric(text.str.slice(4, 6), errors="coerce")
+    millis = pd.to_numeric(text.str.slice(6, 9), errors="coerce")
+    valid &= (
+        hours.between(0, 23)
+        & minutes.between(0, 59)
+        & seconds.between(0, 59)
+        & millis.between(0, 999)
+    )
+
+    total_ms = (
+        hours * 3_600_000
+        + minutes * 60_000
+        + seconds * 1_000
+        + millis
+    )
+    return MORINOMIYA_START_JST.normalize() + pd.to_timedelta(
+        total_ms.where(valid),
+        unit="ms",
+    )
+
+
 def load_filtered_morinomiya(
     npy_path: str,
     basis_lat: float,
@@ -263,18 +344,9 @@ def load_filtered_morinomiya(
     )
 
     if "datetime_jst" in field_names:
-        datetime_jst = pd.to_datetime(
-            pd.Series(arr["datetime_jst"], copy=False),
-            errors="coerce",
-        )
+        datetime_jst = parse_datetime_jst(arr["datetime_jst"])
     else:
-        datetime_jst = pd.Series(
-            MORINOMIYA_START_JST + pd.to_timedelta(
-                numeric_data["datetime"],
-                unit="ms",
-            ),
-            copy=False,
-        )
+        datetime_jst = parse_morinomiya_clock_datetime(numeric_data["datetime"])
 
     datetime_jst_mask = datetime_jst.notna().to_numpy()
     if not np.any(datetime_jst_mask & required_mask):
@@ -452,6 +524,206 @@ def suppress_terminal_curvature(
     return out, profile.reset_index(drop=True)[["x_center", "y_bias"]]
 
 
+def target_japanese_lane_center_y(net, x: float, lane_id: int) -> float:
+    """Return the HighwayEnv Japanese lane center y for a processed x/lane id."""
+    lane_index = target_lane_index_from_lane_id(net, "japanese", float(x), int(lane_id))
+    if lane_index is None:
+        return float("nan")
+    lane = net.get_lane(lane_index)
+    local_s, _local_r = lane.local_coordinates(np.array([float(x), 0.0], dtype=float))
+    lane_length = float(getattr(lane, "length", local_s))
+    if np.isfinite(lane_length) and lane_length > 0:
+        local_s = float(np.clip(local_s, 0.0, lane_length))
+    return float(lane.position(local_s, 0.0)[1])
+
+
+def target_japanese_lane_center_y_array(
+    x_values: np.ndarray,
+    lane_ids: np.ndarray,
+) -> np.ndarray:
+    net = create_japanese_road()
+    out = np.full(len(x_values), np.nan, dtype=float)
+    for i, (x_value, lane_id) in enumerate(zip(x_values, lane_ids)):
+        if not np.isfinite(x_value) or not np.isfinite(lane_id):
+            continue
+        out[i] = target_japanese_lane_center_y(net, float(x_value), int(lane_id))
+    return out
+
+
+def align_lanes_to_japanese_road(
+    df: pd.DataFrame,
+    *,
+    x_col: str = "x_curved",
+    y_col: str = "y_curved",
+    lane_col: str = "traffic_lane",
+    bin_size_m: float = 10.0,
+    sample_step: int = 25,
+    max_abs_lateral_m: float | None = 1.65,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
+    """
+    Align each recorded lane center to the HighwayEnv Japanese road geometry.
+
+    The raw Morinomiya road bends slightly near the downstream end. The Frenet
+    projection straightens that bend, but residual lane-specific lateral drift can
+    remain when the centerline estimate is sparse or traffic mix changes. This
+    correction estimates the median ``raw_y - mapped_lane_center_y`` per lane and
+    longitudinal bin, subtracts only that shared lane bias, and preserves each
+    vehicle's within-lane lateral deviation. Optional clipping keeps centers
+    inside the mapped lane so replay vehicles do not go off-road automatically.
+    """
+    out = df.copy()
+    out["y_curved_raw"] = pd.to_numeric(out[y_col], errors="coerce")
+
+    sample_step = max(1, int(sample_step))
+    bin_size = max(1.0, float(bin_size_m))
+    sample = out.iloc[::sample_step].dropna(subset=[x_col, y_col, lane_col]).copy()
+    if sample.empty:
+        return out, pd.DataFrame(columns=["lane_id", "x_center", "y_bias"]), {
+            "aligned_rows": 0,
+            "clipped_rows": 0,
+            "profile_rows": 0,
+        }
+
+    sample_x = pd.to_numeric(sample[x_col], errors="coerce").to_numpy(dtype=float)
+    sample_lane = pd.to_numeric(sample[lane_col], errors="coerce").to_numpy(dtype=float)
+    sample_y = pd.to_numeric(sample[y_col], errors="coerce").to_numpy(dtype=float)
+    sample_target = target_japanese_lane_center_y_array(sample_x, sample_lane)
+    finite_sample = (
+        np.isfinite(sample_x)
+        & np.isfinite(sample_y)
+        & np.isfinite(sample_lane)
+        & np.isfinite(sample_target)
+    )
+    sample = sample.loc[finite_sample].copy()
+    if sample.empty:
+        return out, pd.DataFrame(columns=["lane_id", "x_center", "y_bias"]), {
+            "aligned_rows": 0,
+            "clipped_rows": 0,
+            "profile_rows": 0,
+        }
+
+    sample["_target_y"] = sample_target[finite_sample]
+    sample["_lane_id"] = sample[lane_col].astype(int)
+    sample["_lateral_residual"] = pd.to_numeric(sample[y_col], errors="coerce") - sample["_target_y"]
+
+    bins = np.arange(
+        0.0,
+        float(np.nanmax(pd.to_numeric(sample[x_col], errors="coerce"))) + bin_size,
+        bin_size,
+        dtype=float,
+    )
+    if bins.size < 2:
+        return out, pd.DataFrame(columns=["lane_id", "x_center", "y_bias"]), {
+            "aligned_rows": 0,
+            "clipped_rows": 0,
+            "profile_rows": 0,
+        }
+
+    sample["_bin"] = pd.cut(sample[x_col], bins=bins, labels=False, include_lowest=True)
+    profile = (
+        sample.groupby(["_lane_id", "_bin"], observed=False)["_lateral_residual"]
+        .median()
+        .dropna()
+        .to_frame("y_bias")
+        .reset_index()
+    )
+    if profile.empty:
+        return out, pd.DataFrame(columns=["lane_id", "x_center", "y_bias"]), {
+            "aligned_rows": 0,
+            "clipped_rows": 0,
+            "profile_rows": 0,
+        }
+
+    profile["lane_id"] = profile["_lane_id"].astype(int)
+    profile["x_center"] = bins[:-1][profile["_bin"].to_numpy(dtype=int)] + 0.5 * bin_size
+    profile["y_bias"] = (
+        profile.groupby("lane_id", group_keys=False)["y_bias"]
+        .transform(lambda s: s.rolling(window=5, center=True, min_periods=1).median())
+    )
+    profile = profile.sort_values(["lane_id", "x_center"]).reset_index(drop=True)
+
+    aligned_rows = 0
+    clipped_rows = 0
+    max_abs_lateral = None
+    if max_abs_lateral_m is not None and float(max_abs_lateral_m) >= 0.0:
+        max_abs_lateral = float(max_abs_lateral_m)
+
+    all_lane_ids = pd.to_numeric(out[lane_col], errors="coerce")
+    for lane_id, lane_profile in profile.groupby("lane_id", sort=True):
+        row_mask = all_lane_ids == int(lane_id)
+        if not row_mask.any():
+            continue
+        profile_x = lane_profile["x_center"].to_numpy(dtype=float)
+        profile_bias = lane_profile["y_bias"].to_numpy(dtype=float)
+        if profile_x.size == 0:
+            continue
+
+        row_x = pd.to_numeric(out.loc[row_mask, x_col], errors="coerce").to_numpy(dtype=float)
+        row_y = pd.to_numeric(out.loc[row_mask, y_col], errors="coerce").to_numpy(dtype=float)
+        correction = np.interp(
+            row_x,
+            profile_x,
+            profile_bias,
+            left=float(profile_bias[0]),
+            right=float(profile_bias[-1]),
+        )
+        aligned_y = row_y - correction
+
+        if max_abs_lateral is not None:
+            target_y = target_japanese_lane_center_y_array(
+                row_x,
+                np.full_like(row_x, float(lane_id), dtype=float),
+            )
+            residual = aligned_y - target_y
+            clipped = np.isfinite(residual) & (np.abs(residual) > max_abs_lateral)
+            clipped_rows += int(clipped.sum())
+            aligned_y = np.where(
+                np.isfinite(target_y),
+                target_y + np.clip(residual, -max_abs_lateral, max_abs_lateral),
+                aligned_y,
+            )
+
+        out.loc[row_mask, y_col] = aligned_y
+        aligned_rows += int(row_mask.sum())
+
+    report_profile = profile[["lane_id", "x_center", "y_bias"]].copy()
+    summary = {
+        "aligned_rows": int(aligned_rows),
+        "clipped_rows": int(clipped_rows),
+        "profile_rows": int(len(report_profile)),
+    }
+    return out, report_profile, summary
+
+
+def clip_japanese_lateral_to_road(
+    df: pd.DataFrame,
+    *,
+    x_col: str = "x_smooth",
+    y_col: str = "y_smooth",
+    lane_col: str = "traffic_lane",
+    max_abs_lateral_m: float = 1.65,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Clip smoothed Japanese vehicle centers inside their mapped road lane."""
+    out = df.copy()
+    if max_abs_lateral_m is None or float(max_abs_lateral_m) < 0.0:
+        return out, {"checked_rows": 0, "clipped_rows": 0}
+
+    x_values = pd.to_numeric(out[x_col], errors="coerce").to_numpy(dtype=float)
+    y_values = pd.to_numeric(out[y_col], errors="coerce").to_numpy(dtype=float)
+    lane_ids = pd.to_numeric(out[lane_col], errors="coerce").to_numpy(dtype=float)
+    target_y = target_japanese_lane_center_y_array(x_values, lane_ids)
+    residual = y_values - target_y
+    valid = np.isfinite(x_values) & np.isfinite(y_values) & np.isfinite(target_y)
+    clipped = valid & (np.abs(residual) > float(max_abs_lateral_m))
+    y_values = np.where(
+        clipped,
+        target_y + np.clip(residual, -float(max_abs_lateral_m), float(max_abs_lateral_m)),
+        y_values,
+    )
+    out[y_col] = y_values
+    return out, {"checked_rows": int(valid.sum()), "clipped_rows": int(clipped.sum())}
+
+
 def build_episode_dicts(
     df_smooth: pd.DataFrame,
     window_sec: int,
@@ -486,7 +758,7 @@ def build_episode_dicts(
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["datetime_jst"] = pd.to_datetime(df["datetime_jst"], errors="coerce")
+    df["datetime_jst"] = parse_datetime_jst(df["datetime_jst"])
     df = df.dropna(subset=["datetime_jst"] + numeric_cols).copy()
 
     if df.empty:
@@ -528,10 +800,32 @@ def build_episode_dicts(
         traj_dict: dict[np.int64, dict[str, np.ndarray]] = {}
         valid_ids: list[np.int64] = []
 
+        window_elapsed = (group["datetime_jst"] - window_start).dt.total_seconds()
+        group = group.copy()
+        group["_frame_idx"] = np.rint(
+            pd.to_numeric(window_elapsed, errors="coerce").to_numpy(dtype=float) / nominal_dt
+        ).astype(int)
+        group = group[
+            (group["_frame_idx"] >= 0)
+            & (group["_frame_idx"] < expected_frames)
+        ].copy()
+
         for veh_id, veh_group in group.groupby("vehicle_id", sort=True):
-            ordered = veh_group.sort_values("datetime_jst")
-            traj = ordered[["x_smooth", "y_smooth", "v_smooth", "traffic_lane"]].to_numpy(dtype=float)
-            traj[:, 3] = ordered["traffic_lane"].to_numpy(dtype=np.int64)
+            ordered = (
+                veh_group.sort_values("datetime_jst")
+                .drop_duplicates("_frame_idx", keep="last")
+                .copy()
+            )
+            if ordered.empty:
+                continue
+
+            traj = np.zeros((expected_frames, 4), dtype=float)
+            frame_idx = ordered["_frame_idx"].to_numpy(dtype=int)
+            values = ordered[
+                ["x_smooth", "y_smooth", "v_smooth", "traffic_lane"]
+            ].to_numpy(dtype=float)
+            values[:, 3] = ordered["traffic_lane"].to_numpy(dtype=np.int64)
+            traj[frame_idx] = values
 
             traj_dict[np.int64(veh_id)] = {
                 "length": np.float64(ordered["vehicle_length"].iloc[0]),
@@ -610,13 +904,25 @@ def main() -> None:
         start_clock=start_clock,
         end_clock=end_clock,
     )
+    loaded_start = df["datetime_jst"].min()
+    loaded_end = df["datetime_jst"].max()
     print(
         f"Loaded {len(df)} cleaned rows across {df['vehicle_id'].nunique()} vehicles "
         f"for JST window {args.start_clock} to {args.end_clock}"
     )
+    print(f"Loaded data time range: {loaded_start} to {loaded_end}")
 
     df = add_vehicle_width(df)
     df = df.dropna(subset=["vehicle_length", "vehicle_width", "velocity"]).copy()
+    allowed_lane_ids = {int(lane_id) for lane_id in args.allowed_lane_ids}
+    if allowed_lane_ids:
+        before_lane_filter = len(df)
+        df = df[df["traffic_lane"].astype(int).isin(allowed_lane_ids)].copy()
+        print(
+            "Filtered unsupported Japanese lane ids: "
+            f"kept={len(df)}, dropped={before_lane_filter - len(df)}, "
+            f"allowed={sorted(allowed_lane_ids)}"
+        )
 
     df_curved, centerline_df = estimate_curvature_remap(
         df,
@@ -626,24 +932,50 @@ def main() -> None:
     df["x_curved"] = pd.to_numeric(df_curved["x_curved"], errors="coerce")
     df["y_curved"] = pd.to_numeric(df_curved["y_curved"], errors="coerce")
     df = df.dropna(subset=["x_curved", "y_curved"]).copy()
-    df, flatten_profile = suppress_terminal_curvature(
-        df,
-        x_col="x_curved",
-        y_col="y_curved",
-        bin_size_m=args.curved_flatten_bin_size_m,
-        sample_step=args.curved_flatten_sample_step,
-    )
+    if args.disable_lane_center_alignment:
+        alignment_profile = pd.DataFrame(columns=["lane_id", "x_center", "y_bias"])
+        alignment_summary = {"aligned_rows": 0, "clipped_rows": 0, "profile_rows": 0}
+    else:
+        max_lane_lateral_m = (
+            None
+            if args.max_lane_lateral_m is None or float(args.max_lane_lateral_m) < 0.0
+            else float(args.max_lane_lateral_m)
+        )
+        df, alignment_profile, alignment_summary = align_lanes_to_japanese_road(
+            df,
+            x_col="x_curved",
+            y_col="y_curved",
+            lane_col="traffic_lane",
+            bin_size_m=args.curved_flatten_bin_size_m,
+            sample_step=args.curved_flatten_sample_step,
+            max_abs_lateral_m=max_lane_lateral_m,
+        )
 
     print(
         "Centerline estimated with "
         f"{len(centerline_df)} samples using lanes {list(args.centerline_lanes)}"
     )
     print(
-        "Applied residual curved-road flattening with "
-        f"{len(flatten_profile)} bias samples"
+        "Applied lane-aware Japanese road recentering with "
+        f"{len(alignment_profile)} bias samples; "
+        f"aligned_rows={alignment_summary['aligned_rows']}, "
+        f"clipped_rows={alignment_summary['clipped_rows']}"
     )
 
     df_smooth = smooth_vehicle_trajectories(df)
+    if not args.disable_lane_center_alignment and max_lane_lateral_m is not None:
+        df_smooth, smooth_clip_summary = clip_japanese_lateral_to_road(
+            df_smooth,
+            x_col="x_smooth",
+            y_col="y_smooth",
+            lane_col="traffic_lane",
+            max_abs_lateral_m=max_lane_lateral_m,
+        )
+        print(
+            "Applied post-smoothing lane lateral guard: "
+            f"checked_rows={smooth_clip_summary['checked_rows']}, "
+            f"clipped_rows={smooth_clip_summary['clipped_rows']}"
+        )
     veh_ids_all, traj_all = build_episode_dicts(
         df_smooth=df_smooth,
         window_sec=args.window_sec,
@@ -653,6 +985,28 @@ def main() -> None:
     episode_keys = sorted(traj_all.keys())
     if not episode_keys:
         raise RuntimeError("No episodes were created from the filtered Japanese dataset.")
+
+    print(f"Episode key range: {episode_keys[0]} to {episode_keys[-1]}")
+
+    if args.min_episode_count and len(episode_keys) < int(args.min_episode_count):
+        raise RuntimeError(
+            f"Built only {len(episode_keys)} episodes, fewer than "
+            f"--min_episode_count={args.min_episode_count}. "
+            f"Loaded data covered {loaded_start} to {loaded_end}; refusing to save."
+        )
+
+    required_episodes = [str(episode_name) for episode_name in args.require_episode]
+    missing_required = [
+        episode_name
+        for episode_name in required_episodes
+        if episode_name not in traj_all
+    ]
+    if missing_required:
+        raise RuntimeError(
+            "Required episode(s) missing before save: "
+            f"{missing_required}. Loaded data covered {loaded_start} to {loaded_end}; "
+            f"built episode range {episode_keys[0]} to {episode_keys[-1]}."
+        )
 
     train_keys, val_keys, test_keys = split_episode_keys(
         episode_keys=episode_keys,

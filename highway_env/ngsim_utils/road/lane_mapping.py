@@ -131,22 +131,24 @@ def target_lane_index_from_lane_id(
         #   lane_id 2 -> right mainline lane
         #   lane_id 1 -> left mainline lane
         #   lane_id 3 -> left merge lane
+        x_merge_start = 150.0
+        x_merge_end = 315.0
         if lane_id == 2:
-            if x < 150.0:
+            if x < x_merge_start:
                 return ("a", "b", 0)
-            if x < 260.0:
+            if x < x_merge_end:
                 return ("b", "c", 0)
             return ("c", "d", 0)
         if lane_id == 1:
-            if x < 150.0:
+            if x < x_merge_start:
                 return ("a", "b", 1)
-            if x < 260.0:
+            if x < x_merge_end:
                 return ("b", "c", 1)
             return ("c", "d", 1)
         if lane_id == 3:
-            if x < 150.0:
+            if x < x_merge_start:
                 return ("j", "b", 0)
-            if x < 260.0:
+            if x < x_merge_end:
                 return ("b", "c", 2)
             # After the merge lane disappears, fold back onto the left mainline lane.
             return ("c", "d", 1)
