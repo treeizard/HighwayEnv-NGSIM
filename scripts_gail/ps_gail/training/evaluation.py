@@ -52,7 +52,7 @@ from .policy import (
 )
 
 _EVAL_POLICY_CACHE = {}
-_EVAL_ENV_CACHE = {}
+_EVAL_ENV_CACHE = OrderedDict()
 _EVAL_ENV_CACHE_HITS = 0
 _EVAL_ENV_CACHE_MISSES = 0
 
