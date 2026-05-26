@@ -62,6 +62,7 @@ EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_unified_expert_conti
 AIRL_TRAIN_SCRIPT="${AIRL_TRAIN_SCRIPT:-${REPODIR}/scripts_gail/train_simple_airl.py}"
 RUN_NAME="${RUN_NAME:-ps_airl_stage2_100veh_${SLURM_JOB_ID}}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
+ALLOW_NON_BEST_RESUME="${ALLOW_NON_BEST_RESUME:-false}"
 WANDB_MODE="${WANDB_MODE:-online}"
 
 # Training defaults: full-episode AIRL rounds. With --rollout-full-episodes,
@@ -108,7 +109,7 @@ fi
 CONTROLLED_VEHICLE_CURRICULUM="${CONTROLLED_VEHICLE_CURRICULUM:-true}"
 # Warmup is disabled for this stage; keep the knobs below only for reference.
 WARMUP_ROUNDS=0
-WARMUP_LEARNING_RATE="${WARMUP_LEARNING_RATE:-1e-4}"
+WARMUP_LEARNING_RATE="${WARMUP_LEARNING_RATE:-0}"
 WARMUP_DISC_LEARNING_RATE="${WARMUP_DISC_LEARNING_RATE:-0}"
 WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.04}"
 WARMUP_CLIP_RANGE="${WARMUP_CLIP_RANGE:-0.10}"
@@ -131,8 +132,9 @@ FINAL_GAMMA="${FINAL_GAMMA:-0.99}"
 GAMMA_CURRICULUM_ROUNDS="${GAMMA_CURRICULUM_ROUNDS:-${TOTAL_ROUNDS}}"
 GAMMA_SCHEDULE="${GAMMA_SCHEDULE:-0:500:0.95:0.95;500:600:0.95:0.99;600:800:0.99:0.99}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
+PPO_EPOCHS="${PPO_EPOCHS:-6}"
 LEARNING_RATE="${LEARNING_RATE:-4e-4}"
-LEARNING_RATE_SCHEDULE="${LEARNING_RATE_SCHEDULE:-0:100:2e-4:3e-4;100:500:3e-4:3e-4;500:600:2e-4:3e-4;600:800:3e-4:3e-4}"
+LEARNING_RATE_SCHEDULE="${LEARNING_RATE_SCHEDULE:-}"
 ENTROPY_COEF="${ENTROPY_COEF:-0.010}"
 ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-0:100:0.04:0.015;100:500:0.015:0.015;500:600:0.04:0.015;600:800:0.015:0.015}"
 CLIP_RANGE="${CLIP_RANGE:-0.20}"
@@ -191,8 +193,21 @@ SAVE_CHECKPOINT_VIDEO="${SAVE_CHECKPOINT_VIDEO:-true}"
 CHECKPOINT_VIDEO_EVERY="${CHECKPOINT_VIDEO_EVERY:-50}"
 CHECKPOINT_VIDEO_STEPS="${CHECKPOINT_VIDEO_STEPS:-200}"
 VALIDATION_EVERY="${VALIDATION_EVERY:-20}"
-VALIDATION_EPISODES="${VALIDATION_EPISODES:-4}"
+VALIDATION_EPISODES="${VALIDATION_EPISODES:-2}"
 VALIDATION_PREBUILT_SPLIT="${VALIDATION_PREBUILT_SPLIT:-val}"
+VALIDATION_VEHICLE_MODE="${VALIDATION_VEHICLE_MODE:-training_count}"
+VALIDATION_STRESS_EVERY="${VALIDATION_STRESS_EVERY:-100}"
+VALIDATION_STRESS_EPISODES="${VALIDATION_STRESS_EPISODES:-2}"
+VALIDATION_STRESS_VEHICLE_MODE="${VALIDATION_STRESS_VEHICLE_MODE:-all}"
+SAVE_BEST_CHECKPOINT="${SAVE_BEST_CHECKPOINT:-true}"
+VALIDATION_MIN_DELTA="${VALIDATION_MIN_DELTA:-0.0}"
+VALIDATION_SCORE_HORIZON_SECONDS="${VALIDATION_SCORE_HORIZON_SECONDS:-20}"
+VALIDATION_SCORE_POSITION_WEIGHT="${VALIDATION_SCORE_POSITION_WEIGHT:-1.0}"
+VALIDATION_SCORE_SPEED_WEIGHT="${VALIDATION_SCORE_SPEED_WEIGHT:-0.5}"
+VALIDATION_SCORE_LANE_OFFSET_WEIGHT="${VALIDATION_SCORE_LANE_OFFSET_WEIGHT:-2.0}"
+VALIDATION_SCORE_CRASH_WEIGHT="${VALIDATION_SCORE_CRASH_WEIGHT:-25.0}"
+VALIDATION_SCORE_OFFROAD_WEIGHT="${VALIDATION_SCORE_OFFROAD_WEIGHT:-25.0}"
+VALIDATION_SCORE_HARD_BRAKE_WEIGHT="${VALIDATION_SCORE_HARD_BRAKE_WEIGHT:-2.0}"
 TEST_EPISODES="${TEST_EPISODES:-4}"
 TEST_PREBUILT_SPLIT="${TEST_PREBUILT_SPLIT:-test}"
 EVALUATION_HORIZONS_SECONDS="${EVALUATION_HORIZONS_SECONDS:-1,5,10,20}"
@@ -207,6 +222,11 @@ if [ "${SAVE_CHECKPOINT_VIDEO}" = "true" ]; then
     CHECKPOINT_VIDEO_ARG="--save-checkpoint-video"
 else
     CHECKPOINT_VIDEO_ARG="--no-save-checkpoint-video"
+fi
+if [ "${SAVE_BEST_CHECKPOINT}" = "true" ]; then
+    SAVE_BEST_CHECKPOINT_ARG="--save-best-checkpoint"
+else
+    SAVE_BEST_CHECKPOINT_ARG="--no-save-best-checkpoint"
 fi
 if [ "${WGAN_REWARD_CENTER}" = "true" ]; then
     WGAN_REWARD_CENTER_ARG="--wgan-reward-center"
@@ -294,6 +314,7 @@ echo "Allow WGAN reward normalization: ${ALLOW_WGAN_REWARD_NORMALIZATION}"
 echo "WGAN reward normalization safety: min_std=${WGAN_REWARD_NORM_MIN_STD} clip=${WGAN_REWARD_NORM_CLIP}"
 echo "Entropy schedule: ${ENTROPY_COEF_SCHEDULE}"
 echo "PPO clip schedule: ${CLIP_RANGE_SCHEDULE}"
+echo "PPO epochs: ${PPO_EPOCHS}"
 echo "AIRL reward updates schedule: ${DISC_UPDATES_PER_ROUND_SCHEDULE}"
 echo "Entropy coef: ${ENTROPY_COEF}"
 echo "Vehicle-increase warmup rounds: ${VEHICLE_INCREASE_WARMUP_ROUNDS}"
@@ -323,18 +344,24 @@ echo "WGAN reward scale: ${WGAN_REWARD_SCALE}"
 echo "Checkpoint every: ${CHECKPOINT_EVERY}"
 echo "Save checkpoint video: ${SAVE_CHECKPOINT_VIDEO}"
 echo "Checkpoint video every: ${CHECKPOINT_VIDEO_EVERY}"
-echo "Validation: every=${VALIDATION_EVERY} episodes=${VALIDATION_EPISODES} split=${VALIDATION_PREBUILT_SPLIT} horizons=${EVALUATION_HORIZONS_SECONDS}"
+echo "Validation: every=${VALIDATION_EVERY} episodes=${VALIDATION_EPISODES} split=${VALIDATION_PREBUILT_SPLIT} mode=${VALIDATION_VEHICLE_MODE} horizons=${EVALUATION_HORIZONS_SECONDS}"
+echo "Validation stress: every=${VALIDATION_STRESS_EVERY} episodes=${VALIDATION_STRESS_EPISODES} mode=${VALIDATION_STRESS_VEHICLE_MODE}"
+echo "Best checkpoint: save=${SAVE_BEST_CHECKPOINT} min_delta=${VALIDATION_MIN_DELTA} score_horizon=${VALIDATION_SCORE_HORIZON_SECONDS}s weights=pos:${VALIDATION_SCORE_POSITION_WEIGHT},speed:${VALIDATION_SCORE_SPEED_WEIGHT},lane:${VALIDATION_SCORE_LANE_OFFSET_WEIGHT},crash:${VALIDATION_SCORE_CRASH_WEIGHT},offroad:${VALIDATION_SCORE_OFFROAD_WEIGHT},hard_brake:${VALIDATION_SCORE_HARD_BRAKE_WEIGHT}"
 echo "Test: episodes=${TEST_EPISODES} split=${TEST_PREBUILT_SPLIT} hard_brake_threshold=${HARD_BRAKE_ACCEL_THRESHOLD}"
 echo "PyTorch CUDA alloc conf: ${PYTORCH_CUDA_ALLOC_CONF}"
 echo "CUDA devices: ${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi || true
 
 if [ -z "${RESUME_CHECKPOINT}" ]; then
-    echo "RESUME_CHECKPOINT must point to a stage-one final.pt or round_XXXX.pt checkpoint." >&2
+    echo "RESUME_CHECKPOINT must point to a stage-one best.pt checkpoint." >&2
     exit 2
 fi
 if [ ! -f "${RESUME_CHECKPOINT}" ]; then
     echo "RESUME_CHECKPOINT not found: ${RESUME_CHECKPOINT}" >&2
+    exit 2
+fi
+if [ "${ALLOW_NON_BEST_RESUME}" != "true" ] && [ "$(basename "${RESUME_CHECKPOINT}")" != "best.pt" ]; then
+    echo "RESUME_CHECKPOINT must point to best.pt. Set ALLOW_NON_BEST_RESUME=true to override." >&2
     exit 2
 fi
 
@@ -379,6 +406,19 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --validation-every "${VALIDATION_EVERY}" \
     --validation-episodes "${VALIDATION_EPISODES}" \
     --validation-prebuilt-split "${VALIDATION_PREBUILT_SPLIT}" \
+    --validation-vehicle-mode "${VALIDATION_VEHICLE_MODE}" \
+    --validation-stress-every "${VALIDATION_STRESS_EVERY}" \
+    --validation-stress-episodes "${VALIDATION_STRESS_EPISODES}" \
+    --validation-stress-vehicle-mode "${VALIDATION_STRESS_VEHICLE_MODE}" \
+    "${SAVE_BEST_CHECKPOINT_ARG}" \
+    --validation-min-delta "${VALIDATION_MIN_DELTA}" \
+    --validation-score-horizon-seconds "${VALIDATION_SCORE_HORIZON_SECONDS}" \
+    --validation-score-position-weight "${VALIDATION_SCORE_POSITION_WEIGHT}" \
+    --validation-score-speed-weight "${VALIDATION_SCORE_SPEED_WEIGHT}" \
+    --validation-score-lane-offset-weight "${VALIDATION_SCORE_LANE_OFFSET_WEIGHT}" \
+    --validation-score-crash-weight "${VALIDATION_SCORE_CRASH_WEIGHT}" \
+    --validation-score-offroad-weight "${VALIDATION_SCORE_OFFROAD_WEIGHT}" \
+    --validation-score-hard-brake-weight "${VALIDATION_SCORE_HARD_BRAKE_WEIGHT}" \
     --test-episodes "${TEST_EPISODES}" \
     --test-prebuilt-split "${TEST_PREBUILT_SPLIT}" \
     --evaluation-horizons-seconds "${EVALUATION_HORIZONS_SECONDS}" \
@@ -466,6 +506,7 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --transformer-memory-storage-dtype "${TRANSFORMER_MEMORY_STORAGE_DTYPE}" \
     "${TRANSFORMER_USE_CAUSAL_ATTENTION_ARG}" \
     --batch-size "${BATCH_SIZE}" \
+    --ppo-epochs "${PPO_EPOCHS}" \
     --entropy-coef "${ENTROPY_COEF}" \
     --entropy-coef-schedule "${ENTROPY_COEF_SCHEDULE}" \
     --clip-range "${CLIP_RANGE}" \

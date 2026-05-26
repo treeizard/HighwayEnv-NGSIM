@@ -1,6 +1,7 @@
 import json
 import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -90,6 +91,9 @@ from scripts_gail.ps_gail.data import (
     standardize_features,
     transform_sequence_features,
 )
+from scripts_gail.ps_gail.training import evaluation as eval_mod
+from scripts_gail.ps_gail.validation import best_checkpoint_payload
+from scripts_gail.ps_gail.validation import validation_cost_and_score
 from scripts_gail.ps_gail.models import (
     SequenceTrajectoryDiscriminator,
     TrajectoryDiscriminator,
@@ -114,9 +118,11 @@ from scripts_gail.ps_gail.trainer import (
 )
 from scripts_gail.train_simple_ps_gail import behavior_clone_pretrain
 from scripts_gail.train_simple_ps_gail import config_for_round as ps_gail_config_for_round
+from scripts_gail.train_simple_ps_gail import parse_args as ps_gail_parse_args
 from scripts_gail.train_simple_airl import AIRLReward
 from scripts_gail.train_simple_airl import _airl_wgan_gradient_penalty
 from scripts_gail.train_simple_airl import config_for_round as airl_config_for_round
+from scripts_gail.train_simple_airl import parse_args as airl_parse_args
 from scripts_gail.train_simple_airl import refresh_airl_rewards
 from scripts_gail.train_simple_airl import update_reward_model
 from scripts_gail.train_simple_iq_learn import convergence_reached, convergence_score
@@ -1410,3 +1416,113 @@ def test_constant_rollout_target_agent_steps_remains_supported():
     assert ps_gail_counts == [20.0, 30.0, 40.0, 40.0]
     assert airl_counts == ps_gail_counts
     assert airl_config_for_round(cfg, 4).rollout_target_agent_steps == 12_345
+
+
+def test_training_count_validation_selects_scheduled_vehicle_count_and_clips(monkeypatch):
+    valid_ids_by_episode = {
+        "ep_a": np.asarray([1, 2, 3], dtype=np.int64),
+        "ep_b": np.asarray([10, 11], dtype=np.int64),
+    }
+
+    def fake_load_prebuilt_data(*_args, **_kwargs):
+        return "", valid_ids_by_episode, {}, ["ep_a", "ep_b"]
+
+    monkeypatch.setattr(eval_mod, "load_prebuilt_data", fake_load_prebuilt_data)
+    cfg = PSGAILConfig(percentage_controlled_vehicles=2, seed=123)
+    specs = eval_mod._evaluation_training_count_episode_specs(cfg, split="val", episodes=2)
+    assert len(specs) == 2
+    assert [len(vehicle_ids) for _idx, _episode, vehicle_ids in specs] == [2, 2]
+    for _idx, episode, vehicle_ids in specs:
+        assert set(vehicle_ids).issubset(set(map(int, valid_ids_by_episode[episode])))
+
+    clipped_cfg = PSGAILConfig(percentage_controlled_vehicles=5, seed=123)
+    clipped_specs = eval_mod._evaluation_training_count_episode_specs(
+        clipped_cfg,
+        split="val",
+        episodes=2,
+    )
+    assert sorted(len(vehicle_ids) for _idx, _episode, vehicle_ids in clipped_specs) == [2, 3]
+
+
+def test_gail_and_airl_parse_same_validation_strategy_defaults(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["train_simple_ps_gail.py"])
+    gail_cfg = ps_gail_parse_args()
+    monkeypatch.setattr(sys, "argv", ["train_simple_airl.py"])
+    airl_cfg, _reward_batch_size = airl_parse_args()
+
+    assert gail_cfg.validation_vehicle_mode == "training_count"
+    assert airl_cfg.validation_vehicle_mode == "training_count"
+    assert gail_cfg.validation_stress_vehicle_mode == "all"
+    assert airl_cfg.validation_stress_vehicle_mode == "all"
+    assert not gail_cfg.validation_control_all_vehicles
+    assert not airl_cfg.validation_control_all_vehicles
+
+
+def test_weighted_validation_score_prefers_lower_rmse_and_safety_rates():
+    cfg = PSGAILConfig()
+    good_metrics = {
+        "validation/rmse_position_20s": 1.0,
+        "validation/rmse_speed_20s": 0.5,
+        "validation/rmse_lane_offset_20s": 0.1,
+        "validation/vehicle_crash_rate": 0.0,
+        "validation/vehicle_offroad_rate": 0.0,
+        "validation/hard_brake_rate": 0.01,
+    }
+    bad_metrics = {
+        "validation/rmse_position_20s": 1.5,
+        "validation/rmse_speed_20s": 0.8,
+        "validation/rmse_lane_offset_20s": 0.3,
+        "validation/vehicle_crash_rate": 0.02,
+        "validation/vehicle_offroad_rate": 0.01,
+        "validation/hard_brake_rate": 0.05,
+    }
+
+    good_cost, good_score, good_components = validation_cost_and_score(good_metrics, cfg)
+    bad_cost, bad_score, bad_components = validation_cost_and_score(bad_metrics, cfg)
+
+    assert np.isfinite(good_cost)
+    assert np.isfinite(bad_cost)
+    assert good_score > bad_score
+    assert good_cost < bad_cost
+    assert good_components["speed_rmse"] == pytest.approx(0.5)
+    assert bad_components["lane_offset_rmse"] == pytest.approx(0.3)
+
+
+def test_best_checkpoint_payload_carries_validation_metadata_and_model_state_keys():
+    base_payload = {
+        "round": 20,
+        "policy_state_dict": {"weight": torch.tensor([1.0])},
+        "discriminator_state_dict": {"weight": torch.tensor([2.0])},
+        "config": {"run_name": "unit"},
+    }
+    metrics = {
+        "validation/rmse_position_20s": 1.0,
+        "validation/rmse_speed_20s": 0.5,
+        "validation/rmse_lane_offset_20s": 0.1,
+    }
+    payload = best_checkpoint_payload(
+        base_payload,
+        round_idx=20,
+        validation_metrics=metrics,
+        validation_score=-1.23,
+        validation_cost=1.23,
+    )
+
+    assert payload["round"] == 20
+    assert payload["best_round"] == 20
+    assert payload["validation_score"] == pytest.approx(-1.23)
+    assert payload["validation_cost"] == pytest.approx(1.23)
+    assert payload["validation_metrics"] == metrics
+    assert "policy_state_dict" in payload
+    assert "discriminator_state_dict" in payload
+
+
+def test_stage2_scripts_require_best_resume_by_default():
+    root = Path(__file__).resolve().parents[1]
+    gail_script = root / "slurum" / "script_finetune" / "train_gail_continuous_gpu_32c_stage2_100veh.bash"
+    airl_script = root / "slurum" / "script_finetune" / "train_airl_continuous_gpu_32c_stage2_100veh.bash"
+    for script in (gail_script, airl_script):
+        text = script.read_text(encoding="utf-8")
+        assert 'ALLOW_NON_BEST_RESUME="${ALLOW_NON_BEST_RESUME:-false}"' in text
+        assert '$(basename "${RESUME_CHECKPOINT}")" != "best.pt"' in text
+        assert "Set ALLOW_NON_BEST_RESUME=true to override" in text

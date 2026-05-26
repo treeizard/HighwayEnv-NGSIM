@@ -46,6 +46,11 @@ from scripts_gail.ps_gail.trainer import (
     subsample_rollout_for_training,
     update_policy,
 )
+from scripts_gail.ps_gail.validation import (
+    best_checkpoint_payload,
+    matched_validation_summary,
+    scored_validation_metrics,
+)
 from scripts_gail.train_simple_ps_gail import (
     append_policy_archive,
     behavior_clone_pretrain,
@@ -175,6 +180,25 @@ def env_signature(cfg: PSGAILConfig) -> tuple[object, ...]:
         int(cfg.max_episode_steps),
         str(cfg.prebuilt_split),
     )
+
+
+def airl_checkpoint_payload(
+    *,
+    round_idx: int,
+    policy: torch.nn.Module,
+    reward_model: torch.nn.Module,
+    expert_metadata: dict[str, object],
+    cfg: PSGAILConfig,
+    round_cfg: PSGAILConfig,
+) -> dict[str, object]:
+    return {
+        "round": int(round_idx),
+        "policy_state_dict": policy.state_dict(),
+        "reward_state_dict": reward_model.state_dict(),
+        "expert_metadata": expert_metadata,
+        "config": vars(cfg),
+        "round_config": vars(round_cfg),
+    }
 
 
 def _policy_log_probs(
@@ -539,7 +563,6 @@ def parse_args() -> tuple[PSGAILConfig, int]:
         transformer_temporal_module=True,
         disc_expert_label=0.8,
         disc_generator_label=0.2,
-        validation_control_all_vehicles=True,
         validation_episodes=4,
     )
     parser = argparse.ArgumentParser(description="Lightweight continuous AIRL test trainer for unified NGSIM expert data.")
@@ -811,6 +834,10 @@ def main() -> None:
         last_checkpoint_video_round = 0
         airl_replay: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
         psro_policy_archive: list[dict[str, torch.Tensor]] = []
+        best_validation_score = float("-inf")
+        best_validation_round = 0
+        best_path = os.path.join(run_dir, "best.pt")
+        last_validation_stress_round = 0
         if bool(getattr(cfg, "psro_lite", False)):
             append_policy_archive(psro_policy_archive, policy, cfg)
             print(
@@ -1109,32 +1136,77 @@ def main() -> None:
                     evaluation_executor=evaluation_executor,
                 )
                 if val_metrics:
-                    monitor.log(val_metrics, step=round_idx)
-                    print(
-                        f"[validation {round_idx:04d}] "
-                        f"episodes={val_metrics.get('validation/episodes', 0):.0f} "
-                        f"vehicles={val_metrics.get('validation/vehicles', 0):.0f} "
-                        f"vehicle_episodes={val_metrics.get('validation/vehicle_episodes', 0):.0f} "
-                        f"terminated={val_metrics.get('validation/terminated_episodes', 0):.0f} "
-                        f"truncated={val_metrics.get('validation/truncated_episodes', 0):.0f} "
-                        f"rmse_pos_20s={val_metrics.get('validation/rmse_position_20s', float('nan')):.4f} "
-                        f"collision={val_metrics.get('validation/vehicle_crash_rate', val_metrics.get('validation/collision_rate', 0.0)):.4f} "
-                        f"offroad={val_metrics.get('validation/vehicle_offroad_rate', val_metrics.get('validation/offroad_duration_rate', 0.0)):.4f} "
-                        f"collision_dur={val_metrics.get('validation/collision_duration_rate', val_metrics.get('validation/collision_rate', 0.0)):.4f} "
-                        f"offroad_dur={val_metrics.get('validation/offroad_duration_rate', 0.0):.4f} "
-                        f"hard_brake={val_metrics.get('validation/hard_brake_rate', 0.0):.4f}"
+                    val_metrics, val_cost, val_score = scored_validation_metrics(
+                        val_metrics,
+                        cfg,
+                        prefix="validation",
                     )
+                    monitor.log(val_metrics, step=round_idx)
+                    improved = (
+                        bool(getattr(cfg, "save_best_checkpoint", True))
+                        and np.isfinite(val_score)
+                        and val_score > best_validation_score + float(getattr(cfg, "validation_min_delta", 0.0))
+                    )
+                    if improved:
+                        best_validation_score = float(val_score)
+                        best_validation_round = int(round_idx)
+                        torch.save(
+                            best_checkpoint_payload(
+                                airl_checkpoint_payload(
+                                    round_idx=round_idx,
+                                    policy=policy,
+                                    reward_model=reward_model,
+                                    expert_metadata=expert.metadata,
+                                    cfg=cfg,
+                                    round_cfg=round_cfg,
+                                ),
+                                round_idx=round_idx,
+                                validation_metrics=val_metrics,
+                                validation_score=val_score,
+                                validation_cost=val_cost,
+                            ),
+                            best_path,
+                        )
+                        monitor.save(best_path)
+                    print(
+                        matched_validation_summary("validation", f"{round_idx:04d}", val_metrics)
+                        + f" best={best_validation_score:.4f}@{best_validation_round}"
+                    )
+            stress_every = int(getattr(cfg, "validation_stress_every", 0))
+            if (
+                stress_every > 0
+                and int(getattr(cfg, "validation_stress_episodes", 0)) > 0
+                and round_idx % stress_every == 0
+            ):
+                stress_metrics = evaluate_policy_matched_trajectories(
+                    policy,
+                    round_cfg,
+                    device,
+                    split=str(getattr(cfg, "validation_prebuilt_split", "val")),
+                    episodes=int(getattr(cfg, "validation_stress_episodes", 0)),
+                    prefix="validation_stress",
+                    evaluation_executor=evaluation_executor,
+                )
+                if stress_metrics:
+                    stress_metrics, _stress_cost, _stress_score = scored_validation_metrics(
+                        stress_metrics,
+                        cfg,
+                        prefix="validation_stress",
+                    )
+                    monitor.log(stress_metrics, step=round_idx)
+                    print(matched_validation_summary("validation_stress", f"{round_idx:04d}", stress_metrics))
+                    last_validation_stress_round = int(round_idx)
             if cfg.checkpoint_every > 0 and round_idx % int(cfg.checkpoint_every) == 0:
                 checkpoint_path = os.path.join(ckpt_dir, f"round_{round_idx:04d}.pt")
                 torch.save(
-                    {
-                        "round": round_idx,
-                        "policy_state_dict": policy.state_dict(),
-                        "reward_state_dict": reward_model.state_dict(),
-                        "expert_metadata": expert.metadata,
-                        "config": vars(cfg),
-                        "round_config": vars(round_cfg),
-                    },
+                    airl_checkpoint_payload(
+                        round_idx=round_idx,
+                        policy=policy,
+                        reward_model=reward_model,
+                        expert_metadata=expert.metadata,
+                        cfg=cfg,
+                        round_cfg=round_cfg,
+                    ),
                     checkpoint_path,
                 )
                 monitor.save(checkpoint_path)
@@ -1155,14 +1227,14 @@ def main() -> None:
         final_round_cfg = config_for_round(cfg, final_round)
         final_path = os.path.join(run_dir, "final.pt")
         torch.save(
-            {
-                "round": final_round,
-                "policy_state_dict": policy.state_dict(),
-                "reward_state_dict": reward_model.state_dict(),
-                "expert_metadata": expert.metadata,
-                "config": vars(cfg),
-                "round_config": vars(final_round_cfg),
-            },
+            airl_checkpoint_payload(
+                round_idx=final_round,
+                policy=policy,
+                reward_model=reward_model,
+                expert_metadata=expert.metadata,
+                cfg=cfg,
+                round_cfg=final_round_cfg,
+            ),
             final_path,
         )
         monitor.save(final_path)
@@ -1186,6 +1258,27 @@ def main() -> None:
                 step=final_round,
                 fps=int(cfg.policy_frequency),
             )
+        if (
+            int(getattr(cfg, "validation_stress_episodes", 0)) > 0
+            and last_validation_stress_round != final_round
+        ):
+            stress_metrics = evaluate_policy_matched_trajectories(
+                policy,
+                final_round_cfg,
+                device,
+                split=str(getattr(cfg, "validation_prebuilt_split", "val")),
+                episodes=int(getattr(cfg, "validation_stress_episodes", 0)),
+                prefix="validation_stress",
+                evaluation_executor=evaluation_executor,
+            )
+            if stress_metrics:
+                stress_metrics, _stress_cost, _stress_score = scored_validation_metrics(
+                    stress_metrics,
+                    cfg,
+                    prefix="validation_stress",
+                )
+                monitor.log(stress_metrics, step=final_round)
+                print(matched_validation_summary("validation_stress", "final", stress_metrics))
         if int(getattr(cfg, "test_episodes", 0)) > 0:
             test_metrics = evaluate_policy_matched_trajectories(
                 policy,

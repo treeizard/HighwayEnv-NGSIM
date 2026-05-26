@@ -23,6 +23,7 @@ from torch.distributions import Categorical, Normal
 
 from highway_env.imitation.expert_dataset import ENV_ID, build_env_config, register_ngsim_env
 from highway_env.ngsim_utils.core.constants import MAX_ACCEL
+from highway_env.ngsim_utils.data.episode_selection import resolve_num_ego_vehicles
 from highway_env.ngsim_utils.data.prebuilt import load_prebuilt_data
 
 from ..config import PSGAILConfig
@@ -55,6 +56,7 @@ _EVAL_POLICY_CACHE = {}
 _EVAL_ENV_CACHE = OrderedDict()
 _EVAL_ENV_CACHE_HITS = 0
 _EVAL_ENV_CACHE_MISSES = 0
+EpisodeSpec = tuple[int, str, tuple[int, ...] | None]
 
 @contextmanager
 def evaluation_thread_context(cfg: PSGAILConfig):
@@ -141,6 +143,61 @@ def _evaluation_episode_names(
     order = rng.permutation(len(names))
     return [names[int(idx)] for idx in order[: min(int(episodes), len(names))]]
 
+def _normalize_evaluation_vehicle_mode(cfg: PSGAILConfig, *, prefix: str) -> str:
+    mode = str(getattr(cfg, f"{prefix}_vehicle_mode", "") or "").strip().lower()
+    if not mode:
+        mode = "all" if bool(getattr(cfg, f"{prefix}_control_all_vehicles", False)) else "single"
+    if bool(getattr(cfg, f"{prefix}_control_all_vehicles", False)):
+        mode = "all"
+    if mode not in {"single", "training_count", "all"}:
+        raise ValueError(
+            f"{prefix}_vehicle_mode must be one of single, training_count, or all; got {mode!r}."
+        )
+    return mode
+
+def _evaluation_training_count_episode_specs(
+    cfg: PSGAILConfig,
+    *,
+    split: str,
+    episodes: int,
+) -> list[EpisodeSpec]:
+    if int(episodes) <= 0:
+        return []
+    _prebuilt_dir, valid_ids_by_episode, _traj_all_by_episode, episode_names = load_prebuilt_data(
+        cfg.episode_root,
+        cfg.scene,
+        str(split),
+        min_occupancy=0.8,
+        cache={},
+    )
+    names = sorted(str(name) for name in episode_names)
+    if not names:
+        raise RuntimeError(f"No evaluation episodes found for split={split!r}.")
+    rng = np.random.default_rng(int(cfg.seed) + (23_417 if str(split) == "val" else 41_713))
+    order = rng.permutation(len(names))
+    specs: list[EpisodeSpec] = []
+    for local_idx, name_idx in enumerate(order[: min(int(episodes), len(names))]):
+        episode_name = names[int(name_idx)]
+        valid_ids = np.asarray(valid_ids_by_episode.get(episode_name, []), dtype=np.int64)
+        if valid_ids.size == 0:
+            continue
+        requested = resolve_num_ego_vehicles(
+            getattr(cfg, "percentage_controlled_vehicles", 1.0),
+            int(valid_ids.size),
+        )
+        selected_count = min(int(requested), int(valid_ids.size))
+        selected = rng.choice(valid_ids, size=selected_count, replace=False)
+        specs.append(
+            (
+                int(local_idx),
+                str(episode_name),
+                tuple(int(value) for value in selected),
+            )
+        )
+    if not specs:
+        raise RuntimeError(f"No training-count evaluation episodes found for split={split!r}.")
+    return specs
+
 def _make_matched_eval_env(
     cfg: PSGAILConfig,
     *,
@@ -205,6 +262,46 @@ def _make_matched_eval_all_vehicle_env(
         max_episode_steps=cfg.max_episode_steps,
         seed=None,
         simulation_period={"episode_name": str(episode_name)},
+        scene_dataset_collection_mode=False,
+        allow_idm=cfg.allow_idm,
+    )
+    env_cfg["expert_test_mode"] = True
+    env_cfg["truncate_to_trajectory_length"] = False
+    env_cfg["complete_controlled_vehicles_at_road_end"] = False
+    env_cfg["disable_controlled_vehicle_collisions"] = not bool(cfg.enable_collision)
+    env_cfg["terminate_when_all_controlled_crashed"] = bool(cfg.terminate_when_all_controlled_crashed)
+    env_cfg["allow_idm"] = bool(cfg.allow_idm)
+    env_cfg["crash_controlled_vehicles_offroad"] = True
+    return gym.make(ENV_ID, config=env_cfg)
+
+def _make_matched_eval_selected_vehicle_env(
+    cfg: PSGAILConfig,
+    *,
+    split: str,
+    episode_name: str,
+    vehicle_ids: tuple[int, ...],
+) -> gym.Env:
+    from ..envs import observation_config
+
+    selected_ids = tuple(int(vehicle_id) for vehicle_id in vehicle_ids)
+    if not selected_ids:
+        raise ValueError("Selected-vehicle evaluation requires at least one vehicle id.")
+    register_ngsim_env()
+    env_cfg = build_env_config(
+        scene=cfg.scene,
+        action_mode=str(cfg.action_mode),
+        episode_root=cfg.episode_root,
+        prebuilt_split=str(split),
+        percentage_controlled_vehicles=float(len(selected_ids)),
+        control_all_vehicles=False,
+        max_surrounding=cfg.max_surrounding,
+        observation_config=observation_config(cfg),
+        simulation_frequency=cfg.simulation_frequency,
+        policy_frequency=cfg.policy_frequency,
+        max_episode_steps=cfg.max_episode_steps,
+        seed=None,
+        simulation_period={"episode_name": str(episode_name)},
+        ego_vehicle_id=list(selected_ids),
         scene_dataset_collection_mode=False,
         allow_idm=cfg.allow_idm,
     )
@@ -321,6 +418,7 @@ def _matched_eval_metrics(
     vehicles: int | None = None,
     vehicle_episodes: int | None = None,
     controlled_vehicle_counts: list[int] | None = None,
+    requested_controlled_vehicle_counts: list[int] | None = None,
     vehicle_ids: set[int] | None = None,
     include_raw: bool = False,
 ) -> dict[str, float]:
@@ -366,6 +464,10 @@ def _matched_eval_metrics(
         metrics[f"{prefix}/mean_controlled_vehicles_per_episode"] = (
             float(np.mean(controlled_vehicle_counts)) if controlled_vehicle_counts else 0.0
         )
+    if requested_controlled_vehicle_counts is not None and requested_controlled_vehicle_counts:
+        metrics[f"{prefix}/mean_requested_controlled_vehicles_per_episode"] = float(
+            np.mean(requested_controlled_vehicle_counts)
+        )
     for horizon in horizons:
         for name, values in squared[horizon].items():
             metric_name = f"{prefix}/rmse_{name}_{horizon}s"
@@ -382,6 +484,9 @@ def _matched_eval_metrics(
         metrics[f"__raw/{prefix}/episode_lengths"] = tuple(int(value) for value in episode_lengths)
         metrics[f"__raw/{prefix}/controlled_vehicle_counts"] = tuple(
             int(value) for value in (controlled_vehicle_counts or [])
+        )
+        metrics[f"__raw/{prefix}/requested_controlled_vehicle_counts"] = tuple(
+            int(value) for value in (requested_controlled_vehicle_counts or [])
         )
         metrics[f"__raw/{prefix}/vehicle_ids"] = tuple(
             sorted(int(value) for value in (vehicle_ids or set()))
@@ -464,14 +569,22 @@ def _combine_matched_eval_metric_dicts(
         )
     episode_lengths: list[int] = []
     controlled_counts: list[int] = []
+    requested_controlled_counts: list[int] = []
     vehicle_ids: set[int] = set()
     for part in parts:
         episode_lengths.extend(int(value) for value in part.get(f"__raw/{prefix}/episode_lengths", ()))
         controlled_counts.extend(int(value) for value in part.get(f"__raw/{prefix}/controlled_vehicle_counts", ()))
+        requested_controlled_counts.extend(
+            int(value) for value in part.get(f"__raw/{prefix}/requested_controlled_vehicle_counts", ())
+        )
         vehicle_ids.update(int(value) for value in part.get(f"__raw/{prefix}/vehicle_ids", ()))
     metrics[f"{prefix}/mean_episode_length"] = float(np.mean(episode_lengths)) if episode_lengths else 0.0
     if controlled_counts:
         metrics[f"{prefix}/mean_controlled_vehicles_per_episode"] = float(np.mean(controlled_counts))
+    if requested_controlled_counts:
+        metrics[f"{prefix}/mean_requested_controlled_vehicles_per_episode"] = float(
+            np.mean(requested_controlled_counts)
+        )
     metrics[f"{prefix}/vehicles"] = (
         float(len(vehicle_ids))
         if controlled_counts and vehicle_ids
@@ -575,15 +688,17 @@ def _matched_eval_env_cache_key(
     split: str,
     episode_name: str,
     vehicle_id: int | None,
+    vehicle_ids: tuple[int, ...] | None = None,
     all_vehicle: bool,
 ) -> tuple[object, ...]:
+    selected_ids = None if vehicle_ids is None else tuple(int(value) for value in vehicle_ids)
     return (
-        "matched_all" if bool(all_vehicle) else "matched_single",
+        "matched_all" if bool(all_vehicle) else ("matched_multi" if selected_ids is not None else "matched_single"),
         str(cfg.scene),
         os.path.abspath(str(cfg.episode_root)),
         str(split),
         str(episode_name),
-        None if vehicle_id is None else int(vehicle_id),
+        selected_ids if selected_ids is not None else (None if vehicle_id is None else int(vehicle_id)),
         str(cfg.action_mode),
         str(cfg.max_surrounding),
         int(cfg.cells),
@@ -602,15 +717,31 @@ def _get_matched_eval_env(
     split: str,
     episode_name: str,
     vehicle_id: int | None = None,
+    vehicle_ids: tuple[int, ...] | None = None,
     all_vehicle: bool,
 ) -> tuple[gym.Env, bool]:
     global _EVAL_ENV_CACHE_HITS, _EVAL_ENV_CACHE_MISSES
     cache_enabled = bool(getattr(cfg, "evaluation_cache_envs", True))
+    selected_ids = None if vehicle_ids is None else tuple(int(value) for value in vehicle_ids)
     if not cache_enabled:
         env = (
             _make_matched_eval_all_vehicle_env(cfg, split=split, episode_name=episode_name)
             if all_vehicle
-            else _make_matched_eval_env(cfg, split=split, episode_name=episode_name, vehicle_id=int(vehicle_id))
+            else (
+                _make_matched_eval_selected_vehicle_env(
+                    cfg,
+                    split=split,
+                    episode_name=episode_name,
+                    vehicle_ids=selected_ids,
+                )
+                if selected_ids is not None
+                else _make_matched_eval_env(
+                    cfg,
+                    split=split,
+                    episode_name=episode_name,
+                    vehicle_id=int(vehicle_id),
+                )
+            )
         )
         _EVAL_ENV_CACHE_MISSES += 1
         return env, False
@@ -619,6 +750,7 @@ def _get_matched_eval_env(
         split=split,
         episode_name=episode_name,
         vehicle_id=vehicle_id,
+        vehicle_ids=selected_ids,
         all_vehicle=all_vehicle,
     )
     env = _EVAL_ENV_CACHE.get(key)
@@ -630,7 +762,21 @@ def _get_matched_eval_env(
     env = (
         _make_matched_eval_all_vehicle_env(cfg, split=split, episode_name=episode_name)
         if all_vehicle
-        else _make_matched_eval_env(cfg, split=split, episode_name=episode_name, vehicle_id=int(vehicle_id))
+        else (
+            _make_matched_eval_selected_vehicle_env(
+                cfg,
+                split=split,
+                episode_name=episode_name,
+                vehicle_ids=selected_ids,
+            )
+            if selected_ids is not None
+            else _make_matched_eval_env(
+                cfg,
+                split=split,
+                episode_name=episode_name,
+                vehicle_id=int(vehicle_id),
+            )
+        )
     )
     _EVAL_ENV_CACHE[key] = env
     _EVAL_ENV_CACHE_MISSES += 1
@@ -650,6 +796,7 @@ def _matched_eval_worker(
     worker_id: int,
     scenarios: list[tuple[int, str, int]] | None,
     episode_names: list[tuple[int, str]] | None,
+    episode_specs: list[EpisodeSpec] | None,
 ) -> dict[str, object]:
     _configure_evaluation_worker_threads(cfg)
     worker_seed = int(cfg.seed) + 700_000 + int(worker_id)
@@ -666,10 +813,11 @@ def _matched_eval_worker(
         worker_cfg,
         torch.device("cpu"),
         split=split,
-        episodes=len(episode_names or scenarios or ()),
+        episodes=len(episode_specs or episode_names or scenarios or ()),
         prefix=prefix,
         scenarios=scenarios,
         episode_names=episode_names,
+        episode_specs=episode_specs,
         include_raw=True,
     )
     metrics[f"__raw/{prefix}/policy_load_seconds"] = float(policy_load_seconds)
@@ -686,21 +834,33 @@ def _evaluate_policy_matched_all_vehicle_episodes(
     episodes: int,
     prefix: str,
     episode_names: list[str] | None = None,
+    episode_specs: list[EpisodeSpec] | None = None,
     include_raw: bool = False,
 ) -> dict[str, float]:
-    raw_episode_names = (
-        list(episode_names)
-        if episode_names is not None
-        else _evaluation_episode_names(cfg, split=split, episodes=int(episodes))
-    )
-    if not raw_episode_names:
+    if episode_specs is not None:
+        raw_episode_specs = list(episode_specs)
+    else:
+        raw_episode_names = (
+            list(episode_names)
+            if episode_names is not None
+            else _evaluation_episode_names(cfg, split=split, episodes=int(episodes))
+        )
+        raw_episode_specs = [
+            (int(item[0]), str(item[1]), None)
+            if isinstance(item, tuple) and len(item) == 2
+            else (int(local_idx), str(item), None)
+            for local_idx, item in enumerate(raw_episode_names)
+        ]
+    if not raw_episode_specs:
         return {}
-    indexed_episode_names: list[tuple[int, str]] = []
-    for local_idx, item in enumerate(raw_episode_names):
-        if isinstance(item, tuple) and len(item) == 2:
-            indexed_episode_names.append((int(item[0]), str(item[1])))
+    indexed_episode_specs: list[EpisodeSpec] = []
+    for local_idx, item in enumerate(raw_episode_specs):
+        if isinstance(item, tuple) and len(item) == 3:
+            vehicle_ids = None if item[2] is None else tuple(int(value) for value in item[2])
+            indexed_episode_specs.append((int(item[0]), str(item[1]), vehicle_ids))
         else:
-            indexed_episode_names.append((int(local_idx), str(item)))
+            episode_name = item
+            indexed_episode_specs.append((int(local_idx), str(episode_name), None))
     horizons = _parse_evaluation_horizons(cfg)
     max_steps = max(1, int(max(horizons) * int(cfg.policy_frequency)))
     max_steps = min(max_steps, max(1, int(cfg.max_episode_steps)))
@@ -720,6 +880,7 @@ def _evaluate_policy_matched_all_vehicle_episodes(
     skipped_empty_rollout = 0
     episode_lengths: list[int] = []
     controlled_vehicle_counts: list[int] = []
+    requested_controlled_vehicle_counts: list[int] = []
     evaluated_episodes = 0
     vehicle_episodes = 0
     evaluated_vehicle_ids: set[int] = set()
@@ -733,12 +894,15 @@ def _evaluate_policy_matched_all_vehicle_episodes(
     was_training = policy.training
     policy.eval()
     try:
-        for episode_idx, episode_name in indexed_episode_names:
+        for episode_idx, episode_name, selected_vehicle_ids in indexed_episode_specs:
+            if selected_vehicle_ids is not None:
+                requested_controlled_vehicle_counts.append(int(len(selected_vehicle_ids)))
             env, env_cached = _get_matched_eval_env(
                 cfg,
                 split=split,
                 episode_name=str(episode_name),
-                all_vehicle=True,
+                vehicle_ids=selected_vehicle_ids,
+                all_vehicle=selected_vehicle_ids is None,
             )
             try:
                 reset_started = time.perf_counter()
@@ -907,7 +1071,7 @@ def _evaluate_policy_matched_all_vehicle_episodes(
             policy.train()
     metrics = _matched_eval_metrics(
         prefix=prefix,
-        attempted_episodes=len(indexed_episode_names),
+        attempted_episodes=len(indexed_episode_specs),
         evaluated_episodes=evaluated_episodes,
         skipped_missing_expert=skipped_missing_expert,
         skipped_bad_reference=skipped_bad_reference,
@@ -927,6 +1091,7 @@ def _evaluate_policy_matched_all_vehicle_episodes(
         vehicles=len(evaluated_vehicle_ids),
         vehicle_episodes=vehicle_episodes,
         controlled_vehicle_counts=controlled_vehicle_counts,
+        requested_controlled_vehicle_counts=requested_controlled_vehicle_counts,
         vehicle_ids=evaluated_vehicle_ids,
         include_raw=include_raw,
     )
@@ -947,16 +1112,25 @@ def evaluate_policy_matched_trajectories(
     evaluation_executor: ProcessPoolExecutor | None = None,
 ) -> dict[str, float]:
     requested_workers = max(1, int(getattr(cfg, "evaluation_num_workers", 1)))
-    all_vehicle_mode = bool(getattr(cfg, f"{prefix}_control_all_vehicles", False))
+    vehicle_mode = _normalize_evaluation_vehicle_mode(cfg, prefix=prefix)
+    all_vehicle_mode = vehicle_mode == "all"
+    training_count_mode = vehicle_mode == "training_count"
     if all_vehicle_mode:
         selected_episode_names = _evaluation_episode_names(cfg, split=split, episodes=int(episodes))
         indexed_episode_names = [(idx, name) for idx, name in enumerate(selected_episode_names)]
         indexed_scenarios = None
+        indexed_episode_specs = None
         parallel_items: list[object] = indexed_episode_names
+    elif training_count_mode:
+        indexed_episode_specs = _evaluation_training_count_episode_specs(cfg, split=split, episodes=int(episodes))
+        indexed_episode_names = None
+        indexed_scenarios = None
+        parallel_items = indexed_episode_specs
     else:
         selected_scenarios = _evaluation_scenarios(cfg, split=split, episodes=int(episodes))
         indexed_scenarios = [(idx, name, vehicle_id) for idx, (name, vehicle_id) in enumerate(selected_scenarios)]
         indexed_episode_names = None
+        indexed_episode_specs = None
         parallel_items = indexed_scenarios
     active_workers = min(requested_workers, len(parallel_items))
     if active_workers <= 1 and evaluation_executor is None:
@@ -970,6 +1144,7 @@ def evaluate_policy_matched_trajectories(
                 prefix=prefix,
                 scenarios=indexed_scenarios,
                 episode_names=indexed_episode_names,
+                episode_specs=indexed_episode_specs,
                 include_raw=True,
             ))
 
@@ -981,7 +1156,7 @@ def evaluate_policy_matched_trajectories(
     print(
         f"[{prefix}] parallel evaluation workers={active_workers} "
         f"worker_threads={max(1, int(getattr(cfg, 'evaluation_worker_threads', 2)))} "
-        f"items={len(parallel_items)}",
+        f"mode={vehicle_mode} items={len(parallel_items)}",
         flush=True,
     )
     executor_context = (
@@ -992,8 +1167,9 @@ def evaluate_policy_matched_trajectories(
     with executor_context as executor:
         futures = []
         for worker_id, chunk in enumerate(chunks):
-            worker_scenarios = None if all_vehicle_mode else list(chunk)
+            worker_scenarios = list(chunk) if vehicle_mode == "single" else None
             worker_episode_names = list(chunk) if all_vehicle_mode else None
+            worker_episode_specs = list(chunk) if training_count_mode else None
             futures.append(
                 executor.submit(
                     _matched_eval_worker,
@@ -1006,6 +1182,7 @@ def evaluate_policy_matched_trajectories(
                     worker_id,
                     worker_scenarios,
                     worker_episode_names,
+                    worker_episode_specs,
                 )
             )
         parts = [future.result() for future in futures]
@@ -1032,9 +1209,10 @@ def _evaluate_policy_matched_trajectories_impl(
     prefix: str,
     scenarios: list[tuple[str, int]] | None = None,
     episode_names: list[str] | None = None,
+    episode_specs: list[EpisodeSpec] | None = None,
     include_raw: bool = False,
 ) -> dict[str, float]:
-    if bool(getattr(cfg, f"{prefix}_control_all_vehicles", False)):
+    if _normalize_evaluation_vehicle_mode(cfg, prefix=prefix) in {"all", "training_count"}:
         return _evaluate_policy_matched_all_vehicle_episodes(
             policy,
             cfg,
@@ -1043,6 +1221,7 @@ def _evaluate_policy_matched_trajectories_impl(
             episodes=int(episodes),
             prefix=prefix,
             episode_names=episode_names,
+            episode_specs=episode_specs,
             include_raw=include_raw,
         )
     raw_scenarios = (
@@ -1247,8 +1426,11 @@ __all__ = [
     '_parse_evaluation_horizons',
     '_evaluation_scenarios',
     '_evaluation_episode_names',
+    '_normalize_evaluation_vehicle_mode',
+    '_evaluation_training_count_episode_specs',
     '_make_matched_eval_env',
     '_make_matched_eval_all_vehicle_env',
+    '_make_matched_eval_selected_vehicle_env',
     '_deterministic_policy_action_tuple',
     '_lane_offset_for_position',
     '_first_controlled_vehicle',
