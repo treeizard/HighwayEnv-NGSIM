@@ -424,6 +424,8 @@ def _matched_eval_metrics(
 ) -> dict[str, float]:
     collision_duration_rate = float(collision_steps / total_steps) if total_steps else float("nan")
     offroad_duration_rate = float(offroad_steps / total_steps) if total_steps else float("nan")
+    crash_agent_fraction = collision_duration_rate
+    offroad_agent_fraction = offroad_duration_rate
     vehicle_denominator = (
         int(vehicle_episodes)
         if vehicle_episodes is not None
@@ -446,9 +448,11 @@ def _matched_eval_metrics(
         f"{prefix}/skipped_bad_reference": float(skipped_bad_reference),
         f"{prefix}/skipped_empty_rollout": float(skipped_empty_rollout),
         f"{prefix}/evaluated_steps": float(total_steps),
+        f"{prefix}/crash_agent_fraction": crash_agent_fraction,
         f"{prefix}/collision_duration_rate": collision_duration_rate,
         f"{prefix}/collision_rate": vehicle_crash_rate if np.isfinite(vehicle_crash_rate) else collision_duration_rate,
         f"{prefix}/vehicle_crash_rate": vehicle_crash_rate,
+        f"{prefix}/offroad_agent_fraction": offroad_agent_fraction,
         f"{prefix}/offroad_duration_rate": offroad_duration_rate,
         f"{prefix}/vehicle_offroad_rate": vehicle_offroad_rate,
         f"{prefix}/hard_brake_rate": float(hard_brake_steps / total_steps) if total_steps else float("nan"),
@@ -543,7 +547,9 @@ def _combine_matched_eval_metric_dicts(
     total_steps = float(metrics.get(f"{prefix}/evaluated_steps", 0.0))
     vehicle_episodes = float(metrics.get(f"{prefix}/vehicle_episodes", metrics.get(f"{prefix}/episodes", 0.0)))
     metrics[f"{prefix}/collision_duration_rate"] = collision_steps / total_steps if total_steps else float("nan")
+    metrics[f"{prefix}/crash_agent_fraction"] = metrics[f"{prefix}/collision_duration_rate"]
     metrics[f"{prefix}/offroad_duration_rate"] = offroad_steps / total_steps if total_steps else float("nan")
+    metrics[f"{prefix}/offroad_agent_fraction"] = metrics[f"{prefix}/offroad_duration_rate"]
     metrics[f"{prefix}/hard_brake_rate"] = hard_brake_steps / total_steps if total_steps else float("nan")
     metrics[f"{prefix}/vehicle_crash_rate"] = (
         crashed_vehicle_episodes / vehicle_episodes if vehicle_episodes else float("nan")

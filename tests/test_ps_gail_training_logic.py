@@ -93,6 +93,7 @@ from scripts_gail.ps_gail.data import (
 )
 from scripts_gail.ps_gail.training import evaluation as eval_mod
 from scripts_gail.ps_gail.validation import best_checkpoint_payload
+from scripts_gail.ps_gail.validation import scored_validation_metrics
 from scripts_gail.ps_gail.validation import validation_cost_and_score
 from scripts_gail.ps_gail.models import (
     SequenceTrajectoryDiscriminator,
@@ -1486,6 +1487,63 @@ def test_weighted_validation_score_prefers_lower_rmse_and_safety_rates():
     assert good_cost < bad_cost
     assert good_components["speed_rmse"] == pytest.approx(0.5)
     assert bad_components["lane_offset_rmse"] == pytest.approx(0.3)
+
+
+def test_matched_validation_reports_crash_agent_fraction_separately_from_incidence():
+    squared = {
+        20: {"x": [], "y": [], "position": [], "speed": [], "lane_offset": []}
+    }
+    final_squared = {"x": [], "y": [], "position": [], "speed": [], "lane_offset": []}
+
+    metrics = eval_mod._matched_eval_metrics(
+        prefix="validation",
+        attempted_episodes=1,
+        evaluated_episodes=1,
+        skipped_missing_expert=0,
+        skipped_bad_reference=0,
+        skipped_empty_rollout=0,
+        total_steps=10,
+        collision_steps=3,
+        offroad_steps=0,
+        hard_brake_steps=0,
+        episode_lengths=[10],
+        squared=squared,
+        final_squared=final_squared,
+        horizons=[20],
+        crashed_vehicle_episodes=1,
+        vehicle_episodes=1,
+    )
+
+    assert metrics["validation/crash_agent_fraction"] == pytest.approx(0.3)
+    assert metrics["validation/collision_duration_rate"] == pytest.approx(0.3)
+    assert metrics["validation/vehicle_crash_rate"] == pytest.approx(1.0)
+    assert metrics["validation/collision_rate"] == pytest.approx(1.0)
+
+
+def test_validation_score_uses_crash_agent_fraction_before_vehicle_crash_rate():
+    cfg = PSGAILConfig()
+    cfg.validation_score_position_weight = 0.0
+    cfg.validation_score_speed_weight = 0.0
+    cfg.validation_score_lane_offset_weight = 0.0
+    cfg.validation_score_crash_weight = 25.0
+    cfg.validation_score_offroad_weight = 0.0
+    cfg.validation_score_hard_brake_weight = 0.0
+    metrics = {
+        "validation/rmse_position_20s": 10.0,
+        "validation/rmse_speed_20s": 10.0,
+        "validation/rmse_lane_offset_20s": 10.0,
+        "validation/crash_agent_fraction": 0.04,
+        "validation/vehicle_crash_rate": 1.0,
+        "validation/vehicle_offroad_rate": 0.0,
+        "validation/hard_brake_rate": 0.0,
+    }
+
+    scored, cost, score = scored_validation_metrics(metrics, cfg)
+
+    assert cost == pytest.approx(1.0)
+    assert score == pytest.approx(-1.0)
+    assert scored["validation/score_component_crash_agent_fraction"] == pytest.approx(0.04)
+    assert scored["validation/score_component_vehicle_crash_rate"] == pytest.approx(1.0)
 
 
 def test_best_checkpoint_payload_carries_validation_metadata_and_model_state_keys():

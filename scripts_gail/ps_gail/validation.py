@@ -53,9 +53,11 @@ def validation_cost_and_score(
                 f"{prefix}/rmse_lane_offset_final",
             ),
         ),
-        "vehicle_crash_rate": _finite_metric(
+        "crash_agent_fraction": _finite_metric(
             metrics,
             (
+                f"{prefix}/crash_agent_fraction",
+                f"{prefix}/collision_duration_rate",
                 f"{prefix}/vehicle_crash_rate",
                 f"{prefix}/collision_rate",
             ),
@@ -76,7 +78,7 @@ def validation_cost_and_score(
         float(getattr(cfg, "validation_score_position_weight", 1.0)) * components["position_rmse"]
         + float(getattr(cfg, "validation_score_speed_weight", 0.5)) * components["speed_rmse"]
         + float(getattr(cfg, "validation_score_lane_offset_weight", 2.0)) * components["lane_offset_rmse"]
-        + float(getattr(cfg, "validation_score_crash_weight", 25.0)) * components["vehicle_crash_rate"]
+        + float(getattr(cfg, "validation_score_crash_weight", 25.0)) * components["crash_agent_fraction"]
         + float(getattr(cfg, "validation_score_offroad_weight", 25.0)) * components["vehicle_offroad_rate"]
         + float(getattr(cfg, "validation_score_hard_brake_weight", 2.0)) * components["hard_brake_rate"]
     )
@@ -96,6 +98,13 @@ def scored_validation_metrics(
     scored[f"{prefix}/score"] = float(score)
     for name, value in components.items():
         scored[f"{prefix}/score_component_{name}"] = float(value)
+    scored[f"{prefix}/score_component_vehicle_crash_rate"] = _finite_metric(
+        scored,
+        (
+            f"{prefix}/vehicle_crash_rate",
+            f"{prefix}/collision_rate",
+        ),
+    )
     return scored, cost, score
 
 
@@ -130,7 +139,8 @@ def matched_validation_summary(prefix: str, label: str, metrics: dict[str, float
         f"rmse_pos_20s={metrics.get(f'{prefix}/rmse_position_20s', float('nan')):.4f} "
         f"rmse_speed_20s={metrics.get(f'{prefix}/rmse_speed_20s', float('nan')):.4f} "
         f"rmse_lane_20s={metrics.get(f'{prefix}/rmse_lane_offset_20s', float('nan')):.4f} "
-        f"collision={metrics.get(f'{prefix}/vehicle_crash_rate', metrics.get(f'{prefix}/collision_rate', 0.0)):.4f} "
+        f"crash_agent={metrics.get(f'{prefix}/crash_agent_fraction', metrics.get(f'{prefix}/collision_duration_rate', 0.0)):.4f} "
+        f"vehicle_crash={metrics.get(f'{prefix}/vehicle_crash_rate', metrics.get(f'{prefix}/collision_rate', 0.0)):.4f} "
         f"offroad={metrics.get(f'{prefix}/vehicle_offroad_rate', metrics.get(f'{prefix}/offroad_duration_rate', 0.0)):.4f} "
         f"hard_brake={metrics.get(f'{prefix}/hard_brake_rate', 0.0):.4f} "
         f"score={metrics.get(f'{prefix}/score', float('nan')):.4f}"
