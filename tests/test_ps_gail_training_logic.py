@@ -1154,6 +1154,74 @@ def test_airl_wgan_uses_shaped_logits_without_rollout_normalization_or_generic_c
     np.testing.assert_allclose(refreshed.rewards, [-15.0, -10.0, -20.0], rtol=1e-6)
 
 
+def test_airl_policy_reward_mode_exposes_old_log_prob_feedback_loop():
+    class ConstantAIRLReward(torch.nn.Module):
+        def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+            return torch.zeros((obs.shape[0],), dtype=torch.float32, device=obs.device)
+
+        def shaped_logits(
+            self,
+            obs: torch.Tensor,
+            actions: torch.Tensor,
+            next_obs: torch.Tensor,
+            dones: torch.Tensor,
+            *,
+            gamma: float,
+        ) -> torch.Tensor:
+            del actions, next_obs, dones, gamma
+            return torch.zeros((obs.shape[0],), dtype=torch.float32, device=obs.device)
+
+    rollout = _minimal_rollout(
+        observations=np.zeros((3, 2), dtype=np.float32),
+        actions=np.zeros((3, 2), dtype=np.float32),
+        old_log_probs=np.asarray([0.0, -5.0, -10.0], dtype=np.float32),
+        old_values=np.zeros(3, dtype=np.float32),
+        returns=np.zeros(3, dtype=np.float32),
+        advantages=np.zeros(3, dtype=np.float32),
+    )
+    base_cfg = dict(
+        discriminator_loss="wgan_gp",
+        normalize_gail_reward=False,
+        gail_reward_clip=0.0,
+        final_reward_clip=0.0,
+    )
+
+    discriminator_cfg = PSGAILConfig(
+        **base_cfg,
+        airl_policy_reward_mode="discriminator",
+    )
+    shaped_cfg = PSGAILConfig(
+        **base_cfg,
+        airl_policy_reward_mode="shaped",
+    )
+    default_cfg = PSGAILConfig(**base_cfg)
+
+    discriminator_refreshed = refresh_airl_rewards(
+        rollout,
+        ConstantAIRLReward(),
+        discriminator_cfg,
+        torch.device("cpu"),
+    )
+    shaped_refreshed = refresh_airl_rewards(
+        rollout,
+        ConstantAIRLReward(),
+        shaped_cfg,
+        torch.device("cpu"),
+    )
+    default_refreshed = refresh_airl_rewards(
+        rollout,
+        ConstantAIRLReward(),
+        default_cfg,
+        torch.device("cpu"),
+    )
+
+    np.testing.assert_allclose(discriminator_refreshed.gail_rewards_raw, [0.0, 5.0, 10.0], rtol=1e-6)
+    np.testing.assert_allclose(discriminator_refreshed.rewards, [0.0, 5.0, 10.0], rtol=1e-6)
+    np.testing.assert_allclose(shaped_refreshed.gail_rewards_normalized, [0.0, 0.0, 0.0], rtol=1e-6)
+    np.testing.assert_allclose(shaped_refreshed.rewards, [0.0, 0.0, 0.0], rtol=1e-6)
+    np.testing.assert_allclose(default_refreshed.rewards, shaped_refreshed.rewards, rtol=1e-6)
+
+
 def test_airl_wgan_gradient_penalty_backprops_through_reward_model_only():
     torch.manual_seed(0)
     reward_model = AIRLReward(obs_dim=3, action_dim=2, hidden_sizes=(8,))

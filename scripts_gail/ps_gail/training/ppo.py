@@ -96,6 +96,9 @@ def _update_recurrent_policy(
     old_log_probs_tensor = torch.as_tensor(rollout.old_log_probs, dtype=torch.float32, device=cpu_device)
     returns_tensor = torch.as_tensor(rollout.returns, dtype=torch.float32, device=cpu_device)
     advantages_tensor = torch.as_tensor(rollout.advantages, dtype=torch.float32, device=cpu_device)
+    log_std = getattr(policy, "log_std", None)
+    initial_log_std_mean = float(log_std.detach().mean().cpu().item()) if log_std is not None else float("nan")
+    initial_action_std_mean = float(torch.exp(log_std.detach()).mean().cpu().item()) if log_std is not None else float("nan")
     bc_coef = max(0.0, float(getattr(cfg, "policy_bc_regularization_coef", 0.0)))
     if bc_coef > 0.0:
         if not _is_continuous(cfg):
@@ -342,6 +345,8 @@ def _update_recurrent_policy(
     finally:
         if was_training:
             policy.train()
+    final_log_std_mean = float(log_std.detach().mean().cpu().item()) if log_std is not None else float("nan")
+    final_action_std_mean = float(torch.exp(log_std.detach()).mean().cpu().item()) if log_std is not None else float("nan")
 
     stats = {
         "policy_loss": float(np.mean(policy_losses)),
@@ -359,6 +364,10 @@ def _update_recurrent_policy(
         "bc_regularization_loss": float(np.mean(bc_losses)) if bc_losses else 0.0,
         "bc_regularization_coef": float(bc_coef),
         "ppo_micro_batch_size": float(micro_sequences),
+        "log_std_mean": final_log_std_mean,
+        "action_std_param_mean": final_action_std_mean,
+        "log_std_delta": final_log_std_mean - initial_log_std_mean,
+        "action_std_param_delta": final_action_std_mean - initial_action_std_mean,
         "transformer_recurrent_chunks": float(len(chunks)),
         "transformer_recurrent_sequence_length": float(
             int(getattr(cfg, "transformer_recurrent_sequence_length", 32))
@@ -413,6 +422,9 @@ def update_policy(
     returns_tensor = torch.as_tensor(rollout.returns, dtype=torch.float32, device=cpu_device)
     advantages_tensor = torch.as_tensor(rollout.advantages, dtype=torch.float32, device=cpu_device)
     bc_coef = max(0.0, float(getattr(cfg, "policy_bc_regularization_coef", 0.0)))
+    log_std = getattr(policy, "log_std", None)
+    initial_log_std_mean = float(log_std.detach().mean().cpu().item()) if log_std is not None else float("nan")
+    initial_action_std_mean = float(torch.exp(log_std.detach()).mean().cpu().item()) if log_std is not None else float("nan")
     if bc_coef > 0.0:
         if not _is_continuous(cfg):
             raise ValueError("policy_bc_regularization_coef currently requires continuous action mode.")
@@ -589,6 +601,8 @@ def update_policy(
     finally:
         if was_training:
             policy.train()
+    final_log_std_mean = float(log_std.detach().mean().cpu().item()) if log_std is not None else float("nan")
+    final_action_std_mean = float(torch.exp(log_std.detach()).mean().cpu().item()) if log_std is not None else float("nan")
 
     return {
         "policy_loss": float(np.mean(policy_losses)),
@@ -606,6 +620,10 @@ def update_policy(
         "bc_regularization_loss": float(np.mean(bc_losses)) if bc_losses else 0.0,
         "bc_regularization_coef": float(bc_coef),
         "ppo_micro_batch_size": float(micro_batch_size),
+        "log_std_mean": final_log_std_mean,
+        "action_std_param_mean": final_action_std_mean,
+        "log_std_delta": final_log_std_mean - initial_log_std_mean,
+        "action_std_param_delta": final_action_std_mean - initial_action_std_mean,
     }
 
 __all__ = [
