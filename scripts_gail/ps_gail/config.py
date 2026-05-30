@@ -161,6 +161,7 @@ class PSGAILConfig:
     wgan_reward_scale: float = 1.0
     wgan_reward_norm_min_std: float = 1.0e-3
     wgan_reward_norm_clip: float = 5.0
+    airl_policy_reward_mode: str = "shaped"
     normalize_discriminator_features: bool = True
     discriminator_feature_clip: float = 10.0
     cgail_k: float = 0.0

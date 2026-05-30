@@ -116,6 +116,7 @@ WGAN_REWARD_CLIP="${WGAN_REWARD_CLIP:-0.0}"
 WGAN_REWARD_SCALE="${WGAN_REWARD_SCALE:-1.0}"
 WGAN_REWARD_NORM_MIN_STD="${WGAN_REWARD_NORM_MIN_STD:-0.001}"
 WGAN_REWARD_NORM_CLIP="${WGAN_REWARD_NORM_CLIP:-5.0}"
+AIRL_POLICY_REWARD_MODE="${AIRL_POLICY_REWARD_MODE:-shaped}"
 
 POLICY_MODEL="${POLICY_MODEL:-transformer}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
@@ -161,6 +162,7 @@ echo "PSRO-lite: ${PSRO_LITE} archive_every=${PSRO_ARCHIVE_EVERY} archive_size=$
 echo "AIRL hard selector: not used by AIRL reward-model training"
 echo "Challenge reward: ${ENABLE_PLAYER_CHALLENGE_REWARD} coef=${CHALLENGE_REWARD_COEF} cap_fraction=${CHALLENGE_MAX_PRIMARY_REWARD_FRACTION} abs_clip=${CHALLENGE_REWARD_CLIP}"
 echo "Challenge targets: ttc=${CHALLENGE_TTC_TARGET} gap=${CHALLENGE_GAP_TARGET} (0 derives from ${SCENE} IDM parameters)"
+echo "AIRL policy reward mode: ${AIRL_POLICY_REWARD_MODE}"
 nvidia-smi || true
 
 if [ ! -f "${AIRL_TRAIN_SCRIPT}" ]; then
@@ -242,6 +244,7 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --wgan-reward-scale "${WGAN_REWARD_SCALE}" \
     --wgan-reward-norm-min-std "${WGAN_REWARD_NORM_MIN_STD}" \
     --wgan-reward-norm-clip "${WGAN_REWARD_NORM_CLIP}" \
+    --airl-policy-reward-mode "${AIRL_POLICY_REWARD_MODE}" \
     --gail-reward-clip "${GAIL_REWARD_CLIP}" \
     --final-reward-clip "${FINAL_REWARD_CLIP}" \
     --collision-penalty "${COLLISION_PENALTY}" \

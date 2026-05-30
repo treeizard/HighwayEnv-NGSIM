@@ -404,8 +404,20 @@ def refresh_airl_rewards(
             gamma=float(cfg.gamma),
         ).detach().cpu().numpy().astype(np.float32)
     corrected_logits = (shaped_logits - rollout.old_log_probs).astype(np.float32, copy=True)
+    reward_mode = str(getattr(cfg, "airl_policy_reward_mode", "shaped")).lower()
+    if reward_mode not in {"discriminator", "shaped", "reward"}:
+        raise ValueError(
+            "airl_policy_reward_mode must be one of 'discriminator', 'shaped', or 'reward', "
+            f"got {reward_mode!r}."
+        )
     if str(getattr(cfg, "discriminator_loss", "airl_bce")).lower() == "wgan_gp":
-        shaped = corrected_logits
+        shaped = (
+            corrected_logits
+            if reward_mode == "discriminator"
+            else shaped_logits
+            if reward_mode == "shaped"
+            else raw
+        )
         if bool(getattr(cfg, "wgan_reward_center", False)) and shaped.size > 1:
             shaped = shaped - shaped.mean()
         reward_scale = float(getattr(cfg, "wgan_reward_scale", 1.0))
@@ -417,7 +429,13 @@ def refresh_airl_rewards(
     else:
         # Canonical AIRL trains the policy on log D - log(1-D), which simplifies to
         # f(s,a,s') - log pi(a|s) for D = exp(f)/(exp(f) + pi(a|s)).
-        shaped = corrected_logits
+        shaped = (
+            corrected_logits
+            if reward_mode == "discriminator"
+            else shaped_logits
+            if reward_mode == "shaped"
+            else raw
+        )
     if should_normalize_gail_reward(cfg) and shaped.size > 1:
         shaped = safe_normalize_adversarial_rewards(shaped, cfg)
     if should_apply_gail_reward_clip(cfg):
@@ -706,6 +724,7 @@ def main() -> None:
             f"policy_model={cfg.policy_model} transformer_layers={cfg.transformer_layers} "
             f"transformer_heads={cfg.transformer_heads} transformer_dropout={cfg.transformer_dropout} "
             f"airl_objective={cfg.discriminator_loss} wgan_gp_lambda={cfg.wgan_gp_lambda} "
+            f"airl_policy_reward_mode={cfg.airl_policy_reward_mode} "
             f"reward_hidden={cfg.discriminator_hidden_sizes} "
             f"reward_dropout={cfg.discriminator_dropout} "
             f"reward_spectral_norm={cfg.discriminator_spectral_norm} "
@@ -968,6 +987,7 @@ def main() -> None:
                 + (
                 f"lr={round_cfg.learning_rate:.2e}/{round_cfg.disc_learning_rate:.2e} "
                 f"kl={policy_stats['approx_kl']:.5f} entropy={policy_stats['entropy']:.4f} "
+                f"log_std={policy_stats['log_std_mean']:.3f} "
                 f"post_kl={policy_stats['post_update_approx_kl']:.5f} "
                 f"clip={policy_stats['clip_fraction']:.3f} "
                 f"airl_reward={reward_stats['expert_reward']:.3f}/{reward_stats['gen_reward']:.3f} "
@@ -1076,6 +1096,18 @@ def main() -> None:
                 "train/wgan_reward_scale": float(round_cfg.wgan_reward_scale),
                 "train/wgan_reward_norm_min_std": float(getattr(round_cfg, "wgan_reward_norm_min_std", 1.0e-3)),
                 "train/wgan_reward_norm_clip": float(getattr(round_cfg, "wgan_reward_norm_clip", 0.0)),
+                "train/airl_policy_reward_mode_discriminator": int(
+                    str(getattr(round_cfg, "airl_policy_reward_mode", "shaped")).lower()
+                    == "discriminator"
+                ),
+                "train/airl_policy_reward_mode_shaped": int(
+                    str(getattr(round_cfg, "airl_policy_reward_mode", "shaped")).lower()
+                    == "shaped"
+                ),
+                "train/airl_policy_reward_mode_reward": int(
+                    str(getattr(round_cfg, "airl_policy_reward_mode", "shaped")).lower()
+                    == "reward"
+                ),
                 "train/normalize_gail_reward_requested": int(bool(round_cfg.normalize_gail_reward)),
                 "train/allow_wgan_reward_normalization": int(
                     bool(getattr(round_cfg, "allow_wgan_reward_normalization", False))
@@ -1098,6 +1130,10 @@ def main() -> None:
                 "policy/advantage_mean": policy_stats["advantage_mean"],
                 "policy/advantage_std": policy_stats["advantage_std"],
                 "policy/ppo_micro_batch_size": policy_stats["ppo_micro_batch_size"],
+                "policy/log_std_mean": policy_stats["log_std_mean"],
+                "policy/action_std_param_mean": policy_stats["action_std_param_mean"],
+                "policy/log_std_delta": policy_stats["log_std_delta"],
+                "policy/action_std_param_delta": policy_stats["action_std_param_delta"],
                 "train/policy_learning_rate": float(round_cfg.learning_rate),
                 "train/reward_learning_rate": float(round_cfg.disc_learning_rate),
                 "train/disc_learning_rate": float(round_cfg.disc_learning_rate),
