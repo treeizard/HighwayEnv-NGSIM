@@ -274,6 +274,7 @@ def _update_recurrent_policy(
                         valid_count,
                     ) = recurrent_micro_forward(micro_chunks)
                     micro_weight = float(valid_count) / float(max(1, batch_transition_count))
+                    # Calculate for Action Critic Loss (With Entropy)
                     loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
                     bc_loss = None
                     if bc_coef > 0.0 and expert_obs_tensor is not None and expert_action_tensor is not None:
@@ -421,7 +422,7 @@ def update_policy(
     old_log_probs_tensor = torch.as_tensor(rollout.old_log_probs, dtype=torch.float32, device=cpu_device)
     returns_tensor = torch.as_tensor(rollout.returns, dtype=torch.float32, device=cpu_device)
     advantages_tensor = torch.as_tensor(rollout.advantages, dtype=torch.float32, device=cpu_device)
-    bc_coef = max(0.0, float(getattr(cfg, "policy_bc_regularization_coef", 0.0)))
+    bc_coef = max(0.0, float(getattr(cfg, "policy_bc_regularization_coef", 0.0))) # Danger (BC Not used, please check if possible)
     log_std = getattr(policy, "log_std", None)
     initial_log_std_mean = float(log_std.detach().mean().cpu().item()) if log_std is not None else float("nan")
     initial_action_std_mean = float(torch.exp(log_std.detach()).mean().cpu().item()) if log_std is not None else float("nan")
@@ -463,7 +464,7 @@ def update_policy(
     post_update_ratio_std = float("nan")
     batch_size = max(1, int(cfg.batch_size))
     num_samples = int(obs_tensor.shape[0])
-
+    # Micro Batch and Mini Batch
     configured_micro_batch_size = int(getattr(cfg, "ppo_micro_batch_size", 0))
     if configured_micro_batch_size > 0:
         micro_batch_size = max(1, min(batch_size, configured_micro_batch_size))

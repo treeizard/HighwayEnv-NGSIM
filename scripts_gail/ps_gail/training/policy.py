@@ -345,6 +345,7 @@ def policy_distribution_values_memory(
     *,
     return_memory: bool = False,
 ) -> tuple[Categorical | SquashedNormal, torch.Tensor, torch.Tensor | None]:
+    # Core of PPO, Need to be aware of recurrent policy memory handling and continuous vs discrete action modes.
     if recurrent_policy_enabled(policy):
         policy_out, values, new_memory = policy(
             obs_tensor,
