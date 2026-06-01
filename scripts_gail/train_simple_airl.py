@@ -5,6 +5,7 @@ import argparse
 import os
 import sys
 import warnings
+from dataclasses import dataclass
 from dataclasses import fields
 from dataclasses import replace
 
@@ -37,6 +38,7 @@ from scripts_gail.ps_gail.trainer import (
     make_evaluation_executor,
     make_rollout_executor,
     policy_distribution_and_values,
+    policy_distribution_values_memory,
     recurrent_policy_enabled,
     resolve_device,
     safe_normalize_adversarial_rewards,
@@ -108,10 +110,67 @@ class AIRLReward(nn.Module):
         return reward + float(gamma) * (1.0 - dones.float()) * next_potential - current_potential
 
 
+@dataclass(frozen=True)
+class AIRLReplayEntry:
+    observations: np.ndarray
+    actions: np.ndarray
+    next_observations: np.ndarray
+    dones: np.ndarray
+    trajectory_ids: np.ndarray
+    timesteps: np.ndarray
+
+
+def _unique_trajectory_values(trajectory_ids: np.ndarray) -> list[object]:
+    return list(dict.fromkeys(np.asarray(trajectory_ids).reshape(-1).tolist()))
+
+
+def _trajectory_timesteps(trajectory_ids: np.ndarray) -> np.ndarray:
+    ids = np.asarray(trajectory_ids).reshape(-1)
+    timesteps = np.zeros(ids.shape[0], dtype=np.int64)
+    for trajectory_id in _unique_trajectory_values(ids):
+        indices = np.flatnonzero(ids == trajectory_id).astype(np.int64)
+        timesteps[indices] = np.arange(indices.shape[0], dtype=np.int64)
+    return timesteps
+
+
+def _prefixed_trajectory_ids(trajectory_ids: np.ndarray, *, source: str) -> np.ndarray:
+    ids = np.asarray(trajectory_ids).reshape(-1)
+    return np.asarray([f"{source}:{item}" for item in ids.tolist()], dtype=object)
+
+
+def _subsample_complete_trajectories(
+    trajectory_ids: np.ndarray,
+    *,
+    max_samples: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    ids = np.asarray(trajectory_ids).reshape(-1)
+    if max_samples <= 0 or ids.shape[0] <= max_samples:
+        return np.arange(ids.shape[0], dtype=np.int64)
+    trajectory_values = _unique_trajectory_values(ids)
+    rng.shuffle(trajectory_values)
+    selected: list[np.ndarray] = []
+    selected_count = 0
+    for trajectory_id in trajectory_values:
+        indices = np.flatnonzero(ids == trajectory_id).astype(np.int64)
+        if selected and selected_count + indices.shape[0] > max_samples:
+            continue
+        selected.append(indices)
+        selected_count += int(indices.shape[0])
+        if selected_count >= max_samples:
+            break
+    if not selected:
+        first_indices = np.flatnonzero(ids == trajectory_values[0]).astype(np.int64)
+        selected.append(first_indices)
+    return np.sort(np.concatenate(selected, axis=0).astype(np.int64, copy=False))
+
+
 def append_airl_replay(
-    replay: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    replay: list[AIRLReplayEntry],
     rollout: RolloutBatch,
     cfg: PSGAILConfig,
+    *,
+    round_idx: int | None = None,
 ) -> None:
     replay_rounds = max(0, int(getattr(cfg, "discriminator_replay_rounds", 0)))
     if replay_rounds <= 0:
@@ -119,12 +178,15 @@ def append_airl_replay(
         return
     if int(rollout.num_agent_steps) <= 0:
         return
+    source = f"round:{int(round_idx)}" if round_idx is not None else f"rollout:{id(rollout)}"
     replay.append(
-        (
-            np.asarray(rollout.policy_observations, dtype=np.float32).copy(),
-            np.asarray(rollout.actions, dtype=np.float32).copy(),
-            np.asarray(rollout.next_policy_observations, dtype=np.float32).copy(),
-            np.asarray(rollout.dones, dtype=bool).copy(),
+        AIRLReplayEntry(
+            observations=np.asarray(rollout.policy_observations, dtype=np.float32).copy(),
+            actions=np.asarray(rollout.actions, dtype=np.float32).copy(),
+            next_observations=np.asarray(rollout.next_policy_observations, dtype=np.float32).copy(),
+            dones=np.asarray(rollout.dones, dtype=bool).copy(),
+            trajectory_ids=_prefixed_trajectory_ids(rollout.trajectory_ids, source=source),
+            timesteps=_trajectory_timesteps(rollout.trajectory_ids),
         )
     )
     del replay[:-replay_rounds]
@@ -132,36 +194,79 @@ def append_airl_replay(
 
 def concat_airl_replay(
     rollout: RolloutBatch,
-    replay: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    replay: list[AIRLReplayEntry],
     cfg: PSGAILConfig,
     *,
     seed: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    preserve_recurrent_context: bool = False,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+]:
+    current_trajectory_ids = _prefixed_trajectory_ids(rollout.trajectory_ids, source="current")
+    current_timesteps = _trajectory_timesteps(rollout.trajectory_ids)
     current = (
         np.asarray(rollout.policy_observations, dtype=np.float32),
         np.asarray(rollout.actions, dtype=np.float32),
         np.asarray(rollout.next_policy_observations, dtype=np.float32),
         np.asarray(rollout.dones, dtype=bool),
+        current_trajectory_ids,
+        current_timesteps,
     )
+    current_log_probs = np.asarray(rollout.old_log_probs, dtype=np.float32)
     replay_rounds = max(0, int(getattr(cfg, "discriminator_replay_rounds", 0)))
     if replay_rounds <= 0 or not replay:
-        return current
-    entries = [entry for entry in replay[-replay_rounds:] if len(entry[0]) > 0]
+        return (*current[:4], current_log_probs, current_trajectory_ids, current_timesteps)
+    entries = [entry for entry in replay[-replay_rounds:] if len(entry.observations) > 0]
     if not entries:
-        return current
-    obs = np.concatenate([*(entry[0] for entry in entries), current[0]], axis=0).astype(np.float32, copy=False)
-    actions = np.concatenate([*(entry[1] for entry in entries), current[1]], axis=0).astype(np.float32, copy=False)
-    next_obs = np.concatenate([*(entry[2] for entry in entries), current[2]], axis=0).astype(np.float32, copy=False)
-    dones = np.concatenate([*(entry[3] for entry in entries), current[3]], axis=0).astype(bool, copy=False)
+        return (*current[:4], current_log_probs, current_trajectory_ids, current_timesteps)
+    obs = np.concatenate([*(entry.observations for entry in entries), current[0]], axis=0).astype(
+        np.float32,
+        copy=False,
+    )
+    actions = np.concatenate([*(entry.actions for entry in entries), current[1]], axis=0).astype(
+        np.float32,
+        copy=False,
+    )
+    next_obs = np.concatenate([*(entry.next_observations for entry in entries), current[2]], axis=0).astype(
+        np.float32,
+        copy=False,
+    )
+    dones = np.concatenate([*(entry.dones for entry in entries), current[3]], axis=0).astype(bool, copy=False)
+    trajectory_ids = np.concatenate([*(entry.trajectory_ids for entry in entries), current[4]], axis=0).astype(
+        object,
+        copy=False,
+    )
+    timesteps = np.concatenate([*(entry.timesteps for entry in entries), current[5]], axis=0).astype(
+        np.int64,
+        copy=False,
+    )
     max_samples = max(0, int(getattr(cfg, "discriminator_replay_max_samples", 0)))
     if max_samples > 0 and len(obs) > max_samples:
         rng = np.random.default_rng(int(seed))
-        indices = rng.choice(len(obs), size=max_samples, replace=False)
+        if preserve_recurrent_context:
+            # Recurrent AIRL needs preceding observations to rebuild transformer
+            # memory under the current policy, so replay sampling keeps whole
+            # trajectory segments instead of isolated transitions.
+            indices = _subsample_complete_trajectories(
+                trajectory_ids,
+                max_samples=max_samples,
+                rng=rng,
+            )
+        else:
+            indices = rng.choice(len(obs), size=max_samples, replace=False)
         obs = obs[indices]
         actions = actions[indices]
         next_obs = next_obs[indices]
         dones = dones[indices]
-    return obs, actions, next_obs, dones
+        trajectory_ids = trajectory_ids[indices]
+        timesteps = timesteps[indices]
+    return obs, actions, next_obs, dones, None, trajectory_ids, timesteps
 
 
 def _as_tensor(array: np.ndarray, *, device: torch.device) -> torch.Tensor:
@@ -209,6 +314,126 @@ def _policy_log_probs(
 ) -> torch.Tensor:
     dist, _values = policy_distribution_and_values(policy, obs, cfg, None)
     return dist.log_prob(actions)
+
+
+def _recurrent_context_windows(
+    trajectory_ids: np.ndarray,
+    timesteps: np.ndarray,
+    target_indices: np.ndarray,
+) -> np.ndarray:
+    ids = np.asarray(trajectory_ids)
+    steps = np.asarray(timesteps, dtype=np.int64)
+    targets = np.asarray(target_indices, dtype=np.int64).reshape(-1)
+    if ids.shape[0] != steps.shape[0]:
+        raise ValueError(f"trajectory_ids/timesteps length mismatch: {ids.shape[0]} != {steps.shape[0]}.")
+    if targets.size == 0:
+        return np.zeros((0, 1), dtype=np.int64)
+
+    orders: dict[object, np.ndarray] = {}
+    positions: dict[int, int] = {}
+    for trajectory_id in _unique_trajectory_values(ids):
+        trajectory_indices = np.flatnonzero(ids == trajectory_id).astype(np.int64)
+        ordered = trajectory_indices[
+            np.lexsort((trajectory_indices, steps[trajectory_indices]))
+        ].astype(np.int64, copy=False)
+        orders[trajectory_id] = ordered
+        for pos, source_index in enumerate(ordered):
+            positions[int(source_index)] = int(pos)
+
+    sequences: list[np.ndarray] = []
+    for row, target_index in enumerate(targets):
+        trajectory_id = ids[int(target_index)]
+        ordered = orders[trajectory_id]
+        pos = positions[int(target_index)]
+        sequence = [int(target_index)]
+        cursor = pos
+        # Step-memory is itself produced by a recurrent forward pass, so exact
+        # AIRL log_pi reconstruction must warm up from the start of the
+        # contiguous expert segment, not only from the last memory-context
+        # observations. Gaps reset memory because skipped frames cannot be
+        # replayed through the policy.
+        while cursor > 0:
+            current_index = int(ordered[cursor])
+            previous_index = int(ordered[cursor - 1])
+            if int(steps[current_index]) - int(steps[previous_index]) != 1:
+                break
+            sequence.append(previous_index)
+            cursor -= 1
+        sequence.reverse()
+        sequences.append(np.asarray(sequence, dtype=np.int64))
+
+    window_width = max(int(len(sequence)) for sequence in sequences)
+    windows = np.full((targets.size, window_width), -1, dtype=np.int64)
+    for row, sequence in enumerate(sequences):
+        windows[row, -len(sequence) :] = sequence
+    return windows
+
+
+def _recurrent_policy_log_probs_for_indices(
+    policy: nn.Module,
+    cfg: PSGAILConfig,
+    observations: np.ndarray,
+    actions: np.ndarray,
+    trajectory_ids: np.ndarray,
+    timesteps: np.ndarray,
+    target_indices: np.ndarray,
+    device: torch.device,
+    *,
+    batch_size: int,
+) -> np.ndarray:
+    target_indices = np.asarray(target_indices, dtype=np.int64).reshape(-1)
+    if target_indices.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+    if not recurrent_policy_enabled(policy):
+        obs = _as_tensor(np.asarray(observations, dtype=np.float32)[target_indices], device=device)
+        act = _as_tensor(np.asarray(actions, dtype=np.float32)[target_indices], device=device)
+        with torch.no_grad():
+            return _policy_log_probs(policy, cfg, obs, act).detach().cpu().numpy().astype(np.float32)
+
+    obs_np = np.asarray(observations, dtype=np.float32)
+    action_np = np.asarray(actions, dtype=np.float32)
+    windows = _recurrent_context_windows(
+        trajectory_ids,
+        timesteps,
+        target_indices,
+    )
+    result = np.empty((target_indices.size,), dtype=np.float32)
+    micro_batch = max(1, min(max(1, int(batch_size)), int(target_indices.size)))
+
+    with torch.no_grad():
+        for start in range(0, target_indices.size, micro_batch):
+            stop = min(target_indices.size, start + micro_batch)
+            batch_windows = windows[start:stop]
+            batch_count = int(batch_windows.shape[0])
+            memory = policy.initial_memory(batch_count, device=device, dtype=torch.float32)
+            batch_log_probs = torch.zeros(batch_count, dtype=torch.float32, device=device)
+            for column in range(batch_windows.shape[1]):
+                active_np = batch_windows[:, column] >= 0
+                if not np.any(active_np):
+                    continue
+                active_rows_np = np.flatnonzero(active_np).astype(np.int64)
+                source_indices = batch_windows[active_rows_np, column].astype(np.int64)
+                active_rows = torch.as_tensor(active_rows_np, dtype=torch.long, device=device)
+                step_memory = memory[active_rows]
+                dist, _values, new_step_memory = policy_distribution_values_memory(
+                    policy,
+                    _as_tensor(obs_np[source_indices], device=device),
+                    cfg,
+                    None,
+                    memory=step_memory,
+                    return_memory=True,
+                )
+                if new_step_memory is None:
+                    raise RuntimeError("Recurrent AIRL log-prob reconstruction did not return memory.")
+                if column == batch_windows.shape[1] - 1:
+                    batch_log_probs[active_rows] = dist.log_prob(
+                        _as_tensor(action_np[source_indices], device=device)
+                    )
+                updated_memory = torch.cat([step_memory[:, 1:], new_step_memory.unsqueeze(1)], dim=1)
+                memory = memory.clone()
+                memory[active_rows] = updated_memory
+            result[start:stop] = batch_log_probs.detach().cpu().numpy().astype(np.float32, copy=False)
+    return result
 
 
 def _airl_wgan_gradient_penalty(
@@ -262,9 +487,15 @@ def update_reward_model(
     device: torch.device,
     *,
     reward_batch_size: int,
+    expert_trajectory_ids: np.ndarray | None = None,
+    expert_timesteps: np.ndarray | None = None,
+    generator_log_probs: np.ndarray | None = None,
+    generator_trajectory_ids: np.ndarray | None = None,
+    generator_timesteps: np.ndarray | None = None,
 ) -> dict[str, float]:
     n = int(len(generator_obs))
     expert_idx = np.random.choice(len(expert_obs), size=n, replace=len(expert_obs) < n)
+    recurrent_policy = recurrent_policy_enabled(policy)
     expert_obs_t = _as_tensor(expert_obs[expert_idx], device=device)
     expert_actions_t = _as_tensor(expert_actions[expert_idx], device=device)
     expert_next_obs_t = _as_tensor(expert_next_obs[expert_idx], device=device)
@@ -276,6 +507,61 @@ def update_reward_model(
 
     policy.eval()
     reward_model.train()
+    if recurrent_policy:
+        if expert_trajectory_ids is None or expert_timesteps is None:
+            raise ValueError(
+                "Recurrent AIRL requires expert_trajectory_ids and expert_timesteps "
+                "to reconstruct expert policy memory for AIRL log_pi."
+            )
+        if generator_log_probs is None:
+            if generator_trajectory_ids is None or generator_timesteps is None:
+                raise ValueError(
+                    "Recurrent AIRL requires generator_log_probs or generator_trajectory_ids/"
+                    "generator_timesteps. Replayed samples must rebuild current-policy "
+                    "transformer memory instead of using blank-memory log_pi."
+                )
+            # Replay samples came from older policies, so their stored old_log_probs
+            # are stale. Recompute current-policy log_pi by replaying each stored
+            # trajectory context through the recurrent policy.
+            generator_log_probs = _recurrent_policy_log_probs_for_indices(
+                policy,
+                cfg,
+                generator_obs,
+                generator_actions,
+                generator_trajectory_ids,
+                generator_timesteps,
+                np.arange(n, dtype=np.int64),
+                device,
+                batch_size=reward_batch_size,
+            )
+        expert_log_probs = _recurrent_policy_log_probs_for_indices(
+            policy,
+            cfg,
+            expert_obs,
+            expert_actions,
+            expert_trajectory_ids,
+            expert_timesteps,
+            expert_idx,
+            device,
+            batch_size=reward_batch_size,
+        )
+    else:
+        expert_log_probs = None
+    gen_log_probs_t = (
+        _as_tensor(np.asarray(generator_log_probs, dtype=np.float32), device=device)
+        if generator_log_probs is not None
+        else None
+    )
+    if gen_log_probs_t is not None and int(gen_log_probs_t.shape[0]) != n:
+        raise ValueError(
+            "generator_log_probs length must match generator samples: "
+            f"{int(gen_log_probs_t.shape[0])} != {n}."
+        )
+    expert_log_probs_t = (
+        _as_tensor(np.asarray(expert_log_probs, dtype=np.float32), device=device)
+        if expert_log_probs is not None
+        else None
+    )
     losses: list[torch.Tensor] = []
     bce_losses: list[torch.Tensor] = []
     wgan_losses: list[torch.Tensor] = []
@@ -313,8 +599,20 @@ def update_reward_model(
                 expert_reward = reward_model(eo, ea)
                 gen_reward = reward_model(go, ga)
                 with torch.no_grad():
-                    expert_log_pi = _policy_log_probs(policy, cfg, eo, ea)
-                    gen_log_pi = _policy_log_probs(policy, cfg, go, ga)
+                    expert_log_pi = (
+                        expert_log_probs_t[idx]
+                        if expert_log_probs_t is not None
+                        else _policy_log_probs(policy, cfg, eo, ea)
+                    )
+                    # For recurrent policies this must be the rollout-time
+                    # likelihood, which already includes transformer memory.
+                    # Recomputing through _policy_log_probs would silently use
+                    # blank memory and corrupt AIRL's f - log pi discriminator.
+                    gen_log_pi = (
+                        gen_log_probs_t[idx]
+                        if gen_log_probs_t is not None
+                        else _policy_log_probs(policy, cfg, go, ga)
+                    )
                 expert_logits = expert_shaped - expert_log_pi
                 gen_logits = gen_shaped - gen_log_pi
                 if loss_type == "wgan_gp":
@@ -851,7 +1149,7 @@ def main() -> None:
 
         last_checkpoint_video_path = None
         last_checkpoint_video_round = 0
-        airl_replay: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        airl_replay: list[AIRLReplayEntry] = []
         psro_policy_archive: list[dict[str, torch.Tensor]] = []
         best_validation_score = float("-inf")
         best_validation_round = 0
@@ -916,11 +1214,15 @@ def main() -> None:
                 reward_generator_actions,
                 reward_generator_next_obs,
                 reward_generator_dones,
+                reward_generator_log_probs,
+                reward_generator_trajectory_ids,
+                reward_generator_timesteps,
             ) = concat_airl_replay(
                 rollout,
                 airl_replay,
                 round_cfg,
                 seed=int(round_cfg.seed) + int(round_idx) * 65537,
+                preserve_recurrent_context=recurrent_policy_enabled(policy),
             )
             reward_stats = update_reward_model(
                 reward_model,
@@ -937,6 +1239,11 @@ def main() -> None:
                 round_cfg,
                 device,
                 reward_batch_size=reward_batch_size,
+                expert_trajectory_ids=expert.trajectory_ids,
+                expert_timesteps=expert.timesteps,
+                generator_log_probs=reward_generator_log_probs,
+                generator_trajectory_ids=reward_generator_trajectory_ids,
+                generator_timesteps=reward_generator_timesteps,
             )
             rollout = refresh_airl_rewards(rollout, reward_model, round_cfg, device)
             policy_stats = update_policy(
@@ -948,7 +1255,7 @@ def main() -> None:
                 expert_policy_observations=expert.policy_observations,
                 expert_actions=expert.actions_continuous_env,
             )
-            append_airl_replay(airl_replay, rollout, round_cfg)
+            append_airl_replay(airl_replay, rollout, round_cfg, round_idx=round_idx)
             print(
                 f"[round {round_idx:04d}] env_steps={collected_rollout.num_env_steps} "
                 f"agent_steps={collected_rollout.num_agent_steps} "

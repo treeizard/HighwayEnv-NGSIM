@@ -29,6 +29,7 @@ class ExpertTransitionData:
     rewards: np.ndarray
     trajectory_states: np.ndarray
     features: np.ndarray
+    trajectory_ids: np.ndarray
     vehicle_ids: np.ndarray
     timesteps: np.ndarray
     metadata: dict[str, Any]
@@ -530,12 +531,13 @@ def load_expert_transition_data(
     steering_accel_parts: list[np.ndarray] = []
     done_parts: list[np.ndarray] = []
     reward_parts: list[np.ndarray] = []
+    trajectory_id_parts: list[np.ndarray] = []
     vehicle_id_parts: list[np.ndarray] = []
     timestep_parts: list[np.ndarray] = []
     metadata_items: list[dict[str, Any]] = []
     samples_by_file: list[dict[str, Any]] = []
 
-    for file_path in files:
+    for file_idx, file_path in enumerate(files):
         idx = sample_plan.get(file_path)
         if file_path not in sample_plan:
             continue
@@ -564,6 +566,10 @@ def load_expert_transition_data(
             rewards = np.asarray(data["rewards"], dtype=np.float32)
             vehicle_ids = np.asarray(data["vehicle_ids"], dtype=np.int64)
             timesteps = np.asarray(data["timesteps"], dtype=np.int64)
+            trajectory_ids = np.asarray(
+                [f"{file_idx}:{int(vehicle_id)}" for vehicle_id in vehicle_ids],
+                dtype=object,
+            )
             _validate_action_conditioned_arrays(
                 file_path,
                 observations=obs,
@@ -588,6 +594,7 @@ def load_expert_transition_data(
                 steering_accel = steering_accel[idx] if steering_accel is not None else None
                 dones = dones[idx]
                 rewards = rewards[idx]
+                trajectory_ids = trajectory_ids[idx]
                 vehicle_ids = vehicle_ids[idx]
                 timesteps = timesteps[idx]
             take = int(len(obs))
@@ -601,6 +608,7 @@ def load_expert_transition_data(
                 steering_accel_parts.append(steering_accel.astype(np.float32, copy=False))
             done_parts.append(dones.astype(bool, copy=False))
             reward_parts.append(rewards.astype(np.float32, copy=False))
+            trajectory_id_parts.append(trajectory_ids.astype(object, copy=False))
             vehicle_id_parts.append(vehicle_ids.astype(np.int64, copy=False))
             timestep_parts.append(timesteps.astype(np.int64, copy=False))
             samples_by_file.append(
@@ -630,6 +638,7 @@ def load_expert_transition_data(
     )
     dones = np.concatenate(done_parts, axis=0).astype(bool, copy=False)
     rewards = np.concatenate(reward_parts, axis=0).astype(np.float32, copy=False)
+    trajectory_ids = np.concatenate(trajectory_id_parts, axis=0).astype(object, copy=False)
     vehicle_ids = np.concatenate(vehicle_id_parts, axis=0).astype(np.int64, copy=False)
     timesteps = np.concatenate(timestep_parts, axis=0).astype(np.int64, copy=False)
     features = discriminator_features(policy_obs, trajectory_states)
@@ -652,6 +661,7 @@ def load_expert_transition_data(
         if actions_steering_acceleration is not None
         else None,
         "trajectory_frame": str(trajectory_frame).lower(),
+        "trajectory_id_schema": "file_index:vehicle_id",
         "sampling": "uniform_without_replacement",
         "max_samples": int(max_samples),
         "samples_by_file": samples_by_file,
@@ -666,6 +676,7 @@ def load_expert_transition_data(
         rewards=rewards,
         trajectory_states=trajectory_states,
         features=features,
+        trajectory_ids=trajectory_ids,
         vehicle_ids=vehicle_ids,
         timesteps=timesteps,
         metadata=metadata,

@@ -106,6 +106,7 @@ from scripts_gail.ps_gail.trainer import (
     central_critic_observations,
     combine_primary_env_challenge_rewards,
     policy_distribution_and_values,
+    policy_distribution_values_memory,
     player_challenge_bonus,
     player_challenge_payoff,
     player_challenge_pressure_from_metric,
@@ -122,6 +123,9 @@ from scripts_gail.train_simple_ps_gail import config_for_round as ps_gail_config
 from scripts_gail.train_simple_ps_gail import parse_args as ps_gail_parse_args
 from scripts_gail.train_simple_airl import AIRLReward
 from scripts_gail.train_simple_airl import _airl_wgan_gradient_penalty
+from scripts_gail.train_simple_airl import _recurrent_policy_log_probs_for_indices
+from scripts_gail.train_simple_airl import append_airl_replay
+from scripts_gail.train_simple_airl import concat_airl_replay
 from scripts_gail.train_simple_airl import config_for_round as airl_config_for_round
 from scripts_gail.train_simple_airl import parse_args as airl_parse_args
 from scripts_gail.train_simple_airl import refresh_airl_rewards
@@ -137,8 +141,11 @@ def _minimal_rollout(
     old_values: np.ndarray,
     returns: np.ndarray,
     advantages: np.ndarray,
+    next_observations: np.ndarray | None = None,
     critic_observations: np.ndarray | None = None,
     next_critic_observations: np.ndarray | None = None,
+    trajectory_ids: np.ndarray | None = None,
+    dones: np.ndarray | None = None,
     generator_features: np.ndarray | None = None,
     env_penalties: np.ndarray | None = None,
     sequence_features: np.ndarray | None = None,
@@ -163,7 +170,11 @@ def _minimal_rollout(
     )
     return RolloutBatch(
         policy_observations=observations.astype(np.float32),
-        next_policy_observations=observations.astype(np.float32),
+        next_policy_observations=(
+            next_observations.astype(np.float32)
+            if next_observations is not None
+            else observations.astype(np.float32)
+        ),
         critic_observations=(
             critic_observations.astype(np.float32)
             if critic_observations is not None
@@ -182,8 +193,16 @@ def _minimal_rollout(
         action_masks=np.ones((n, 5), dtype=bool),
         old_log_probs=old_log_probs.astype(np.float32),
         old_values=old_values.astype(np.float32),
-        trajectory_ids=np.arange(n, dtype=np.int32),
-        dones=np.ones(n, dtype=bool),
+        trajectory_ids=(
+            trajectory_ids
+            if trajectory_ids is not None
+            else np.arange(n, dtype=np.int32)
+        ),
+        dones=(
+            dones.astype(bool)
+            if dones is not None
+            else np.ones(n, dtype=bool)
+        ),
         rewards=np.zeros(n, dtype=np.float32),
         gail_rewards_raw=np.zeros(n, dtype=np.float32),
         gail_rewards_normalized=np.zeros(n, dtype=np.float32),
@@ -330,6 +349,8 @@ def test_action_conditioned_loader_returns_valid_continuous_transition_data(tmp_
     assert data.actions_steering_acceleration is not None
     assert data.actions_steering_acceleration.shape == (2, 2)
     assert np.all(np.isfinite(data.actions_continuous_env))
+    assert data.trajectory_ids.shape == (2,)
+    assert data.metadata["trajectory_id_schema"] == "file_index:vehicle_id"
     assert data.metadata["continuous_action_dim"] == 2
     assert data.metadata["actions_continuous_env_columns"] == list(ACTION_CONTINUOUS_ENV_COLUMNS)
 
@@ -1219,7 +1240,7 @@ def test_airl_policy_reward_mode_exposes_old_log_prob_feedback_loop():
     np.testing.assert_allclose(discriminator_refreshed.rewards, [0.0, 5.0, 10.0], rtol=1e-6)
     np.testing.assert_allclose(shaped_refreshed.gail_rewards_normalized, [0.0, 0.0, 0.0], rtol=1e-6)
     np.testing.assert_allclose(shaped_refreshed.rewards, [0.0, 0.0, 0.0], rtol=1e-6)
-    np.testing.assert_allclose(default_refreshed.rewards, shaped_refreshed.rewards, rtol=1e-6)
+    np.testing.assert_allclose(default_refreshed.rewards, discriminator_refreshed.rewards, rtol=1e-6)
 
 
 def test_airl_wgan_gradient_penalty_backprops_through_reward_model_only():
@@ -1251,6 +1272,252 @@ def test_airl_wgan_gradient_penalty_backprops_through_reward_model_only():
 
     assert torch.isfinite(gradient_penalty)
     assert any(param.grad is not None for param in reward_model.parameters())
+
+
+def test_recurrent_airl_log_probs_replay_expert_memory_context():
+    torch.manual_seed(3)
+    np.random.seed(3)
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        policy_model="recurrent_transformer",
+        continuous_action_dim=2,
+        hidden_size=16,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+    )
+    policy = make_actor_critic(
+        "recurrent_transformer",
+        obs_dim=6,
+        hidden_size=16,
+        action_mode="continuous",
+        continuous_action_dim=2,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+    ).eval()
+    observations = np.random.randn(5, 6).astype(np.float32)
+    actions = []
+    expected_log_probs = []
+    memory = policy.initial_memory(1, dtype=torch.float32)
+    with torch.no_grad():
+        for step in range(len(observations)):
+            dist, _values, step_memory = policy_distribution_values_memory(
+                policy,
+                torch.as_tensor(observations[step : step + 1], dtype=torch.float32),
+                cfg,
+                None,
+                memory=memory,
+                return_memory=True,
+            )
+            action = dist.sample()
+            actions.append(action.squeeze(0).detach().cpu().numpy())
+            expected_log_probs.append(float(dist.log_prob(action).detach().cpu().item()))
+            memory = torch.cat([memory[:, 1:], step_memory.unsqueeze(1)], dim=1)
+
+    reconstructed = _recurrent_policy_log_probs_for_indices(
+        policy,
+        cfg,
+        observations,
+        np.asarray(actions, dtype=np.float32),
+        np.asarray(["0:7"] * len(observations), dtype=object),
+        np.arange(len(observations), dtype=np.int64),
+        np.arange(len(observations), dtype=np.int64),
+        torch.device("cpu"),
+        batch_size=2,
+    )
+
+    np.testing.assert_allclose(reconstructed, expected_log_probs, rtol=1e-5, atol=1e-5)
+
+
+def test_airl_replay_keeps_recurrent_trajectory_context():
+    cfg = PSGAILConfig(
+        discriminator_replay_rounds=1,
+        discriminator_replay_max_samples=0,
+    )
+    replay_rollout = _minimal_rollout(
+        observations=np.arange(12, dtype=np.float32).reshape(6, 2),
+        next_observations=np.arange(100, 112, dtype=np.float32).reshape(6, 2),
+        actions=np.zeros((6, 2), dtype=np.float32),
+        old_log_probs=np.zeros(6, dtype=np.float32),
+        old_values=np.zeros(6, dtype=np.float32),
+        returns=np.zeros(6, dtype=np.float32),
+        advantages=np.zeros(6, dtype=np.float32),
+        trajectory_ids=np.asarray([7, 7, 7, 8, 8, 8], dtype=np.int64),
+        dones=np.asarray([False, False, True, False, False, True]),
+    )
+    current_rollout = _minimal_rollout(
+        observations=np.arange(20, 26, dtype=np.float32).reshape(3, 2),
+        next_observations=np.arange(120, 126, dtype=np.float32).reshape(3, 2),
+        actions=np.ones((3, 2), dtype=np.float32),
+        old_log_probs=np.full(3, -1.0, dtype=np.float32),
+        old_values=np.zeros(3, dtype=np.float32),
+        returns=np.zeros(3, dtype=np.float32),
+        advantages=np.zeros(3, dtype=np.float32),
+        trajectory_ids=np.asarray([9, 9, 9], dtype=np.int64),
+        dones=np.asarray([False, False, True]),
+    )
+
+    replay = []
+    append_airl_replay(replay, replay_rollout, cfg, round_idx=12)
+    obs, actions, next_obs, dones, log_probs, trajectory_ids, timesteps = concat_airl_replay(
+        current_rollout,
+        replay,
+        cfg,
+        seed=123,
+        preserve_recurrent_context=True,
+    )
+
+    assert log_probs is None
+    assert obs.shape == (9, 2)
+    assert actions.shape == (9, 2)
+    assert next_obs.shape == (9, 2)
+    assert dones.shape == (9,)
+    assert trajectory_ids is not None
+    assert timesteps is not None
+    assert any(str(item).startswith("round:12:") for item in trajectory_ids)
+    assert any(str(item).startswith("current:") for item in trajectory_ids)
+    for trajectory_id in dict.fromkeys(trajectory_ids.tolist()):
+        steps = timesteps[trajectory_ids == trajectory_id]
+        np.testing.assert_array_equal(steps, np.arange(len(steps), dtype=np.int64))
+
+
+def test_airl_replay_subsamples_complete_recurrent_trajectories():
+    cfg = PSGAILConfig(
+        discriminator_replay_rounds=1,
+        discriminator_replay_max_samples=4,
+    )
+    replay_rollout = _minimal_rollout(
+        observations=np.arange(12, dtype=np.float32).reshape(6, 2),
+        actions=np.zeros((6, 2), dtype=np.float32),
+        old_log_probs=np.zeros(6, dtype=np.float32),
+        old_values=np.zeros(6, dtype=np.float32),
+        returns=np.zeros(6, dtype=np.float32),
+        advantages=np.zeros(6, dtype=np.float32),
+        trajectory_ids=np.asarray([1, 1, 1, 2, 2, 2], dtype=np.int64),
+    )
+    current_rollout = _minimal_rollout(
+        observations=np.arange(20, 26, dtype=np.float32).reshape(3, 2),
+        actions=np.ones((3, 2), dtype=np.float32),
+        old_log_probs=np.full(3, -1.0, dtype=np.float32),
+        old_values=np.zeros(3, dtype=np.float32),
+        returns=np.zeros(3, dtype=np.float32),
+        advantages=np.zeros(3, dtype=np.float32),
+        trajectory_ids=np.asarray([3, 3, 3], dtype=np.int64),
+    )
+
+    replay = []
+    append_airl_replay(replay, replay_rollout, cfg, round_idx=1)
+    obs, _actions, _next_obs, _dones, _log_probs, trajectory_ids, timesteps = concat_airl_replay(
+        current_rollout,
+        replay,
+        cfg,
+        seed=99,
+        preserve_recurrent_context=True,
+    )
+
+    assert len(obs) <= 4
+    assert trajectory_ids is not None
+    assert timesteps is not None
+    for trajectory_id in dict.fromkeys(trajectory_ids.tolist()):
+        steps = timesteps[trajectory_ids == trajectory_id]
+        np.testing.assert_array_equal(steps, np.arange(len(steps), dtype=np.int64))
+
+
+def test_recurrent_airl_reward_update_requires_log_probs_or_generator_context():
+    torch.manual_seed(4)
+    np.random.seed(4)
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        continuous_action_dim=2,
+        policy_model="recurrent_transformer",
+        hidden_size=16,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+        discriminator_loss="wgan_gp",
+        disc_updates_per_round=1,
+        max_grad_norm=0.5,
+        gamma=0.99,
+        wgan_gp_lambda=2.0,
+    )
+    policy = make_actor_critic(
+        "recurrent_transformer",
+        obs_dim=6,
+        hidden_size=16,
+        action_mode="continuous",
+        continuous_action_dim=2,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+    )
+    reward_model = AIRLReward(obs_dim=6, action_dim=2, hidden_sizes=(8,))
+    optimizer = torch.optim.Adam(reward_model.parameters(), lr=1.0e-3)
+    expert_obs = np.random.randn(5, 6).astype(np.float32)
+    expert_actions = np.tanh(np.random.randn(5, 2)).astype(np.float32)
+    expert_next_obs = np.random.randn(5, 6).astype(np.float32)
+    expert_dones = np.zeros(5, dtype=bool)
+    gen_obs = np.random.randn(5, 6).astype(np.float32)
+    gen_actions = np.tanh(np.random.randn(5, 2)).astype(np.float32)
+    gen_next_obs = np.random.randn(5, 6).astype(np.float32)
+    gen_dones = np.zeros(5, dtype=bool)
+    expert_trajectory_ids = np.asarray(["0:7"] * 5, dtype=object)
+    expert_timesteps = np.arange(5, dtype=np.int64)
+    generator_trajectory_ids = np.asarray(["round:1:0"] * 5, dtype=object)
+    generator_timesteps = np.arange(5, dtype=np.int64)
+
+    with pytest.raises(ValueError, match="generator_log_probs or generator_trajectory_ids"):
+        update_reward_model(
+            reward_model,
+            optimizer,
+            policy,
+            expert_obs,
+            expert_actions,
+            expert_next_obs,
+            expert_dones,
+            gen_obs,
+            gen_actions,
+            gen_next_obs,
+            gen_dones,
+            cfg,
+            torch.device("cpu"),
+            reward_batch_size=2,
+            expert_trajectory_ids=expert_trajectory_ids,
+            expert_timesteps=expert_timesteps,
+        )
+
+    stats = update_reward_model(
+        reward_model,
+        optimizer,
+        policy,
+        expert_obs,
+        expert_actions,
+        expert_next_obs,
+        expert_dones,
+        gen_obs,
+        gen_actions,
+        gen_next_obs,
+        gen_dones,
+        cfg,
+        torch.device("cpu"),
+        reward_batch_size=2,
+        expert_trajectory_ids=expert_trajectory_ids,
+        expert_timesteps=expert_timesteps,
+        generator_trajectory_ids=generator_trajectory_ids,
+        generator_timesteps=generator_timesteps,
+    )
+
+    assert np.isfinite(stats["reward_loss"])
+    assert all(param.requires_grad for param in policy.parameters())
+    assert all(param.grad is None for param in policy.parameters())
 
 
 def test_airl_wgan_reward_update_with_transformer_policy_keeps_policy_out_of_backward():
