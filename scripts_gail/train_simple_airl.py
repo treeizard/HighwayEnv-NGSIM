@@ -306,6 +306,47 @@ def airl_checkpoint_payload(
     }
 
 
+def load_airl_resume_checkpoint(
+    *,
+    resume_checkpoint: str,
+    policy: torch.nn.Module,
+    reward_model: torch.nn.Module,
+    device: torch.device,
+    allow_missing_reward_state: bool = False,
+) -> dict[str, object]:
+    if not os.path.isfile(resume_checkpoint):
+        raise FileNotFoundError(f"resume_checkpoint does not exist: {resume_checkpoint}")
+    try:
+        checkpoint = torch.load(resume_checkpoint, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+    if "policy_state_dict" not in checkpoint:
+        raise RuntimeError(f"Checkpoint is missing policy_state_dict: {resume_checkpoint}")
+    if "reward_state_dict" not in checkpoint and not bool(allow_missing_reward_state):
+        raise RuntimeError(
+            f"Checkpoint {resume_checkpoint!r} is missing reward_state_dict. "
+            "This is not a valid AIRL resume checkpoint; pass "
+            "--allow-airl-resume-without-reward only for an intentional ablation."
+        )
+    try:
+        policy.load_state_dict(checkpoint["policy_state_dict"])
+        if "reward_state_dict" in checkpoint:
+            reward_model.load_state_dict(checkpoint["reward_state_dict"])
+        else:
+            warnings.warn(
+                f"Checkpoint {resume_checkpoint!r} has no reward_state_dict; "
+                "AIRL reward model will start from initialization.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Failed to load AIRL resume checkpoint. Check that policy/reward "
+            "architecture settings match the checkpoint."
+        ) from exc
+    return checkpoint
+
+
 def _policy_log_probs(
     policy: nn.Module,
     cfg: PSGAILConfig,
@@ -980,30 +1021,13 @@ def main() -> None:
         ).to(device)
         resume_checkpoint = str(getattr(cfg, "resume_checkpoint", "") or "").strip()
         if resume_checkpoint:
-            if not os.path.isfile(resume_checkpoint):
-                raise FileNotFoundError(f"resume_checkpoint does not exist: {resume_checkpoint}")
-            try:
-                checkpoint = torch.load(resume_checkpoint, map_location=device, weights_only=False)
-            except TypeError:
-                checkpoint = torch.load(resume_checkpoint, map_location=device)
-            if "policy_state_dict" not in checkpoint:
-                raise RuntimeError(f"Checkpoint is missing policy_state_dict: {resume_checkpoint}")
-            try:
-                policy.load_state_dict(checkpoint["policy_state_dict"])
-                if "reward_state_dict" in checkpoint:
-                    reward_model.load_state_dict(checkpoint["reward_state_dict"])
-                else:
-                    warnings.warn(
-                        f"Checkpoint {resume_checkpoint!r} has no reward_state_dict; "
-                        "AIRL reward model will start from initialization.",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-            except RuntimeError as exc:
-                raise RuntimeError(
-                    "Failed to load AIRL resume checkpoint. Check that policy/reward "
-                    "architecture settings match the checkpoint."
-                ) from exc
+            checkpoint = load_airl_resume_checkpoint(
+                resume_checkpoint=resume_checkpoint,
+                policy=policy,
+                reward_model=reward_model,
+                device=device,
+                allow_missing_reward_state=bool(cfg.allow_airl_resume_without_reward),
+            )
             print(
                 "resumed_checkpoint="
                 f"{os.path.abspath(resume_checkpoint)} "

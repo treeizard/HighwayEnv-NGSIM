@@ -64,6 +64,11 @@ RUN_NAME="${RUN_NAME:-ps_airl_stage2_100veh_${SLURM_JOB_ID}}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 ALLOW_NON_BEST_RESUME="${ALLOW_NON_BEST_RESUME:-false}"
 WANDB_MODE="${WANDB_MODE:-online}"
+SCENE="${SCENE:-us-101}"
+EPISODE_ROOT="${EPISODE_ROOT:-${REPODIR}/highway_env/data/processed_20s}"
+PREBUILT_SPLIT="${PREBUILT_SPLIT:-train}"
+AIRL_POLICY_REWARD_MODE="${AIRL_POLICY_REWARD_MODE:-shaped}"
+ALLOW_AIRL_RESUME_WITHOUT_REWARD="${ALLOW_AIRL_RESUME_WITHOUT_REWARD:-false}"
 
 # Training defaults: full-episode AIRL rounds. With --rollout-full-episodes,
 # active rollout workers are capped by ROLLOUT_MIN_EPISODES.
@@ -78,7 +83,7 @@ ROLLOUT_TRAINING_AGENT_STEPS="${ROLLOUT_TRAINING_AGENT_STEPS:-0}"
 ROLLOUT_MAX_EPISODE_STEPS="${ROLLOUT_MAX_EPISODE_STEPS:-0}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
 MAX_EPISODE_STEPS_SCHEDULE="${MAX_EPISODE_STEPS_SCHEDULE:-}"
-MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-100000}"
+MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-0}"
 TRAJECTORY_FRAME="${TRAJECTORY_FRAME:-relative}"
 # Piecewise schedules below are the source of truth for stage two. The older
 # fraction defaults are intentionally commented out because they are superseded
@@ -111,7 +116,7 @@ CONTROLLED_VEHICLE_CURRICULUM="${CONTROLLED_VEHICLE_CURRICULUM:-true}"
 WARMUP_ROUNDS=0
 WARMUP_LEARNING_RATE="${WARMUP_LEARNING_RATE:-0}"
 WARMUP_DISC_LEARNING_RATE="${WARMUP_DISC_LEARNING_RATE:-0}"
-WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.04}"
+WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.001}"
 WARMUP_CLIP_RANGE="${WARMUP_CLIP_RANGE:-0.10}"
 WARMUP_DISC_UPDATES_PER_ROUND="${WARMUP_DISC_UPDATES_PER_ROUND:-0}"
 WARMUP_GAIL_REWARD_CLIP="${WARMUP_GAIL_REWARD_CLIP:-2.0}"
@@ -135,8 +140,8 @@ BATCH_SIZE="${BATCH_SIZE:-4096}"
 PPO_EPOCHS="${PPO_EPOCHS:-6}"
 LEARNING_RATE="${LEARNING_RATE:-2e-4}"
 LEARNING_RATE_SCHEDULE="${LEARNING_RATE_SCHEDULE:-}"
-ENTROPY_COEF="${ENTROPY_COEF:-0.010}"
-ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-0:100:0.04:0.015;100:500:0.015:0.015;500:600:0.04:0.015;600:800:0.015:0.015}"
+ENTROPY_COEF="${ENTROPY_COEF:-0.001}"
+ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"
 CLIP_RANGE="${CLIP_RANGE:-0.20}"
 CLIP_RANGE_SCHEDULE="${CLIP_RANGE_SCHEDULE:-0:100:0.10:0.20;100:500:0.20:0.20;500:600:0.10:0.20;600:800:0.20:0.20}"
 DISC_LEARNING_RATE="${DISC_LEARNING_RATE:-0.0004}"
@@ -244,6 +249,11 @@ if [ "${ALLOW_WGAN_REWARD_NORMALIZATION}" = "true" ]; then
 else
     ALLOW_WGAN_REWARD_NORMALIZATION_ARG="--no-allow-wgan-reward-normalization"
 fi
+if [ "${ALLOW_AIRL_RESUME_WITHOUT_REWARD}" = "true" ]; then
+    ALLOW_AIRL_RESUME_WITHOUT_REWARD_ARG="--allow-airl-resume-without-reward"
+else
+    ALLOW_AIRL_RESUME_WITHOUT_REWARD_ARG="--no-allow-airl-resume-without-reward"
+fi
 # Temporal convolution module is no longer used.
 # if [ "${TRANSFORMER_TEMPORAL_MODULE}" = "true" ]; then
 #     TRANSFORMER_TEMPORAL_MODULE_ARG="--transformer-temporal-module"
@@ -294,6 +304,12 @@ fi
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Expert data: ${EXPERT_DATA}"
 echo "AIRL trainer: ${AIRL_TRAIN_SCRIPT}"
+echo "Scene: ${SCENE}"
+echo "Episode root: ${EPISODE_ROOT}"
+echo "Prebuilt split: ${PREBUILT_SPLIT}"
+echo "Max expert samples: ${MAX_EXPERT_SAMPLES} (0 means full dataset)"
+echo "AIRL policy reward mode: ${AIRL_POLICY_REWARD_MODE}"
+echo "Allow AIRL resume without reward state: ${ALLOW_AIRL_RESUME_WITHOUT_REWARD}"
 echo "Total rounds: ${TOTAL_ROUNDS}"
 echo "Rollout steps: ${ROLLOUT_STEPS}"
 echo "Rollout min episodes: ${ROLLOUT_MIN_EPISODES}"
@@ -401,10 +417,10 @@ fi
 python "${AIRL_TRAIN_SCRIPT}" \
     --expert-data "${EXPERT_DATA}" \
     --resume-checkpoint "${RESUME_CHECKPOINT}" \
-    --scene us-101 \
+    --scene "${SCENE}" \
     --action-mode continuous \
-    --episode-root "${REPODIR}/highway_env/data/processed_20s" \
-    --prebuilt-split train \
+    --episode-root "${EPISODE_ROOT}" \
+    --prebuilt-split "${PREBUILT_SPLIT}" \
     --validation-every "${VALIDATION_EVERY}" \
     --validation-episodes "${VALIDATION_EPISODES}" \
     --validation-prebuilt-split "${VALIDATION_PREBUILT_SPLIT}" \
@@ -520,6 +536,8 @@ python "${AIRL_TRAIN_SCRIPT}" \
     "${WGAN_REWARD_CENTER_ARG}" \
     --wgan-reward-clip "${WGAN_REWARD_CLIP}" \
     --wgan-reward-scale "${WGAN_REWARD_SCALE}" \
+    --airl-policy-reward-mode "${AIRL_POLICY_REWARD_MODE}" \
+    "${ALLOW_AIRL_RESUME_WITHOUT_REWARD_ARG}" \
     --disc-learning-rate "${DISC_LEARNING_RATE}" \
     --disc-learning-rate-schedule "${DISC_LEARNING_RATE_SCHEDULE}" \
     --discriminator-replay-rounds "${DISCRIMINATOR_REPLAY_ROUNDS}" \

@@ -127,6 +127,7 @@ from scripts_gail.train_simple_airl import _recurrent_policy_log_probs_for_indic
 from scripts_gail.train_simple_airl import append_airl_replay
 from scripts_gail.train_simple_airl import concat_airl_replay
 from scripts_gail.train_simple_airl import config_for_round as airl_config_for_round
+from scripts_gail.train_simple_airl import load_airl_resume_checkpoint
 from scripts_gail.train_simple_airl import parse_args as airl_parse_args
 from scripts_gail.train_simple_airl import refresh_airl_rewards
 from scripts_gail.train_simple_airl import update_reward_model
@@ -343,16 +344,49 @@ def test_action_conditioned_loader_returns_valid_continuous_transition_data(tmp_
 
     data = load_expert_transition_data(str(path), max_samples=2, seed=0)
 
-    assert data.policy_observations.shape == (2, 6)
-    assert data.next_policy_observations.shape == (2, 6)
-    assert data.actions_continuous_env.shape == (2, 2)
+    assert data.policy_observations.shape == (3, 6)
+    assert data.next_policy_observations.shape == (3, 6)
+    assert data.actions_continuous_env.shape == (3, 2)
     assert data.actions_steering_acceleration is not None
-    assert data.actions_steering_acceleration.shape == (2, 2)
+    assert data.actions_steering_acceleration.shape == (3, 2)
     assert np.all(np.isfinite(data.actions_continuous_env))
-    assert data.trajectory_ids.shape == (2,)
+    assert data.trajectory_ids.shape == (3,)
     assert data.metadata["trajectory_id_schema"] == "file_index:vehicle_id"
     assert data.metadata["continuous_action_dim"] == 2
     assert data.metadata["actions_continuous_env_columns"] == list(ACTION_CONTINUOUS_ENV_COLUMNS)
+    assert data.metadata["sampling"] == "trajectory_preserving_without_replacement"
+
+
+def test_action_conditioned_loader_caps_by_complete_trajectories(tmp_path):
+    path = tmp_path / "expert_multi_vehicle.npz"
+    observations = np.arange(6 * 7, dtype=np.float32).reshape(6, 7)
+    arrays = {
+        "observations": observations,
+        "next_observations": observations + 0.5,
+        "trajectory_states": np.stack(
+            [
+                np.arange(6, dtype=np.float32),
+                np.zeros(6, dtype=np.float32),
+                np.ones(6, dtype=np.float32),
+            ],
+            axis=1,
+        ),
+        "vehicle_ids": np.asarray([1, 1, 1, 2, 2, 2], dtype=np.int64),
+        "timesteps": np.asarray([0, 1, 2, 0, 1, 2], dtype=np.int64),
+        "dones": np.asarray([False, False, True, False, False, True], dtype=bool),
+        "rewards": np.zeros(6, dtype=np.float32),
+        ACTION_CONTINUOUS_ENV_KEY: np.zeros((6, 2), dtype=np.float32),
+        ACTION_STEERING_ACCELERATION_KEY: np.zeros((6, 2), dtype=np.float32),
+    }
+    np.savez_compressed(path, **arrays)
+
+    data = load_expert_transition_data(str(path), max_samples=4, seed=7)
+
+    assert len(data.policy_observations) in {3, 6}
+    for trajectory_id in dict.fromkeys(data.trajectory_ids.tolist()):
+        steps = data.timesteps[data.trajectory_ids == trajectory_id]
+        np.testing.assert_array_equal(steps, [0, 1, 2])
+    assert data.metadata["sampling"] == "trajectory_preserving_without_replacement"
 
 
 def test_feature_standardizer_supports_sequence_features_and_clipping():
@@ -1240,7 +1274,61 @@ def test_airl_policy_reward_mode_exposes_old_log_prob_feedback_loop():
     np.testing.assert_allclose(discriminator_refreshed.rewards, [0.0, 5.0, 10.0], rtol=1e-6)
     np.testing.assert_allclose(shaped_refreshed.gail_rewards_normalized, [0.0, 0.0, 0.0], rtol=1e-6)
     np.testing.assert_allclose(shaped_refreshed.rewards, [0.0, 0.0, 0.0], rtol=1e-6)
-    np.testing.assert_allclose(default_refreshed.rewards, discriminator_refreshed.rewards, rtol=1e-6)
+    np.testing.assert_allclose(default_refreshed.rewards, shaped_refreshed.rewards, rtol=1e-6)
+
+
+def test_airl_resume_rejects_gail_checkpoint_without_reward_state(tmp_path):
+    torch.manual_seed(0)
+    policy = make_actor_critic(
+        "mlp",
+        obs_dim=3,
+        hidden_size=8,
+        action_mode="continuous",
+        continuous_action_dim=2,
+    )
+    reward_model = AIRLReward(obs_dim=3, action_dim=2, hidden_sizes=(8,))
+    checkpoint_path = tmp_path / "best.pt"
+    torch.save({"policy_state_dict": policy.state_dict(), "round": 1}, checkpoint_path)
+
+    with pytest.raises(RuntimeError, match="missing reward_state_dict"):
+        load_airl_resume_checkpoint(
+            resume_checkpoint=str(checkpoint_path),
+            policy=policy,
+            reward_model=reward_model,
+            device=torch.device("cpu"),
+        )
+
+
+def test_airl_resume_missing_reward_state_requires_explicit_override(tmp_path):
+    torch.manual_seed(0)
+    source_policy = make_actor_critic(
+        "mlp",
+        obs_dim=3,
+        hidden_size=8,
+        action_mode="continuous",
+        continuous_action_dim=2,
+    )
+    policy = make_actor_critic(
+        "mlp",
+        obs_dim=3,
+        hidden_size=8,
+        action_mode="continuous",
+        continuous_action_dim=2,
+    )
+    reward_model = AIRLReward(obs_dim=3, action_dim=2, hidden_sizes=(8,))
+    checkpoint_path = tmp_path / "best.pt"
+    torch.save({"policy_state_dict": source_policy.state_dict(), "round": 1}, checkpoint_path)
+
+    with pytest.warns(RuntimeWarning, match="no reward_state_dict"):
+        checkpoint = load_airl_resume_checkpoint(
+            resume_checkpoint=str(checkpoint_path),
+            policy=policy,
+            reward_model=reward_model,
+            device=torch.device("cpu"),
+            allow_missing_reward_state=True,
+        )
+
+    assert checkpoint["round"] == 1
 
 
 def test_airl_wgan_gradient_penalty_backprops_through_reward_model_only():
@@ -1852,6 +1940,7 @@ def test_gail_and_airl_parse_same_validation_strategy_defaults(monkeypatch):
     assert not gail_cfg.validation_control_all_vehicles
     assert not airl_cfg.validation_control_all_vehicles
     assert airl_log_prob_batch_size == 512
+    assert airl_cfg.airl_policy_reward_mode == "shaped"
 
 
 def test_airl_parse_exposes_separate_log_prob_batch_size(monkeypatch):
@@ -1870,6 +1959,73 @@ def test_airl_parse_exposes_separate_log_prob_batch_size(monkeypatch):
 
     assert reward_batch_size == 4096
     assert airl_log_prob_batch_size == 128
+
+
+def test_paper_slurm_scripts_keep_scene_and_expert_budget_explicit():
+    root = Path(__file__).resolve().parents[1]
+    scripts = [
+        root / "slurum/script_pretrain/train_gail_continuous_gpu_32c_stage1_50veh.bash",
+        root / "slurum/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
+        root / "slurum/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash",
+        root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
+    ]
+
+    for script in scripts:
+        text = script.read_text(encoding="utf-8")
+        assert 'SCENE="${SCENE:-us-101}"' in text
+        assert 'EPISODE_ROOT="${EPISODE_ROOT:-${REPODIR}/highway_env/data/processed_20s}"' in text
+        assert 'PREBUILT_SPLIT="${PREBUILT_SPLIT:-train}"' in text
+        assert 'MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-0}"' in text
+        assert '--scene "${SCENE}"' in text
+        assert '--episode-root "${EPISODE_ROOT}"' in text
+        assert '--prebuilt-split "${PREBUILT_SPLIT}"' in text
+        assert "--scene us-101" not in text
+        assert '--max-expert-samples "${MAX_EXPERT_SAMPLES}"' in text
+
+
+def test_paper_airl_slurm_scripts_pin_shaped_reward_mode():
+    root = Path(__file__).resolve().parents[1]
+    scripts = [
+        root / "slurum/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash",
+        root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
+    ]
+
+    for script in scripts:
+        text = script.read_text(encoding="utf-8")
+        assert 'AIRL_POLICY_REWARD_MODE="${AIRL_POLICY_REWARD_MODE:-shaped}"' in text
+        assert '--airl-policy-reward-mode "${AIRL_POLICY_REWARD_MODE}"' in text
+    assert "ALLOW_AIRL_RESUME_WITHOUT_REWARD" in scripts[1].read_text(encoding="utf-8")
+
+
+def test_paper_slurm_scripts_use_fixed_low_entropy():
+    root = Path(__file__).resolve().parents[1]
+    airl_stage1 = (
+        root / "slurum/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash"
+    ).read_text(encoding="utf-8")
+    airl_stage2 = (
+        root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash"
+    ).read_text(encoding="utf-8")
+    gail_stage1 = (
+        root / "slurum/script_pretrain/train_gail_continuous_gpu_32c_stage1_50veh.bash"
+    ).read_text(encoding="utf-8")
+    gail_stage2 = (
+        root / "slurum/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash"
+    ).read_text(encoding="utf-8")
+
+    assert 'WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.001}"' in airl_stage1
+    assert 'ENTROPY_COEF="${ENTROPY_COEF:-0.001}"' in airl_stage1
+    assert 'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"' in airl_stage1
+    assert 'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"' in airl_stage2
+    assert 'WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.0015}"' in gail_stage1
+    assert 'ENTROPY_COEF="${ENTROPY_COEF:-0.0015}"' in gail_stage1
+    assert 'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"' in gail_stage1
+    assert 'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"' in gail_stage2
+    for text in (airl_stage1, airl_stage2, gail_stage1, gail_stage2):
+        assert "0:100:0.04:0.015" not in text
+        assert "0:600:0.0005:0.001" not in text
+        assert "0:200:0.0005:0.001" not in text
+        assert "0:600:0.0008:0.0015" not in text
+        assert "0:200:0.0008:0.0015" not in text
 
 
 def test_weighted_validation_score_prefers_lower_rmse_and_safety_rates():

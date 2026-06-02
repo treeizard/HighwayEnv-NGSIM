@@ -79,6 +79,9 @@ PY
 
 RUN_NAME="${RUN_NAME:-ps_gail_stage1_50veh_${SLURM_JOB_ID}}"
 ACTION_MODE="${ACTION_MODE:-continuous}"
+SCENE="${SCENE:-us-101}"
+EPISODE_ROOT="${EPISODE_ROOT:-${REPODIR}/highway_env/data/processed_20s}"
+PREBUILT_SPLIT="${PREBUILT_SPLIT:-train}"
 EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_unified_expert_continuous_55145982}"
 WANDB_MODE="${WANDB_MODE:-online}"
 TOTAL_ROUNDS="${TOTAL_ROUNDS:-600}"
@@ -92,7 +95,7 @@ ROLLOUT_TRAINING_AGENT_STEPS="${ROLLOUT_TRAINING_AGENT_STEPS:-0}"
 ROLLOUT_MAX_EPISODE_STEPS="${ROLLOUT_MAX_EPISODE_STEPS:-0}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
 MAX_EPISODE_STEPS_SCHEDULE="${MAX_EPISODE_STEPS_SCHEDULE:-}"
-MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-100000}"
+MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-0}"
 TRAJECTORY_FRAME="${TRAJECTORY_FRAME:-relative}"
 # Piecewise schedules below are the source of truth for stage one. The older
 # fraction defaults are intentionally commented out because they are superseded
@@ -125,7 +128,7 @@ CONTROLLED_VEHICLE_CURRICULUM="${CONTROLLED_VEHICLE_CURRICULUM:-true}"
 WARMUP_ROUNDS=0
 WARMUP_LEARNING_RATE="${WARMUP_LEARNING_RATE:-0}"
 WARMUP_DISC_LEARNING_RATE="${WARMUP_DISC_LEARNING_RATE:-0}"
-WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.04}"
+WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.0015}"
 WARMUP_CLIP_RANGE="${WARMUP_CLIP_RANGE:-0.10}"
 WARMUP_DISC_UPDATES_PER_ROUND="${WARMUP_DISC_UPDATES_PER_ROUND:-0}"
 WARMUP_GAIL_REWARD_CLIP="${WARMUP_GAIL_REWARD_CLIP:-2.0}"
@@ -195,8 +198,8 @@ EVALUATION_HORIZONS_SECONDS="${EVALUATION_HORIZONS_SECONDS:-1,5,10,20}"
 HARD_BRAKE_ACCEL_THRESHOLD="${HARD_BRAKE_ACCEL_THRESHOLD:--3.0}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
 PPO_EPOCHS="${PPO_EPOCHS:-6}"
-ENTROPY_COEF="${ENTROPY_COEF:-0.015}"
-ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-0:100:0.04:0.015;100:500:0.015:0.015;500:600:0.04:0.015;600:800:0.015:0.015}"
+ENTROPY_COEF="${ENTROPY_COEF:-0.0015}"
+ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"
 CLIP_RANGE="${CLIP_RANGE:-0.20}"
 CLIP_RANGE_SCHEDULE="${CLIP_RANGE_SCHEDULE:-0:100:0.10:0.20;100:500:0.20:0.20;500:600:0.10:0.20;600:800:0.20:0.20}"
 DISC_BATCH_SIZE="${DISC_BATCH_SIZE:-4096}"
@@ -233,6 +236,9 @@ CENTRAL_CRITIC_ATTENTION_HEADS="${CENTRAL_CRITIC_ATTENTION_HEADS:-4}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-20}"
 TERMINATE_WHEN_ALL_CONTROLLED_CRASHED="${TERMINATE_WHEN_ALL_CONTROLLED_CRASHED:-true}"
 export EXPERT_DATA
+export SCENE
+export EPISODE_ROOT
+export PREBUILT_SPLIT
 export INITIAL_CONTROLLED_VEHICLES
 if [ "${TERMINATE_WHEN_ALL_CONTROLLED_CRASHED}" = "true" ]; then
     TERMINATION_ARG="--terminate-when-all-controlled-crashed"
@@ -317,6 +323,10 @@ else
 fi
 
 echo "Expert data: ${EXPERT_DATA}"
+echo "Scene: ${SCENE}"
+echo "Episode root: ${EPISODE_ROOT}"
+echo "Prebuilt split: ${PREBUILT_SPLIT}"
+echo "Max expert samples: ${MAX_EXPERT_SAMPLES} (0 means full dataset)"
 echo "Total rounds: ${TOTAL_ROUNDS}"
 echo "Rollout target-aware episodes: ${ROLLOUT_TARGET_AWARE_EPISODES} min=${ROLLOUT_TARGET_MIN_EPISODES} safety=${ROLLOUT_TARGET_EPISODE_SAFETY_FACTOR}"
 echo "Rollout training subsample: ${ROLLOUT_TRAINING_SUBSAMPLE} cap=${ROLLOUT_TRAINING_AGENT_STEPS:-0} (0 follows rollout target)"
@@ -400,9 +410,9 @@ episode_name = "t1118846979700"
 requested = float(os.environ["INITIAL_CONTROLLED_VEHICLES"])
 register_ngsim_env()
 cfg = {
-    "scene": "us-101",
-    "episode_root": os.path.join(os.environ["REPODIR"], "highway_env/data/processed_20s"),
-    "prebuilt_split": "train",
+    "scene": os.environ["SCENE"],
+    "episode_root": os.environ["EPISODE_ROOT"],
+    "prebuilt_split": os.environ["PREBUILT_SPLIT"],
     "simulation_period": {"episode_name": episode_name},
     "percentage_controlled_vehicles": requested,
     "control_all_vehicles": False,
@@ -441,11 +451,11 @@ PY
 
 python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --expert-data "${EXPERT_DATA}" \
-    --scene us-101 \
+    --scene "${SCENE}" \
     --action-mode "${ACTION_MODE}" \
     --discriminator-input "${DISCRIMINATOR_INPUT}" \
-    --episode-root "${REPODIR}/highway_env/data/processed_20s" \
-    --prebuilt-split train \
+    --episode-root "${EPISODE_ROOT}" \
+    --prebuilt-split "${PREBUILT_SPLIT}" \
     --validation-every "${VALIDATION_EVERY}" \
     --validation-episodes "${VALIDATION_EPISODES}" \
     --validation-prebuilt-split "${VALIDATION_PREBUILT_SPLIT}" \

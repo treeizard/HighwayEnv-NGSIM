@@ -62,6 +62,10 @@ EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_unified_expert_conti
 AIRL_TRAIN_SCRIPT="${AIRL_TRAIN_SCRIPT:-${REPODIR}/scripts_gail/train_simple_airl.py}"
 RUN_NAME="${RUN_NAME:-ps_airl_stage1_50veh_${SLURM_JOB_ID}}"
 WANDB_MODE="${WANDB_MODE:-online}"
+SCENE="${SCENE:-us-101}"
+EPISODE_ROOT="${EPISODE_ROOT:-${REPODIR}/highway_env/data/processed_20s}"
+PREBUILT_SPLIT="${PREBUILT_SPLIT:-train}"
+AIRL_POLICY_REWARD_MODE="${AIRL_POLICY_REWARD_MODE:-shaped}"
 
 # Training defaults: full-episode AIRL rounds. With --rollout-full-episodes,
 # active rollout workers are capped by ROLLOUT_MIN_EPISODES.
@@ -76,7 +80,7 @@ ROLLOUT_TRAINING_AGENT_STEPS="${ROLLOUT_TRAINING_AGENT_STEPS:-0}"
 ROLLOUT_MAX_EPISODE_STEPS="${ROLLOUT_MAX_EPISODE_STEPS:-0}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
 MAX_EPISODE_STEPS_SCHEDULE="${MAX_EPISODE_STEPS_SCHEDULE:-}"
-MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-100000}"
+MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-0}"
 TRAJECTORY_FRAME="${TRAJECTORY_FRAME:-relative}"
 # Piecewise schedules below are the source of truth for stage one. The older
 # fraction defaults are intentionally commented out because they are superseded
@@ -109,7 +113,7 @@ CONTROLLED_VEHICLE_CURRICULUM="${CONTROLLED_VEHICLE_CURRICULUM:-true}"
 WARMUP_ROUNDS=0
 WARMUP_LEARNING_RATE="${WARMUP_LEARNING_RATE:-0}"
 WARMUP_DISC_LEARNING_RATE="${WARMUP_DISC_LEARNING_RATE:-0}"
-WARMUP_ENTROPY_COEF="0.010"
+WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.001}"
 WARMUP_CLIP_RANGE="${WARMUP_CLIP_RANGE:-0.10}"
 WARMUP_DISC_UPDATES_PER_ROUND="${WARMUP_DISC_UPDATES_PER_ROUND:-0}"
 WARMUP_GAIL_REWARD_CLIP="${WARMUP_GAIL_REWARD_CLIP:-2.0}"
@@ -133,8 +137,8 @@ BATCH_SIZE="${BATCH_SIZE:-4096}"
 PPO_EPOCHS="${PPO_EPOCHS:-6}"
 LEARNING_RATE="${LEARNING_RATE:-2e-4}"
 LEARNING_RATE_SCHEDULE="${LEARNING_RATE_SCHEDULE:-}"
-ENTROPY_COEF="0.010"
-ENTROPY_COEF_SCHEDULE=""
+ENTROPY_COEF="${ENTROPY_COEF:-0.001}"
+ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"
 CLIP_RANGE="${CLIP_RANGE:-0.20}"
 CLIP_RANGE_SCHEDULE="${CLIP_RANGE_SCHEDULE:-0:100:0.10:0.20;100:500:0.20:0.20;500:600:0.10:0.20;600:800:0.20:0.20}"
 DISC_LEARNING_RATE="${DISC_LEARNING_RATE:-0.0004}"
@@ -292,6 +296,11 @@ fi
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Expert data: ${EXPERT_DATA}"
 echo "AIRL trainer: ${AIRL_TRAIN_SCRIPT}"
+echo "Scene: ${SCENE}"
+echo "Episode root: ${EPISODE_ROOT}"
+echo "Prebuilt split: ${PREBUILT_SPLIT}"
+echo "Max expert samples: ${MAX_EXPERT_SAMPLES} (0 means full dataset)"
+echo "AIRL policy reward mode: ${AIRL_POLICY_REWARD_MODE}"
 echo "Total rounds: ${TOTAL_ROUNDS}"
 echo "Rollout steps: ${ROLLOUT_STEPS}"
 echo "Rollout min episodes: ${ROLLOUT_MIN_EPISODES}"
@@ -385,10 +394,10 @@ fi
 
 python "${AIRL_TRAIN_SCRIPT}" \
     --expert-data "${EXPERT_DATA}" \
-    --scene us-101 \
+    --scene "${SCENE}" \
     --action-mode continuous \
-    --episode-root "${REPODIR}/highway_env/data/processed_20s" \
-    --prebuilt-split train \
+    --episode-root "${EPISODE_ROOT}" \
+    --prebuilt-split "${PREBUILT_SPLIT}" \
     --validation-every "${VALIDATION_EVERY}" \
     --validation-episodes "${VALIDATION_EPISODES}" \
     --validation-prebuilt-split "${VALIDATION_PREBUILT_SPLIT}" \
@@ -504,6 +513,7 @@ python "${AIRL_TRAIN_SCRIPT}" \
     "${WGAN_REWARD_CENTER_ARG}" \
     --wgan-reward-clip "${WGAN_REWARD_CLIP}" \
     --wgan-reward-scale "${WGAN_REWARD_SCALE}" \
+    --airl-policy-reward-mode "${AIRL_POLICY_REWARD_MODE}" \
     --disc-learning-rate "${DISC_LEARNING_RATE}" \
     --disc-learning-rate-schedule "${DISC_LEARNING_RATE_SCHEDULE}" \
     --discriminator-replay-rounds "${DISCRIMINATOR_REPLAY_ROUNDS}" \

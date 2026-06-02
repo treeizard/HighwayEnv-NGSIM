@@ -412,6 +412,56 @@ def _uniform_file_sample_plan(
     return plan
 
 
+def _trajectory_preserving_file_sample_plan(
+    files: list[str],
+    counts: dict[str, int],
+    *,
+    max_samples: int,
+    rng: np.random.Generator,
+) -> tuple[dict[str, np.ndarray | None], str]:
+    total = int(sum(counts[file_path] for file_path in files))
+    if total <= 0:
+        raise RuntimeError("Expert dataset contains no samples.")
+    if int(max_samples) <= 0 or int(max_samples) >= total:
+        return {file_path: None for file_path in files}, "full_dataset"
+
+    trajectory_rows: list[tuple[str, np.ndarray]] = []
+    for file_path in files:
+        with np.load(file_path, allow_pickle=True) as data:
+            _require_arrays(file_path, list(data.files), {"vehicle_ids"})
+            vehicle_ids = np.asarray(data["vehicle_ids"], dtype=np.int64)
+            if int(vehicle_ids.shape[0]) != int(counts[file_path]):
+                raise ValueError(
+                    f"{file_path} vehicle_ids length {vehicle_ids.shape[0]} does not match "
+                    f"observations {counts[file_path]}."
+                )
+            for vehicle_id in np.unique(vehicle_ids):
+                indices = np.flatnonzero(vehicle_ids == vehicle_id)
+                if indices.size:
+                    trajectory_rows.append((file_path, indices.astype(np.int64, copy=False)))
+    if not trajectory_rows:
+        raise RuntimeError("Expert dataset contains no trajectory ids to sample.")
+
+    order = rng.permutation(len(trajectory_rows))
+    selected_by_file: dict[str, list[np.ndarray]] = {}
+    selected = 0
+    for trajectory_index in order:
+        file_path, indices = trajectory_rows[int(trajectory_index)]
+        selected_by_file.setdefault(file_path, []).append(indices)
+        selected += int(indices.size)
+        if selected >= int(max_samples):
+            break
+
+    plan: dict[str, np.ndarray | None] = {}
+    for file_path, index_parts in selected_by_file.items():
+        if index_parts:
+            plan[file_path] = np.sort(np.concatenate(index_parts, axis=0)).astype(
+                np.int64,
+                copy=False,
+            )
+    return plan, "trajectory_preserving_without_replacement"
+
+
 def load_expert_policy_and_disc_data(
     path: str,
     *,
@@ -517,7 +567,7 @@ def load_expert_transition_data(
     rng = np.random.default_rng(seed)
     files = _dataset_files(path)
     counts = _dataset_file_counts(path, files)
-    sample_plan = _uniform_file_sample_plan(
+    sample_plan, sampling_mode = _trajectory_preserving_file_sample_plan(
         files,
         counts,
         max_samples=int(max_samples),
@@ -662,7 +712,7 @@ def load_expert_transition_data(
         else None,
         "trajectory_frame": str(trajectory_frame).lower(),
         "trajectory_id_schema": "file_index:vehicle_id",
-        "sampling": "uniform_without_replacement",
+        "sampling": sampling_mode,
         "max_samples": int(max_samples),
         "samples_by_file": samples_by_file,
         "episodes": metadata_items,

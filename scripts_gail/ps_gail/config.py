@@ -17,6 +17,7 @@ class PSGAILConfig:
     expert_data: str = "expert_data/ngsim_ps_traj_expert_discrete_54902119" # Define the path of the expert data. 
     run_name: str = "simple_ps_gail"
     resume_checkpoint: str = ""
+    allow_airl_resume_without_reward: bool = False
     scene: str = "us-101"
     action_mode: str = "discrete"
     continuous_action_dim: int = 2 # -> [acceleration, lane change]
@@ -161,7 +162,7 @@ class PSGAILConfig:
     wgan_reward_scale: float = 1.0
     wgan_reward_norm_min_std: float = 1.0e-3
     wgan_reward_norm_clip: float = 5.0
-    airl_policy_reward_mode: str = "discriminator"
+    airl_policy_reward_mode: str = "shaped"
     normalize_discriminator_features: bool = True
     discriminator_feature_clip: float = 10.0
     cgail_k: float = 0.0
