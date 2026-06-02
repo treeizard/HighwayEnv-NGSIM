@@ -82,6 +82,8 @@ RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 ALLOW_NON_BEST_RESUME="${ALLOW_NON_BEST_RESUME:-false}"
 ACTION_MODE="${ACTION_MODE:-continuous}"
 SCENE="${SCENE:-us-101}"
+CKPT_ROOT="${CKPT_ROOT:-${REPODIR}/ckpt}"
+CKPT_DATASET="${CKPT_DATASET:-}"
 EPISODE_ROOT="${EPISODE_ROOT:-${REPODIR}/highway_env/data/processed_20s}"
 PREBUILT_SPLIT="${PREBUILT_SPLIT:-train}"
 EXPERT_DATA="${EXPERT_DATA:-${REPODIR}/expert_data/ngsim_ps_unified_expert_continuous_55145982}"
@@ -324,8 +326,33 @@ else
     CENTRAL_CRITIC_INCLUDE_LOCAL_OBS_ARG="--no-central-critic-include-local-obs"
 fi
 
+if [ -z "${CKPT_DATASET}" ]; then
+    case "${SCENE}" in
+        us-101|us)
+            CKPT_DATASET="us"
+            ;;
+        japanese|japan)
+            CKPT_DATASET="japan"
+            ;;
+        *)
+            CKPT_DATASET="${SCENE}"
+            ;;
+    esac
+fi
+if [ -z "${RESUME_CHECKPOINT}" ]; then
+    for candidate in \
+        "${CKPT_ROOT}/${CKPT_DATASET}/gail/final_pretrain.pt"; do
+        if [ -f "${candidate}" ]; then
+            RESUME_CHECKPOINT="${candidate}"
+            break
+        fi
+    done
+fi
+
 echo "Expert data: ${EXPERT_DATA}"
 echo "Scene: ${SCENE}"
+echo "Checkpoint root: ${CKPT_ROOT}"
+echo "Checkpoint dataset: ${CKPT_DATASET}"
 echo "Episode root: ${EPISODE_ROOT}"
 echo "Prebuilt split: ${PREBUILT_SPLIT}"
 echo "Max expert samples: ${MAX_EXPERT_SAMPLES} (0 means full dataset)"
@@ -383,8 +410,9 @@ if [ ! -f "${RESUME_CHECKPOINT}" ]; then
     echo "RESUME_CHECKPOINT not found: ${RESUME_CHECKPOINT}" >&2
     exit 2
 fi
-if [ "${ALLOW_NON_BEST_RESUME}" != "true" ] && [ "$(basename "${RESUME_CHECKPOINT}")" != "best.pt" ]; then
-    echo "RESUME_CHECKPOINT must point to best.pt. Set ALLOW_NON_BEST_RESUME=true to override." >&2
+if [ "${ALLOW_NON_BEST_RESUME}" != "true" ] \
+    && [ "$(basename "${RESUME_CHECKPOINT}")" != "final_pretrain.pt" ]; then
+    echo "RESUME_CHECKPOINT must point to final_pretrain.pt. Set ALLOW_NON_BEST_RESUME=true to override." >&2
     exit 2
 fi
 

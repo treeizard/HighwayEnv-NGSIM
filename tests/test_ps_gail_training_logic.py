@@ -1997,6 +1997,33 @@ def test_paper_airl_slurm_scripts_pin_shaped_reward_mode():
     assert "ALLOW_AIRL_RESUME_WITHOUT_REWARD" in scripts[1].read_text(encoding="utf-8")
 
 
+def test_paper_finetune_slurm_scripts_auto_resolve_ckpt_folder():
+    root = Path(__file__).resolve().parents[1]
+    gail = (
+        root / "slurum/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash"
+    ).read_text(encoding="utf-8")
+    airl = (
+        root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash"
+    ).read_text(encoding="utf-8")
+
+    assert 'CKPT_ROOT="${CKPT_ROOT:-${REPODIR}/ckpt}"' in gail
+    assert 'CKPT_ROOT="${CKPT_ROOT:-${REPODIR}/ckpt}"' in airl
+    assert 'CKPT_DATASET="${CKPT_DATASET:-}"' in gail
+    assert 'CKPT_DATASET="${CKPT_DATASET:-}"' in airl
+    assert '"${CKPT_ROOT}/${CKPT_DATASET}/gail/final_pretrain.pt"' in gail
+    assert '"${CKPT_ROOT}/${CKPT_DATASET}/airl/final_pretrain.pt"' in airl
+    assert '"${CKPT_ROOT}/${CKPT_DATASET}/gail/best.pt"' not in gail
+    assert '"${CKPT_ROOT}/${CKPT_DATASET}/gail/final.pt"' not in gail
+    assert '"${CKPT_ROOT}/${CKPT_DATASET}/airl/best.pt"' not in airl
+    assert '"${CKPT_ROOT}/${CKPT_DATASET}/airl/final.pt"' not in airl
+    assert '$(basename "${RESUME_CHECKPOINT}")" != "final_pretrain.pt"' in gail
+    assert '$(basename "${RESUME_CHECKPOINT}")" != "final_pretrain.pt"' in airl
+    assert '$(basename "${RESUME_CHECKPOINT}")" != "best.pt"' not in gail
+    assert '$(basename "${RESUME_CHECKPOINT}")" != "best.pt"' not in airl
+    assert '$(basename "${RESUME_CHECKPOINT}")" != "final.pt"' not in gail
+    assert '$(basename "${RESUME_CHECKPOINT}")" != "final.pt"' not in airl
+
+
 def test_paper_slurm_scripts_use_fixed_low_entropy():
     root = Path(__file__).resolve().parents[1]
     airl_stage1 = (
@@ -2144,12 +2171,14 @@ def test_best_checkpoint_payload_carries_validation_metadata_and_model_state_key
     assert "discriminator_state_dict" in payload
 
 
-def test_stage2_scripts_require_best_resume_by_default():
+def test_stage2_scripts_require_final_pretrain_resume_by_default():
     root = Path(__file__).resolve().parents[1]
     gail_script = root / "slurum" / "script_finetune" / "train_gail_continuous_gpu_32c_stage2_100veh.bash"
     airl_script = root / "slurum" / "script_finetune" / "train_airl_continuous_gpu_32c_stage2_100veh.bash"
     for script in (gail_script, airl_script):
         text = script.read_text(encoding="utf-8")
         assert 'ALLOW_NON_BEST_RESUME="${ALLOW_NON_BEST_RESUME:-false}"' in text
-        assert '$(basename "${RESUME_CHECKPOINT}")" != "best.pt"' in text
+        assert '$(basename "${RESUME_CHECKPOINT}")" != "final_pretrain.pt"' in text
+        assert '$(basename "${RESUME_CHECKPOINT}")" != "best.pt"' not in text
+        assert '$(basename "${RESUME_CHECKPOINT}")" != "final.pt"' not in text
         assert "Set ALLOW_NON_BEST_RESUME=true to override" in text
