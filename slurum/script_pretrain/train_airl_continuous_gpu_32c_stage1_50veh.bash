@@ -143,6 +143,7 @@ DISC_UPDATES_PER_ROUND="${DISC_UPDATES_PER_ROUND:-2}"
 DISC_UPDATES_PER_ROUND_SCHEDULE="${DISC_UPDATES_PER_ROUND_SCHEDULE:-}"
 DISC_BATCH_SIZE="${DISC_BATCH_SIZE:-4096}"
 REWARD_BATCH_SIZE="${REWARD_BATCH_SIZE:-${DISC_BATCH_SIZE}}"
+AIRL_LOG_PROB_BATCH_SIZE="${AIRL_LOG_PROB_BATCH_SIZE:-512}"
 DISCRIMINATOR_REPLAY_ROUNDS="${DISCRIMINATOR_REPLAY_ROUNDS:-3}"
 DISCRIMINATOR_REPLAY_MAX_SAMPLES="${DISCRIMINATOR_REPLAY_MAX_SAMPLES:-120000}"
 DISC_EXPERT_LABEL="${DISC_EXPERT_LABEL:-0.8}"
@@ -332,6 +333,7 @@ echo "AIRL critic spectral norm: ${DISCRIMINATOR_SPECTRAL_NORM}"
 echo "AIRL reward lr: ${DISC_LEARNING_RATE}"
 echo "AIRL reward updates per round: ${DISC_UPDATES_PER_ROUND}"
 echo "AIRL reward batch size: ${REWARD_BATCH_SIZE}"
+echo "AIRL log-prob reconstruction batch size: ${AIRL_LOG_PROB_BATCH_SIZE}"
 echo "AIRL reward replay: rounds=${DISCRIMINATOR_REPLAY_ROUNDS} max_samples=${DISCRIMINATOR_REPLAY_MAX_SAMPLES}"
 echo "AIRL objective: ${DISCRIMINATOR_LOSS}"
 echo "AIRL reward labels (BCE only): expert=${DISC_EXPERT_LABEL}, generator=${DISC_GENERATOR_LABEL}"
@@ -496,6 +498,7 @@ python "${AIRL_TRAIN_SCRIPT}" \
     --clip-range "${CLIP_RANGE}" \
     --clip-range-schedule "${CLIP_RANGE_SCHEDULE}" \
     --reward-batch-size "${REWARD_BATCH_SIZE}" \
+    --airl-log-prob-batch-size "${AIRL_LOG_PROB_BATCH_SIZE}" \
     --discriminator-loss "${DISCRIMINATOR_LOSS}" \
     --wgan-gp-lambda "${WGAN_GP_LAMBDA}" \
     "${WGAN_REWARD_CENTER_ARG}" \

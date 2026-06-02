@@ -1334,6 +1334,65 @@ def test_recurrent_airl_log_probs_replay_expert_memory_context():
     np.testing.assert_allclose(reconstructed, expected_log_probs, rtol=1e-5, atol=1e-5)
 
 
+def test_recurrent_airl_log_probs_skip_centralized_critic(monkeypatch):
+    torch.manual_seed(5)
+    np.random.seed(5)
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        policy_model="recurrent_transformer",
+        continuous_action_dim=2,
+        hidden_size=16,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+        centralized_critic=True,
+        central_critic_pooling="attention",
+        central_critic_max_vehicles=1,
+        central_critic_attention_heads=4,
+    )
+    policy = make_actor_critic(
+        "recurrent_transformer",
+        obs_dim=6,
+        hidden_size=16,
+        action_mode="continuous",
+        continuous_action_dim=2,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+        centralized_critic=True,
+        critic_obs_dim=central_critic_observation_dim(6, cfg),
+        central_critic_pooling="attention",
+        central_critic_max_vehicles=1,
+        central_critic_attention_heads=4,
+    ).eval()
+
+    def fail_if_called(_critic_obs):
+        raise AssertionError("AIRL log-prob reconstruction should not run the centralized critic.")
+
+    monkeypatch.setattr(policy.critic_encoder, "forward", fail_if_called)
+    observations = np.random.randn(4, 6).astype(np.float32)
+    actions = np.tanh(np.random.randn(4, 2)).astype(np.float32)
+
+    reconstructed = _recurrent_policy_log_probs_for_indices(
+        policy,
+        cfg,
+        observations,
+        actions,
+        np.asarray(["0:7"] * len(observations), dtype=object),
+        np.arange(len(observations), dtype=np.int64),
+        np.arange(len(observations), dtype=np.int64),
+        torch.device("cpu"),
+        batch_size=2,
+    )
+
+    assert reconstructed.shape == (len(observations),)
+    assert np.isfinite(reconstructed).all()
+
+
 def test_airl_replay_keeps_recurrent_trajectory_context():
     cfg = PSGAILConfig(
         discriminator_replay_rounds=1,
@@ -1784,7 +1843,7 @@ def test_gail_and_airl_parse_same_validation_strategy_defaults(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["train_simple_ps_gail.py"])
     gail_cfg = ps_gail_parse_args()
     monkeypatch.setattr(sys, "argv", ["train_simple_airl.py"])
-    airl_cfg, _reward_batch_size = airl_parse_args()
+    airl_cfg, _reward_batch_size, airl_log_prob_batch_size = airl_parse_args()
 
     assert gail_cfg.validation_vehicle_mode == "training_count"
     assert airl_cfg.validation_vehicle_mode == "training_count"
@@ -1792,6 +1851,25 @@ def test_gail_and_airl_parse_same_validation_strategy_defaults(monkeypatch):
     assert airl_cfg.validation_stress_vehicle_mode == "all"
     assert not gail_cfg.validation_control_all_vehicles
     assert not airl_cfg.validation_control_all_vehicles
+    assert airl_log_prob_batch_size == 512
+
+
+def test_airl_parse_exposes_separate_log_prob_batch_size(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_simple_airl.py",
+            "--reward-batch-size",
+            "4096",
+            "--airl-log-prob-batch-size",
+            "128",
+        ],
+    )
+    _airl_cfg, reward_batch_size, airl_log_prob_batch_size = airl_parse_args()
+
+    assert reward_batch_size == 4096
+    assert airl_log_prob_batch_size == 128
 
 
 def test_weighted_validation_score_prefers_lower_rmse_and_safety_rates():

@@ -364,6 +364,43 @@ def policy_distribution_values_memory(
     dist = Categorical(logits=_masked_discrete_logits(policy_out, action_masks))
     return dist, values, new_memory if return_memory else None
 
+
+def policy_distribution_memory(
+    policy: nn.Module,
+    obs_tensor: torch.Tensor,
+    cfg: PSGAILConfig,
+    action_masks: torch.Tensor | None = None,
+    memory: torch.Tensor | None = None,
+    *,
+    return_memory: bool = False,
+) -> tuple[Categorical | SquashedNormal, torch.Tensor | None]:
+    if recurrent_policy_enabled(policy):
+        if not hasattr(policy, "_encode_actor"):
+            dist, _values, new_memory = policy_distribution_values_memory(
+                policy,
+                obs_tensor,
+                cfg,
+                action_masks,
+                memory=memory,
+                return_memory=True,
+            )
+            return dist, new_memory if return_memory else None
+        encoded, new_memory = policy._encode_actor(obs_tensor, memory, return_memory=True)
+        policy_out = policy.policy_head(encoded)
+        if _is_continuous(cfg):
+            policy_out = torch.tanh(policy_out)
+    else:
+        policy_out = policy.actor(obs_tensor)
+        new_memory = None
+    if _is_continuous(cfg):
+        if policy.log_std is None:
+            raise RuntimeError("Continuous action mode requires policy.log_std.")
+        std = torch.exp(policy.log_std).expand_as(policy_out)
+        return SquashedNormal(policy_out, std), new_memory if return_memory else None
+    dist = Categorical(logits=_masked_discrete_logits(policy_out, action_masks))
+    return dist, new_memory if return_memory else None
+
+
 def _make_policy_from_state_dict(
     state_dict: dict[str, torch.Tensor],
     cfg: PSGAILConfig,
@@ -424,5 +461,6 @@ __all__ = [
     '_shift_recurrent_memory',
     'recurrent_memory_stats',
     'policy_distribution_values_memory',
+    'policy_distribution_memory',
     '_make_policy_from_state_dict'
 ]

@@ -38,7 +38,7 @@ from scripts_gail.ps_gail.trainer import (
     make_evaluation_executor,
     make_rollout_executor,
     policy_distribution_and_values,
-    policy_distribution_values_memory,
+    policy_distribution_memory,
     recurrent_policy_enabled,
     resolve_device,
     safe_normalize_adversarial_rewards,
@@ -415,7 +415,7 @@ def _recurrent_policy_log_probs_for_indices(
                 source_indices = batch_windows[active_rows_np, column].astype(np.int64)
                 active_rows = torch.as_tensor(active_rows_np, dtype=torch.long, device=device)
                 step_memory = memory[active_rows]
-                dist, _values, new_step_memory = policy_distribution_values_memory(
+                dist, new_step_memory = policy_distribution_memory(
                     policy,
                     _as_tensor(obs_np[source_indices], device=device),
                     cfg,
@@ -487,6 +487,7 @@ def update_reward_model(
     device: torch.device,
     *,
     reward_batch_size: int,
+    log_prob_batch_size: int | None = None,
     expert_trajectory_ids: np.ndarray | None = None,
     expert_timesteps: np.ndarray | None = None,
     generator_log_probs: np.ndarray | None = None,
@@ -508,6 +509,10 @@ def update_reward_model(
     policy.eval()
     reward_model.train()
     if recurrent_policy:
+        log_prob_micro_batch_size = max(
+            1,
+            int(log_prob_batch_size if log_prob_batch_size is not None else reward_batch_size),
+        )
         if expert_trajectory_ids is None or expert_timesteps is None:
             raise ValueError(
                 "Recurrent AIRL requires expert_trajectory_ids and expert_timesteps "
@@ -532,7 +537,7 @@ def update_reward_model(
                 generator_timesteps,
                 np.arange(n, dtype=np.int64),
                 device,
-                batch_size=reward_batch_size,
+                batch_size=log_prob_micro_batch_size,
             )
         expert_log_probs = _recurrent_policy_log_probs_for_indices(
             policy,
@@ -543,7 +548,7 @@ def update_reward_model(
             expert_timesteps,
             expert_idx,
             device,
-            batch_size=reward_batch_size,
+            batch_size=log_prob_micro_batch_size,
         )
     else:
         expert_log_probs = None
@@ -862,7 +867,7 @@ def save_checkpoint_video(policy: nn.Module, cfg: PSGAILConfig, *, run_dir: str,
     return path
 
 
-def parse_args() -> tuple[PSGAILConfig, int]:
+def parse_args() -> tuple[PSGAILConfig, int, int]:
     defaults = PSGAILConfig(
         action_mode="continuous",
         run_name="simple_airl",
@@ -890,14 +895,16 @@ def parse_args() -> tuple[PSGAILConfig, int]:
         else:
             parser.add_argument(arg, type=type(value), default=value)
     parser.add_argument("--reward-batch-size", type=int, default=int(defaults.disc_batch_size))
+    parser.add_argument("--airl-log-prob-batch-size", type=int, default=512)
     args = parser.parse_args()
     values = vars(args)
     reward_batch_size = int(values.pop("reward_batch_size"))
-    return PSGAILConfig(**values), reward_batch_size
+    airl_log_prob_batch_size = int(values.pop("airl_log_prob_batch_size"))
+    return PSGAILConfig(**values), reward_batch_size, airl_log_prob_batch_size
 
 
 def main() -> None:
-    cfg, reward_batch_size = parse_args()
+    cfg, reward_batch_size, airl_log_prob_batch_size = parse_args()
     if str(cfg.action_mode).lower() != "continuous":
         raise ValueError("This AIRL test trainer currently supports --action-mode continuous only.")
     airl_objective = str(cfg.discriminator_loss).lower()
@@ -1239,6 +1246,7 @@ def main() -> None:
                 round_cfg,
                 device,
                 reward_batch_size=reward_batch_size,
+                log_prob_batch_size=airl_log_prob_batch_size,
                 expert_trajectory_ids=expert.trajectory_ids,
                 expert_timesteps=expert.timesteps,
                 generator_log_probs=reward_generator_log_probs,
@@ -1450,6 +1458,7 @@ def main() -> None:
                 "train/disc_updates_per_round": int(round_cfg.disc_updates_per_round),
                 "train/expert_samples": int(expert.policy_observations.shape[0]),
                 "train/reward_batch_size": int(reward_batch_size),
+                "train/airl_log_prob_batch_size": int(airl_log_prob_batch_size),
                 "train/rollout_workers": int(round_cfg.num_rollout_workers),
                 "train/rollout_worker_threads": int(round_cfg.rollout_worker_threads),
                 "train/evaluation_workers": int(round_cfg.evaluation_num_workers),
