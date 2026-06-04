@@ -123,6 +123,7 @@ from scripts_gail.train_simple_ps_gail import config_for_round as ps_gail_config
 from scripts_gail.train_simple_ps_gail import parse_args as ps_gail_parse_args
 from scripts_gail.train_simple_airl import AIRLReward
 from scripts_gail.train_simple_airl import _airl_wgan_gradient_penalty
+from scripts_gail.train_simple_airl import _build_recurrent_trajectory_index
 from scripts_gail.train_simple_airl import _recurrent_policy_log_probs_for_indices
 from scripts_gail.train_simple_airl import append_airl_replay
 from scripts_gail.train_simple_airl import concat_airl_replay
@@ -1362,6 +1363,31 @@ def test_airl_wgan_gradient_penalty_backprops_through_reward_model_only():
     assert any(param.grad is not None for param in reward_model.parameters())
 
 
+def test_airl_reward_components_match_raw_and_shaped_logits():
+    torch.manual_seed(11)
+    reward_model = AIRLReward(obs_dim=4, action_dim=2, hidden_sizes=(8,))
+    obs = torch.randn(5, 4)
+    actions = torch.randn(5, 2)
+    next_obs = torch.randn(5, 4)
+    dones = torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0])
+
+    raw, current_potential, next_potential, shaped = reward_model.components(
+        obs,
+        actions,
+        next_obs,
+        dones,
+        gamma=0.95,
+    )
+
+    torch.testing.assert_close(raw, reward_model(obs, actions))
+    torch.testing.assert_close(
+        shaped,
+        reward_model.shaped_logits(obs, actions, next_obs, dones, gamma=0.95),
+    )
+    torch.testing.assert_close(current_potential, reward_model.potential(obs).squeeze(-1))
+    torch.testing.assert_close(next_potential, reward_model.potential(next_obs).squeeze(-1))
+
+
 def test_recurrent_airl_log_probs_replay_expert_memory_context():
     torch.manual_seed(3)
     np.random.seed(3)
@@ -1481,6 +1507,128 @@ def test_recurrent_airl_log_probs_skip_centralized_critic(monkeypatch):
     assert np.isfinite(reconstructed).all()
 
 
+def test_recurrent_airl_log_probs_scan_segments_once(monkeypatch):
+    import scripts_gail.train_simple_airl as airl
+
+    torch.manual_seed(7)
+    np.random.seed(7)
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        policy_model="recurrent_transformer",
+        continuous_action_dim=2,
+        hidden_size=16,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+    )
+    policy = make_actor_critic(
+        "recurrent_transformer",
+        obs_dim=6,
+        hidden_size=16,
+        action_mode="continuous",
+        continuous_action_dim=2,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+    ).eval()
+    observations = np.random.randn(6, 6).astype(np.float32)
+    actions = np.tanh(np.random.randn(6, 2)).astype(np.float32)
+    seen_rows = 0
+    original = airl.policy_distribution_memory
+
+    def counting_policy_distribution_memory(policy_arg, obs_tensor, *args, **kwargs):
+        nonlocal seen_rows
+        seen_rows += int(obs_tensor.shape[0])
+        return original(policy_arg, obs_tensor, *args, **kwargs)
+
+    monkeypatch.setattr(airl, "policy_distribution_memory", counting_policy_distribution_memory)
+    reconstructed = _recurrent_policy_log_probs_for_indices(
+        policy,
+        cfg,
+        observations,
+        actions,
+        np.asarray(["traj"] * len(observations), dtype=object),
+        np.arange(len(observations), dtype=np.int64),
+        np.asarray([5, 2, 5], dtype=np.int64),
+        torch.device("cpu"),
+        batch_size=16,
+    )
+
+    assert reconstructed.shape == (3,)
+    assert reconstructed[0] == pytest.approx(reconstructed[2])
+    assert seen_rows == len(observations)
+
+
+def test_recurrent_airl_log_probs_cached_index_matches_on_demand_with_gaps():
+    torch.manual_seed(13)
+    np.random.seed(13)
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        policy_model="recurrent_transformer",
+        continuous_action_dim=2,
+        hidden_size=16,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+    )
+    policy = make_actor_critic(
+        "recurrent_transformer",
+        obs_dim=6,
+        hidden_size=16,
+        action_mode="continuous",
+        continuous_action_dim=2,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+    ).eval()
+    observations = np.random.randn(8, 6).astype(np.float32)
+    actions = np.tanh(np.random.randn(8, 2)).astype(np.float32)
+    trajectory_ids = np.asarray(["a", "b", "a", "b", "a", "b", "a", "b"], dtype=object)
+    timesteps = np.asarray([0, 0, 1, 1, 3, 2, 4, 4], dtype=np.int64)
+    targets = np.asarray([7, 2, 4, 7, 5], dtype=np.int64)
+    trajectory_index = _build_recurrent_trajectory_index(trajectory_ids, timesteps)
+
+    on_demand = _recurrent_policy_log_probs_for_indices(
+        policy,
+        cfg,
+        observations,
+        actions,
+        trajectory_ids,
+        timesteps,
+        targets,
+        torch.device("cpu"),
+        batch_size=2,
+    )
+    cached, stats = _recurrent_policy_log_probs_for_indices(
+        policy,
+        cfg,
+        observations,
+        actions,
+        trajectory_ids,
+        timesteps,
+        targets,
+        torch.device("cpu"),
+        batch_size=2,
+        trajectory_index=trajectory_index,
+        return_stats=True,
+    )
+
+    np.testing.assert_allclose(cached, on_demand, rtol=1e-6, atol=1e-6)
+    assert cached[0] == pytest.approx(cached[3])
+    assert stats.selected_targets == len(targets)
+    assert stats.unique_targets == len(np.unique(targets))
+    assert stats.segment_count >= 3
+    assert stats.scanned_transitions <= len(observations)
+
+
 def test_airl_replay_keeps_recurrent_trajectory_context():
     cfg = PSGAILConfig(
         discriminator_replay_rounds=1,
@@ -1519,11 +1667,13 @@ def test_airl_replay_keeps_recurrent_trajectory_context():
         preserve_recurrent_context=True,
     )
 
-    assert log_probs is None
+    assert log_probs is not None
     assert obs.shape == (9, 2)
     assert actions.shape == (9, 2)
     assert next_obs.shape == (9, 2)
     assert dones.shape == (9,)
+    assert np.isnan(log_probs[:6]).all()
+    np.testing.assert_allclose(log_probs[6:], np.full(3, -1.0, dtype=np.float32))
     assert trajectory_ids is not None
     assert timesteps is not None
     assert any(str(item).startswith("round:12:") for item in trajectory_ids)
@@ -1995,6 +2145,25 @@ def test_paper_airl_slurm_scripts_pin_shaped_reward_mode():
         assert 'AIRL_POLICY_REWARD_MODE="${AIRL_POLICY_REWARD_MODE:-shaped}"' in text
         assert '--airl-policy-reward-mode "${AIRL_POLICY_REWARD_MODE}"' in text
     assert "ALLOW_AIRL_RESUME_WITHOUT_REWARD" in scripts[1].read_text(encoding="utf-8")
+
+
+def test_paper_airl_slurm_scripts_default_to_gradual_vehicle_schedules():
+    root = Path(__file__).resolve().parents[1]
+    airl_stage1 = (
+        root / "slurum/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash"
+    ).read_text(encoding="utf-8")
+    airl_stage2 = (
+        root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash"
+    ).read_text(encoding="utf-8")
+
+    assert 'CONTROLLED_VEHICLE_SCHEDULE_PROFILE="${CONTROLLED_VEHICLE_SCHEDULE_PROFILE:-gradual}"' in airl_stage1
+    assert 'CONTROLLED_VEHICLE_SCHEDULE_PROFILE="${CONTROLLED_VEHICLE_SCHEDULE_PROFILE:-gradual}"' in airl_stage2
+    assert 'INITIAL_CONTROLLED_VEHICLES="${INITIAL_CONTROLLED_VEHICLES:-50}"' in airl_stage2
+    assert (
+        'CONTROLLED_VEHICLE_SCHEDULE_GRADUAL="${CONTROLLED_VEHICLE_SCHEDULE_GRADUAL:-'
+        '0:50:50:60;50:100:60:75;100:150:75:90;150:200:90:100}"'
+    ) in airl_stage2
+    assert 'CONTROLLED_VEHICLE_SCHEDULE_SUDDEN="${CONTROLLED_VEHICLE_SCHEDULE_SUDDEN:-0:200:100:100}"' in airl_stage2
 
 
 def test_paper_finetune_slurm_scripts_auto_resolve_ckpt_folder():

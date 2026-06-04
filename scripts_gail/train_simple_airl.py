@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 import warnings
 from dataclasses import dataclass
 from dataclasses import fields
@@ -95,6 +96,21 @@ class AIRLReward(nn.Module):
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         return self.reward(torch.cat([obs, actions], dim=-1)).squeeze(-1)
 
+    def components(
+        self,
+        obs: torch.Tensor,
+        actions: torch.Tensor,
+        next_obs: torch.Tensor,
+        dones: torch.Tensor,
+        *,
+        gamma: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        reward = self.forward(obs, actions)
+        current_potential = self.potential(obs).squeeze(-1)
+        next_potential = self.potential(next_obs).squeeze(-1)
+        shaped = reward + float(gamma) * (1.0 - dones.float()) * next_potential - current_potential
+        return reward, current_potential, next_potential, shaped
+
     def shaped_logits(
         self,
         obs: torch.Tensor,
@@ -104,10 +120,7 @@ class AIRLReward(nn.Module):
         *,
         gamma: float,
     ) -> torch.Tensor:
-        reward = self.forward(obs, actions)
-        current_potential = self.potential(obs).squeeze(-1)
-        next_potential = self.potential(next_obs).squeeze(-1)
-        return reward + float(gamma) * (1.0 - dones.float()) * next_potential - current_potential
+        return self.components(obs, actions, next_obs, dones, gamma=gamma)[3]
 
 
 @dataclass(frozen=True)
@@ -118,6 +131,23 @@ class AIRLReplayEntry:
     dones: np.ndarray
     trajectory_ids: np.ndarray
     timesteps: np.ndarray
+
+
+@dataclass(frozen=True)
+class RecurrentTrajectoryIndex:
+    segments: tuple[np.ndarray, ...]
+    index_to_segment: dict[int, int]
+    index_to_position: dict[int, int]
+
+
+@dataclass(frozen=True)
+class RecurrentLogProbStats:
+    index_build_seconds: float = 0.0
+    scan_forward_seconds: float = 0.0
+    selected_targets: int = 0
+    unique_targets: int = 0
+    segment_count: int = 0
+    scanned_transitions: int = 0
 
 
 def _unique_trajectory_values(trajectory_ids: np.ndarray) -> list[object]:
@@ -238,6 +268,14 @@ def concat_airl_replay(
         copy=False,
     )
     dones = np.concatenate([*(entry.dones for entry in entries), current[3]], axis=0).astype(bool, copy=False)
+    log_probs = np.concatenate(
+        [
+            np.full(len(entry.observations), np.nan, dtype=np.float32)
+            for entry in entries
+        ]
+        + [current_log_probs],
+        axis=0,
+    ).astype(np.float32, copy=False)
     trajectory_ids = np.concatenate([*(entry.trajectory_ids for entry in entries), current[4]], axis=0).astype(
         object,
         copy=False,
@@ -264,9 +302,10 @@ def concat_airl_replay(
         actions = actions[indices]
         next_obs = next_obs[indices]
         dones = dones[indices]
+        log_probs = log_probs[indices]
         trajectory_ids = trajectory_ids[indices]
         timesteps = timesteps[indices]
-    return obs, actions, next_obs, dones, None, trajectory_ids, timesteps
+    return obs, actions, next_obs, dones, log_probs, trajectory_ids, timesteps
 
 
 def _as_tensor(array: np.ndarray, *, device: torch.device) -> torch.Tensor:
@@ -410,6 +449,61 @@ def _recurrent_context_windows(
     return windows
 
 
+def _build_recurrent_trajectory_index(
+    trajectory_ids: np.ndarray,
+    timesteps: np.ndarray,
+) -> RecurrentTrajectoryIndex:
+    ids = np.asarray(trajectory_ids).reshape(-1)
+    steps = np.asarray(timesteps, dtype=np.int64).reshape(-1)
+    if ids.shape[0] != steps.shape[0]:
+        raise ValueError(f"trajectory_ids/timesteps length mismatch: {ids.shape[0]} != {steps.shape[0]}.")
+    grouped: dict[object, list[int]] = {}
+    for index, trajectory_id in enumerate(ids.tolist()):
+        grouped.setdefault(trajectory_id, []).append(int(index))
+
+    segments: list[np.ndarray] = []
+    index_to_segment: dict[int, int] = {}
+    index_to_position: dict[int, int] = {}
+    for indices in grouped.values():
+        ordered = np.asarray(indices, dtype=np.int64)
+        ordered = ordered[np.lexsort((ordered, steps[ordered]))].astype(np.int64, copy=False)
+        start = 0
+        for cursor in range(1, int(ordered.size) + 1):
+            if cursor < int(ordered.size) and int(steps[ordered[cursor]]) - int(steps[ordered[cursor - 1]]) == 1:
+                continue
+            segment = ordered[start:cursor].astype(np.int64, copy=False)
+            segment_id = len(segments)
+            segments.append(segment)
+            for position, source_index in enumerate(segment.tolist()):
+                index_to_segment[int(source_index)] = int(segment_id)
+                index_to_position[int(source_index)] = int(position)
+            start = cursor
+
+    return RecurrentTrajectoryIndex(
+        segments=tuple(segments),
+        index_to_segment=index_to_segment,
+        index_to_position=index_to_position,
+    )
+
+
+def _selected_recurrent_segments(
+    trajectory_index: RecurrentTrajectoryIndex,
+    unique_targets: np.ndarray,
+) -> list[np.ndarray]:
+    targets_by_segment: dict[int, int] = {}
+    for target_index in np.asarray(unique_targets, dtype=np.int64).reshape(-1).tolist():
+        source_index = int(target_index)
+        if source_index not in trajectory_index.index_to_segment:
+            raise ValueError(f"Target index {source_index} is missing from the recurrent trajectory index.")
+        segment_id = trajectory_index.index_to_segment[source_index]
+        target_position = trajectory_index.index_to_position[source_index]
+        targets_by_segment[segment_id] = max(int(target_position), targets_by_segment.get(segment_id, -1))
+    return [
+        trajectory_index.segments[segment_id][: last_position + 1].astype(np.int64, copy=False)
+        for segment_id, last_position in targets_by_segment.items()
+    ]
+
+
 def _recurrent_policy_log_probs_for_indices(
     policy: nn.Module,
     cfg: PSGAILConfig,
@@ -421,33 +515,61 @@ def _recurrent_policy_log_probs_for_indices(
     device: torch.device,
     *,
     batch_size: int,
-) -> np.ndarray:
+    trajectory_index: RecurrentTrajectoryIndex | None = None,
+    return_stats: bool = False,
+) -> np.ndarray | tuple[np.ndarray, RecurrentLogProbStats]:
+    index_build_seconds = 0.0
+    scan_forward_seconds = 0.0
     target_indices = np.asarray(target_indices, dtype=np.int64).reshape(-1)
     if target_indices.size == 0:
-        return np.zeros((0,), dtype=np.float32)
+        result = np.zeros((0,), dtype=np.float32)
+        stats = RecurrentLogProbStats()
+        return (result, stats) if return_stats else result
     if not recurrent_policy_enabled(policy):
         obs = _as_tensor(np.asarray(observations, dtype=np.float32)[target_indices], device=device)
         act = _as_tensor(np.asarray(actions, dtype=np.float32)[target_indices], device=device)
         with torch.no_grad():
-            return _policy_log_probs(policy, cfg, obs, act).detach().cpu().numpy().astype(np.float32)
+            result = _policy_log_probs(policy, cfg, obs, act).detach().cpu().numpy().astype(np.float32)
+        stats = RecurrentLogProbStats(
+            selected_targets=int(target_indices.size),
+            unique_targets=int(np.unique(target_indices).size),
+        )
+        return (result, stats) if return_stats else result
 
     obs_np = np.asarray(observations, dtype=np.float32)
     action_np = np.asarray(actions, dtype=np.float32)
-    windows = _recurrent_context_windows(
-        trajectory_ids,
-        timesteps,
-        target_indices,
-    )
-    result = np.empty((target_indices.size,), dtype=np.float32)
-    micro_batch = max(1, min(max(1, int(batch_size)), int(target_indices.size)))
+    ids = np.asarray(trajectory_ids)
+    steps = np.asarray(timesteps, dtype=np.int64)
+    if ids.shape[0] != steps.shape[0]:
+        raise ValueError(f"trajectory_ids/timesteps length mismatch: {ids.shape[0]} != {steps.shape[0]}.")
+
+    unique_targets, inverse = np.unique(target_indices, return_inverse=True)
+    target_set = {int(index) for index in unique_targets.tolist()}
+    target_positions = {int(index): int(pos) for pos, index in enumerate(unique_targets.tolist())}
+    unique_result = np.empty((unique_targets.size,), dtype=np.float32)
+    if trajectory_index is None:
+        index_started = time.perf_counter()
+        trajectory_index = _build_recurrent_trajectory_index(ids, steps)
+        index_build_seconds = time.perf_counter() - index_started
+    segments = _selected_recurrent_segments(trajectory_index, unique_targets)
+
+    if not segments:
+        raise ValueError("No recurrent AIRL trajectory segments contained the requested target indices.")
+
+    micro_batch = max(1, min(max(1, int(batch_size)), len(segments)))
+    scanned_transitions = int(sum(int(segment.size) for segment in segments))
 
     with torch.no_grad():
-        for start in range(0, target_indices.size, micro_batch):
-            stop = min(target_indices.size, start + micro_batch)
-            batch_windows = windows[start:stop]
-            batch_count = int(batch_windows.shape[0])
+        scan_started = time.perf_counter()
+        for start in range(0, len(segments), micro_batch):
+            stop = min(len(segments), start + micro_batch)
+            batch_segments = segments[start:stop]
+            batch_count = len(batch_segments)
+            max_len = max(int(segment.size) for segment in batch_segments)
+            batch_windows = np.full((batch_count, max_len), -1, dtype=np.int64)
+            for row, segment in enumerate(batch_segments):
+                batch_windows[row, : int(segment.size)] = segment
             memory = policy.initial_memory(batch_count, device=device, dtype=torch.float32)
-            batch_log_probs = torch.zeros(batch_count, dtype=torch.float32, device=device)
             for column in range(batch_windows.shape[1]):
                 active_np = batch_windows[:, column] >= 0
                 if not np.any(active_np):
@@ -466,15 +588,37 @@ def _recurrent_policy_log_probs_for_indices(
                 )
                 if new_step_memory is None:
                     raise RuntimeError("Recurrent AIRL log-prob reconstruction did not return memory.")
-                if column == batch_windows.shape[1] - 1:
-                    batch_log_probs[active_rows] = dist.log_prob(
+                target_rows_np = np.asarray(
+                    [row for row, index in enumerate(source_indices.tolist()) if int(index) in target_set],
+                    dtype=np.int64,
+                )
+                if target_rows_np.size:
+                    target_source_indices = source_indices[target_rows_np]
+                    step_log_probs = dist.log_prob(
                         _as_tensor(action_np[source_indices], device=device)
                     )
+                    target_log_probs = step_log_probs[
+                        torch.as_tensor(target_rows_np, dtype=torch.long, device=device)
+                    ]
+                    for value, source_index in zip(
+                        target_log_probs.detach().cpu().numpy().astype(np.float32, copy=False),
+                        target_source_indices.tolist(),
+                    ):
+                        unique_result[target_positions[int(source_index)]] = float(value)
                 updated_memory = torch.cat([step_memory[:, 1:], new_step_memory.unsqueeze(1)], dim=1)
                 memory = memory.clone()
                 memory[active_rows] = updated_memory
-            result[start:stop] = batch_log_probs.detach().cpu().numpy().astype(np.float32, copy=False)
-    return result
+        scan_forward_seconds = time.perf_counter() - scan_started
+    result = unique_result[inverse].astype(np.float32, copy=False)
+    stats = RecurrentLogProbStats(
+        index_build_seconds=float(index_build_seconds),
+        scan_forward_seconds=float(scan_forward_seconds),
+        selected_targets=int(target_indices.size),
+        unique_targets=int(unique_targets.size),
+        segment_count=int(len(segments)),
+        scanned_transitions=int(scanned_transitions),
+    )
+    return (result, stats) if return_stats else result
 
 
 def _airl_wgan_gradient_penalty(
@@ -531,9 +675,11 @@ def update_reward_model(
     log_prob_batch_size: int | None = None,
     expert_trajectory_ids: np.ndarray | None = None,
     expert_timesteps: np.ndarray | None = None,
+    expert_trajectory_index: RecurrentTrajectoryIndex | None = None,
     generator_log_probs: np.ndarray | None = None,
     generator_trajectory_ids: np.ndarray | None = None,
     generator_timesteps: np.ndarray | None = None,
+    generator_trajectory_index: RecurrentTrajectoryIndex | None = None,
 ) -> dict[str, float]:
     n = int(len(generator_obs))
     expert_idx = np.random.choice(len(expert_obs), size=n, replace=len(expert_obs) < n)
@@ -549,6 +695,15 @@ def update_reward_model(
 
     policy.eval()
     reward_model.train()
+    log_prob_seconds = 0.0
+    expert_log_prob_seconds = 0.0
+    generator_log_prob_seconds = 0.0
+    log_prob_index_build_seconds = 0.0
+    log_prob_scan_forward_seconds = 0.0
+    log_prob_selected_targets = 0
+    log_prob_unique_targets = 0
+    log_prob_segment_count = 0
+    log_prob_scanned_transitions = 0
     if recurrent_policy:
         log_prob_micro_batch_size = max(
             1,
@@ -559,7 +714,17 @@ def update_reward_model(
                 "Recurrent AIRL requires expert_trajectory_ids and expert_timesteps "
                 "to reconstruct expert policy memory for AIRL log_pi."
             )
-        if generator_log_probs is None:
+        generator_log_probs_array = (
+            None
+            if generator_log_probs is None
+            else np.asarray(generator_log_probs, dtype=np.float32).copy()
+        )
+        missing_generator_log_probs = (
+            np.ones(n, dtype=bool)
+            if generator_log_probs_array is None
+            else ~np.isfinite(generator_log_probs_array)
+        )
+        if bool(missing_generator_log_probs.any()):
             if generator_trajectory_ids is None or generator_timesteps is None:
                 raise ValueError(
                     "Recurrent AIRL requires generator_log_probs or generator_trajectory_ids/"
@@ -569,18 +734,35 @@ def update_reward_model(
             # Replay samples came from older policies, so their stored old_log_probs
             # are stale. Recompute current-policy log_pi by replaying each stored
             # trajectory context through the recurrent policy.
-            generator_log_probs = _recurrent_policy_log_probs_for_indices(
+            log_prob_started = time.perf_counter()
+            reconstructed_generator_log_probs, generator_log_prob_stats = _recurrent_policy_log_probs_for_indices(
                 policy,
                 cfg,
                 generator_obs,
                 generator_actions,
                 generator_trajectory_ids,
                 generator_timesteps,
-                np.arange(n, dtype=np.int64),
+                np.flatnonzero(missing_generator_log_probs).astype(np.int64),
                 device,
                 batch_size=log_prob_micro_batch_size,
+                trajectory_index=generator_trajectory_index,
+                return_stats=True,
             )
-        expert_log_probs = _recurrent_policy_log_probs_for_indices(
+            generator_elapsed = time.perf_counter() - log_prob_started
+            generator_log_prob_seconds += generator_elapsed
+            log_prob_seconds += generator_elapsed
+            log_prob_index_build_seconds += generator_log_prob_stats.index_build_seconds
+            log_prob_scan_forward_seconds += generator_log_prob_stats.scan_forward_seconds
+            log_prob_selected_targets += generator_log_prob_stats.selected_targets
+            log_prob_unique_targets += generator_log_prob_stats.unique_targets
+            log_prob_segment_count += generator_log_prob_stats.segment_count
+            log_prob_scanned_transitions += generator_log_prob_stats.scanned_transitions
+            if generator_log_probs_array is None:
+                generator_log_probs_array = np.empty((n,), dtype=np.float32)
+            generator_log_probs_array[missing_generator_log_probs] = reconstructed_generator_log_probs
+        generator_log_probs = generator_log_probs_array
+        log_prob_started = time.perf_counter()
+        expert_log_probs, expert_log_prob_stats = _recurrent_policy_log_probs_for_indices(
             policy,
             cfg,
             expert_obs,
@@ -590,7 +772,18 @@ def update_reward_model(
             expert_idx,
             device,
             batch_size=log_prob_micro_batch_size,
+            trajectory_index=expert_trajectory_index,
+            return_stats=True,
         )
+        expert_elapsed = time.perf_counter() - log_prob_started
+        expert_log_prob_seconds += expert_elapsed
+        log_prob_seconds += expert_elapsed
+        log_prob_index_build_seconds += expert_log_prob_stats.index_build_seconds
+        log_prob_scan_forward_seconds += expert_log_prob_stats.scan_forward_seconds
+        log_prob_selected_targets += expert_log_prob_stats.selected_targets
+        log_prob_unique_targets += expert_log_prob_stats.unique_targets
+        log_prob_segment_count += expert_log_prob_stats.segment_count
+        log_prob_scanned_transitions += expert_log_prob_stats.scanned_transitions
     else:
         expert_log_probs = None
     gen_log_probs_t = (
@@ -627,6 +820,7 @@ def update_reward_model(
     for param in policy_params:
         param.requires_grad_(False)
 
+    update_started = time.perf_counter()
     try:
         for _ in range(max(1, int(cfg.disc_updates_per_round))):
             permutation = torch.randperm(n, device=device)
@@ -640,10 +834,20 @@ def update_reward_model(
                 ga = gen_actions_t[idx]
                 gno = gen_next_obs_t[idx]
                 gd = gen_dones_t[idx]
-                expert_shaped = reward_model.shaped_logits(eo, ea, eno, ed, gamma=float(cfg.gamma))
-                gen_shaped = reward_model.shaped_logits(go, ga, gno, gd, gamma=float(cfg.gamma))
-                expert_reward = reward_model(eo, ea)
-                gen_reward = reward_model(go, ga)
+                expert_reward, _expert_v, _expert_next_v, expert_shaped = reward_model.components(
+                    eo,
+                    ea,
+                    eno,
+                    ed,
+                    gamma=float(cfg.gamma),
+                )
+                gen_reward, _gen_v, _gen_next_v, gen_shaped = reward_model.components(
+                    go,
+                    ga,
+                    gno,
+                    gd,
+                    gamma=float(cfg.gamma),
+                )
                 with torch.no_grad():
                     expert_log_pi = (
                         expert_log_probs_t[idx]
@@ -725,6 +929,19 @@ def update_reward_model(
         "gen_acc": mean(gen_accs),
         "expert_reward": mean(expert_rewards),
         "gen_reward": mean(gen_rewards),
+        "log_prob_seconds": float(log_prob_seconds),
+        "expert_log_prob_seconds": float(expert_log_prob_seconds),
+        "generator_log_prob_seconds": float(generator_log_prob_seconds),
+        "log_prob_index_build_seconds": float(log_prob_index_build_seconds),
+        "log_prob_scan_forward_seconds": float(log_prob_scan_forward_seconds),
+        "log_prob_selected_targets": float(log_prob_selected_targets),
+        "log_prob_unique_targets": float(log_prob_unique_targets),
+        "log_prob_segment_count": float(log_prob_segment_count),
+        "log_prob_scanned_transitions": float(log_prob_scanned_transitions),
+        "reward_update_seconds": float(time.perf_counter() - update_started),
+        "reward_train_samples": float(n),
+        "reward_batches_per_update": float(int(np.ceil(n / batch_size))),
+        "recurrent_policy": float(int(recurrent_policy)),
     }
 
 
@@ -736,17 +953,29 @@ def refresh_airl_rewards(
 ) -> RolloutBatch:
     reward_model.eval()
     with torch.no_grad():
-        raw = reward_model(
-            _as_tensor(rollout.policy_observations, device=device),
-            _as_tensor(rollout.actions.astype(np.float32, copy=False), device=device),
-        ).detach().cpu().numpy().astype(np.float32)
-        shaped_logits = reward_model.shaped_logits(
-            _as_tensor(rollout.policy_observations, device=device),
-            _as_tensor(rollout.actions.astype(np.float32, copy=False), device=device),
-            _as_tensor(rollout.next_policy_observations, device=device),
-            _as_tensor(rollout.dones.astype(np.float32), device=device),
-            gamma=float(cfg.gamma),
-        ).detach().cpu().numpy().astype(np.float32)
+        obs_t = _as_tensor(rollout.policy_observations, device=device)
+        actions_t = _as_tensor(rollout.actions.astype(np.float32, copy=False), device=device)
+        next_obs_t = _as_tensor(rollout.next_policy_observations, device=device)
+        dones_t = _as_tensor(rollout.dones.astype(np.float32), device=device)
+        if hasattr(reward_model, "components"):
+            raw_t, _current_potential, _next_potential, shaped_logits_t = reward_model.components(
+                obs_t,
+                actions_t,
+                next_obs_t,
+                dones_t,
+                gamma=float(cfg.gamma),
+            )
+        else:
+            raw_t = reward_model(obs_t, actions_t)
+            shaped_logits_t = reward_model.shaped_logits(
+                obs_t,
+                actions_t,
+                next_obs_t,
+                dones_t,
+                gamma=float(cfg.gamma),
+            )
+        raw = raw_t.detach().cpu().numpy().astype(np.float32)
+        shaped_logits = shaped_logits_t.detach().cpu().numpy().astype(np.float32)
     corrected_logits = (shaped_logits - rollout.old_log_probs).astype(np.float32, copy=True)
     reward_mode = str(getattr(cfg, "airl_policy_reward_mode", "shaped")).lower()
     if reward_mode not in {"discriminator", "shaped", "reward"}:
@@ -1012,6 +1241,11 @@ def main() -> None:
             central_critic_max_vehicles=int(cfg.central_critic_max_vehicles),
             central_critic_attention_heads=int(cfg.central_critic_attention_heads),
         ).to(device)
+        expert_trajectory_index = (
+            _build_recurrent_trajectory_index(expert.trajectory_ids, expert.timesteps)
+            if recurrent_policy_enabled(policy)
+            else None
+        )
         reward_model = AIRLReward(
             policy_obs_dim,
             int(cfg.continuous_action_dim),
@@ -1198,6 +1432,7 @@ def main() -> None:
         previous_controlled_vehicles = None
         last_vehicle_jump_round = None
         for round_idx in range(1, int(cfg.total_rounds) + 1):
+            round_started = time.perf_counter()
             round_cfg = config_for_round(cfg, round_idx)
             round_cfg.continuous_action_dim = cfg.continuous_action_dim
             if previous_controlled_vehicles is not None and (
@@ -1223,6 +1458,7 @@ def main() -> None:
                 env.close()
                 env = make_training_env(round_cfg)
                 current_env_signature = env_signature(round_cfg)
+            collect_started = time.perf_counter()
             collected_rollout = collect_round_rollouts(
                 env,
                 policy,
@@ -1234,12 +1470,16 @@ def main() -> None:
                 rollout_executor=rollout_executor,
                 archive_policy_state_dicts=psro_archive_for_round,
             )
+            collect_seconds = time.perf_counter() - collect_started
+            subsample_started = time.perf_counter()
             rollout = subsample_rollout_for_training(
                 collected_rollout,
                 round_cfg,
                 seed=int(round_cfg.seed) + int(round_idx) * 104729,
             )
             rollout_was_subsampled = int(rollout.num_agent_steps) != int(collected_rollout.num_agent_steps)
+            subsample_seconds = time.perf_counter() - subsample_started
+            replay_started = time.perf_counter()
             (
                 reward_generator_obs,
                 reward_generator_actions,
@@ -1255,6 +1495,15 @@ def main() -> None:
                 seed=int(round_cfg.seed) + int(round_idx) * 65537,
                 preserve_recurrent_context=recurrent_policy_enabled(policy),
             )
+            reward_generator_trajectory_index = (
+                _build_recurrent_trajectory_index(reward_generator_trajectory_ids, reward_generator_timesteps)
+                if recurrent_policy_enabled(policy)
+                and reward_generator_trajectory_ids is not None
+                and reward_generator_timesteps is not None
+                else None
+            )
+            replay_seconds = time.perf_counter() - replay_started
+            reward_update_started = time.perf_counter()
             reward_stats = update_reward_model(
                 reward_model,
                 reward_optimizer,
@@ -1273,11 +1522,17 @@ def main() -> None:
                 log_prob_batch_size=airl_log_prob_batch_size,
                 expert_trajectory_ids=expert.trajectory_ids,
                 expert_timesteps=expert.timesteps,
+                expert_trajectory_index=expert_trajectory_index,
                 generator_log_probs=reward_generator_log_probs,
                 generator_trajectory_ids=reward_generator_trajectory_ids,
                 generator_timesteps=reward_generator_timesteps,
+                generator_trajectory_index=reward_generator_trajectory_index,
             )
+            reward_total_seconds = time.perf_counter() - reward_update_started
+            refresh_started = time.perf_counter()
             rollout = refresh_airl_rewards(rollout, reward_model, round_cfg, device)
+            refresh_seconds = time.perf_counter() - refresh_started
+            policy_started = time.perf_counter()
             policy_stats = update_policy(
                 policy,
                 policy_optimizer,
@@ -1287,7 +1542,11 @@ def main() -> None:
                 expert_policy_observations=expert.policy_observations,
                 expert_actions=expert.actions_continuous_env,
             )
+            policy_seconds = time.perf_counter() - policy_started
+            replay_append_started = time.perf_counter()
             append_airl_replay(airl_replay, rollout, round_cfg, round_idx=round_idx)
+            replay_append_seconds = time.perf_counter() - replay_append_started
+            round_seconds = time.perf_counter() - round_started
             print(
                 f"[round {round_idx:04d}] env_steps={collected_rollout.num_env_steps} "
                 f"agent_steps={collected_rollout.num_agent_steps} "
@@ -1330,7 +1589,14 @@ def main() -> None:
                 f"post_kl={policy_stats['post_update_approx_kl']:.5f} "
                 f"clip={policy_stats['clip_fraction']:.3f} "
                 f"airl_reward={reward_stats['expert_reward']:.3f}/{reward_stats['gen_reward']:.3f} "
-                f"reward={float(rollout.rewards.mean()):.4f}"
+                f"reward={float(rollout.rewards.mean()):.4f} "
+                f"time={round_seconds:.1f}s "
+                f"collect={collect_seconds:.1f}s "
+                f"airl_logp={reward_stats['log_prob_seconds']:.1f}s "
+                f"logp_scan={reward_stats['log_prob_scan_forward_seconds']:.1f}s "
+                f"airl_update={reward_stats['reward_update_seconds']:.1f}s "
+                f"refresh={refresh_seconds:.1f}s "
+                f"ppo={policy_seconds:.1f}s"
                 )
                 )
             )
@@ -1483,6 +1749,33 @@ def main() -> None:
                 "train/expert_samples": int(expert.policy_observations.shape[0]),
                 "train/reward_batch_size": int(reward_batch_size),
                 "train/airl_log_prob_batch_size": int(airl_log_prob_batch_size),
+                "perf/round_seconds": float(round_seconds),
+                "perf/collect_rollouts_seconds": float(collect_seconds),
+                "perf/subsample_rollout_seconds": float(subsample_seconds),
+                "perf/airl_replay_concat_seconds": float(replay_seconds),
+                "perf/airl_reward_total_seconds": float(reward_total_seconds),
+                "perf/airl_log_prob_seconds": float(reward_stats["log_prob_seconds"]),
+                "perf/airl_expert_log_prob_seconds": float(reward_stats["expert_log_prob_seconds"]),
+                "perf/airl_generator_log_prob_seconds": float(reward_stats["generator_log_prob_seconds"]),
+                "perf/airl_log_prob_index_build_seconds": float(
+                    reward_stats["log_prob_index_build_seconds"]
+                ),
+                "perf/airl_log_prob_scan_forward_seconds": float(
+                    reward_stats["log_prob_scan_forward_seconds"]
+                ),
+                "perf/airl_reward_update_seconds": float(reward_stats["reward_update_seconds"]),
+                "perf/airl_refresh_rewards_seconds": float(refresh_seconds),
+                "perf/policy_update_seconds": float(policy_seconds),
+                "perf/airl_replay_append_seconds": float(replay_append_seconds),
+                "perf/airl_reward_train_samples": float(reward_stats["reward_train_samples"]),
+                "perf/airl_reward_batches_per_update": float(reward_stats["reward_batches_per_update"]),
+                "perf/airl_recurrent_policy": float(reward_stats["recurrent_policy"]),
+                "perf/airl_log_prob_selected_targets": float(reward_stats["log_prob_selected_targets"]),
+                "perf/airl_log_prob_unique_targets": float(reward_stats["log_prob_unique_targets"]),
+                "perf/airl_log_prob_segment_count": float(reward_stats["log_prob_segment_count"]),
+                "perf/airl_log_prob_scanned_transitions": float(
+                    reward_stats["log_prob_scanned_transitions"]
+                ),
                 "train/rollout_workers": int(round_cfg.num_rollout_workers),
                 "train/rollout_worker_threads": int(round_cfg.rollout_worker_threads),
                 "train/evaluation_workers": int(round_cfg.evaluation_num_workers),
