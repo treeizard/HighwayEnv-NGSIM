@@ -2,7 +2,7 @@
 #SBATCH --job-name=ps_gail_stage2_100veh
 #SBATCH --account=bt60
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:L40S:1
 #SBATCH --time=5-00:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
