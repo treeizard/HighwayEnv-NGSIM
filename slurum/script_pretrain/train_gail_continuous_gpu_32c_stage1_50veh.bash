@@ -214,13 +214,14 @@ SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-8}"
 SEQUENCE_STRIDE="${SEQUENCE_STRIDE:-1}"
 SEQUENCE_REWARD_COEF="${SEQUENCE_REWARD_COEF:-1.0}"
 SEQUENCE_REWARD_ASSIGNMENT="${SEQUENCE_REWARD_ASSIGNMENT:-mean}"
+ENABLE_VENDI_DIAGNOSTICS="${ENABLE_VENDI_DIAGNOSTICS:-false}"
+VENDI_MAX_WINDOWS="${VENDI_MAX_WINDOWS:-2048}"
+VENDI_RBF_SIGMA="${VENDI_RBF_SIGMA:-0.0}"
+VENDI_SAFE_ONLY="${VENDI_SAFE_ONLY:-true}"
+VENDI_SEED="${VENDI_SEED:-0}"
 TRANSFORMER_LAYERS="${TRANSFORMER_LAYERS:-3}"
 TRANSFORMER_HEADS="${TRANSFORMER_HEADS:-4}"
 TRANSFORMER_DROPOUT="${TRANSFORMER_DROPOUT:-0.1}"
-# Temporal convolution module is no longer used.
-# TRANSFORMER_TEMPORAL_MODULE="${TRANSFORMER_TEMPORAL_MODULE:-false}"
-# TRANSFORMER_TEMPORAL_KERNEL_SIZE="${TRANSFORMER_TEMPORAL_KERNEL_SIZE:-5}"
-# TRANSFORMER_TEMPORAL_LAYERS="${TRANSFORMER_TEMPORAL_LAYERS:-1}"
 TRANSFORMER_MEMORY_TOKENS="${TRANSFORMER_MEMORY_TOKENS:-8}"
 TRANSFORMER_MEMORY_CONTEXT_LENGTH="${TRANSFORMER_MEMORY_CONTEXT_LENGTH:-32}"
 TRANSFORMER_RECURRENT_SEQUENCE_LENGTH="${TRANSFORMER_RECURRENT_SEQUENCE_LENGTH:-32}"
@@ -285,6 +286,16 @@ if [ "${ENABLE_SEQUENCE_DISCRIMINATOR}" = "true" ]; then
 else
     SEQUENCE_DISCRIMINATOR_ARG="--no-enable-sequence-discriminator"
 fi
+if [ "${ENABLE_VENDI_DIAGNOSTICS}" = "true" ]; then
+    VENDI_DIAGNOSTICS_ARG="--enable-vendi-diagnostics"
+else
+    VENDI_DIAGNOSTICS_ARG="--no-enable-vendi-diagnostics"
+fi
+if [ "${VENDI_SAFE_ONLY}" = "true" ]; then
+    VENDI_SAFE_ONLY_ARG="--vendi-safe-only"
+else
+    VENDI_SAFE_ONLY_ARG="--no-vendi-safe-only"
+fi
 if [ "${NORMALIZE_GAIL_REWARD}" = "true" ]; then
     NORMALIZE_GAIL_REWARD_ARG="--normalize-gail-reward"
 else
@@ -300,12 +311,6 @@ if [ "${WGAN_REWARD_CENTER}" = "true" ]; then
 else
     WGAN_REWARD_CENTER_ARG="--no-wgan-reward-center"
 fi
-# Temporal convolution module is no longer used.
-# if [ "${TRANSFORMER_TEMPORAL_MODULE}" = "true" ]; then
-#     TRANSFORMER_TEMPORAL_MODULE_ARG="--transformer-temporal-module"
-# else
-#     TRANSFORMER_TEMPORAL_MODULE_ARG="--no-transformer-temporal-module"
-# fi
 if [ "${TRANSFORMER_USE_CAUSAL_ATTENTION}" = "true" ]; then
     TRANSFORMER_USE_CAUSAL_ATTENTION_ARG="--transformer-use-causal-attention"
 else
@@ -362,7 +367,6 @@ echo "Normalize GAIL reward: ${NORMALIZE_GAIL_REWARD}"
 echo "Allow WGAN reward normalization: ${ALLOW_WGAN_REWARD_NORMALIZATION}"
 echo "WGAN reward shaping: center=${WGAN_REWARD_CENTER} clip=${WGAN_REWARD_CLIP} scale=${WGAN_REWARD_SCALE} norm_min_std=${WGAN_REWARD_NORM_MIN_STD} norm_clip=${WGAN_REWARD_NORM_CLIP}"
 echo "Transformer: layers=${TRANSFORMER_LAYERS} heads=${TRANSFORMER_HEADS} dropout=${TRANSFORMER_DROPOUT}"
-# echo "Transformer temporal module: temporal=${TRANSFORMER_TEMPORAL_MODULE} kernel=${TRANSFORMER_TEMPORAL_KERNEL_SIZE} temporal_layers=${TRANSFORMER_TEMPORAL_LAYERS}"
 echo "Recurrent transformer: memory_tokens=${TRANSFORMER_MEMORY_TOKENS} context=${TRANSFORMER_MEMORY_CONTEXT_LENGTH} sequence_length=${TRANSFORMER_RECURRENT_SEQUENCE_LENGTH} sequences_per_batch=${TRANSFORMER_RECURRENT_SEQUENCES_PER_BATCH} micro_sequences=${TRANSFORMER_RECURRENT_MICRO_BATCH_SEQUENCES} storage=${TRANSFORMER_MEMORY_STORAGE_DTYPE} causal=${TRANSFORMER_USE_CAUSAL_ATTENTION}"
 echo "Checkpoint every: ${CHECKPOINT_EVERY}"
 echo "Save checkpoint video: ${SAVE_CHECKPOINT_VIDEO}"
@@ -564,6 +568,11 @@ python "${REPODIR}/scripts_gail/train_simple_ps_gail.py" \
     --sequence-stride "${SEQUENCE_STRIDE}" \
     --sequence-reward-coef "${SEQUENCE_REWARD_COEF}" \
     --sequence-reward-assignment "${SEQUENCE_REWARD_ASSIGNMENT}" \
+    "${VENDI_DIAGNOSTICS_ARG}" \
+    --vendi-max-windows "${VENDI_MAX_WINDOWS}" \
+    --vendi-rbf-sigma "${VENDI_RBF_SIGMA}" \
+    "${VENDI_SAFE_ONLY_ARG}" \
+    --vendi-seed "${VENDI_SEED}" \
     --transformer-layers "${TRANSFORMER_LAYERS}" \
     --transformer-heads "${TRANSFORMER_HEADS}" \
     --transformer-dropout "${TRANSFORMER_DROPOUT}" \

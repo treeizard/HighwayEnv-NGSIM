@@ -115,9 +115,9 @@ class ContinuousAction(ActionType):
         """
         super().__init__(env)
         self.acceleration_range = (
-            acceleration_range if acceleration_range else self.ACCELERATION_RANGE
+            acceleration_range if acceleration_range is not None else self.ACCELERATION_RANGE
         )
-        self.steering_range = steering_range if steering_range else self.STEERING_RANGE
+        self.steering_range = steering_range if steering_range is not None else self.STEERING_RANGE
         self.speed_range = speed_range
         self.lateral = lateral
         self.longitudinal = longitudinal
@@ -148,7 +148,7 @@ class ContinuousAction(ActionType):
     def get_action(self, action: np.ndarray):
         if self.clip:
             action = np.clip(action, -1, 1)
-        if self.speed_range:
+        if self.speed_range is not None:
             (
                 self.controlled_vehicle.MIN_SPEED,
                 self.controlled_vehicle.MAX_SPEED,

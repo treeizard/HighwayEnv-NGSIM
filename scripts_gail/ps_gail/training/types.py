@@ -2,41 +2,11 @@
 
 from __future__ import annotations
 
-import multiprocessing as mp
-import os
-import time
-from collections import OrderedDict
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
-from contextlib import contextmanager
-from contextlib import nullcontext
 from dataclasses import dataclass
 from dataclasses import field
-from dataclasses import replace
 
-import gymnasium as gym
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Categorical, Normal
 
-from highway_env.imitation.expert_dataset import ENV_ID, build_env_config, register_ngsim_env
-from highway_env.ngsim_utils.core.constants import MAX_ACCEL
-from highway_env.ngsim_utils.data.prebuilt import load_prebuilt_data
-
-from ..config import PSGAILConfig
-from ..data import (
-    SCENE_FEATURE_DIM_PER_VEHICLE,
-    build_sequence_windows,
-    discriminator_features,
-    normalize_trajectory_frame,
-    scene_snapshot_features,
-    standardize_features,
-    transform_sequence_features,
-)
-from ..models import NUM_DISCRETE_META_ACTIONS, make_actor_critic
-from ..observations import flatten_agent_observations, policy_observations_from_flat
 
 @dataclass
 class AgentTransition:
@@ -63,6 +33,7 @@ class AgentTransition:
     challenge_gap_target: float
     done: bool
     policy_step_memory: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=np.float16))
+
 
 @dataclass
 class RolloutBatch:
@@ -123,6 +94,7 @@ class RolloutBatch:
     psro_current_decisions: int = 0
     psro_archive_decisions: int = 0
     psro_current_fraction: float = 1.0
+
 
 __all__ = [
     'AgentTransition',

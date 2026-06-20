@@ -2,41 +2,12 @@
 
 from __future__ import annotations
 
-import multiprocessing as mp
-import os
-import time
-from collections import OrderedDict
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
-from contextlib import contextmanager
-from contextlib import nullcontext
-from dataclasses import dataclass
-from dataclasses import field
-from dataclasses import replace
-
-import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical, Normal
-
-from highway_env.imitation.expert_dataset import ENV_ID, build_env_config, register_ngsim_env
-from highway_env.ngsim_utils.core.constants import MAX_ACCEL
-from highway_env.ngsim_utils.data.prebuilt import load_prebuilt_data
 
 from ..config import PSGAILConfig
-from ..data import (
-    SCENE_FEATURE_DIM_PER_VEHICLE,
-    build_sequence_windows,
-    discriminator_features,
-    normalize_trajectory_frame,
-    scene_snapshot_features,
-    standardize_features,
-    transform_sequence_features,
-)
-from ..models import NUM_DISCRETE_META_ACTIONS, make_actor_critic
-from ..observations import flatten_agent_observations, policy_observations_from_flat
 
 from .policy import (
     _is_continuous,
@@ -48,6 +19,7 @@ from .policy import (
     recurrent_policy_enabled,
 )
 from .types import RolloutBatch
+
 
 def _recurrent_rollout_chunks(
     rollout: RolloutBatch,
@@ -65,6 +37,7 @@ def _recurrent_rollout_chunks(
             if end > start:
                 chunks.append((indices, start, end))
     return chunks
+
 
 def _update_recurrent_policy(
     policy: nn.Module,
@@ -115,6 +88,13 @@ def _update_recurrent_policy(
             dtype=torch.float32,
             device=cpu_device,
         )
+        if len(expert_obs_tensor) != len(expert_action_tensor):
+            raise ValueError(
+                "Expert BC regularization observation/action count mismatch: "
+                f"{len(expert_obs_tensor)} != {len(expert_action_tensor)}."
+            )
+        if len(expert_obs_tensor) == 0:
+            raise ValueError("Expert BC regularization received no expert samples.")
     else:
         expert_obs_tensor = None
         expert_action_tensor = None
@@ -422,7 +402,7 @@ def update_policy(
     old_log_probs_tensor = torch.as_tensor(rollout.old_log_probs, dtype=torch.float32, device=cpu_device)
     returns_tensor = torch.as_tensor(rollout.returns, dtype=torch.float32, device=cpu_device)
     advantages_tensor = torch.as_tensor(rollout.advantages, dtype=torch.float32, device=cpu_device)
-    bc_coef = max(0.0, float(getattr(cfg, "policy_bc_regularization_coef", 0.0))) # Danger (BC Not used, please check if possible)
+    bc_coef = max(0.0, float(getattr(cfg, "policy_bc_regularization_coef", 0.0)))
     log_std = getattr(policy, "log_std", None)
     initial_log_std_mean = float(log_std.detach().mean().cpu().item()) if log_std is not None else float("nan")
     initial_action_std_mean = float(torch.exp(log_std.detach()).mean().cpu().item()) if log_std is not None else float("nan")

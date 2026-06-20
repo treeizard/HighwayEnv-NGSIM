@@ -17,6 +17,7 @@ ACTION_CONTINUOUS_ENV_KEY = "actions_continuous_env"
 ACTION_STEERING_ACCELERATION_KEY = "actions_steering_acceleration"
 ACTION_CONTINUOUS_ENV_COLUMNS = ("acceleration_norm", "steering_norm")
 ACTION_STEERING_ACCELERATION_COLUMNS = ("steering_rad", "acceleration_mps2")
+ACTION_NORMALIZED_BOUND_TOLERANCE = 1.0e-6
 
 
 @dataclass(frozen=True)
@@ -358,6 +359,16 @@ def _validate_action_conditioned_arrays(
             f"{file_path} next_observations shape {next_observations.shape} does not match "
             f"observations {observations.shape}."
         )
+    for name, value in (
+        ("observations", observations),
+        ("next_observations", next_observations),
+        ("trajectory_states", trajectory_states),
+        ("rewards", rewards),
+        ("vehicle_ids", vehicle_ids),
+        ("timesteps", timesteps),
+    ):
+        if not np.all(np.isfinite(value)):
+            raise ValueError(f"{file_path} array {name!r} contains non-finite values.")
     if trajectory_states.ndim != 2 or trajectory_states.shape[1] != 3:
         raise ValueError(f"{file_path} trajectory_states must have shape [N, 3], got {trajectory_states.shape}.")
     if actions_continuous_env.ndim != 2 or actions_continuous_env.shape[1] != 2:
@@ -367,6 +378,12 @@ def _validate_action_conditioned_arrays(
         )
     if not np.all(np.isfinite(actions_continuous_env)):
         raise ValueError(f"{file_path} {ACTION_CONTINUOUS_ENV_KEY} contains non-finite values.")
+    max_abs_action = float(np.max(np.abs(actions_continuous_env))) if actions_continuous_env.size else 0.0
+    if max_abs_action > 1.0 + ACTION_NORMALIZED_BOUND_TOLERANCE:
+        raise ValueError(
+            f"{file_path} {ACTION_CONTINUOUS_ENV_KEY} must be normalized to [-1, 1] "
+            f"with columns {ACTION_CONTINUOUS_ENV_COLUMNS}; max_abs={max_abs_action:.6g}."
+        )
     if actions_steering_acceleration is not None:
         if actions_steering_acceleration.ndim != 2 or actions_steering_acceleration.shape[1] != 2:
             raise ValueError(

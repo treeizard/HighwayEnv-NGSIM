@@ -20,7 +20,7 @@ class PSGAILConfig:
     allow_airl_resume_without_reward: bool = False
     scene: str = "us-101"
     action_mode: str = "discrete"
-    continuous_action_dim: int = 2 # -> [acceleration, lane change]
+    continuous_action_dim: int = 2 # -> [acceleration_norm, steering_norm]
     episode_root: str = "highway_env/data/processed_20s"
     prebuilt_split: str = "train"
     seed: int = 0
@@ -112,7 +112,7 @@ class PSGAILConfig:
     central_critic_attention_heads: int = 4
     learning_rate: float = 4e-4
     learning_rate_schedule: str = ""
-    bc_pretrain_epochs: int = 0 # Behavior cloning pretraining epochs. Setting this to >0 will enable a BC pretraining phase before GAIL training. (Not utilized as of this moment)
+    bc_pretrain_epochs: int = 0 # Behavior cloning pretraining epochs. Setting this to >0 enables a BC pretraining phase before GAIL/AIRL training.
     bc_pretrain_learning_rate: float = 3e-4
     bc_pretrain_batch_size: int = 4096
     bc_pretrain_micro_batch_size: int = 0

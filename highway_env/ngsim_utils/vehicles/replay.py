@@ -773,7 +773,7 @@ class NGSIMVehicle(IDMVehicle):
         not getattr(other, "COLLISIONS_ENABLED", True):
             return
 
-        # 2. NEW: ghost/“not yet appeared” guard.
+        # 2. Ghost/not-yet-appeared guard.
         #    If either vehicle is marked as not appearing, skip collisions entirely.
         if hasattr(self, "appear") and not self.appear:
             return

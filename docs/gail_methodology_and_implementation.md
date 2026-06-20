@@ -113,11 +113,15 @@ The replay collection pathway is:
 
 The code path is:
 
-- `highway_env/imitation/expert_dataset.py:115` builds replay-mode environment config.
-- `highway_env/imitation/expert_dataset.py:391` collects and saves expert datasets.
-- `highway_env/envs/ngsim_env.py:906` initializes `PurePursuitTracker`.
-- `highway_env/ngsim_utils/expert/ngsim_expert_mixin.py:637` resolves expert actions.
-- `highway_env/envs/ngsim_env.py:1323` exposes expert actions in `info`.
+- `highway_env/imitation/expert_dataset.py` builds replay-mode environment
+  config and collects/saves expert datasets.
+- `highway_env/envs/ngsim_env.py` initializes `PurePursuitTracker` for NGSIM
+  replay control.
+- `highway_env/ngsim_utils/expert/ngsim_expert_mixin.py::_resolve_expert_action()`
+  resolves expert controls and exposes them through `info`.
+- `highway_env/ngsim_utils/core/constants.py` defines the shared
+  `[-10, 10]` m/s^2 acceleration range used by expert tracking,
+  normalization, and continuous environment actions.
 
 This design supports both `per_vehicle` datasets for transition-level imitation and `scene` datasets for multi-agent or scene-level discriminators.
 
@@ -142,12 +146,24 @@ $$
 x_t = [o_t,\; a_t].
 $$
 
+Unified continuous expert files store `actions_continuous_env` with columns
+`[acceleration_norm, steering_norm]`. The action-conditioned loader validates
+that these values stay within `[-1, 1]` and that observations, next
+observations, trajectory states, rewards, vehicle ids, and timesteps are finite
+before training starts. This catches stale or corrupted expert files before a
+long GAIL/AIRL run turns them into unstable losses or misleading metrics.
+
 The implementation anchors are:
 
-- `scripts_gail/ps_gail/data.py:71` builds `[policy_observation, trajectory_state]` discriminator features.
-- `scripts_gail/ps_gail/data.py:414` loads policy and discriminator data from expert files.
-- `scripts_gail/ps_gail/data.py:503` loads full transition data for action-conditioned or BC-regularized variants.
-- `scripts_gail/ps_gail/training/rewards.py:286` builds action-conditioned continuous features.
+- `scripts_gail/ps_gail/data.py::discriminator_features()` builds
+  `[policy_observation, trajectory_state]` discriminator features.
+- `scripts_gail/ps_gail/data.py::load_expert_policy_and_disc_data()` loads
+  policy and discriminator data from expert files.
+- `scripts_gail/ps_gail/data.py::load_expert_transition_data()` loads full
+  transition data for action-conditioned, AIRL, diagnostics, or explicitly
+  BC-regularized variants.
+- `scripts_gail/ps_gail/training/rewards.py::action_conditioned_features()`
+  builds action-conditioned continuous features.
 
 Optional feature standardization is enabled by default for discriminator inputs. The config clips standardized features to avoid unstable outliers.
 
@@ -155,16 +171,19 @@ Optional feature standardization is enabled by default for discriminator inputs.
 
 The policy is an actor-critic network. The default is an MLP policy, with optional transformer and recurrent-transformer variants:
 
-- `scripts_gail/ps_gail/models.py:162` defines `SharedActorCritic`.
-- `scripts_gail/ps_gail/models.py:252` defines `TransformerActorCritic`.
-- `scripts_gail/ps_gail/models.py:395` defines `RecurrentTransformerActorCritic`.
-- `scripts_gail/ps_gail/models.py:707` selects the model in `make_actor_critic()`.
+- `scripts_gail/ps_gail/models.py::SharedActorCritic`
+- `scripts_gail/ps_gail/models.py::TransformerActorCritic`
+- `scripts_gail/ps_gail/models.py::RecurrentTransformerActorCritic`
+- `scripts_gail/ps_gail/models.py::make_actor_critic()`
 
 The discriminator family is:
 
-- `scripts_gail/ps_gail/models.py:784` for transition/trajectory MLP discrimination.
-- `scripts_gail/ps_gail/models.py:807` for scene snapshot discrimination.
-- `scripts_gail/ps_gail/models.py:811` for sequence discrimination using a GRU over trajectory-feature windows.
+- `scripts_gail/ps_gail/models.py::TrajectoryDiscriminator` for
+  transition/trajectory MLP discrimination.
+- `scripts_gail/ps_gail/models.py::SceneDiscriminator` for scene snapshot
+  discrimination.
+- `scripts_gail/ps_gail/models.py::SequenceTrajectoryDiscriminator` for
+  sequence discrimination using a GRU over trajectory-feature windows.
 
 The default discriminator hidden layout is configured as:
 
@@ -190,14 +209,16 @@ The training loop in `scripts_gail/train_simple_ps_gail.py` performs:
 
 The main implementation anchors are:
 
-- `scripts_gail/train_simple_ps_gail.py:644` starts training setup.
-- `scripts_gail/train_simple_ps_gail.py:1049` enters the training-round loop.
-- `scripts_gail/train_simple_ps_gail.py:1079` collects policy rollouts.
-- `scripts_gail/train_simple_ps_gail.py:1112` updates the discriminator.
-- `scripts_gail/train_simple_ps_gail.py:1146` refreshes adversarial rollout rewards.
-- `scripts_gail/train_simple_ps_gail.py:1161` updates the policy.
-- `scripts_gail/train_simple_ps_gail.py:1563` runs validation.
-- `scripts_gail/train_simple_ps_gail.py:1745` runs final test evaluation.
+- `scripts_gail/train_simple_ps_gail.py::main()` owns setup, the
+  round-by-round training loop, validation, checkpointing, and final testing.
+- `scripts_gail/ps_gail/training/rollouts.py::collect_round_rollouts()`
+  collects policy rollouts.
+- `scripts_gail/ps_gail/training/discriminator.py::update_discriminator()`
+  updates the discriminator/critic.
+- `scripts_gail/ps_gail/training/rollouts.py::refresh_rollout_rewards()`
+  refreshes adversarial rollout rewards.
+- `scripts_gail/ps_gail/training/ppo.py::update_policy()` performs PPO policy
+  updates.
 
 ## Discriminator Update
 
@@ -229,9 +250,12 @@ $$
 
 Code anchors:
 
-- `scripts_gail/ps_gail/training/discriminator.py:43` computes the WGAN-GP penalty.
-- `scripts_gail/ps_gail/training/discriminator.py:226` updates the discriminator/critic.
-- `scripts_gail/ps_gail/training/discriminator.py:134` optionally selects hard expert/generator examples.
+- `scripts_gail/ps_gail/training/discriminator.py::_wgan_gradient_penalty()`
+  computes the WGAN-GP penalty.
+- `scripts_gail/ps_gail/training/discriminator.py::update_discriminator()`
+  updates the discriminator/critic.
+- `scripts_gail/ps_gail/training/discriminator.py::select_hard_discriminator_examples()`
+  optionally selects hard expert/generator examples.
 
 ## Reward Construction
 
@@ -250,9 +274,12 @@ The simple transition discriminator gives `r_D`. Optional scene and sequence dis
 
 Code anchors:
 
-- `scripts_gail/ps_gail/training/rewards.py:68` converts discriminator output to adversarial reward.
-- `scripts_gail/ps_gail/training/rewards.py:322` shapes, scales, normalizes, and clips adversarial rewards.
-- `scripts_gail/ps_gail/training/rollouts.py:242` combines transition, scene, sequence, safety, and challenge rewards.
+- `scripts_gail/ps_gail/training/rewards.py::discriminator_reward()` converts
+  discriminator output to adversarial reward.
+- `scripts_gail/ps_gail/training/rewards.py::shape_adversarial_rewards()`
+  shapes, scales, normalizes, and clips adversarial rewards.
+- `scripts_gail/ps_gail/training/rollouts.py::combine_primary_env_challenge_rewards()`
+  combines transition, scene, sequence, safety, and challenge rewards.
 
 ## Policy Update with PPO
 
@@ -297,8 +324,10 @@ $$
 
 Code anchors:
 
-- `scripts_gail/ps_gail/training/rewards.py:44` computes returns and GAE advantages.
-- `scripts_gail/ps_gail/training/ppo.py:382` performs PPO updates.
+- `scripts_gail/ps_gail/training/rewards.py::compute_returns_and_advantages()`
+  computes returns and GAE advantages.
+- `scripts_gail/ps_gail/training/ppo.py::update_policy()` performs PPO
+  updates.
 - `scripts_gail/ps_gail/training/policy.py` handles distributions, action masking, continuous actions, and centralized-critic inputs.
 
 ## Rollout and Testing System
@@ -315,40 +344,59 @@ The rollout code controls one or more NGSIM vehicles with the learned policy whi
 
 The code path is:
 
-- `scripts_gail/ps_gail/training/rollouts.py:366` collects rollouts.
-- `scripts_gail/ps_gail/training/rollouts.py:701` builds generator features.
-- `scripts_gail/ps_gail/training/rollouts.py:715` initializes rollout rewards before discriminator refresh.
-- `scripts_gail/ps_gail/training/rollouts.py:780` merges rollout batches across workers.
+- `scripts_gail/ps_gail/training/rollouts.py::collect_rollout()` collects
+  rollouts.
+- `scripts_gail/ps_gail/training/rollouts.py::collect_round_rollouts()`
+  coordinates worker collection and optional training subsampling.
+- `scripts_gail/ps_gail/training/rollouts.py::merge_rollout_batches()` merges
+  rollout batches across workers.
+- `scripts_gail/ps_gail/training/rollouts.py::refresh_rollout_rewards()`
+  recomputes rollout rewards after discriminator updates.
 
 The testing system evaluates trained policies against held-out prebuilt splits using matched trajectory metrics. The final test printout includes 20-second position RMSE, crash rate, offroad rate, and hard-brake rate. This matters because discriminator reward alone is not enough evidence of driving quality; matched trajectory metrics provide a simulator-grounded behavioral check against the original NGSIM trajectory.
 
 Evaluation anchors:
 
-- `scripts_gail/ps_gail/training/evaluation.py:1110` evaluates matched trajectories.
-- `scripts_gail/ps_gail/validation.py:88` converts validation metrics into a model-selection score.
-- `scripts_gail/train_simple_ps_gail.py:1745` runs final test evaluation.
+- `scripts_gail/ps_gail/training/evaluation.py::evaluate_policy_matched_trajectories()`
+  evaluates matched trajectories.
+- `scripts_gail/ps_gail/validation.py::validation_cost_and_score()` converts
+  validation metrics into a model-selection score.
+- `scripts_gail/train_simple_ps_gail.py::main()` runs final test evaluation.
+
+## Monitoring Diagnostics
+
+The optional `--enable-vendi-diagnostics` path is monitoring-only. It does not
+change rewards, losses, action scaling, entropy schedules, rollout collection,
+or checkpoint compatibility. Sequence Vendi diagnostics summarize trajectory
+window diversity. In continuous-action PS-GAIL, the same gate also logs expert
+and policy steering summaries, fixed-bin steering histograms, absolute-steering
+quantiles, steering-event rates, steering-window Vendi, safe steering-window
+Vendi, and RBF-MMD between expert and policy steering samples.
+
+The steering event-rate metrics are only threshold proxies on
+`abs(steering_norm)`. They should not be described as true lane-change rates
+unless a later data path also records lane-index transitions.
 
 Regression tests also cover the GAIL-specific choices:
 
-- `tests/test_ps_gail_training_logic.py:301` checks unified action-conditioned expert loading.
-- `tests/test_ps_gail_training_logic.py:355` checks the discriminator architecture.
-- `tests/test_ps_gail_training_logic.py:745` checks discriminator feature normalization during reward refresh.
-- `tests/test_ps_gail_training_logic.py:837` checks BCE reward clipping.
-- `tests/test_ps_gail_training_logic.py:1358` checks WGAN-GP discriminator metrics.
-- `tests/test_ps_gail_training_logic.py:1387` checks WGAN-GP sequence discriminator support.
+- `tests/test_ps_gail_training_logic.py` checks unified action-conditioned
+  expert loading, expert action-range validation, steering diagnostics, PPO
+  update behavior, discriminator metrics, WGAN-GP sequence support, Slurm
+  parser compatibility, and schedule behavior.
 
 ## Traceability Matrix
 
 | Methodological choice | Mathematical role | Code anchor |
 | --- | --- | --- |
-| Expert replay through simulator | Samples from `\rho_E` under the same observation/action interface as training | `highway_env/imitation/expert_dataset.py:391` |
-| Occupancy feature vector `[o_t, x_t, y_t, v_t]` | Approximate state/trajectory occupancy matching for discrete control | `scripts_gail/ps_gail/data.py:71` |
-| Action-conditioned continuous feature `[o_t, a_t]` | Classical state-action GAIL feature for continuous control | `scripts_gail/ps_gail/training/rewards.py:286` |
-| WGAN-GP critic default | Stabilized occupancy divergence estimate | `scripts_gail/ps_gail/training/discriminator.py:43` |
-| Adversarial reward from discriminator | Learned reward/cost replacing hand-designed expert reward | `scripts_gail/ps_gail/training/rewards.py:68` |
-| PPO update | Policy-gradient optimizer for discriminator-derived rewards | `scripts_gail/ps_gail/training/ppo.py:382` |
-| Collision/offroad penalties | Safety constraints retained during adversarial imitation | `scripts_gail/ps_gail/training/rollouts.py:575` |
-| Matched validation/test metrics | External behavioral check against held-out trajectories | `scripts_gail/ps_gail/training/evaluation.py:1110` |
+| Expert replay through simulator | Samples from `\rho_E` under the same observation/action interface as training | `highway_env/imitation/expert_dataset.py`, `highway_env/ngsim_utils/expert/ngsim_expert_mixin.py` |
+| Occupancy feature vector `[o_t, x_t, y_t, v_t]` | Approximate state/trajectory occupancy matching for discrete control | `scripts_gail/ps_gail/data.py::discriminator_features()` |
+| Action-conditioned continuous feature `[o_t, a_t]` | Classical state-action GAIL feature for continuous control | `scripts_gail/ps_gail/training/rewards.py::action_conditioned_features()` |
+| WGAN-GP critic default | Stabilized occupancy divergence estimate | `scripts_gail/ps_gail/training/discriminator.py::_wgan_gradient_penalty()` |
+| Adversarial reward from discriminator | Learned reward/cost replacing hand-designed expert reward | `scripts_gail/ps_gail/training/rewards.py::discriminator_reward()` |
+| PPO update | Policy-gradient optimizer for discriminator-derived rewards | `scripts_gail/ps_gail/training/ppo.py::update_policy()` |
+| Collision/offroad penalties | Safety constraints retained during adversarial imitation | `scripts_gail/ps_gail/training/rollouts.py::combine_primary_env_challenge_rewards()` |
+| Steering diagnostics | Monitoring-only action-distribution and diversity checks | `scripts_gail/ps_gail/steering_diagnostics.py` |
+| Matched validation/test metrics | External behavioral check against held-out trajectories | `scripts_gail/ps_gail/training/evaluation.py::evaluate_policy_matched_trajectories()` |
 
 ## Literature Links
 

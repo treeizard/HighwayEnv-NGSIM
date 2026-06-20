@@ -36,6 +36,13 @@ from scripts_gail.ps_gail.models import (
 )
 from scripts_gail.ps_gail.observations import flatten_agent_observations, policy_observations_from_flat
 from scripts_gail.ps_gail.schedule import config_for_round
+from scripts_gail.ps_gail.steering_diagnostics import (
+    policy_safe_steering_vendi_metrics,
+    safe_policy_steering_actions,
+    steering_mmd_rbf,
+    steering_summary_metrics,
+    steering_vendi_metrics,
+)
 from scripts_gail.ps_gail.trainer import (
     action_conditioned_features,
     collect_round_rollouts,
@@ -763,6 +770,10 @@ def main() -> None:
     try:
         sequence_only_discriminator = bool(cfg.enable_sequence_discriminator)
         expert_transitions = None
+        needs_steering_diagnostics = (
+            bool(getattr(cfg, "enable_vendi_diagnostics", False))
+            and str(getattr(cfg, "action_mode", "")).lower() == "continuous"
+        )
         if discriminator_input_mode(cfg) == "action":
             if sequence_only_discriminator or bool(cfg.enable_scene_discriminator):
                 raise ValueError(
@@ -788,7 +799,11 @@ def main() -> None:
                 seed=cfg.seed,
                 trajectory_frame=cfg.trajectory_frame,
             )
-            if int(cfg.bc_pretrain_epochs) > 0 or float(cfg.policy_bc_regularization_coef) > 0.0:
+            if (
+                int(cfg.bc_pretrain_epochs) > 0
+                or float(cfg.policy_bc_regularization_coef) > 0.0
+                or needs_steering_diagnostics
+            ):
                 expert_transitions = load_expert_transition_data(
                     cfg.expert_data,
                     max_samples=cfg.max_expert_samples,
@@ -941,6 +956,26 @@ def main() -> None:
             cfg,
         )
         expert_sequence_log_vendi = expert_vendi_metrics.get("vendi/expert_sequence_log")
+        expert_steering_metrics: dict[str, float] = {}
+        if needs_steering_diagnostics and expert_transitions is not None:
+            expert_steering_metrics.update(
+                steering_summary_metrics(
+                    expert_transitions.actions_continuous_env,
+                    prefix="expert",
+                )
+            )
+            expert_steering_metrics.update(
+                steering_vendi_metrics(
+                    expert_transitions.actions_continuous_env,
+                    expert_transitions.trajectory_ids,
+                    prefix="expert",
+                    sequence_length=int(cfg.sequence_length),
+                    stride=int(cfg.sequence_stride),
+                    max_windows=int(cfg.vendi_max_windows),
+                    seed=int(cfg.vendi_seed),
+                    rbf_sigma=float(cfg.vendi_rbf_sigma),
+                )
+            )
         expert_scene_features_train = (
             apply_optional_discriminator_normalizer(
                 expert_scene_features,
@@ -1606,6 +1641,56 @@ def main() -> None:
                     )
                 )
                 metrics.update(expert_vendi_metrics)
+            if needs_steering_diagnostics and expert_transitions is not None:
+                metrics.update(expert_steering_metrics)
+                metrics.update(steering_summary_metrics(rollout.actions, prefix="policy"))
+                metrics.update(
+                    steering_vendi_metrics(
+                        rollout.actions,
+                        rollout.trajectory_ids,
+                        prefix="policy",
+                        sequence_length=int(round_cfg.sequence_length),
+                        stride=int(round_cfg.sequence_stride),
+                        max_windows=int(round_cfg.vendi_max_windows),
+                        seed=int(round_cfg.vendi_seed) + int(round_idx) + 11,
+                        rbf_sigma=float(round_cfg.vendi_rbf_sigma),
+                    )
+                )
+                metrics["mmd/steering_policy_vs_expert"] = steering_mmd_rbf(
+                    rollout.actions,
+                    expert_transitions.actions_continuous_env,
+                    max_samples=int(round_cfg.vendi_max_windows),
+                    seed=int(round_cfg.vendi_seed) + int(round_idx) + 23,
+                    rbf_sigma=float(round_cfg.vendi_rbf_sigma),
+                )
+                if bool(getattr(round_cfg, "vendi_safe_only", True)):
+                    metrics.update(
+                        policy_safe_steering_vendi_metrics(
+                            rollout.actions,
+                            rollout.trajectory_ids,
+                            rollout.env_penalties,
+                            prefix="policy",
+                            sequence_length=int(round_cfg.sequence_length),
+                            stride=int(round_cfg.sequence_stride),
+                            max_windows=int(round_cfg.vendi_max_windows),
+                            seed=int(round_cfg.vendi_seed) + int(round_idx) + 17,
+                            rbf_sigma=float(round_cfg.vendi_rbf_sigma),
+                        )
+                    )
+                    safe_policy_actions = safe_policy_steering_actions(
+                        rollout.actions,
+                        rollout.trajectory_ids,
+                        rollout.env_penalties,
+                        sequence_length=int(round_cfg.sequence_length),
+                        stride=int(round_cfg.sequence_stride),
+                    )
+                    metrics["mmd/steering_policy_safe_vs_expert"] = steering_mmd_rbf(
+                        safe_policy_actions,
+                        expert_transitions.actions_continuous_env,
+                        max_samples=int(round_cfg.vendi_max_windows),
+                        seed=int(round_cfg.vendi_seed) + int(round_idx) + 29,
+                        rbf_sigma=float(round_cfg.vendi_rbf_sigma),
+                    )
             for stat_key, stat_value in policy_stats.items():
                 if stat_key.startswith("perf/"):
                     metrics[stat_key] = float(stat_value)

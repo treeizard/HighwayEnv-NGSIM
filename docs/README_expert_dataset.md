@@ -99,7 +99,17 @@ Default observation:
 Supported action modes:
 
 - `discrete`: `DiscreteSteerMetaAction`, scalar action in `{0, 1, 2, 3, 4}`
-- `continuous`: `ContinuousAction`, normalized `float32 [2]` for acceleration and steering
+- `continuous`: `ContinuousAction`, normalized `float32 [2]` stored as
+  `[acceleration_norm, steering_norm]`
+
+For NGSIM continuous control, the normalized action interval is always
+`[-1, 1]`. `acceleration_norm=-1` maps to `-10 m/s^2`,
+`acceleration_norm=1` maps to `10 m/s^2`, and `steering_norm` maps to
+`[-pi/4, pi/4]` radians. Expert files produced for action-conditioned
+GAIL/AIRL should also contain `actions_continuous_env` with these normalized
+columns and, when available, `actions_steering_acceleration` with physical
+`[steering_rad, acceleration_mps2]` columns. Loaders reject non-finite
+continuous expert arrays and normalized continuous actions outside `[-1, 1]`.
 
 ## Build a Dataset
 

@@ -19,7 +19,7 @@
 
 
 import numpy as np
-from highway_env.ngsim_utils.core.constants import MAX_STEER
+from highway_env.ngsim_utils.core.constants import MAX_ACCEL, MAX_STEER, MIN_ACCEL
 
 try:
     from scipy.interpolate import UnivariateSpline
@@ -411,8 +411,8 @@ class PurePursuitTracker:
         ks_s: float = 2.0,
         v_cmd_min: float = 0.0,
         v_cmd_max: float = 40.0,
-        a_min: float = -10.0,
-        a_max: float = 8.0,
+        a_min: float = MIN_ACCEL,
+        a_max: float = MAX_ACCEL,
         jerk_limit: float | None = 10.0,
         # steering dynamics
         steer_rate_limit: float = 6.0,
@@ -422,15 +422,12 @@ class PurePursuitTracker:
         proj_fwd: int = 80,
         max_time_slip: int = 30,
 
-        # FIX 1: Added default value '= None' so legacy calls don't crash
-        ref_lanes: np.ndarray | None = None, 
+        # Optional lane references preserve compatibility with older callers.
+        ref_lanes: np.ndarray | None = None,
     ):
         self.ref_xy = np.asarray(ref_xy, dtype=float)
-        # ... (rest of validation logic matches your code) ...
-
         self.ref_v = None if ref_v is None else np.asarray(ref_v, dtype=float)
-        
-        # ... (Parameter assignments match your code) ...
+
         self.dt = float(dt)
         self.L = float(L_forward)
         self.max_steer = float(max_steer)
@@ -469,9 +466,16 @@ class PurePursuitTracker:
         else:
             self.v_ref_from_s = np.zeros(self.N, dtype=float)
 
-        self.ref_lanes = None if ref_lanes is None else np.asarray(ref_lanes, dtype=int)
+        if ref_lanes is None:
+            self.ref_lanes = None
+        else:
+            self.ref_lanes = np.asarray(ref_lanes, dtype=int).reshape(-1)
+            if self.ref_lanes.shape[0] < self.N:
+                raise ValueError(
+                    "ref_lanes must have at least as many entries as ref_xy: "
+                    f"{self.ref_lanes.shape[0]} < {self.N}."
+                )
 
-    # ... (reset, _ref_speed_time, _project_to_polyline_s, _target_index_from_time_anchor are fine) ...
     def reset(self, k0: int = 0) -> None:
         self._k = int(np.clip(k0, 0, max(0, self.N - 1)))
         self._steer_prev = 0.0
@@ -522,10 +526,7 @@ class PurePursuitTracker:
         heading: float,
         speed: float,
     ) -> tuple[float, float, int, int, int]:
-        """
-        Compute closed-loop controls.
-        Restored original steering logic to fix direction inversion.
-        """
+        """Compute closed-loop controls."""
         if self.N == 0:
             return 0.0, 0.0, 0, 0, -1
 
@@ -543,9 +544,6 @@ class PurePursuitTracker:
         i_tgt = self._target_index_from_time_anchor(k_time, Ld)
         tgt = self.ref_xy[i_tgt]
 
-        # ---------------------------------------------------------
-        # RESTORED: Your Original Steering Logic
-        # ---------------------------------------------------------
         dx = float(tgt[0] - pos_xy[0])
         dy = float(tgt[1] - pos_xy[1])
         
@@ -563,9 +561,7 @@ class PurePursuitTracker:
         )[0]
         steer_cmd = float(steer_raw)
 
-        # ---------------------------------------------------------
-        # Smoothing & Dynamics (Unchanged)
-        # ---------------------------------------------------------
+        # Smooth steering to match vehicle dynamics.
         if self.steer_lpf_tau > 1e-6:
             a = self.dt / (self.steer_lpf_tau + self.dt)
             steer_cmd = (1.0 - a) * self._steer_prev + a * steer_cmd
@@ -576,9 +572,7 @@ class PurePursuitTracker:
         steer_cmd = float(np.clip(steer_cmd, -self.max_steer, self.max_steer))
         self._steer_prev = steer_cmd
 
-        # ---------------------------------------------------------
-        # Longitudinal Control (Unchanged)
-        # ---------------------------------------------------------
+        # Longitudinal control keeps simulated progress close to reference time.
         s_des = float(self.s_ref[k_time])
         s_cur = self._project_to_polyline_s(pos_xy, k_hint=k_time)
         s_err = s_des - s_cur
@@ -596,9 +590,6 @@ class PurePursuitTracker:
 
         self._k = min(self._k + 1, self.N - 1)
 
-        # ---------------------------------------------------------
-        # NEW: Target Lane Extraction (The only addition)
-        # ---------------------------------------------------------
         target_lane_id = -1
         if self.ref_lanes is not None:
             idx = int(np.clip(i_tgt, 0, self.N - 1))

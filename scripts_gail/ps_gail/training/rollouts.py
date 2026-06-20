@@ -5,37 +5,23 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import time
-from collections import OrderedDict
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import contextmanager
 from contextlib import nullcontext
-from dataclasses import dataclass
-from dataclasses import field
-from dataclasses import replace
 
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Categorical, Normal
-
-from highway_env.imitation.expert_dataset import ENV_ID, build_env_config, register_ngsim_env
-from highway_env.ngsim_utils.core.constants import MAX_ACCEL
-from highway_env.ngsim_utils.data.prebuilt import load_prebuilt_data
 
 from ..config import PSGAILConfig
 from ..data import (
-    SCENE_FEATURE_DIM_PER_VEHICLE,
     build_sequence_windows,
     discriminator_features,
     normalize_trajectory_frame,
     scene_snapshot_features,
-    standardize_features,
     transform_sequence_features,
 )
-from ..models import NUM_DISCRETE_META_ACTIONS, make_actor_critic
 from ..observations import flatten_agent_observations, policy_observations_from_flat
 
 from .policy import (
@@ -1149,6 +1135,17 @@ def _subset_sequence_features(
         remapped_windows,
     )
 
+def _transition_rows(values: np.ndarray, n: int, *, dtype: np.dtype) -> np.ndarray:
+    """Return transition-aligned rows while preserving trailing dimensions."""
+
+    n = max(0, int(n))
+    arr = np.asarray(values, dtype=dtype)
+    if arr.ndim >= 1 and arr.shape[0] == n:
+        return arr.astype(dtype, copy=False)
+    trailing_shape = arr.shape[1:] if arr.ndim >= 1 else ()
+    return np.zeros((n, *trailing_shape), dtype=dtype)
+
+
 def subsample_rollout_for_training(
     rollout: RolloutBatch,
     cfg: PSGAILConfig,
@@ -1236,10 +1233,11 @@ def subsample_rollout_for_training(
             dtype=np.int64,
             fill=-1,
         )[selected_indices].astype(np.int64, copy=False),
-        policy_step_memories=rollout.policy_step_memories[selected_indices].astype(
-            _memory_storage_dtype(cfg),
-            copy=False,
-        ),
+        policy_step_memories=_transition_rows(
+            rollout.policy_step_memories,
+            rollout.num_agent_steps,
+            dtype=_memory_storage_dtype(cfg),
+        )[selected_indices].astype(_memory_storage_dtype(cfg), copy=False),
         challenge_pressures=_transition_array(
             rollout.challenge_pressures,
             rollout.num_agent_steps,

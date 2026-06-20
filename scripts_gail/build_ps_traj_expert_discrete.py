@@ -50,6 +50,7 @@ from highway_env.ngsim_utils.data.trajectory_gen import (  # noqa: E402
 from scripts_gail.ps_gail.data import (  # noqa: E402
     ACTION_CONTINUOUS_ENV_COLUMNS,
     ACTION_CONTINUOUS_ENV_KEY,
+    ACTION_NORMALIZED_BOUND_TOLERANCE,
     ACTION_STEERING_ACCELERATION_COLUMNS,
     ACTION_STEERING_ACCELERATION_KEY,
     scene_snapshot_features,
@@ -951,6 +952,12 @@ def load_ps_traj_expert_dataset(path: str) -> tuple[np.ndarray, dict[str, Any], 
                 )
             if not np.all(np.isfinite(actions_continuous_env)):
                 raise ValueError(f"{ACTION_CONTINUOUS_ENV_KEY} contains non-finite values.")
+            max_abs_action = float(np.max(np.abs(actions_continuous_env))) if actions_continuous_env.size else 0.0
+            if max_abs_action > 1.0 + ACTION_NORMALIZED_BOUND_TOLERANCE:
+                raise ValueError(
+                    f"{ACTION_CONTINUOUS_ENV_KEY} must be normalized to [-1, 1] with columns "
+                    f"{ACTION_CONTINUOUS_ENV_COLUMNS}; max_abs={max_abs_action:.6g}."
+                )
         if ACTION_STEERING_ACCELERATION_KEY in arrays:
             steering_accel = np.asarray(arrays[ACTION_STEERING_ACCELERATION_KEY], dtype=np.float32)
             if steering_accel.ndim != 2 or steering_accel.shape[1] != 2:

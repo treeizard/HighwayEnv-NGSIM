@@ -1,11 +1,16 @@
 # Simple PS-GAIL
 
-This package is a small modular trainer for the NGSIM discrete meta-action setup.
+This package is a small modular trainer for NGSIM policy-space GAIL/AIRL. It
+supports both the older discrete meta-action setup and the current continuous
+control setup.
 
 - Policy input: lidar + lane observation + `[length, velocity, heading]`.
-- Policy output: discrete meta action index from `DiscreteSteerMetaAction`.
+- Policy output: either a discrete meta action index from `DiscreteSteerMetaAction`
+  or continuous environment actions `[acceleration_norm, steering_norm]`.
 - Discriminator input: policy observation + trajectory state `[x, y, v]`.
-- Discriminator does not receive the discrete meta action.
+- The default trajectory discriminator does not receive policy actions. Use the
+  action-conditioned discriminator path only for explicit action-input
+  experiments.
 - Generator environment defaults to `enable_collision=True` and `allow_idm=True`.
 - Optional scene discriminator: fixed-size full-road snapshots encoded as
   top-K `[presence, rel_x, rel_y, vx, vy]` road-vehicle rows. Rebuild expert
@@ -21,6 +26,12 @@ This package is a small modular trainer for the NGSIM discrete meta-action setup
   control, add `actions_continuous_env` with columns
   `[acceleration_norm, steering_norm]` plus `actions_steering_acceleration`
   with columns `[steering_rad, acceleration_mps2]`.
+- Optional Vendi diagnostics (`--enable-vendi-diagnostics`) log monitoring-only
+  trajectory-window diversity. For continuous-action GAIL they also log
+  expert-vs-policy steering summaries, fixed-bin steering histograms, steering
+  Vendi, safe steering Vendi, and steering MMD. The steering event-rate metrics
+  are threshold proxies on `abs(steering_norm)`; they are not true lane-change
+  rates because lane-index transitions are not collected here.
 - Expert collection can run episodes in parallel with
   `--num-collection-workers N --collection-worker-threads 2`; each worker owns
   one environment at a time and caps native CPU thread pools.

@@ -1,4 +1,7 @@
+import ast
+from dataclasses import fields
 import json
+import re
 import sys
 import types
 from pathlib import Path
@@ -95,6 +98,16 @@ from scripts_gail.ps_gail.training import evaluation as eval_mod
 from scripts_gail.ps_gail.validation import best_checkpoint_payload
 from scripts_gail.ps_gail.validation import scored_validation_metrics
 from scripts_gail.ps_gail.validation import validation_cost_and_score
+import scripts_gail.ps_gail.steering_diagnostics as steering_diag_mod
+from scripts_gail.ps_gail.steering_diagnostics import (
+    STEERING_HISTOGRAM_BINS,
+    policy_safe_steering_vendi_metrics,
+    safe_policy_steering_actions,
+    steering_mmd_rbf,
+    steering_summary_metrics,
+    steering_vendi_metrics,
+    steering_windows,
+)
 from scripts_gail.ps_gail.vendi import safe_sequence_window_mask, vendi_score
 from scripts_gail.ps_gail.models import (
     SequenceTrajectoryDiscriminator,
@@ -251,10 +264,12 @@ def test_rollout_training_subsample_keeps_complete_trajectories_and_remaps_indic
     rollout.trajectory_ids = np.repeat(np.arange(4, dtype=np.int32), 3)
     rollout.scene_features = np.arange(n * 2, dtype=np.float32).reshape(n, 2)
     rollout.transition_scene_indices = np.arange(n, dtype=np.int64)
+    rollout.policy_step_memories = np.arange(n * 2 * 3, dtype=np.float16).reshape(n, 2, 3)
     cfg = PSGAILConfig(
         rollout_training_subsample=True,
         rollout_training_agent_steps=5,
         gamma=0.95,
+        transformer_memory_storage_dtype="float16",
     )
 
     sampled = subsample_rollout_for_training(rollout, cfg, seed=7)
@@ -268,19 +283,35 @@ def test_rollout_training_subsample_keeps_complete_trajectories_and_remaps_indic
     assert sampled.generator_features.shape[0] == sampled.num_agent_steps
     assert sampled.scene_features.shape[0] == sampled.num_agent_steps
     assert np.all(sampled.transition_scene_indices >= 0)
+    assert sampled.policy_step_memories.shape == (sampled.num_agent_steps, 2, 3)
+    selected_original_indices = (sampled.policy_observations[:, 0] / 2).astype(np.int64)
+    np.testing.assert_array_equal(
+        sampled.policy_step_memories,
+        rollout.policy_step_memories[selected_original_indices],
+    )
     if sampled.sequence_transition_indices.size:
         assert int(sampled.sequence_transition_indices.max()) < sampled.num_agent_steps
         assert int(sampled.sequence_last_indices.max()) < sampled.num_agent_steps
 
 
-def _write_action_conditioned_expert_file(path, *, include_actions: bool = True) -> None:
-    observations = np.asarray(
-        [
-            [0.0, 1.0, 2.0, 10.0, 0.10, 2.0, 4.5],
-            [0.5, 1.5, 2.5, 11.0, 0.20, 2.0, 4.5],
-            [1.0, 2.0, 3.0, 12.0, 0.30, 2.0, 4.5],
-        ],
-        dtype=np.float32,
+def _write_action_conditioned_expert_file(
+    path,
+    *,
+    include_actions: bool = True,
+    observations_override: np.ndarray | None = None,
+    actions_continuous_env: np.ndarray | None = None,
+) -> None:
+    observations = (
+        np.asarray(observations_override, dtype=np.float32)
+        if observations_override is not None
+        else np.asarray(
+            [
+                [0.0, 1.0, 2.0, 10.0, 0.10, 2.0, 4.5],
+                [0.5, 1.5, 2.5, 11.0, 0.20, 2.0, 4.5],
+                [1.0, 2.0, 3.0, 12.0, 0.30, 2.0, 4.5],
+            ],
+            dtype=np.float32,
+        )
     )
     next_observations = observations + 0.25
     trajectory_states = np.asarray(
@@ -310,7 +341,9 @@ def _write_action_conditioned_expert_file(path, *, include_actions: bool = True)
     }
     if include_actions:
         arrays[ACTION_CONTINUOUS_ENV_KEY] = np.asarray(
-            [[0.1, -0.2], [0.0, 0.3], [-0.4, 0.5]],
+            actions_continuous_env
+            if actions_continuous_env is not None
+            else [[0.1, -0.2], [0.0, 0.3], [-0.4, 0.5]],
             dtype=np.float32,
         )
         arrays[ACTION_STEERING_ACCELERATION_KEY] = np.asarray(
@@ -337,6 +370,36 @@ def test_action_conditioned_loader_requires_continuous_actions(tmp_path):
     _write_action_conditioned_expert_file(path, include_actions=False)
 
     with pytest.raises(KeyError, match=ACTION_CONTINUOUS_ENV_KEY):
+        load_expert_transition_data(str(path))
+
+
+def test_action_conditioned_loader_rejects_out_of_range_normalized_actions(tmp_path):
+    path = tmp_path / "bad_expert.npz"
+    _write_action_conditioned_expert_file(
+        path,
+        actions_continuous_env=np.asarray(
+            [[0.1, -0.2], [1.25, 0.3], [-0.4, 0.5]],
+            dtype=np.float32,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must be normalized to \\[-1, 1\\]"):
+        load_expert_transition_data(str(path))
+
+
+def test_action_conditioned_loader_rejects_nonfinite_observations(tmp_path):
+    path = tmp_path / "bad_observations.npz"
+    observations = np.asarray(
+        [
+            [0.0, 1.0, 2.0, 10.0, 0.10, 2.0, 4.5],
+            [0.5, np.nan, 2.5, 11.0, 0.20, 2.0, 4.5],
+            [1.0, 2.0, 3.0, 12.0, 0.30, 2.0, 4.5],
+        ],
+        dtype=np.float32,
+    )
+    _write_action_conditioned_expert_file(path, observations_override=observations)
+
+    with pytest.raises(ValueError, match="array 'observations' contains non-finite"):
         load_expert_transition_data(str(path))
 
 
@@ -554,6 +617,61 @@ def test_update_policy_trains_centralized_critic_values():
 
     assert np.isfinite(stats["value_loss"])
     assert stats["value_loss"] > 0.0
+
+
+def test_recurrent_update_policy_validates_bc_expert_lengths():
+    torch.manual_seed(0)
+    np.random.seed(0)
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        policy_model="recurrent_transformer",
+        continuous_action_dim=2,
+        hidden_size=16,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+        transformer_recurrent_sequence_length=2,
+        policy_bc_regularization_coef=0.1,
+        batch_size=4,
+        ppo_epochs=1,
+    )
+    policy = make_actor_critic(
+        "recurrent_transformer",
+        obs_dim=6,
+        hidden_size=16,
+        action_mode="continuous",
+        continuous_action_dim=2,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+    )
+    observations = np.random.randn(4, 6).astype(np.float32)
+    rollout = _minimal_rollout(
+        observations=observations,
+        actions=np.zeros((4, 2), dtype=np.float32),
+        old_log_probs=np.zeros(4, dtype=np.float32),
+        old_values=np.zeros(4, dtype=np.float32),
+        returns=np.zeros(4, dtype=np.float32),
+        advantages=np.ones(4, dtype=np.float32),
+        trajectory_ids=np.zeros(4, dtype=np.int64),
+        dones=np.asarray([False, False, False, True]),
+    )
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+
+    with pytest.raises(ValueError, match="observation/action count mismatch"):
+        update_policy(
+            policy,
+            optimizer,
+            rollout,
+            cfg,
+            torch.device("cpu"),
+            expert_policy_observations=np.zeros((3, 6), dtype=np.float32),
+            expert_actions=np.zeros((2, 2), dtype=np.float32),
+        )
 
 
 def test_central_critic_observations_encode_per_agent_scene_context():
@@ -800,6 +918,260 @@ def test_safe_sequence_window_mask_uses_env_penalties():
         np.asarray([0.0, 0.0, -2.0, 0.0], dtype=np.float32),
     )
     np.testing.assert_array_equal(mask, np.asarray([True, False, False]))
+
+
+def test_steering_summary_metrics_histogram_quantiles_and_events():
+    actions = np.asarray(
+        [
+            [0.0, -0.20],
+            [0.0, -0.10],
+            [0.0, 0.00],
+            [0.0, 0.10],
+            [0.0, 0.40],
+        ],
+        dtype=np.float32,
+    )
+
+    metrics = steering_summary_metrics(actions, prefix="policy")
+    hist_sum = sum(
+        metrics[f"steering/policy_hist_bin_{idx:02d}"]
+        for idx in range(len(STEERING_HISTOGRAM_BINS) - 1)
+    )
+
+    assert metrics["steering/policy_count"] == pytest.approx(5.0)
+    assert metrics["steering/policy_steer_mean"] == pytest.approx(0.04)
+    assert metrics["steering/policy_abs_steer_mean"] == pytest.approx(0.16)
+    assert metrics["steering/policy_abs_steer_p50"] == pytest.approx(0.10)
+    assert metrics["steering/policy_event_rate_abs_ge_0p10"] == pytest.approx(0.8)
+    assert metrics["steering/policy_event_rate_abs_ge_0p30"] == pytest.approx(0.2)
+    assert hist_sum == pytest.approx(1.0)
+
+
+def test_steering_summary_metrics_empty_inputs_are_stable():
+    metrics = steering_summary_metrics(np.zeros((0, 2), dtype=np.float32), prefix="expert")
+
+    hist_sum = sum(
+        metrics[f"steering/expert_hist_bin_{idx:02d}"]
+        for idx in range(len(STEERING_HISTOGRAM_BINS) - 1)
+    )
+
+    assert metrics["steering/expert_count"] == pytest.approx(0.0)
+    assert np.isnan(metrics["steering/expert_steer_mean"])
+    assert metrics["steering/expert_event_rate_abs_ge_0p20"] == pytest.approx(0.0)
+    assert hist_sum == pytest.approx(0.0)
+
+
+def test_steering_vendi_identical_and_diverse_windows():
+    ids = np.asarray([1, 1, 1, 2, 2, 2], dtype=np.int64)
+    identical = np.asarray(
+        [[0.0, 0.1], [0.0, 0.1], [0.0, 0.1], [0.0, 0.1], [0.0, 0.1], [0.0, 0.1]],
+        dtype=np.float32,
+    )
+    diverse = np.asarray(
+        [[0.0, -0.8], [0.0, -0.6], [0.0, -0.4], [0.0, 0.4], [0.0, 0.6], [0.0, 0.8]],
+        dtype=np.float32,
+    )
+
+    identical_metrics = steering_vendi_metrics(
+        identical,
+        ids,
+        prefix="policy",
+        sequence_length=2,
+        stride=1,
+        max_windows=16,
+        seed=3,
+        rbf_sigma=0.0,
+    )
+    diverse_metrics = steering_vendi_metrics(
+        diverse,
+        ids,
+        prefix="policy",
+        sequence_length=2,
+        stride=1,
+        max_windows=16,
+        seed=3,
+        rbf_sigma=0.0,
+    )
+
+    assert identical_metrics["vendi/policy_steering"] == pytest.approx(1.0, abs=1e-6)
+    assert diverse_metrics["vendi/policy_steering"] > identical_metrics["vendi/policy_steering"]
+
+
+def test_steering_windows_keep_ids_aligned_after_nonfinite_filtering():
+    actions = np.asarray(
+        [[0.0, -0.2], [0.0, np.nan], [0.0, -0.1], [0.0, 0.2]],
+        dtype=np.float32,
+    )
+    ids = np.asarray([7, 7, 7, 7], dtype=np.int64)
+
+    windows, last_indices, window_indices = steering_windows(
+        actions,
+        ids,
+        sequence_length=2,
+        stride=1,
+        return_window_indices=True,
+    )
+
+    assert windows.shape == (2, 2, 1)
+    np.testing.assert_allclose(windows[:, :, 0], [[-0.2, -0.1], [-0.1, 0.2]])
+    np.testing.assert_array_equal(last_indices, [2, 3])
+    np.testing.assert_array_equal(window_indices, [[0, 2], [2, 3]])
+
+
+def test_steering_windows_accept_column_trajectory_ids():
+    actions = np.asarray(
+        [[0.0, -0.2], [0.0, -0.1], [0.0, 0.2], [0.0, 0.3]],
+        dtype=np.float32,
+    )
+    ids = np.asarray([[7], [7], [8], [8]], dtype=np.int64)
+
+    windows, last_indices = steering_windows(
+        actions,
+        ids,
+        sequence_length=2,
+        stride=1,
+    )
+
+    assert windows.shape == (2, 2, 1)
+    np.testing.assert_allclose(windows[:, :, 0], [[-0.2, -0.1], [0.2, 0.3]])
+    np.testing.assert_array_equal(last_indices, [1, 3])
+
+
+def test_steering_mmd_is_zero_for_identical_and_positive_for_separated():
+    left = np.asarray([[0.0, -0.2], [0.0, 0.0], [0.0, 0.2]], dtype=np.float32)
+    same = left.copy()
+    shifted = np.asarray([[0.0, 0.6], [0.0, 0.7], [0.0, 0.8]], dtype=np.float32)
+
+    assert steering_mmd_rbf(left, same, max_samples=16, seed=5) == pytest.approx(0.0, abs=1e-7)
+    assert steering_mmd_rbf(left, shifted, max_samples=16, seed=5) > 0.0
+
+
+def test_steering_mmd_is_zero_for_identical_inputs_with_subsampling():
+    rng = np.random.default_rng(13)
+    actions = np.column_stack(
+        [
+            np.zeros(5000, dtype=np.float32),
+            rng.uniform(-1.0, 1.0, 5000).astype(np.float32),
+        ]
+    )
+
+    assert steering_mmd_rbf(actions, actions.copy(), max_samples=128, seed=5) == pytest.approx(
+        0.0,
+        abs=1e-7,
+    )
+
+
+def test_steering_mmd_bandwidth_matches_explicit_pairwise_median():
+    left = np.asarray([-0.5, -0.1, 0.2], dtype=np.float32)
+    right = np.asarray([0.4, 0.9], dtype=np.float32)
+    values = np.sort(np.concatenate([left, right]).astype(np.float64))
+    diffs = np.abs(values[:, None] - values[None, :])
+    positive = diffs[np.triu_indices(values.size, k=1)]
+    expected = float(np.median(positive[positive > 1.0e-12]))
+
+    assert steering_diag_mod._median_pairwise_bandwidth(left, right) == pytest.approx(expected, abs=1e-6)
+
+
+def test_steering_mmd_bandwidth_handles_duplicate_values():
+    left = np.asarray([-0.1, -0.1, 0.2], dtype=np.float32)
+    right = np.asarray([0.2, 0.5], dtype=np.float32)
+    values = np.sort(np.concatenate([left, right]).astype(np.float64))
+    diffs = np.abs(values[:, None] - values[None, :])
+    positive = diffs[np.triu_indices(values.size, k=1)]
+    expected = float(np.median(positive[positive > 1.0e-12]))
+
+    assert steering_diag_mod._median_pairwise_bandwidth(left, right) == pytest.approx(expected, abs=1e-6)
+
+
+def test_steering_mmd_chunked_kernel_mean_matches_dense(monkeypatch):
+    left = np.linspace(-0.5, 0.5, 9, dtype=np.float32)
+    right = np.linspace(-0.25, 0.75, 7, dtype=np.float32)
+    sigma = 0.3
+    dense = np.exp(
+        -((left.astype(np.float64)[:, None] - right.astype(np.float64)[None, :]) ** 2)
+        / (2.0 * sigma * sigma)
+    ).mean()
+
+    monkeypatch.setattr(steering_diag_mod, "_RBF_KERNEL_MAX_PAIRS", 5)
+
+    assert steering_diag_mod._rbf_kernel_mean(left, right, sigma) == pytest.approx(float(dense), abs=1e-12)
+
+
+def test_safe_steering_vendi_uses_only_zero_penalty_windows():
+    actions = np.asarray(
+        [
+            [0.0, -0.5],
+            [0.0, -0.5],
+            [0.0, 0.0],
+            [0.0, 0.8],
+            [0.0, 0.8],
+        ],
+        dtype=np.float32,
+    )
+    ids = np.asarray([1, 1, 1, 1, 1], dtype=np.int64)
+    penalties = np.asarray([0.0, 0.0, -2.0, 0.0, 0.0], dtype=np.float32)
+
+    metrics = policy_safe_steering_vendi_metrics(
+        actions,
+        ids,
+        penalties,
+        prefix="policy",
+        sequence_length=2,
+        stride=1,
+        max_windows=16,
+        seed=7,
+        rbf_sigma=0.0,
+    )
+
+    assert metrics["vendi/policy_steering_safe_windows"] == pytest.approx(2.0)
+    assert metrics["vendi/policy_steering_safe_fraction"] == pytest.approx(0.5)
+    assert metrics["vendi/policy_steering_safe"] > 1.0
+
+
+def test_safe_policy_steering_actions_use_zero_penalty_windows():
+    actions = np.asarray(
+        [
+            [0.0, -0.7],
+            [0.0, -0.6],
+            [0.0, 0.0],
+            [0.0, 0.6],
+            [0.0, 0.7],
+        ],
+        dtype=np.float32,
+    )
+    ids = np.asarray([1, 1, 1, 1, 1], dtype=np.int64)
+    penalties = np.asarray([0.0, 0.0, -2.0, 0.0, 0.0], dtype=np.float32)
+
+    safe_actions = safe_policy_steering_actions(
+        actions,
+        ids,
+        penalties,
+        sequence_length=2,
+        stride=1,
+    )
+
+    np.testing.assert_allclose(safe_actions[:, 1], [-0.7, -0.6, 0.6, 0.7])
+
+
+def test_steering_safe_diagnostics_respect_vendi_safe_only_gate():
+    source = (Path(__file__).resolve().parents[1] / "scripts_gail/train_simple_ps_gail.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+
+    def node_text(node) -> str:
+        return ast.unparse(node)
+
+    matching_ifs = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and "vendi_safe_only" in node_text(node.test)
+        and "policy_safe_steering_vendi_metrics" in node_text(node)
+        and "mmd/steering_policy_safe_vs_expert" in node_text(node)
+    ]
+
+    assert matching_ifs
 
 
 def test_refresh_rollout_rewards_can_use_dense_sequence_assignment():
@@ -2166,6 +2538,98 @@ def test_airl_parse_exposes_separate_log_prob_batch_size(monkeypatch):
     assert airl_log_prob_batch_size == 128
 
 
+def _parser_flag_set(*, airl: bool = False) -> set[str]:
+    flags = {
+        "--" + field.name.replace("_", "-")
+        for field in fields(PSGAILConfig)
+    }
+    for field in fields(PSGAILConfig):
+        if isinstance(getattr(PSGAILConfig(), field.name), bool):
+            flags.add("--no-" + field.name.replace("_", "-"))
+    if airl:
+        flags.update({"--reward-batch-size", "--airl-log-prob-batch-size"})
+    return flags
+
+
+def _python_flags_from_slurm_script(script: Path, train_target_pattern: str) -> set[str]:
+    text = script.read_text(encoding="utf-8")
+    match = re.search(
+        rf"python\s+\"{train_target_pattern}\"\s+\\(?P<body>.*?)(?:\n\s*(?:if|echo|$))",
+        text,
+        flags=re.DOTALL,
+    )
+    assert match is not None, f"Could not find training invocation in {script}"
+    literal_flags = set(re.findall(r"(?<![\w-])--[a-z0-9][a-z0-9-]*", match.group("body")))
+    arg_variable_flags = set(
+        re.findall(r'\b[A-Z0-9_]*ARG="(--(?:no-)?[a-z0-9][a-z0-9-]*)"', text)
+    )
+    return literal_flags | arg_variable_flags
+
+
+def test_primary_slurm_scripts_only_pass_known_training_flags():
+    root = Path(__file__).resolve().parents[1]
+    cases = [
+        (
+            root / "slurum/script_pretrain/train_gail_continuous_gpu_32c_stage1_50veh.bash",
+            r"\$\{REPODIR\}/scripts_gail/train_simple_ps_gail\.py",
+            _parser_flag_set(),
+        ),
+        (
+            root / "slurum/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
+            r"\$\{REPODIR\}/scripts_gail/train_simple_ps_gail\.py",
+            _parser_flag_set(),
+        ),
+        (
+            root / "slurum/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash",
+            r"\$\{AIRL_TRAIN_SCRIPT\}",
+            _parser_flag_set(airl=True),
+        ),
+        (
+            root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
+            r"\$\{AIRL_TRAIN_SCRIPT\}",
+            _parser_flag_set(airl=True),
+        ),
+    ]
+
+    for script, train_target_pattern, known_flags in cases:
+        unknown_flags = sorted(
+            flag
+            for flag in _python_flags_from_slurm_script(script, train_target_pattern)
+            if flag not in known_flags
+        )
+        assert unknown_flags == [], f"{script.name} passes unknown flags: {unknown_flags}"
+
+
+def test_gail_methodology_doc_uses_stable_code_anchors():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "docs/gail_methodology_and_implementation.md").read_text(encoding="utf-8")
+
+    assert re.search(r"`[^`]+\.py:\d+`", text) is None
+    for anchor in [
+        "load_expert_transition_data()",
+        "action_conditioned_features()",
+        "select_hard_discriminator_examples()",
+        "shape_adversarial_rewards()",
+        "evaluate_policy_matched_trajectories()",
+        "scripts_gail/ps_gail/steering_diagnostics.py",
+    ]:
+        assert anchor in text
+
+
+def test_expert_dataset_doc_describes_ngsim_continuous_action_contract():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "docs/README_expert_dataset.md").read_text(encoding="utf-8")
+
+    for phrase in [
+        "[acceleration_norm, steering_norm]",
+        "`acceleration_norm=-1` maps to `-10 m/s^2`",
+        "`acceleration_norm=1` maps to `10 m/s^2`",
+        "`[-pi/4, pi/4]` radians",
+        "normalized continuous actions outside `[-1, 1]`",
+    ]:
+        assert phrase in text
+
+
 def test_paper_slurm_scripts_keep_scene_and_expert_budget_explicit():
     root = Path(__file__).resolve().parents[1]
     scripts = [
@@ -2216,7 +2680,7 @@ def test_paper_airl_slurm_scripts_default_to_gradual_vehicle_schedules():
     assert 'INITIAL_CONTROLLED_VEHICLES="${INITIAL_CONTROLLED_VEHICLES:-50}"' in airl_stage2
     assert (
         'CONTROLLED_VEHICLE_SCHEDULE_GRADUAL="${CONTROLLED_VEHICLE_SCHEDULE_GRADUAL:-'
-        '0:50:50:60;50:100:60:75;100:150:75:90;150:200:90:100}"'
+        '0:40:50:70;40:80:70:90;80:100:90:100;100:200:100:100}"'
     ) in airl_stage2
     assert 'CONTROLLED_VEHICLE_SCHEDULE_SUDDEN="${CONTROLLED_VEHICLE_SCHEDULE_SUDDEN:-0:200:100:100}"' in airl_stage2
 
@@ -2248,7 +2712,7 @@ def test_paper_finetune_slurm_scripts_auto_resolve_ckpt_folder():
     assert '$(basename "${RESUME_CHECKPOINT}")" != "final.pt"' not in airl
 
 
-def test_paper_slurm_scripts_use_fixed_low_entropy():
+def test_paper_slurm_scripts_use_low_nonzero_entropy():
     root = Path(__file__).resolve().parents[1]
     airl_stage1 = (
         root / "slurum/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash"
@@ -2266,17 +2730,114 @@ def test_paper_slurm_scripts_use_fixed_low_entropy():
     assert 'WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.001}"' in airl_stage1
     assert 'ENTROPY_COEF="${ENTROPY_COEF:-0.001}"' in airl_stage1
     assert 'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"' in airl_stage1
-    assert 'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"' in airl_stage2
+    assert (
+        'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-'
+        '0:50:0.001:0.0005;50:100:0.0005:0.0001;100:200:0.0001:0.0001}"'
+    ) in airl_stage2
     assert 'WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.0015}"' in gail_stage1
     assert 'ENTROPY_COEF="${ENTROPY_COEF:-0.0015}"' in gail_stage1
     assert 'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"' in gail_stage1
-    assert 'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"' in gail_stage2
+    assert 'WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.001}"' in gail_stage2
+    assert 'ENTROPY_COEF="${ENTROPY_COEF:-0.001}"' in gail_stage2
+    assert (
+        'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-'
+        '0:50:0.001:0.0005;50:100:0.0005:0.0001;100:200:0.0001:0.0001}"'
+    ) in gail_stage2
     for text in (airl_stage1, airl_stage2, gail_stage1, gail_stage2):
         assert "0:100:0.04:0.015" not in text
         assert "0:600:0.0005:0.001" not in text
         assert "0:200:0.0005:0.001" not in text
         assert "0:600:0.0008:0.0015" not in text
         assert "0:200:0.0008:0.0015" not in text
+
+
+def test_finetune_schedule_reaches_full_load_by_round_100_and_holds():
+    cfg = PSGAILConfig(
+        controlled_vehicle_curriculum=True,
+        initial_controlled_vehicles=50,
+        final_controlled_vehicles=100,
+        controlled_vehicle_schedule="0:40:50:70;40:80:70:90;80:100:90:100;100:200:100:100",
+        rollout_target_agent_steps=0,
+        initial_rollout_target_agent_steps=10000,
+        final_rollout_target_agent_steps=40000,
+        rollout_target_agent_steps_schedule=(
+            "0:40:10000:18000;40:80:18000:30000;"
+            "80:100:30000:40000;100:200:40000:40000"
+        ),
+        gamma_schedule="0:50:0.95:0.97;50:100:0.97:0.99;100:200:0.99:0.99",
+        entropy_coef=0.001,
+        warmup_entropy_coef=-1.0,
+        entropy_coef_schedule=(
+            "0:50:0.001:0.0005;50:100:0.0005:0.0001;"
+            "100:200:0.0001:0.0001"
+        ),
+    )
+
+    round_100 = ps_gail_config_for_round(cfg, 100)
+    round_200 = ps_gail_config_for_round(cfg, 200)
+
+    assert round_100.percentage_controlled_vehicles == pytest.approx(100.0)
+    assert round_100.rollout_target_agent_steps == 40000
+    assert round_100.gamma == pytest.approx(0.99)
+    assert round_100.entropy_coef == pytest.approx(0.0001)
+    assert round_200.percentage_controlled_vehicles == pytest.approx(100.0)
+    assert round_200.rollout_target_agent_steps == 40000
+    assert round_200.gamma == pytest.approx(0.99)
+    assert round_200.entropy_coef == pytest.approx(0.0001)
+
+
+def test_finetune_slurm_scripts_use_200_round_stage2_schedules():
+    root = Path(__file__).resolve().parents[1]
+    scripts = [
+        root / "slurum/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
+        root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
+    ]
+    expected_vehicle_schedule = (
+        "0:40:50:70;40:80:70:90;80:100:90:100;100:200:100:100"
+    )
+    expected_rollout_schedule = (
+        "0:40:10000:18000;40:80:18000:30000;"
+        "80:100:30000:40000;100:200:40000:40000"
+    )
+    expected_gamma_schedule = "0:50:0.95:0.97;50:100:0.97:0.99;100:200:0.99:0.99"
+
+    for script in scripts:
+        text = script.read_text(encoding="utf-8")
+        assert expected_vehicle_schedule in text
+        assert expected_rollout_schedule in text
+        assert expected_gamma_schedule in text
+        assert "0:500:10000:10000" not in text
+        assert "600:800:0.99:0.99" not in text
+
+
+def test_finetune_slurm_scripts_keep_stage2_safety_penalties_consistent():
+    root = Path(__file__).resolve().parents[1]
+    scripts = [
+        root / "slurum/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
+        root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
+    ]
+
+    for script in scripts:
+        text = script.read_text(encoding="utf-8")
+        assert 'COLLISION_PENALTY="${COLLISION_PENALTY:-2.0}"' in text
+        assert 'OFFROAD_PENALTY="${OFFROAD_PENALTY:-2.0}"' in text
+        assert 'COLLISION_PENALTY="${COLLISION_PENALTY:-4.0}"' not in text
+        assert 'OFFROAD_PENALTY="${OFFROAD_PENALTY:-4.0}"' not in text
+
+
+def test_full_training_submitters_export_stage2_safety_penalties():
+    root = Path(__file__).resolve().parents[1]
+    scripts = [
+        root / "slurum/script_full_training/submit_gail_pretrain_finetune_5day.bash",
+        root / "slurum/script_full_training/submit_airl_pretrain_finetune_5day.bash",
+    ]
+
+    for script in scripts:
+        text = script.read_text(encoding="utf-8")
+        assert 'FINETUNE_COLLISION_PENALTY="${FINETUNE_COLLISION_PENALTY:-2.0}"' in text
+        assert 'FINETUNE_OFFROAD_PENALTY="${FINETUNE_OFFROAD_PENALTY:-2.0}"' in text
+        assert "COLLISION_PENALTY=${FINETUNE_COLLISION_PENALTY}" in text
+        assert "OFFROAD_PENALTY=${FINETUNE_OFFROAD_PENALTY}" in text
 
 
 def test_weighted_validation_score_prefers_lower_rmse_and_safety_rates():
