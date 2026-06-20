@@ -27,7 +27,7 @@ from typing import Any
 import numpy as np
 
 from highway_env.envs.common.action import Action
-from highway_env.ngsim_utils.core.constants import MAX_ACCEL, MAX_STEER
+from highway_env.ngsim_utils.core.constants import MAX_STEER, normalize_acceleration
 from highway_env.ngsim_utils.vehicles.ego import EgoVehicle
 from highway_env.ngsim_utils.expert.trajectory_to_action import map_discrete_expert_action
 
@@ -659,7 +659,7 @@ class NGSimExpertMixin:
         expert_action_idx: int | None = None
 
         if self.control_mode == "continuous":
-            accel_norm = float(np.clip(accel_cmd / MAX_ACCEL, -1.0, 1.0))
+            accel_norm = float(np.clip(normalize_acceleration(accel_cmd), -1.0, 1.0))
             steer_norm = float(np.clip(steer_cmd / MAX_STEER, -1.0, 1.0))
             expert_action = np.array([accel_norm, steer_norm], dtype=np.float32)
             action: Action = expert_action

@@ -35,7 +35,11 @@ from highway_env.imitation.expert_dataset import (  # noqa: E402
     build_env_config,
     register_ngsim_env,
 )
-from highway_env.ngsim_utils.core.constants import MAX_ACCEL, MAX_STEER  # noqa: E402
+from highway_env.ngsim_utils.core.constants import (  # noqa: E402
+    MAX_STEER,
+    denormalize_acceleration,
+    normalize_acceleration,
+)
 from highway_env.ngsim_utils.data.ego_trajectory import load_ego_trajectory  # noqa: E402
 from highway_env.ngsim_utils.data.prebuilt import load_prebuilt_data  # noqa: E402
 from highway_env.ngsim_utils.data.episode_selection import resolve_num_ego_vehicles  # noqa: E402
@@ -377,7 +381,7 @@ def _coerce_continuous_env_action(action: Any) -> np.ndarray:
     if action is None:
         raise ValueError("Continuous expert action is missing for an active controlled vehicle.")
     if isinstance(action, dict):
-        accel_norm = float(action.get("acceleration", 0.0)) / float(MAX_ACCEL)
+        accel_norm = normalize_acceleration(float(action.get("acceleration", 0.0)))
         steer_norm = float(action.get("steering", 0.0)) / float(MAX_STEER)
         arr = np.asarray([accel_norm, steer_norm], dtype=np.float32)
     else:
@@ -397,7 +401,7 @@ def continuous_env_action_to_steering_acceleration(action: np.ndarray) -> np.nda
     action = _coerce_continuous_env_action(action)
     accel_norm, steer_norm = float(action[0]), float(action[1])
     return np.asarray(
-        [steer_norm * float(MAX_STEER), accel_norm * float(MAX_ACCEL)],
+        [steer_norm * float(MAX_STEER), denormalize_acceleration(accel_norm)],
         dtype=np.float32,
     )
 

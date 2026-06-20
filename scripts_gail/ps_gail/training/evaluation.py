@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical, Normal
 
 from highway_env.imitation.expert_dataset import ENV_ID, build_env_config, register_ngsim_env
-from highway_env.ngsim_utils.core.constants import MAX_ACCEL
+from highway_env.ngsim_utils.core.constants import denormalize_acceleration
 from highway_env.ngsim_utils.data.episode_selection import resolve_num_ego_vehicles
 from highway_env.ngsim_utils.data.prebuilt import load_prebuilt_data
 
@@ -382,7 +382,7 @@ def _physical_accel_from_action(action_tuple: tuple[object, ...], cfg: PSGAILCon
     action = np.asarray(action_tuple[0], dtype=np.float32).reshape(-1)
     if action.size < 1:
         return float("nan")
-    return float(np.clip(float(action[0]), -1.0, 1.0) * float(MAX_ACCEL))
+    return denormalize_acceleration(np.clip(float(action[0]), -1.0, 1.0))
 
 def _physical_accels_from_actions(action_tuple: tuple[object, ...], cfg: PSGAILConfig) -> np.ndarray:
     if not _is_continuous(cfg) or not action_tuple:
@@ -392,7 +392,7 @@ def _physical_accels_from_actions(action_tuple: tuple[object, ...], cfg: PSGAILC
         action_arr = np.asarray(action, dtype=np.float32).reshape(-1)
         if action_arr.size < 1:
             continue
-        accels.append(float(np.clip(float(action_arr[0]), -1.0, 1.0) * float(MAX_ACCEL)))
+        accels.append(denormalize_acceleration(np.clip(float(action_arr[0]), -1.0, 1.0)))
     return np.asarray(accels, dtype=np.float32)
 
 def _matched_eval_metrics(

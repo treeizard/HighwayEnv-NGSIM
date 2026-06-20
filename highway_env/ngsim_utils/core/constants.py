@@ -27,8 +27,28 @@ FEET_PER_METER = 3.281
 METERS_PER_FOOT = 1.0 / FEET_PER_METER
 
 # Vehicle/control limits
-MAX_ACCEL = 5.0
+ACCELERATION_RANGE = (-10.0, 10.0)
+MIN_ACCEL = ACCELERATION_RANGE[0]
+MAX_ACCEL = ACCELERATION_RANGE[1]
 MAX_STEER = np.pi / 4
+
+
+def normalize_acceleration(acceleration: float) -> float:
+    """Map physical acceleration to the normalized env action interval."""
+    low, high = ACCELERATION_RANGE
+    acceleration = float(acceleration)
+    if acceleration >= 0.0:
+        return float(acceleration / high) if high > 0.0 else 0.0
+    return float(acceleration / abs(low)) if low < 0.0 else 0.0
+
+
+def denormalize_acceleration(action: float) -> float:
+    """Map normalized env acceleration action to physical m/s^2."""
+    low, high = ACCELERATION_RANGE
+    action = float(action)
+    if action >= 0.0:
+        return float(action * high)
+    return float(action * abs(low))
 
 # IDM / MOBIL parameter placeholders by dataset/region.
 # These are configuration placeholders so the environment can cleanly select

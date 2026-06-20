@@ -98,6 +98,7 @@ class ContinuousAction(ActionType):
         lateral: bool = True,
         dynamical: bool = False,
         clip: bool = True,
+        zero_centered_acceleration: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -120,6 +121,7 @@ class ContinuousAction(ActionType):
         self.speed_range = speed_range
         self.lateral = lateral
         self.longitudinal = longitudinal
+        self.zero_centered_acceleration = bool(zero_centered_acceleration)
         if not self.lateral and not self.longitudinal:
             raise ValueError(
                 "Either longitudinal and/or lateral control must be enabled"
@@ -128,6 +130,13 @@ class ContinuousAction(ActionType):
         self.clip = clip
         self.size = 2 if self.lateral and self.longitudinal else 1
         self.last_action = np.zeros(self.size)
+
+    def _acceleration_from_action(self, action_value: float) -> float:
+        if self.zero_centered_acceleration:
+            low, high = (float(v) for v in self.acceleration_range)
+            if low < 0.0 < high:
+                return float(action_value * (high if action_value >= 0.0 else abs(low)))
+        return utils.lmap(action_value, [-1, 1], self.acceleration_range)
 
     def space(self) -> spaces.Box:
         return spaces.Box(-1.0, 1.0, shape=(self.size,), dtype=np.float32)
@@ -146,12 +155,12 @@ class ContinuousAction(ActionType):
             ) = self.speed_range
         if self.longitudinal and self.lateral:
             return {
-                "acceleration": utils.lmap(action[0], [-1, 1], self.acceleration_range),
+                "acceleration": self._acceleration_from_action(float(action[0])),
                 "steering": utils.lmap(action[1], [-1, 1], self.steering_range),
             }
         elif self.longitudinal:
             return {
-                "acceleration": utils.lmap(action[0], [-1, 1], self.acceleration_range),
+                "acceleration": self._acceleration_from_action(float(action[0])),
                 "steering": 0,
             }
         elif self.lateral:

@@ -59,6 +59,7 @@ from highway_env.ngsim_utils.vehicles.replay import (
 )
 from highway_env.ngsim_utils.road.gen_road import create_ngsim_101_road, create_japanese_road
 from highway_env.ngsim_utils.core.constants import (
+    ACCELERATION_RANGE,
     FEET_PER_METER,
     MAX_STEER,
 )
@@ -114,7 +115,11 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                     "normalize": True,
                 },
                 # Will be normalized from action_mode inside __init__
-                "action": {"type": "ContinuousAction"},
+                "action": {
+                    "type": "ContinuousAction",
+                    "acceleration_range": list(ACCELERATION_RANGE),
+                    "zero_centered_acceleration": True,
+                },
                 "action_mode": "discrete",  # "continuous", "discrete", or "teleport"
                 "action_config": {
                     "lateral_offset_step": 0.10,

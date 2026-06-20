@@ -24,6 +24,7 @@ import math
 from copy import deepcopy
 
 from highway_env.ngsim_utils.core.constants import (
+    ACCELERATION_RANGE,
     IDM_PARAMETER_PRESETS,
     SCENE_IDM_PARAMETER_KEY,
 )
@@ -121,6 +122,12 @@ def normalize_action_mode(cfg: dict, raw_config: dict | None = None) -> str:
                 "'ContinuousAction' or 'DiscreteSteerMetaAction'."
             )
         cfg["action"] = deep_update(cfg_action_cfg, raw_action_cfg)
+        if control_mode == "continuous":
+            cfg["action"].setdefault("action_config", {})
+            cfg["action"]["action_config"].setdefault(
+                "acceleration_range", list(ACCELERATION_RANGE)
+            )
+            cfg["action"]["action_config"].setdefault("zero_centered_acceleration", True)
         return control_mode
 
     if "action_mode" in raw_config:
@@ -142,4 +149,7 @@ def normalize_action_mode(cfg: dict, raw_config: dict | None = None) -> str:
     if control_mode not in action_types:
         raise ValueError(f"Unknown action_mode={control_mode!r}")
     cfg["action"] = {"type": action_types[control_mode]}
+    if control_mode == "continuous":
+        cfg["action"]["acceleration_range"] = list(ACCELERATION_RANGE)
+        cfg["action"]["zero_centered_acceleration"] = True
     return control_mode

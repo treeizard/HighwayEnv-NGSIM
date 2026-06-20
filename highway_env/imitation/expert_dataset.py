@@ -29,6 +29,7 @@ import torch
 from gymnasium.envs.registration import register, registry
 from torch.utils.data import Dataset
 
+from highway_env.ngsim_utils.core.constants import ACCELERATION_RANGE
 from highway_env.ngsim_utils.data.episode_selection import resolve_num_ego_vehicles
 
 
@@ -122,10 +123,14 @@ def build_env_config(
         raise ValueError(f"Unsupported action_mode={action_mode!r}")
 
     obs_cfg = dict(observation_config or default_observation_config())
-    action_type = (
-        "ContinuousAction"
+    action_config = (
+        {
+            "type": "ContinuousAction",
+            "acceleration_range": list(ACCELERATION_RANGE),
+            "zero_centered_acceleration": True,
+        }
         if action_mode == "continuous"
-        else "DiscreteSteerMetaAction"
+        else {"type": "DiscreteSteerMetaAction"}
     )
 
     if control_all_vehicles or float(percentage_controlled_vehicles) > 0.0:
@@ -135,11 +140,11 @@ def build_env_config(
         }
         action = {
             "type": "MultiAgentAction",
-            "action_config": {"type": action_type},
+            "action_config": action_config,
         }
     else:
         observation = obs_cfg
-        action = {"type": action_type}
+        action = action_config
 
     return {
         "scene": str(scene),
