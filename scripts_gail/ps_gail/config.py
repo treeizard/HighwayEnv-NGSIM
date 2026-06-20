@@ -177,6 +177,11 @@ class PSGAILConfig:
     sequence_stride: int = 1
     sequence_reward_coef: float = 1.0
     sequence_reward_assignment: str = "last"
+    enable_vendi_diagnostics: bool = False
+    vendi_max_windows: int = 2048
+    vendi_rbf_sigma: float = 0.0
+    vendi_safe_only: bool = True
+    vendi_seed: int = 0
     entropy_coef: float = 0.015
     entropy_coef_schedule: str = ""
     value_coef: float = 0.5

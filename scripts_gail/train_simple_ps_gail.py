@@ -62,6 +62,7 @@ from scripts_gail.ps_gail.validation import (
     matched_validation_summary,
     scored_validation_metrics,
 )
+from scripts_gail.ps_gail.vendi import safe_sequence_window_mask, vendi_score
 
 
 def env_signature(cfg: PSGAILConfig) -> tuple[object, ...]:
@@ -169,6 +170,102 @@ def mean_bonus_to_primary_ratio(bonuses: np.ndarray, primary_rewards: np.ndarray
         return 0.0
     scale = np.maximum(np.abs(primary), mean_abs_primary)
     return float(np.mean(np.abs(bonus_arr) / scale))
+
+
+def _finite_corr(a: np.ndarray, b: np.ndarray) -> float:
+    left = np.asarray(a, dtype=np.float64).reshape(-1)
+    right = np.asarray(b, dtype=np.float64).reshape(-1)
+    if left.shape != right.shape or left.size < 2:
+        return float("nan")
+    mask = np.isfinite(left) & np.isfinite(right)
+    if int(mask.sum()) < 2:
+        return float("nan")
+    left = left[mask]
+    right = right[mask]
+    if float(left.std()) <= 1.0e-12 or float(right.std()) <= 1.0e-12:
+        return float("nan")
+    return float(np.corrcoef(left, right)[0, 1])
+
+
+def sequence_interaction_metrics(rollout) -> dict[str, float]:
+    assigned = np.asarray(rollout.sequence_rewards_assigned, dtype=np.float32).reshape(-1)
+    counts = np.asarray(rollout.sequence_window_counts, dtype=np.float32).reshape(-1)
+    window_rewards = np.asarray(rollout.sequence_rewards_raw, dtype=np.float32).reshape(-1)
+    if assigned.shape[0] != int(rollout.num_agent_steps):
+        assigned = np.zeros(int(rollout.num_agent_steps), dtype=np.float32)
+    if counts.shape[0] != int(rollout.num_agent_steps):
+        counts = np.zeros(int(rollout.num_agent_steps), dtype=np.float32)
+    covered = counts > 0.0
+    return {
+        "sequence/reward_window_mean": float(window_rewards.mean()) if window_rewards.size else 0.0,
+        "sequence/reward_window_std": float(window_rewards.std()) if window_rewards.size else 0.0,
+        "sequence/reward_assigned_mean": float(assigned.mean()) if assigned.size else 0.0,
+        "sequence/reward_assigned_std": float(assigned.std()) if assigned.size else 0.0,
+        "sequence/windows_per_transition_mean": float(counts.mean()) if counts.size else 0.0,
+        "sequence/windows_per_transition_std": float(counts.std()) if counts.size else 0.0,
+        "sequence/windows_per_covered_transition_mean": (
+            float(counts[covered].mean()) if bool(covered.any()) else 0.0
+        ),
+        "sequence/covered_transition_fraction": float(covered.mean()) if covered.size else 0.0,
+        "sequence/reward_advantage_corr": _finite_corr(assigned, rollout.advantages),
+        "sequence/reward_env_penalty_corr": _finite_corr(assigned, rollout.env_penalties),
+        "sequence/reward_window_count_corr": _finite_corr(assigned, counts),
+    }
+
+
+def expert_sequence_vendi_metrics(
+    expert_sequence_features: np.ndarray | None,
+    cfg: PSGAILConfig,
+) -> dict[str, float]:
+    if not bool(getattr(cfg, "enable_vendi_diagnostics", False)) or expert_sequence_features is None:
+        return {}
+    return vendi_score(
+        expert_sequence_features,
+        max_windows=int(cfg.vendi_max_windows),
+        seed=int(cfg.vendi_seed),
+        rbf_sigma=float(cfg.vendi_rbf_sigma),
+    ).as_dict("vendi/expert_sequence")
+
+
+def policy_sequence_vendi_metrics(
+    rollout,
+    cfg: PSGAILConfig,
+    *,
+    expert_log_vendi: float | None,
+    round_idx: int,
+) -> dict[str, float]:
+    if not bool(getattr(cfg, "enable_vendi_diagnostics", False)):
+        return {}
+    metrics: dict[str, float] = {}
+    policy_metrics = vendi_score(
+        rollout.sequence_features,
+        max_windows=int(cfg.vendi_max_windows),
+        seed=int(cfg.vendi_seed) + int(round_idx),
+        rbf_sigma=float(cfg.vendi_rbf_sigma),
+    )
+    metrics.update(policy_metrics.as_dict("vendi/policy_sequence"))
+    if expert_log_vendi is not None and np.isfinite(float(expert_log_vendi)):
+        metrics["vendi/sequence_log_gap"] = float(policy_metrics.log_vendi - float(expert_log_vendi))
+
+    if bool(getattr(cfg, "vendi_safe_only", True)) and rollout.sequence_transition_indices.size:
+        safe_mask = safe_sequence_window_mask(
+            rollout.sequence_transition_indices,
+            rollout.env_penalties,
+        )
+        if safe_mask.shape[0] == rollout.sequence_features.shape[0]:
+            safe_metrics = vendi_score(
+                rollout.sequence_features[safe_mask],
+                max_windows=int(cfg.vendi_max_windows),
+                seed=int(cfg.vendi_seed) + int(round_idx) + 17,
+                rbf_sigma=float(cfg.vendi_rbf_sigma),
+            )
+            metrics.update(safe_metrics.as_dict("vendi/policy_sequence_safe"))
+            metrics["vendi/policy_sequence_safe_fraction"] = (
+                float(safe_mask.mean()) if safe_mask.size else 0.0
+            )
+        else:
+            metrics["vendi/policy_sequence_safe_available"] = 0.0
+    return metrics
 
 
 def checkpoint_expert_metadata(metadata: dict[str, object]) -> dict[str, object]:
@@ -834,6 +931,16 @@ def main() -> None:
                 f"{os.path.abspath(resume_checkpoint)} "
                 f"round={checkpoint.get('round', 'unknown')}"
             )
+        discriminator_expert_features_train = apply_optional_discriminator_normalizer(
+            discriminator_expert_features,
+            primary_discriminator_normalizer,
+            cfg,
+        )
+        expert_vendi_metrics = expert_sequence_vendi_metrics(
+            discriminator_expert_features_train if sequence_only_discriminator else expert_sequence_features,
+            cfg,
+        )
+        expert_sequence_log_vendi = expert_vendi_metrics.get("vendi/expert_sequence_log")
         expert_scene_features_train = (
             apply_optional_discriminator_normalizer(
                 expert_scene_features,
@@ -937,6 +1044,14 @@ def main() -> None:
                 f"feature_dim={expert_sequence_metadata.get('sequence_feature_dim')} "
                 f"reward_assignment={cfg.sequence_reward_assignment} "
                 f"trajectory_frame={cfg.trajectory_frame}"
+            )
+        if expert_vendi_metrics:
+            print(
+                "vendi_sequence="
+                f"expert={expert_vendi_metrics['vendi/expert_sequence']:.4f} "
+                f"log={expert_vendi_metrics['vendi/expert_sequence_log']:.4f} "
+                f"windows={int(expert_vendi_metrics['vendi/expert_sequence_windows'])} "
+                f"sigma={expert_vendi_metrics['vendi/expert_sequence_sigma']:.4f}"
             )
         if cfg.controlled_vehicle_curriculum:
             print(
@@ -1407,6 +1522,10 @@ def main() -> None:
                 "policy/ratio_mean": policy_stats["ratio_mean"],
                 "policy/ratio_std": policy_stats["ratio_std"],
                 "policy/ppo_micro_batch_size": policy_stats["ppo_micro_batch_size"],
+                "policy/log_std_mean": policy_stats.get("log_std_mean", float("nan")),
+                "policy/action_std_param_mean": policy_stats.get("action_std_param_mean", float("nan")),
+                "policy/log_std_delta": policy_stats.get("log_std_delta", float("nan")),
+                "policy/action_std_param_delta": policy_stats.get("action_std_param_delta", float("nan")),
                 "train/policy_obs_dim": policy_obs_dim,
                 "train/critic_obs_dim": critic_obs_dim,
                 "train/centralized_critic": int(bool(round_cfg.centralized_critic)),
@@ -1476,6 +1595,17 @@ def main() -> None:
                     bool(getattr(round_cfg, "transformer_temporal_module", False))
                 ),
             }
+            if sequence_discriminator is not None:
+                metrics.update(sequence_interaction_metrics(rollout))
+                metrics.update(
+                    policy_sequence_vendi_metrics(
+                        rollout,
+                        round_cfg,
+                        expert_log_vendi=expert_sequence_log_vendi,
+                        round_idx=round_idx,
+                    )
+                )
+                metrics.update(expert_vendi_metrics)
             for stat_key, stat_value in policy_stats.items():
                 if stat_key.startswith("perf/"):
                     metrics[stat_key] = float(stat_value)

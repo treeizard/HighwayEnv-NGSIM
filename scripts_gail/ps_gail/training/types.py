@@ -90,6 +90,9 @@ class RolloutBatch:
     sequence_transition_indices: np.ndarray
     num_env_steps: int
     num_agent_steps: int
+    sequence_rewards_raw: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
+    sequence_rewards_assigned: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
+    sequence_window_counts: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
     vehicle_ids: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.int64))
     policy_step_memories: np.ndarray = field(default_factory=lambda: np.zeros((0, 0, 0), dtype=np.float16))
     challenge_pressures: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))

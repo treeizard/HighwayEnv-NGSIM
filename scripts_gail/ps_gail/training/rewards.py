@@ -283,6 +283,34 @@ def sequence_rewards_to_transition_rewards(
         f"Unsupported sequence_reward_assignment={mode!r}. Expected 'last', 'mean', or 'sum'."
     )
 
+def sequence_window_counts_to_transition_counts(
+    *,
+    num_transitions: int,
+    sequence_last_indices: np.ndarray,
+    sequence_transition_indices: np.ndarray | None = None,
+    assignment: str = "last",
+) -> np.ndarray:
+    num_transitions = max(0, int(num_transitions))
+    counts = np.zeros(num_transitions, dtype=np.float32)
+    if num_transitions == 0:
+        return counts
+    mode = str(assignment).lower()
+    if mode in {"last", "last_step", "terminal"}:
+        for last_idx in np.asarray(sequence_last_indices, dtype=np.int64).reshape(-1):
+            last_idx = int(last_idx)
+            if 0 <= last_idx < num_transitions:
+                counts[last_idx] += 1.0
+        return counts
+    if sequence_transition_indices is None:
+        return counts
+    if mode in {"mean", "average", "dense_mean", "sum", "dense_sum"}:
+        for window_indices in np.asarray(sequence_transition_indices, dtype=np.int64):
+            valid = window_indices[(0 <= window_indices) & (window_indices < num_transitions)]
+            if valid.size:
+                counts[valid] += 1.0
+        return counts
+    return counts.astype(np.float32, copy=False)
+
 def action_conditioned_features(policy_observations: np.ndarray, actions: np.ndarray) -> np.ndarray:
     policy_observations = np.asarray(policy_observations, dtype=np.float32)
     actions = np.asarray(actions, dtype=np.float32)
@@ -363,6 +391,7 @@ __all__ = [
     'player_challenge_bonus',
     'combine_primary_env_challenge_rewards',
     'sequence_rewards_to_transition_rewards',
+    'sequence_window_counts_to_transition_counts',
     'action_conditioned_features',
     'should_normalize_gail_reward',
     'should_apply_gail_reward_clip',

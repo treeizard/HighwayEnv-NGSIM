@@ -64,6 +64,7 @@ from .rewards import (
     player_challenge_payoff,
     player_challenge_pressure_from_metric,
     sequence_rewards_to_transition_rewards,
+    sequence_window_counts_to_transition_counts,
     shape_adversarial_rewards,
 )
 from .types import AgentTransition, RolloutBatch
@@ -252,6 +253,9 @@ def refresh_rollout_rewards(
     sequence_discriminator_normalizer: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> RolloutBatch:
     feature_clip = float(getattr(cfg, "discriminator_feature_clip", 0.0))
+    sequence_rewards_raw = np.zeros(len(rollout.sequence_features), dtype=np.float32)
+    sequence_rewards_assigned = np.zeros(int(rollout.num_agent_steps), dtype=np.float32)
+    sequence_window_counts = np.zeros(int(rollout.num_agent_steps), dtype=np.float32)
     if discriminator is None:
         combined_raw_gail_rewards = np.zeros(int(rollout.num_agent_steps), dtype=np.float32)
     else:
@@ -289,13 +293,21 @@ def refresh_rollout_rewards(
             loss_type=str(getattr(cfg, "discriminator_loss", "bce")),
         )
         sequence_rewards = sequence_rewards * float(cfg.sequence_reward_coef)
-        combined_raw_gail_rewards += sequence_rewards_to_transition_rewards(
+        sequence_rewards_raw = sequence_rewards.astype(np.float32, copy=True)
+        sequence_rewards_assigned = sequence_rewards_to_transition_rewards(
             sequence_rewards,
             num_transitions=len(combined_raw_gail_rewards),
             sequence_last_indices=rollout.sequence_last_indices,
             sequence_transition_indices=rollout.sequence_transition_indices,
             assignment=str(getattr(cfg, "sequence_reward_assignment", "last")),
         )
+        sequence_window_counts = sequence_window_counts_to_transition_counts(
+            num_transitions=len(combined_raw_gail_rewards),
+            sequence_last_indices=rollout.sequence_last_indices,
+            sequence_transition_indices=rollout.sequence_transition_indices,
+            assignment=str(getattr(cfg, "sequence_reward_assignment", "last")),
+        )
+        combined_raw_gail_rewards += sequence_rewards_assigned
     normalized_gail_rewards = shape_adversarial_rewards(combined_raw_gail_rewards, cfg)
     rewards, challenge_bonuses = combine_primary_env_challenge_rewards(
         normalized_gail_rewards,
@@ -335,6 +347,9 @@ def refresh_rollout_rewards(
         sequence_transition_indices=rollout.sequence_transition_indices,
         num_env_steps=rollout.num_env_steps,
         num_agent_steps=rollout.num_agent_steps,
+        sequence_rewards_raw=sequence_rewards_raw,
+        sequence_rewards_assigned=sequence_rewards_assigned,
+        sequence_window_counts=sequence_window_counts,
         vehicle_ids=rollout.vehicle_ids,
         policy_step_memories=rollout.policy_step_memories,
         challenge_pressures=rollout.challenge_pressures,
@@ -744,6 +759,9 @@ def collect_rollout(
         sequence_transition_indices=sequence_transition_indices,
         num_env_steps=env_steps,
         num_agent_steps=len(transitions),
+        sequence_rewards_raw=np.zeros(len(sequence_features), dtype=np.float32),
+        sequence_rewards_assigned=np.zeros(len(transitions), dtype=np.float32),
+        sequence_window_counts=np.zeros(len(transitions), dtype=np.float32),
         vehicle_ids=rollout_vehicle_ids,
         policy_step_memories=policy_step_memories,
         challenge_pressures=challenge_pressures,
@@ -818,6 +836,23 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
     gail_rewards_normalized = np.concatenate(
         [batch.gail_rewards_normalized for batch in batches], axis=0
     ).astype(np.float32)
+    sequence_rewards_raw = np.concatenate(
+        [batch.sequence_rewards_raw for batch in batches], axis=0
+    ).astype(np.float32)
+    sequence_rewards_assigned = np.concatenate(
+        [
+            _transition_array(batch.sequence_rewards_assigned, batch.num_agent_steps, dtype=np.float32)
+            for batch in batches
+        ],
+        axis=0,
+    ).astype(np.float32)
+    sequence_window_counts = np.concatenate(
+        [
+            _transition_array(batch.sequence_window_counts, batch.num_agent_steps, dtype=np.float32)
+            for batch in batches
+        ],
+        axis=0,
+    ).astype(np.float32)
     env_penalties = np.concatenate([batch.env_penalties for batch in batches], axis=0).astype(
         np.float32
     )
@@ -870,6 +905,9 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
         sequence_transition_indices=np.concatenate(sequence_transition_indices, axis=0).astype(np.int64),
         num_env_steps=sum(batch.num_env_steps for batch in batches),
         num_agent_steps=sum(batch.num_agent_steps for batch in batches),
+        sequence_rewards_raw=sequence_rewards_raw,
+        sequence_rewards_assigned=sequence_rewards_assigned,
+        sequence_window_counts=sequence_window_counts,
         vehicle_ids=np.concatenate(
             [_transition_array(batch.vehicle_ids, batch.num_agent_steps, dtype=np.int64, fill=-1) for batch in batches],
             axis=0,
@@ -1148,6 +1186,16 @@ def subsample_rollout_for_training(
         np.float32,
         copy=False,
     )
+    sequence_rewards_assigned = _transition_array(
+        rollout.sequence_rewards_assigned,
+        rollout.num_agent_steps,
+        dtype=np.float32,
+    )[selected_indices].astype(np.float32, copy=False)
+    sequence_window_counts = _transition_array(
+        rollout.sequence_window_counts,
+        rollout.num_agent_steps,
+        dtype=np.float32,
+    )[selected_indices].astype(np.float32, copy=False)
     return RolloutBatch(
         policy_observations=rollout.policy_observations[selected_indices].astype(np.float32, copy=False),
         next_policy_observations=rollout.next_policy_observations[selected_indices].astype(
@@ -1179,6 +1227,9 @@ def subsample_rollout_for_training(
         sequence_transition_indices=sequence_transition_indices,
         num_env_steps=rollout.num_env_steps,
         num_agent_steps=int(selected_indices.size),
+        sequence_rewards_raw=rollout.sequence_rewards_raw[:0].astype(np.float32, copy=False),
+        sequence_rewards_assigned=sequence_rewards_assigned,
+        sequence_window_counts=sequence_window_counts,
         vehicle_ids=_transition_array(
             rollout.vehicle_ids,
             rollout.num_agent_steps,

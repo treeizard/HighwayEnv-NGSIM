@@ -95,6 +95,7 @@ from scripts_gail.ps_gail.training import evaluation as eval_mod
 from scripts_gail.ps_gail.validation import best_checkpoint_payload
 from scripts_gail.ps_gail.validation import scored_validation_metrics
 from scripts_gail.ps_gail.validation import validation_cost_and_score
+from scripts_gail.ps_gail.vendi import safe_sequence_window_mask, vendi_score
 from scripts_gail.ps_gail.models import (
     SequenceTrajectoryDiscriminator,
     TrajectoryDiscriminator,
@@ -754,6 +755,53 @@ def test_sequence_reward_assignment_mean_densifies_overlapping_windows():
     np.testing.assert_allclose(rewards, [10.0, 15.0, 15.0, 20.0], rtol=1e-6)
 
 
+def test_vendi_score_identical_windows_has_one_effective_mode():
+    windows = np.ones((5, 3, 2), dtype=np.float32)
+    metrics = vendi_score(windows, max_windows=16, seed=7)
+    assert metrics.vendi == pytest.approx(1.0, abs=1e-6)
+    assert metrics.log_vendi == pytest.approx(0.0, abs=1e-6)
+    assert metrics.n_windows == 5
+
+
+def test_vendi_score_increases_for_dissimilar_windows():
+    identical = vendi_score(np.ones((4, 2, 2), dtype=np.float32))
+    separated = np.zeros((4, 2, 2), dtype=np.float32)
+    for idx in range(4):
+        separated[idx, :, :] = float(idx) * 10.0
+    diverse = vendi_score(separated)
+    assert diverse.vendi > identical.vendi
+    assert diverse.vendi > 2.0
+
+
+def test_vendi_score_empty_and_single_window_are_finite():
+    empty = vendi_score(np.zeros((0, 2, 3), dtype=np.float32))
+    single = vendi_score(np.zeros((1, 2, 3), dtype=np.float32))
+    assert np.isfinite(empty.vendi)
+    assert np.isfinite(empty.log_vendi)
+    assert empty.vendi == pytest.approx(0.0)
+    assert single.vendi == pytest.approx(1.0)
+    assert single.effective_ratio == pytest.approx(1.0)
+
+
+def test_vendi_score_deterministic_subsampling_is_stable():
+    windows = np.arange(20 * 2 * 2, dtype=np.float32).reshape(20, 2, 2)
+    first = vendi_score(windows, max_windows=6, seed=123)
+    second = vendi_score(windows, max_windows=6, seed=123)
+    third = vendi_score(windows, max_windows=6, seed=456)
+    assert first.vendi == pytest.approx(second.vendi)
+    assert first.log_vendi == pytest.approx(second.log_vendi)
+    assert np.isfinite(third.vendi)
+    assert first.n_windows == second.n_windows == third.n_windows == 6
+
+
+def test_safe_sequence_window_mask_uses_env_penalties():
+    mask = safe_sequence_window_mask(
+        np.asarray([[0, 1], [1, 2], [2, 3]], dtype=np.int64),
+        np.asarray([0.0, 0.0, -2.0, 0.0], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(mask, np.asarray([True, False, False]))
+
+
 def test_refresh_rollout_rewards_can_use_dense_sequence_assignment():
     class FirstTokenDiscriminator(torch.nn.Module):
         def forward(self, features: torch.Tensor) -> torch.Tensor:
@@ -796,6 +844,13 @@ def test_refresh_rollout_rewards_can_use_dense_sequence_assignment():
     )
 
     np.testing.assert_allclose(refreshed.gail_rewards_raw, [10.0, 15.0, 15.0, 20.0], rtol=1e-6)
+    np.testing.assert_allclose(refreshed.sequence_rewards_raw, [10.0, 20.0], rtol=1e-6)
+    np.testing.assert_allclose(
+        refreshed.sequence_rewards_assigned,
+        [10.0, 15.0, 15.0, 20.0],
+        rtol=1e-6,
+    )
+    np.testing.assert_allclose(refreshed.sequence_window_counts, [1.0, 2.0, 2.0, 1.0], rtol=1e-6)
 
 
 def test_refresh_rollout_rewards_applies_discriminator_feature_normalizer():
