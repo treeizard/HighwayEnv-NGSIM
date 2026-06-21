@@ -23,6 +23,7 @@ from ..data import (
     scene_snapshot_features,
     transform_sequence_features,
 )
+from ..models import make_actor_critic
 from ..observations import flatten_agent_observations, policy_observations_from_flat
 
 from .policy import (

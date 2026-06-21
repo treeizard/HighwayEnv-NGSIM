@@ -13,6 +13,7 @@ from ..data import (
     SCENE_FEATURE_DIM_PER_VEHICLE,
     scene_snapshot_features,
 )
+from ..models import NUM_DISCRETE_META_ACTIONS, make_actor_critic
 from ..observations import flatten_agent_observations, policy_observations_from_flat
 
 from .torch_utils import SquashedNormal
