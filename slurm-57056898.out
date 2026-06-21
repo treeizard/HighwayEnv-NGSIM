@@ -1,0 +1,9 @@
+Submitting full PS-GAIL training
+  REPODIR=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM
+  RUN_STAMP=20260620_231521
+  JOB_TIME=5-00:00:00
+  EXPERT_DATA=/home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/expert_data/ngsim_ps_unified_expert_continuous_55145982
+Submitted jobs:
+  GAIL pretrain : 57056941 (full_20260620_231521_gail_stage1_50veh)
+  GAIL finetune : 57056943 (full_20260620_231521_gail_stage2_100veh) afterok:57056941
+  GAIL resume   : /home/ytao0016/bt60/ytao0016/HighwayEnv-NGSIM/logs/simple_ps_gail/full_20260620_231521_gail_stage1_50veh/final.pt

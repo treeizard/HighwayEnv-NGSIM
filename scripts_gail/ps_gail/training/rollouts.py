@@ -8,6 +8,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
+from dataclasses import replace
 
 import gymnasium as gym
 import numpy as np
