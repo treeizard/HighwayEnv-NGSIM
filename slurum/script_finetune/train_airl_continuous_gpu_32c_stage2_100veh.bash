@@ -387,7 +387,7 @@ echo "CUDA devices: ${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi || true
 
 if [ -z "${RESUME_CHECKPOINT}" ]; then
-    echo "RESUME_CHECKPOINT must point to a stage-one best.pt checkpoint." >&2
+    echo "RESUME_CHECKPOINT must point to a stage-one final_pretrain.pt checkpoint, or set ALLOW_NON_BEST_RESUME=true for another checkpoint." >&2
     exit 2
 fi
 if [ ! -f "${RESUME_CHECKPOINT}" ]; then

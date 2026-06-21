@@ -410,7 +410,7 @@ echo "Test: episodes=${TEST_EPISODES} split=${TEST_PREBUILT_SPLIT} hard_brake_th
 echo "PyTorch CUDA alloc conf: ${PYTORCH_CUDA_ALLOC_CONF}"
 
 if [ -z "${RESUME_CHECKPOINT}" ]; then
-    echo "RESUME_CHECKPOINT must point to a stage-one best.pt checkpoint." >&2
+    echo "RESUME_CHECKPOINT must point to a stage-one final_pretrain.pt checkpoint, or set ALLOW_NON_BEST_RESUME=true for another checkpoint." >&2
     exit 2
 fi
 if [ ! -f "${RESUME_CHECKPOINT}" ]; then
