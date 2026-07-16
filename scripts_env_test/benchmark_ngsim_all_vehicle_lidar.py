@@ -11,10 +11,6 @@ from typing import Any
 
 import numpy as np
 
-PARENT_DIR = Path(__file__).resolve().parents[1]
-if str(PARENT_DIR) not in sys.path:
-    sys.path.insert(0, str(PARENT_DIR))
-
 from highway_env.imitation.expert_dataset import ENV_ID, build_env_config, register_ngsim_env
 from scripts_gail.ps_gail.config import PSGAILConfig
 from scripts_gail.ps_gail.envs import observation_config
@@ -25,7 +21,7 @@ def parse_args() -> argparse.Namespace:
         description="Benchmark exact all-vehicle NGSIM LidarCamera env stepping.",
     )
     parser.add_argument("--scene", default="us-101")
-    parser.add_argument("--episode-root", default="highway_env/data/processed_20s")
+    parser.add_argument("--episode-root", default="data/highway_env/processed_20s")
     parser.add_argument("--split", default="val", choices=("train", "val", "test"))
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--steps", type=int, default=200)

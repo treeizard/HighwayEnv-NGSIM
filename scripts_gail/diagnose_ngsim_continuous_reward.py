@@ -11,10 +11,6 @@ from typing import Any
 import numpy as np
 import torch
 
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-
 from scripts_gail.ps_gail.config import PSGAILConfig  # noqa: E402
 from scripts_gail.ps_gail.data import load_expert_transition_data, standardize_features  # noqa: E402
 from scripts_gail.ps_gail.envs import make_training_env  # noqa: E402
@@ -43,7 +39,7 @@ def parse_args() -> argparse.Namespace:
         default="logs/simple_ps_gail/ps_gail_unified_continuous_test_55205758/final.pt",
     )
     parser.add_argument("--expert-data", default="")
-    parser.add_argument("--episode-root", default="highway_env/data/processed_20s")
+    parser.add_argument("--episode-root", default="data/highway_env/processed_20s")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--rollout-episodes", type=int, default=2)
     parser.add_argument("--rollout-steps", type=int, default=200)
@@ -85,7 +81,7 @@ def cfg_from_checkpoint(checkpoint: dict[str, Any], args: argparse.Namespace) ->
     )
     cfg.episode_root = localize_path(
         str(args.episode_root or getattr(cfg, "episode_root", "")),
-        fallback="highway_env/data/processed_20s",
+        fallback="data/highway_env/processed_20s",
     )
     cfg.device = str(args.device)
     cfg.seed = int(args.seed)

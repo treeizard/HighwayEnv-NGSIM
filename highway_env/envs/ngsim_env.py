@@ -145,7 +145,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 "ego_vehicle_ID": None,
                 "simulation_period": None,
                 # Raw data selections
-                "episode_root": "highway_env/data/processed_20s",
+                "episode_root": "data/highway_env/processed_20s",
                 "prebuilt_split": "train",
                 # Quality of life/ debugging
                 "control_all_vehicles": False,

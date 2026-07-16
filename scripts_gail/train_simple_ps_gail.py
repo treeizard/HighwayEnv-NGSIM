@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 import warnings
 from dataclasses import fields
 
@@ -11,10 +12,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical, Independent, Normal
-
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
 
 from scripts_gail.ps_gail.config import PSGAILConfig, should_save_checkpoint_video
 from scripts_gail.ps_gail.data import (
@@ -290,6 +287,7 @@ def checkpoint_expert_metadata(metadata: dict[str, object]) -> dict[str, object]
         "actions_steering_acceleration_columns": metadata.get(
             "actions_steering_acceleration_columns"
         ),
+        "lane_change_sampling": metadata.get("lane_change_sampling"),
     }
 
 
@@ -785,6 +783,10 @@ def main() -> None:
                 max_samples=cfg.max_expert_samples,
                 seed=cfg.seed,
                 trajectory_frame=cfg.trajectory_frame,
+                lane_change_fraction=cfg.expert_lane_change_fraction,
+                lane_change_min_lateral_displacement=cfg.expert_lane_change_min_lateral_displacement,
+                lane_change_min_abs_steer=cfg.expert_lane_change_min_abs_steer,
+                lane_change_min_steer_fraction=cfg.expert_lane_change_min_steer_fraction,
             )
             expert_policy_obs = expert_transitions.policy_observations
             expert_features = action_conditioned_features(
@@ -798,6 +800,10 @@ def main() -> None:
                 max_samples=cfg.max_expert_samples,
                 seed=cfg.seed,
                 trajectory_frame=cfg.trajectory_frame,
+                lane_change_fraction=cfg.expert_lane_change_fraction,
+                lane_change_min_lateral_displacement=cfg.expert_lane_change_min_lateral_displacement,
+                lane_change_min_abs_steer=cfg.expert_lane_change_min_abs_steer,
+                lane_change_min_steer_fraction=cfg.expert_lane_change_min_steer_fraction,
             )
             if (
                 int(cfg.bc_pretrain_epochs) > 0
@@ -809,6 +815,10 @@ def main() -> None:
                     max_samples=cfg.max_expert_samples,
                     seed=cfg.seed,
                     trajectory_frame=cfg.trajectory_frame,
+                    lane_change_fraction=cfg.expert_lane_change_fraction,
+                    lane_change_min_lateral_displacement=cfg.expert_lane_change_min_lateral_displacement,
+                    lane_change_min_abs_steer=cfg.expert_lane_change_min_abs_steer,
+                    lane_change_min_steer_fraction=cfg.expert_lane_change_min_steer_fraction,
                 )
         expert_scene_features = None
         expert_scene_metadata = {}
@@ -913,6 +923,9 @@ def main() -> None:
             else None
         )
         resume_checkpoint = str(getattr(cfg, "resume_checkpoint", "") or "").strip()
+        initial_policy_checkpoint = str(getattr(cfg, "initial_policy_checkpoint", "") or "").strip()
+        if resume_checkpoint and initial_policy_checkpoint:
+            raise ValueError("Use either --resume-checkpoint or --initial-policy-checkpoint, not both.")
         if resume_checkpoint:
             if not os.path.isfile(resume_checkpoint):
                 raise FileNotFoundError(f"resume_checkpoint does not exist: {resume_checkpoint}")
@@ -945,6 +958,35 @@ def main() -> None:
                 "resumed_checkpoint="
                 f"{os.path.abspath(resume_checkpoint)} "
                 f"round={checkpoint.get('round', 'unknown')}"
+            )
+        elif initial_policy_checkpoint:
+            if not os.path.isfile(initial_policy_checkpoint):
+                raise FileNotFoundError(
+                    f"initial_policy_checkpoint does not exist: {initial_policy_checkpoint}"
+                )
+            try:
+                checkpoint = torch.load(initial_policy_checkpoint, map_location=device, weights_only=False)
+            except TypeError:
+                checkpoint = torch.load(initial_policy_checkpoint, map_location=device)
+            policy_state = (
+                checkpoint.get("policy_state_dict")
+                if isinstance(checkpoint, dict)
+                else checkpoint
+            )
+            if policy_state is None:
+                raise RuntimeError(
+                    f"Initial policy checkpoint is missing policy_state_dict: {initial_policy_checkpoint}"
+                )
+            try:
+                policy.load_state_dict(policy_state)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Failed to load initial policy checkpoint. Check policy architecture and observation/action dims."
+                ) from exc
+            print(
+                "initialized_policy_checkpoint="
+                f"{os.path.abspath(initial_policy_checkpoint)} "
+                f"round={checkpoint.get('round', 'unknown') if isinstance(checkpoint, dict) else 'state_dict'}"
             )
         discriminator_expert_features_train = apply_optional_discriminator_normalizer(
             discriminator_expert_features,
@@ -1006,6 +1048,16 @@ def main() -> None:
             f"loaded_samples={expert_metadata.get('num_samples')} "
             f"source_samples={expert_metadata.get('num_source_samples', 'unknown')}"
         )
+        lane_change_sampling = expert_metadata.get("lane_change_sampling", {})
+        if isinstance(lane_change_sampling, dict) and lane_change_sampling.get("enabled"):
+            print(
+                "expert_lane_change_sampling="
+                f"target={float(lane_change_sampling.get('target_fraction', 0.0)):.3f} "
+                f"actual={float(lane_change_sampling.get('selected_lane_change_fraction', 0.0)):.3f} "
+                f"lc_traj={lane_change_sampling.get('lane_change_trajectories', 0)} "
+                f"regular_traj={lane_change_sampling.get('regular_trajectories', 0)} "
+                f"fallback={int(bool(lane_change_sampling.get('fallback', False)))}"
+            )
         print(
             f"collision_enabled={cfg.enable_collision} allow_idm={cfg.allow_idm} "
             f"action_mode={cfg.action_mode} "
@@ -1226,6 +1278,7 @@ def main() -> None:
                 env = make_training_env(round_cfg)
                 current_env_signature = round_env_signature
 
+            rollout_started = time.perf_counter()
             collected_rollout = collect_round_rollouts(
                 env,
                 policy,
@@ -1237,6 +1290,7 @@ def main() -> None:
                 rollout_executor=rollout_executor,
                 archive_policy_state_dicts=psro_archive_for_round,
             )
+            rollout_collect_seconds = max(1.0e-9, time.perf_counter() - rollout_started)
             rollout = subsample_rollout_for_training(
                 collected_rollout,
                 round_cfg,
@@ -1437,6 +1491,13 @@ def main() -> None:
                 "rollout/env_steps": collected_rollout.num_env_steps,
                 "rollout/agent_steps": collected_rollout.num_agent_steps,
                 "rollout/training_agent_steps": rollout.num_agent_steps,
+                "rollout/collect_seconds": float(rollout_collect_seconds),
+                "rollout/env_steps_per_second": float(
+                    collected_rollout.num_env_steps / rollout_collect_seconds
+                ),
+                "rollout/agent_steps_per_second": float(
+                    collected_rollout.num_agent_steps / rollout_collect_seconds
+                ),
                 "rollout/training_subsampled": int(rollout_was_subsampled),
                 "rollout/episodes": collected_rollout.num_episodes,
                 "rollout/terminated": collected_rollout.num_terminated,
@@ -1452,6 +1513,9 @@ def main() -> None:
                 "rollout/controlled_vehicle_fraction": float(round_cfg.percentage_controlled_vehicles),
                 "rollout/mean_controlled_vehicles": collected_rollout.mean_controlled_vehicles,
                 "rollout/mean_road_vehicles": collected_rollout.mean_road_vehicles,
+                "rollout/collision_physics_enabled_fraction": float(
+                    collected_rollout.collision_physics_enabled_fraction
+                ),
                 "psro/active": int(bool(collected_rollout.psro_active)),
                 "psro/archive_size": int(len(psro_policy_archive)),
                 "psro/archive_used": int(len(psro_archive_for_round or [])),
@@ -1465,6 +1529,16 @@ def main() -> None:
                 "rollout/mean_raw_gail_reward": rollout.mean_raw_gail_reward,
                 "rollout/mean_normalized_gail_reward": rollout.mean_normalized_gail_reward,
                 "rollout/mean_env_penalty": rollout.mean_env_penalty,
+                "rollout/collision_proxy_pressure_mean": (
+                    float(rollout.collision_proxy_pressures.mean())
+                    if rollout.collision_proxy_pressures.size
+                    else 0.0
+                ),
+                "rollout/collision_proxy_penalty_mean": (
+                    float(rollout.collision_proxy_penalties.mean())
+                    if rollout.collision_proxy_penalties.size
+                    else 0.0
+                ),
                 "rollout/reward_std": float(rollout.rewards.std()),
                 "rollout/raw_gail_reward_std": float(rollout.gail_rewards_raw.std()),
                 "rollout/normalized_gail_reward_std": float(rollout.gail_rewards_normalized.std()),
@@ -1575,6 +1649,16 @@ def main() -> None:
                 "train/clip_range": float(round_cfg.clip_range),
                 "train/disc_updates_per_round": int(round_cfg.disc_updates_per_round),
                 "train/expert_samples": int(expert_features.shape[0]),
+                "train/expert_lane_change_target_fraction": float(
+                    expert_metadata.get("lane_change_sampling", {}).get("target_fraction", 0.0)
+                    if isinstance(expert_metadata.get("lane_change_sampling", {}), dict)
+                    else 0.0
+                ),
+                "train/expert_lane_change_sample_fraction": float(
+                    expert_metadata.get("lane_change_sampling", {}).get("selected_lane_change_fraction", 0.0)
+                    if isinstance(expert_metadata.get("lane_change_sampling", {}), dict)
+                    else 0.0
+                ),
                 "train/disc_feature_norm": int(bool(cfg.normalize_discriminator_features)),
                 "train/disc_feature_clip": float(cfg.discriminator_feature_clip),
                 "train/discriminator_spectral_norm": int(bool(round_cfg.discriminator_spectral_norm)),
@@ -1583,6 +1667,19 @@ def main() -> None:
                 ),
                 "train/enable_player_challenge_reward": int(
                     bool(getattr(round_cfg, "enable_player_challenge_reward", False))
+                ),
+                "train/collision_physics_enabled": int(bool(getattr(round_cfg, "enable_collision", True))),
+                "train/collision_termination_enabled": int(
+                    bool(getattr(round_cfg, "terminate_when_all_controlled_crashed", True))
+                ),
+                "train/collision_mode_soft": int(str(getattr(round_cfg, "collision_mode_schedule", "")) == "soft"),
+                "train/collision_mode_mixed": int(str(getattr(round_cfg, "collision_mode_schedule", "")) == "mixed"),
+                "train/collision_mode_full": int(str(getattr(round_cfg, "collision_mode_schedule", "")) in {"full", ""}),
+                "train/collision_proxy_penalty_coef": float(
+                    getattr(round_cfg, "collision_proxy_penalty_coef", 0.0)
+                ),
+                "train/collision_mixed_on_fraction": float(
+                    getattr(round_cfg, "collision_mixed_on_fraction", 0.0)
                 ),
                 "train/challenge_max_primary_reward_fraction": float(
                     getattr(round_cfg, "challenge_max_primary_reward_fraction", 0.10)

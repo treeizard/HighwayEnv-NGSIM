@@ -5,17 +5,11 @@ import argparse
 import json
 import math
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 from highway_env.ngsim_utils.road.gen_road import create_japanese_road, create_ngsim_101_road
@@ -51,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--episode-root",
-        default="highway_env/data/processed_20s",
+        default="data/highway_env/processed_20s",
         help="Root folder containing <scene>/prebuilt/trajectory_<split>.npy files.",
     )
     parser.add_argument(

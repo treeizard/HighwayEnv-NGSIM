@@ -17,10 +17,6 @@ try:
 except Exception:  # pragma: no cover
     tqdm = None
 
-PARENT_DIR = Path(__file__).resolve().parents[1]
-if str(PARENT_DIR) not in sys.path:
-    sys.path.insert(0, str(PARENT_DIR))
-
 from scripts_gail.ps_gail.config import PSGAILConfig
 from scripts_gail.ps_gail.envs import make_training_env
 from scripts_gail.ps_gail.models import make_actor_critic
@@ -48,7 +44,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--scene", default="us-101")
-    parser.add_argument("--episode-root", default="highway_env/data/processed_20s")
+    parser.add_argument("--episode-root", default="data/highway_env/processed_20s")
     parser.add_argument("--split", default="train", choices=("train", "val", "test"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=int, default=200)

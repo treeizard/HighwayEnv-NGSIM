@@ -23,6 +23,8 @@ class AgentTransition:
     trajectory_state: np.ndarray
     scene_index: int
     env_penalty: float
+    collision_proxy_pressure: float
+    collision_proxy_penalty: float
     crashed: bool
     offroad: bool
     challenge_pressure: float
@@ -51,6 +53,8 @@ class RolloutBatch:
     gail_rewards_raw: np.ndarray
     gail_rewards_normalized: np.ndarray
     env_penalties: np.ndarray
+    collision_proxy_pressures: np.ndarray
+    collision_proxy_penalties: np.ndarray
     returns: np.ndarray
     advantages: np.ndarray
     generator_features: np.ndarray
@@ -90,6 +94,7 @@ class RolloutBatch:
     episode_names: tuple[str, ...] = ()
     mean_controlled_vehicles: float = 0.0
     mean_road_vehicles: float = 0.0
+    collision_physics_enabled_fraction: float = 0.0
     psro_active: bool = False
     psro_current_decisions: int = 0
     psro_archive_decisions: int = 0

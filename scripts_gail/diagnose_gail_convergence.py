@@ -11,10 +11,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-
 from scripts_gail.ps_gail.config import PSGAILConfig  # noqa: E402
 from scripts_gail.ps_gail.data import (  # noqa: E402
     load_expert_policy_and_disc_data,
@@ -41,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--expert-data", default="expert_data/ngsim_ps_traj_expert_discrete_54902119")
     parser.add_argument("--scene", default="us-101")
-    parser.add_argument("--episode-root", default="highway_env/data/processed_20s")
+    parser.add_argument("--episode-root", default="data/highway_env/processed_20s")
     parser.add_argument("--prebuilt-split", default="train")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")

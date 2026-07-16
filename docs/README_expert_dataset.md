@@ -23,7 +23,7 @@ That gives us:
 
 The pipeline uses `NGSimEnv` expert replay mode with processed trajectories under:
 
-`highway_env/data/processed_20s/<scene>/prebuilt/`
+`data/highway_env/processed_20s/<scene>/prebuilt/`
 
 It relies on two existing properties of the environment:
 

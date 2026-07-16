@@ -20,7 +20,7 @@ def _active_traj(length: int, start: int = 0, end: int | None = None) -> np.ndar
 def _collection_args(**overrides):
     defaults = {
         "scene": "us-101",
-        "episode_root": "highway_env/data/processed_20s",
+        "episode_root": "data/highway_env/processed_20s",
         "prebuilt_split": "train",
         "controlled_min_occupancy": 0.8,
         "max_steps_per_episode": 200,

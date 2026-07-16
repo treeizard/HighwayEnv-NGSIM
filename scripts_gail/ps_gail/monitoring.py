@@ -45,6 +45,12 @@ class WandbMonitor:
                 np.float_ = np.float64  # type: ignore[attr-defined]
             if not hasattr(np, "complex_"):
                 np.complex_ = np.complex128  # type: ignore[attr-defined]
+            if not hasattr(np, "string_"):
+                np.string_ = np.bytes_  # type: ignore[attr-defined]
+            if not hasattr(np, "unicode_"):
+                np.unicode_ = np.str_  # type: ignore[attr-defined]
+            if not hasattr(np, "Inf"):
+                np.Inf = np.inf  # type: ignore[attr-defined]
             import wandb
         except ModuleNotFoundError as exc:
             raise SystemExit(
@@ -99,10 +105,39 @@ class WandbMonitor:
             log_freq=max(1, int(self.cfg.checkpoint_every)),
         )
 
+    def _compact_metrics(self, metrics: dict[str, float | int]) -> dict[str, float | int]:
+        if not bool(getattr(self.cfg, "wandb_compact_metrics", True)):
+            return metrics
+        compact: dict[str, float | int] = {}
+        challenge_enabled = bool(getattr(self.cfg, "enable_player_challenge_reward", False))
+        for key, value in metrics.items():
+            if "/rmse_" in key and not key.endswith("_final"):
+                continue
+            if key.startswith("challenge/") and not challenge_enabled:
+                continue
+            if key.startswith("discriminator/hard_selector_") and not bool(
+                getattr(self.cfg, "enable_hard_example_selection", False)
+            ):
+                continue
+            if key.startswith("vendi/") and not (
+                key in {
+                    "vendi/sequence_log_gap",
+                    "vendi/policy_sequence",
+                    "vendi/policy_sequence_safe",
+                    "vendi/policy_sequence_safe_fraction",
+                    "vendi/expert_sequence",
+                }
+                or key.endswith("_safe")
+                or key.endswith("_safe_fraction")
+            ):
+                continue
+            compact[key] = value
+        return compact
+
     def log(self, metrics: dict[str, float | int], *, step: int) -> None:
         if not self.enabled or self._wandb is None:
             return
-        self._wandb.log(metrics, step=int(step))
+        self._wandb.log(self._compact_metrics(metrics), step=int(step))
 
     def save(self, path: str) -> None:
         if not self.enabled or self._wandb is None:

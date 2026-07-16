@@ -13,10 +13,6 @@ import numpy as np
 from gymnasium.envs.registration import register, registry
 from gymnasium.wrappers import RecordVideo
 
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-
 
 from highway_env.ngsim_utils.vehicles.replay import NGSIMVehicle
 
@@ -50,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--episode-root",
         type=str,
-        default="highway_env/data/processed_20s",
+        default="data/highway_env/processed_20s",
         help="Dataset root containing <scene>/prebuilt/*.npy. The bundled default is a 20-second dataset.",
     )
     parser.add_argument(

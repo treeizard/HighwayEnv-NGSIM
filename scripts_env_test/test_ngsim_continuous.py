@@ -8,10 +8,6 @@ from gymnasium.wrappers import RecordVideo
 from gymnasium.envs.registration import register, registry
 
 # Make sure project root is importable
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
-
 # Register NGSimEnv
 if "NGSim-US101-v0" not in registry:
     register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
@@ -53,7 +49,7 @@ def main():
         "ego_vehicle_ID": None,
 
         # Replay chunk root directory
-        "episode_root": "highway_env/data/processed_20s",
+        "episode_root": "data/highway_env/processed_20s",
         "prebuilt_split": "train",
 
         # Random episode selection each reset

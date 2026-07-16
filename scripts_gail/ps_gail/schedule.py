@@ -9,6 +9,7 @@ from math import ceil, floor
 from .config import PSGAILConfig
 
 ScheduleSegment = tuple[int, int, float, float]
+CollisionModeSegment = tuple[int, int, str]
 
 
 def _positive_value(value: float | int, *, name: str) -> float:
@@ -335,6 +336,62 @@ def _scheduled_policy_bc_coef(cfg: PSGAILConfig, round_idx: int) -> float:
     return _linear_schedule(start=start, end=end, round_idx=int(round_idx), rounds=rounds)
 
 
+@lru_cache(maxsize=128)
+def _parse_collision_mode_schedule(schedule: str) -> tuple[CollisionModeSegment, ...]:
+    text = str(schedule or "").strip()
+    if not text:
+        return ()
+    valid_modes = {"soft", "mixed", "full", "off", "on"}
+    segments: list[CollisionModeSegment] = []
+    for raw_segment in text.split(";"):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        parts = [part.strip() for part in segment.replace(",", ":").split(":")]
+        if len(parts) != 3:
+            raise ValueError(
+                "collision_mode_schedule segments must be start_round:end_round:mode, "
+                f"got {segment!r}."
+            )
+        start_round = int(float(parts[0]))
+        end_round = int(float(parts[1]))
+        mode = parts[2].lower()
+        if end_round < start_round:
+            raise ValueError(f"collision_mode_schedule end round must be >= start round, got {segment!r}.")
+        if mode not in valid_modes:
+            raise ValueError(
+                f"Unsupported collision mode {mode!r}; expected one of {sorted(valid_modes)}."
+            )
+        segments.append((start_round, end_round, mode))
+    return tuple(segments)
+
+
+def _scheduled_collision_mode(cfg: PSGAILConfig, round_idx: int) -> str:
+    segments = _parse_collision_mode_schedule(str(getattr(cfg, "collision_mode_schedule", "") or ""))
+    if not segments:
+        return "full" if bool(getattr(cfg, "enable_collision", True)) else "soft"
+    round_idx = int(round_idx)
+    selected: CollisionModeSegment | None = None
+    for segment in segments:
+        start_round, end_round, _mode = segment
+        if max(1, int(start_round)) <= round_idx <= max(1, int(end_round)):
+            selected = segment
+    if selected is None:
+        first_start, _first_end, first_mode = segments[0]
+        _last_start, _last_end, last_mode = segments[-1]
+        return first_mode if round_idx < max(1, int(first_start)) else last_mode
+    return selected[2]
+
+
+def _collision_settings_for_mode(cfg: PSGAILConfig, round_idx: int) -> tuple[bool, bool, str]:
+    mode = _scheduled_collision_mode(cfg, round_idx)
+    if mode in {"soft", "off"}:
+        return False, False, mode
+    if mode == "mixed":
+        return bool(cfg.enable_collision), bool(cfg.terminate_when_all_controlled_crashed), mode
+    return bool(cfg.enable_collision), bool(cfg.terminate_when_all_controlled_crashed), mode
+
+
 def _scheduled_warmup_value(
     *,
     start: float,
@@ -415,6 +472,10 @@ def config_for_round(cfg: PSGAILConfig, round_idx: int) -> PSGAILConfig:
     percentage_controlled_vehicles = float(cfg.percentage_controlled_vehicles)
     if bool(cfg.controlled_vehicle_curriculum):
         percentage_controlled_vehicles = _scheduled_controlled_vehicles(cfg, round_idx)
+    enable_collision, terminate_when_all_controlled_crashed, collision_mode = _collision_settings_for_mode(
+        cfg,
+        round_idx,
+    )
 
     warmup_rounds, warmup_round_idx = _warmup_context(
         cfg,
@@ -524,6 +585,9 @@ def config_for_round(cfg: PSGAILConfig, round_idx: int) -> PSGAILConfig:
             else bool(cfg.control_all_vehicles)
         ),
         percentage_controlled_vehicles=percentage_controlled_vehicles,
+        enable_collision=enable_collision,
+        terminate_when_all_controlled_crashed=terminate_when_all_controlled_crashed,
+        collision_mode_schedule=collision_mode,
         learning_rate=learning_rate,
         disc_learning_rate=disc_learning_rate,
         entropy_coef=entropy_coef,

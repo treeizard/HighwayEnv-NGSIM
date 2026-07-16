@@ -479,22 +479,212 @@ def _trajectory_preserving_file_sample_plan(
     return plan, "trajectory_preserving_without_replacement"
 
 
+def _trajectory_lane_change_sample_plan(
+    files: list[str],
+    counts: dict[str, int],
+    *,
+    max_samples: int,
+    rng: np.random.Generator,
+    lane_change_fraction: float,
+    min_lateral_displacement: float,
+    min_abs_steer: float,
+    min_steer_fraction: float,
+) -> tuple[dict[str, np.ndarray | None], str, dict[str, Any]]:
+    total = int(sum(counts[file_path] for file_path in files))
+    if total <= 0:
+        raise RuntimeError("Expert dataset contains no samples.")
+    target_total = total if int(max_samples) <= 0 else min(total, int(max_samples))
+    target_fraction = min(1.0, max(0.0, float(lane_change_fraction)))
+    if target_fraction <= 0.0:
+        plan, sampling = _trajectory_preserving_file_sample_plan(
+            files,
+            counts,
+            max_samples=int(max_samples),
+            rng=rng,
+        )
+        return plan, sampling, {
+            "enabled": False,
+            "target_fraction": target_fraction,
+        }
+
+    lane_change_rows: list[tuple[str, np.ndarray, dict[str, float]]] = []
+    regular_rows: list[tuple[str, np.ndarray, dict[str, float]]] = []
+    for file_path in files:
+        with np.load(file_path, allow_pickle=True) as data:
+            _require_arrays(file_path, list(data.files), {"trajectory_states", "vehicle_ids"})
+            trajectory_states = np.asarray(data["trajectory_states"], dtype=np.float32)
+            vehicle_ids = np.asarray(data["vehicle_ids"], dtype=np.int64)
+            steering_values: np.ndarray | None = None
+            if ACTION_STEERING_ACCELERATION_KEY in data.files:
+                steering_values = np.asarray(data[ACTION_STEERING_ACCELERATION_KEY], dtype=np.float32)[:, 0]
+            elif ACTION_CONTINUOUS_ENV_KEY in data.files:
+                steering_values = np.asarray(data[ACTION_CONTINUOUS_ENV_KEY], dtype=np.float32)[:, 1]
+            for vehicle_id in np.unique(vehicle_ids):
+                indices = np.flatnonzero(vehicle_ids == vehicle_id).astype(np.int64, copy=False)
+                if indices.size == 0:
+                    continue
+                traj = trajectory_states[indices]
+                lateral_displacement = (
+                    float(np.nanmax(traj[:, 1]) - np.nanmin(traj[:, 1]))
+                    if traj.ndim == 2 and traj.shape[1] >= 2 and traj.size
+                    else 0.0
+                )
+                if steering_values is not None:
+                    abs_steer = np.abs(steering_values[indices].astype(np.float32, copy=False))
+                    max_abs_steer = float(np.nanmax(abs_steer)) if abs_steer.size else 0.0
+                    steer_fraction = float(np.mean(abs_steer >= float(min_abs_steer))) if abs_steer.size else 0.0
+                else:
+                    max_abs_steer = 0.0
+                    steer_fraction = 0.0
+                is_lane_change = bool(
+                    lateral_displacement >= float(min_lateral_displacement)
+                    or (
+                        max_abs_steer >= float(min_abs_steer)
+                        and steer_fraction >= float(min_steer_fraction)
+                    )
+                )
+                stats = {
+                    "samples": float(indices.size),
+                    "lateral_displacement": float(lateral_displacement),
+                    "max_abs_steer": float(max_abs_steer),
+                    "steer_fraction": float(steer_fraction),
+                }
+                if is_lane_change:
+                    lane_change_rows.append((file_path, indices, stats))
+                else:
+                    regular_rows.append((file_path, indices, stats))
+
+    if not lane_change_rows or not regular_rows:
+        plan, sampling = _trajectory_preserving_file_sample_plan(
+            files,
+            counts,
+            max_samples=int(max_samples),
+            rng=rng,
+        )
+        return plan, f"{sampling}_lane_change_fallback", {
+            "enabled": True,
+            "fallback": True,
+            "target_fraction": target_fraction,
+            "lane_change_trajectories": int(len(lane_change_rows)),
+            "regular_trajectories": int(len(regular_rows)),
+            "reason": "missing_lane_change_or_regular_trajectories",
+        }
+
+    def _take_rows(
+        rows: list[tuple[str, np.ndarray, dict[str, float]]],
+        sample_budget: int,
+        selected: list[tuple[str, np.ndarray, dict[str, float], bool]],
+        *,
+        is_lane_change: bool,
+    ) -> int:
+        selected_count = 0
+        if sample_budget <= 0:
+            return 0
+        for row_idx in rng.permutation(len(rows)):
+            file_path, indices, stats = rows[int(row_idx)]
+            selected.append((file_path, indices, stats, is_lane_change))
+            selected_count += int(indices.size)
+            if selected_count >= int(sample_budget):
+                break
+        return selected_count
+
+    target_lane_change = int(round(target_total * target_fraction))
+    selected_rows: list[tuple[str, np.ndarray, dict[str, float], bool]] = []
+    selected_lane_change = _take_rows(
+        lane_change_rows,
+        target_lane_change,
+        selected_rows,
+        is_lane_change=True,
+    )
+    selected_regular = _take_rows(
+        regular_rows,
+        max(0, target_total - selected_lane_change),
+        selected_rows,
+        is_lane_change=False,
+    )
+    selected_total = selected_lane_change + selected_regular
+    if selected_total < target_total:
+        selected_identity = {(file_path, int(indices[0])) for file_path, indices, _stats, _lc in selected_rows}
+        remaining = [
+            (file_path, indices, stats, is_lane_change)
+            for is_lane_change, rows in ((True, lane_change_rows), (False, regular_rows))
+            for file_path, indices, stats in rows
+            if (file_path, int(indices[0])) not in selected_identity
+        ]
+        for row_idx in rng.permutation(len(remaining)):
+            selected_rows.append(remaining[int(row_idx)])
+            selected_total += int(remaining[int(row_idx)][1].size)
+            if selected_total >= target_total:
+                break
+
+    selected_by_file: dict[str, list[np.ndarray]] = {}
+    lane_change_samples = 0
+    regular_samples = 0
+    for file_path, indices, _stats, is_lane_change in selected_rows:
+        selected_by_file.setdefault(file_path, []).append(indices)
+        if is_lane_change:
+            lane_change_samples += int(indices.size)
+        else:
+            regular_samples += int(indices.size)
+    plan = {
+        file_path: np.sort(np.concatenate(index_parts, axis=0)).astype(np.int64, copy=False)
+        for file_path, index_parts in selected_by_file.items()
+        if index_parts
+    }
+    loaded_samples = lane_change_samples + regular_samples
+    return plan, "trajectory_preserving_lane_change_balanced", {
+        "enabled": True,
+        "fallback": False,
+        "target_fraction": target_fraction,
+        "target_samples": int(target_total),
+        "lane_change_trajectories": int(len(lane_change_rows)),
+        "regular_trajectories": int(len(regular_rows)),
+        "selected_trajectories": int(len(selected_rows)),
+        "selected_lane_change_samples": int(lane_change_samples),
+        "selected_regular_samples": int(regular_samples),
+        "selected_lane_change_fraction": (
+            float(lane_change_samples / loaded_samples) if loaded_samples else 0.0
+        ),
+        "min_lateral_displacement": float(min_lateral_displacement),
+        "min_abs_steer": float(min_abs_steer),
+        "min_steer_fraction": float(min_steer_fraction),
+    }
+
+
 def load_expert_policy_and_disc_data(
     path: str,
     *,
     max_samples: int = 100_000,
     seed: int = 0,
     trajectory_frame: str = "relative",
+    lane_change_fraction: float = 0.0,
+    lane_change_min_lateral_displacement: float = 2.0,
+    lane_change_min_abs_steer: float = 0.08,
+    lane_change_min_steer_fraction: float = 0.05,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     rng = np.random.default_rng(seed)
     files = _dataset_files(path)
     counts = _dataset_file_counts(path, files)
-    sample_plan = _uniform_file_sample_plan(
-        files,
-        counts,
-        max_samples=int(max_samples),
-        rng=rng,
-    )
+    if float(lane_change_fraction) > 0.0:
+        sample_plan, sampling_mode, lane_change_metadata = _trajectory_lane_change_sample_plan(
+            files,
+            counts,
+            max_samples=int(max_samples),
+            rng=rng,
+            lane_change_fraction=float(lane_change_fraction),
+            min_lateral_displacement=float(lane_change_min_lateral_displacement),
+            min_abs_steer=float(lane_change_min_abs_steer),
+            min_steer_fraction=float(lane_change_min_steer_fraction),
+        )
+    else:
+        sample_plan = _uniform_file_sample_plan(
+            files,
+            counts,
+            max_samples=int(max_samples),
+            rng=rng,
+        )
+        sampling_mode = "uniform_without_replacement"
+        lane_change_metadata = {"enabled": False}
     obs_parts: list[np.ndarray] = []
     traj_parts: list[np.ndarray] = []
     metadata_items: list[dict[str, Any]] = []
@@ -560,7 +750,8 @@ def load_expert_policy_and_disc_data(
         "actions_steering_acceleration_columns": (
             _metadata_values(metadata_items, "actions_steering_acceleration_columns") or [None]
         )[0],
-        "sampling": "uniform_without_replacement",
+        "sampling": sampling_mode,
+        "lane_change_sampling": lane_change_metadata,
         "max_samples": int(max_samples),
         "samples_by_file": samples_by_file,
         "episodes": metadata_items,
@@ -574,6 +765,10 @@ def load_expert_transition_data(
     max_samples: int = 100_000,
     seed: int = 0,
     trajectory_frame: str = "relative",
+    lane_change_fraction: float = 0.0,
+    lane_change_min_lateral_displacement: float = 2.0,
+    lane_change_min_abs_steer: float = 0.08,
+    lane_change_min_steer_fraction: float = 0.05,
 ) -> ExpertTransitionData:
     """Load action-conditioned expert transitions for AIRL/IQ-Learn-style trainers.
 
@@ -584,12 +779,25 @@ def load_expert_transition_data(
     rng = np.random.default_rng(seed)
     files = _dataset_files(path)
     counts = _dataset_file_counts(path, files)
-    sample_plan, sampling_mode = _trajectory_preserving_file_sample_plan(
-        files,
-        counts,
-        max_samples=int(max_samples),
-        rng=rng,
-    )
+    if float(lane_change_fraction) > 0.0:
+        sample_plan, sampling_mode, lane_change_metadata = _trajectory_lane_change_sample_plan(
+            files,
+            counts,
+            max_samples=int(max_samples),
+            rng=rng,
+            lane_change_fraction=float(lane_change_fraction),
+            min_lateral_displacement=float(lane_change_min_lateral_displacement),
+            min_abs_steer=float(lane_change_min_abs_steer),
+            min_steer_fraction=float(lane_change_min_steer_fraction),
+        )
+    else:
+        sample_plan, sampling_mode = _trajectory_preserving_file_sample_plan(
+            files,
+            counts,
+            max_samples=int(max_samples),
+            rng=rng,
+        )
+        lane_change_metadata = {"enabled": False}
 
     obs_parts: list[np.ndarray] = []
     next_obs_parts: list[np.ndarray] = []
@@ -730,6 +938,7 @@ def load_expert_transition_data(
         "trajectory_frame": str(trajectory_frame).lower(),
         "trajectory_id_schema": "file_index:vehicle_id",
         "sampling": sampling_mode,
+        "lane_change_sampling": lane_change_metadata,
         "max_samples": int(max_samples),
         "samples_by_file": samples_by_file,
         "episodes": metadata_items,
@@ -765,7 +974,7 @@ def load_expert_scene_data(
             if "scene_features" not in data.files:
                 raise KeyError(
                     f"{file_path} is missing scene_features. Rebuild the expert data with the updated "
-                    "scripts_gail/build_ps_traj_expert_discrete.py before enabling the scene discriminator."
+                    "python -m scripts_gail.build_ps_traj_expert_discrete before enabling the scene discriminator."
                 )
             scene = np.asarray(data["scene_features"], dtype=np.float32)
             if scene.ndim != 2:

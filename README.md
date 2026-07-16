@@ -1,56 +1,44 @@
-# Highway Env with NGSIM Integration Guide
-## 1. Reference Documentation
-- Original Highway_Env: https://highway-env.farama.org/index.html
-- Stable Baseline 3: https://stable-baselines3.readthedocs.io/en/master/
-- Drive-IRL Sim: https://github.com/MCZhi/Driving-IRL-NGSIM/blob/main/NGSIM_env/envs/ngsim_env.py
-## 2. Installation Guide
-### 2.1. Install All Packages
-1. Create a conda environment:
-```
-conda create -n highway_ngsim python=3.11
-```
-2. Activate conda environment:
-```
-conda activate highway_ngsim
-```
-3. Install **Pytorch with CUDA** following the guidelines outlined on the official documentation, then install stable-baseline 3 for RL. 
-```
-pip install git+https://github.com/DLR-RM/stable-baselines3
-```
-Sometimes the packages: `typeguard` and `pyyaml` will be missing. 
-4. Install highway-env:
-```
-pip install highway-env
-```
-5. Install gymnasium, imitation and tensorboard:
-```
-pip install gymnasium
-```
-```
-pip install gymnasium[other]
-```
-```
-pip install imitation
-```
-```
-pip install tensorboard
-```
-### 2.2. Validate Installation
-Within the `./HighwayEnv-NGSIM` directory level, run: 
-```
-python3 scripts/sb3_highway_dqn.py
-```
-You should see rendering of the highway env environment and video playing. 
+# HighwayEnv-NGSIM
 
-### 2.3. Data setup
-#### 2.3.1. NGSIM Data setup
+Independent simulator and imitation-learning fork used by the
+validation-first interpretability project. This repository owns `highway_env`,
+`scripts_gail`, dataset preparation, simulator diagnostics, tests, and Slurm
+launchers. It remains a separate Git repository when checked out below
+`components/HighwayEnv-NGSIM` in the parent project.
+
+## Environment
+
+Use the existing `ngsim_env` environment and install this checkout in editable
+mode:
+
+```bash
+conda activate ngsim_env
+python -m pip install -e '.[training,testing]'
+python -m pytest
+```
+
+Supported Python versions are 3.10 through 3.12. Entrypoints use installed
+modules and do not require `PYTHONPATH` changes.
+
+## Layout
+
+- `highway_env/`: simulator, replay environment, and NGSIM data utilities.
+- `scripts_gail/`: BC, GAIL, AIRL, and IQ-Learn training code.
+- `scripts_setup/`: dataset preparation commands.
+- `scripts_env_test/`: simulator and training diagnostics.
+- `hpc/slurm/`: Linux HPC launchers.
+- `tests/`: fork-owned unit and integration tests.
+
+## Data setup
+
+### NGSIM data
 1. Download the raw NGSIM data from the [link](https://data.transportation.gov/Automobiles/Next-Generation-Simulation-NGSIM-Vehicle-Trajector/8ect-6jqj/about_data), the download process may take some time. 
 2. Place the csv trajectory file inside the `raw_data` folder. If you do not change the name of the raw Data, you can just run:
 ```
-python scripts_setup/dump_data_ngsim.py raw_data/Next_Generation_Simulation__NGSIM__Vehicle_Trajectories_and_Supporting_Data.csv 
+python -m scripts_setup.dump_data_ngsim raw_data/Next_Generation_Simulation__NGSIM__Vehicle_Trajectories_and_Supporting_Data.csv
 ```
 in development:
 ```
-python scripts_setup/dump_data_time_ngsim.py raw_data/Next_Generation_Simulation__NGSIM__Vehicle_Trajectories_and_Supporting_Data.csv
+python -m scripts_setup.dump_data_time_ngsim raw_data/Next_Generation_Simulation__NGSIM__Vehicle_Trajectories_and_Supporting_Data.csv
 ```
 #### 2.3.2. Morinomiya Datasetup Data setup

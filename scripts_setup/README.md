@@ -43,7 +43,7 @@ python scripts_setup/dump_data_ngsim.py <path-to-csv> [--scene us-101]
 - writes processed files into:
 
 ```text
-highway_env/data/processed/<scene>/
+data/highway_env/processed/<scene>/
 ```
 
 #### Output Files
@@ -69,7 +69,7 @@ By default it creates 20-second non-overlapping windows and splits them chronolo
 ```bash
 python scripts_setup/dump_data_time_ngsim.py <path-to-csv> \
   [--scene us-101] \
-  [--out_root highway_env/data/processed_20s] \
+  [--out_root data/highway_env/processed_20s] \
   [--episode_len_sec 20.0] \
   [--stride_sec 20.0] \
   [--val_ratio 0.1] \
@@ -81,7 +81,7 @@ python scripts_setup/dump_data_time_ngsim.py <path-to-csv> \
 
 - `path`: path to the raw NGSIM CSV file.
 - `--scene`: scene/location name. Default: `us-101`.
-- `--out_root`: root directory for windowed output. Default: `highway_env/data/processed_20s`.
+- `--out_root`: root directory for windowed output. Default: `data/highway_env/processed_20s`.
 - `--episode_len_sec`: episode length in seconds. Default: `20.0`.
 - `--stride_sec`: time between episode starts in seconds. Default: `20.0`.
 - `--val_ratio`: fraction of windows assigned to validation. Default: `0.1`.
@@ -99,7 +99,7 @@ python scripts_setup/dump_data_time_ngsim.py <path-to-csv> \
 #### Output Layout
 
 ```text
-highway_env/data/processed_20s/<scene>/
+data/highway_env/processed_20s/<scene>/
   train/
     t1118846663000/
       vehicle_record_file.csv
@@ -208,7 +208,7 @@ This is useful when you want to regenerate:
 - `veh_ids_test.npy`
 - `trajectory_test.npy`
 
-for a target folder such as `highway_env/data/processed_20s/japanese/prebuilt/`.
+for a target folder such as `data/highway_env/processed_20s/japanese/prebuilt/`.
 
 ### `plot_vehicle_size_distribution.py`
 
@@ -216,8 +216,8 @@ Plots vehicle length/width distributions for both the repository's US-101 (NGSIM
 
 By default it reads:
 
-- `highway_env/data/processed_20s/us-101/prebuilt/trajectory_train.npy`
-- `highway_env/data/processed_10s/japanese/prebuilt/trajectory_train.npy`
+- `data/highway_env/processed_20s/us-101/prebuilt/trajectory_train.npy`
+- `data/highway_env/processed_10s/japanese/prebuilt/trajectory_train.npy`
 
 and converts US-101 dimensions from feet to meters before plotting.
 
@@ -252,7 +252,7 @@ python scripts_setup/build_prebuilt_japanese.py
 #### Default Inputs and Outputs
 
 - input: `raw_data/morinomiya_filtered_without_duplicates.npy`
-- output root: `highway_env/data/processed_20s`
+- output root: `data/highway_env/processed_20s`
 - scene: `japanese`
 - window size: `20` seconds
 - JST time filter: `09:00:00 <= time < 12:00:00`
@@ -269,7 +269,7 @@ python scripts_setup/build_prebuilt_japanese.py
 - writes prebuilt `.npy` files under:
 
 ```text
-highway_env/data/processed_20s/japanese/prebuilt/
+data/highway_env/processed_20s/japanese/prebuilt/
 ```
 
 #### Example
@@ -277,7 +277,7 @@ highway_env/data/processed_20s/japanese/prebuilt/
 ```bash
 python scripts_setup/build_prebuilt_japanese.py \
   --input_npy raw_data/morinomiya_filtered_without_duplicates.npy \
-  --episode_root highway_env/data/processed_20s \
+  --episode_root data/highway_env/processed_20s \
   --window_sec 20
 ```
 

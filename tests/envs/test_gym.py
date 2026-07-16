@@ -1,3 +1,4 @@
+import inspect
 import warnings
 
 import gymnasium as gym
@@ -25,6 +26,8 @@ CHECK_ENV_IGNORE_WARNINGS = [
     for message in [
         "A Box observation space minimum value is -infinity. This is probably too low.",
         "A Box observation space maximum value is infinity. This is probably too high.",
+        "A Box observation space maximum value is -infinity. This is probably too high.",
+        "env.seed to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.seed` for environment variables or `env.get_wrapper_attr('seed')` that will search the reminding wrappers.",
         # "For Box action spaces, we recommend using a symmetric and normalized space (range=[-1, 1] or [0, 1]). See https://stable-baselines3.readthedocs.io/en/master/guide/rl_tips.html for more information.",
         "The environment intersection-v0 is out of date. You should consider upgrading to version `v1`.",
         "The environment intersection-multi-agent-v0 is out of date. You should consider upgrading to version `v1`.",
@@ -110,12 +113,15 @@ def test_env_vectorization__info_dtype_is_float(env_spec):
 
         return make
 
+    vector_kwargs = {}
+    if "autoreset_mode" in inspect.signature(gym.vector.SyncVectorEnv).parameters:
+        vector_kwargs["autoreset_mode"] = "SameStep"
     envs = gym.vector.SyncVectorEnv(
         [
             thunk(duration=2, simulation_frequency=2),
             thunk(duration=1, simulation_frequency=2),
         ],
-        autoreset_mode="SameStep",
+        **vector_kwargs,
     )
 
     _obs, info = envs.reset()

@@ -5,17 +5,12 @@ import argparse
 import json
 import math
 import os
-import sys
 from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
 
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from highway_env.ngsim_utils.core.constants import (  # noqa: E402
     FEET_PER_METER,
@@ -37,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--episode-root",
-        default="highway_env/data/processed_20s",
+        default="data/highway_env/processed_20s",
         help="Root folder containing <scene>/prebuilt/trajectory_<split>.npy.",
     )
     parser.add_argument(

@@ -82,7 +82,7 @@ def trajectory_smoothing(trajectory):
 
 def build_trajectory(scene, period, vehicle_ID):
     ng = ngsim_data(scene)
-    ng.load('highway_env/data/processed/'+scene)
+    ng.load('data/highway_env/processed/'+scene)
     records = ng.vr_dict
     vehicles = ng.veh_dict
     snapshots = ng.snap_dict
@@ -152,7 +152,7 @@ def build_trajectory_from_chunk(scene, vehicle_ID, episode_dir):
     Load only one processed episode folder instead of the full us-101 dataset.
 
     episode_dir example:
-        "highway_env/data/processed_20s/us-101/t1118846663000"
+        "data/highway_env/processed_20s/us-101/t1118846663000"
     """
     ng = ngsim_data(scene)
     ng.load(episode_dir)          # <-- loads only that small episode

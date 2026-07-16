@@ -13,10 +13,6 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-
 from highway_env.imitation.expert_dataset import ENV_ID, build_env_config, register_ngsim_env
 from scripts_gail.ps_gail.config import PSGAILConfig
 from scripts_gail.ps_gail.data import load_expert_transition_data
@@ -49,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
 
     parser.add_argument("--scene", default="us-101")
-    parser.add_argument("--episode-root", default="highway_env/data/processed_20s")
+    parser.add_argument("--episode-root", default="data/highway_env/processed_20s")
     parser.add_argument("--prebuilt-split", default="train")
     parser.add_argument("--trajectory-frame", default="relative", choices=["relative", "absolute"])
     parser.add_argument("--episode-name", default="")
@@ -64,14 +60,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cells", type=int, default=128)
     parser.add_argument("--maximum-range", type=float, default=64.0)
 
-    parser.add_argument("--policy-model", choices=["mlp", "transformer"], default="mlp")
+    parser.add_argument("--policy-model", choices=["mlp", "transformer", "recurrent_transformer"], default="mlp")
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--transformer-layers", type=int, default=2)
     parser.add_argument("--transformer-heads", type=int, default=4)
     parser.add_argument("--transformer-dropout", type=float, default=0.1)
+    parser.add_argument("--transformer-memory-tokens", type=int, default=8)
+    parser.add_argument("--transformer-memory-context-length", type=int, default=32)
+    parser.add_argument("--transformer-use-causal-attention", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--video-out", default="logs/bc_pretrain_continuous/sample_replay.mp4")
     parser.add_argument("--video-steps", type=int, default=200)
+    parser.add_argument("--skip-video", action="store_true")
     parser.add_argument("--screen-width", type=int, default=1200)
     parser.add_argument("--screen-height", type=int, default=608)
     parser.add_argument("--scaling", type=float, default=5.5)
@@ -105,6 +105,9 @@ def cfg_from_args(args: argparse.Namespace) -> PSGAILConfig:
         transformer_layers=int(args.transformer_layers),
         transformer_heads=int(args.transformer_heads),
         transformer_dropout=float(args.transformer_dropout),
+        transformer_memory_tokens=int(args.transformer_memory_tokens),
+        transformer_memory_context_length=int(args.transformer_memory_context_length),
+        transformer_use_causal_attention=bool(args.transformer_use_causal_attention),
         bc_pretrain_epochs=int(args.epochs),
         bc_pretrain_learning_rate=float(args.learning_rate),
         bc_pretrain_batch_size=int(args.batch_size),
@@ -186,6 +189,9 @@ def build_policy_for_env(cfg: PSGAILConfig, env: gym.Env, device: torch.device) 
         transformer_layers=int(cfg.transformer_layers),
         transformer_heads=int(cfg.transformer_heads),
         transformer_dropout=float(cfg.transformer_dropout),
+        transformer_memory_tokens=int(cfg.transformer_memory_tokens),
+        transformer_memory_context_length=int(cfg.transformer_memory_context_length),
+        transformer_use_causal_attention=bool(cfg.transformer_use_causal_attention),
     ).to(device)
     return policy, obs_dim, action_dim
 
@@ -318,6 +324,9 @@ def save_checkpoint(
                 "transformer_layers": int(cfg.transformer_layers),
                 "transformer_heads": int(cfg.transformer_heads),
                 "transformer_dropout": float(cfg.transformer_dropout),
+                "transformer_memory_tokens": int(cfg.transformer_memory_tokens),
+                "transformer_memory_context_length": int(cfg.transformer_memory_context_length),
+                "transformer_use_causal_attention": bool(cfg.transformer_use_causal_attention),
             },
             "bc_stats": stats,
             "default_video_scenario": {
@@ -403,28 +412,29 @@ def main() -> None:
         )
         print(f"Saved BC checkpoint: {checkpoint_out}")
 
-    video_stats = render_selected_replay(
-        policy,
-        cfg,
-        episode_name=episode_name,
-        vehicle_id=vehicle_id,
-        device=device,
-        video_path=str(args.video_out),
-        steps=int(args.video_steps),
-        deterministic=bool(args.deterministic),
-        screen_width=int(args.screen_width),
-        screen_height=int(args.screen_height),
-        scaling=float(args.scaling),
-    )
-    print(
-        "Replay video: "
-        f"path={video_stats['video_path']} "
-        f"episode={video_stats['episode_name']} "
-        f"vehicle={video_stats['requested_vehicle_id']} "
-        f"controlled={video_stats['controlled_vehicle_ids']} "
-        f"steps={video_stats['steps']} "
-        f"crash={video_stats['crash']} offroad={video_stats['offroad']}"
-    )
+    if not bool(args.skip_video):
+        video_stats = render_selected_replay(
+            policy,
+            cfg,
+            episode_name=episode_name,
+            vehicle_id=vehicle_id,
+            device=device,
+            video_path=str(args.video_out),
+            steps=int(args.video_steps),
+            deterministic=bool(args.deterministic),
+            screen_width=int(args.screen_width),
+            screen_height=int(args.screen_height),
+            scaling=float(args.scaling),
+        )
+        print(
+            "Replay video: "
+            f"path={video_stats['video_path']} "
+            f"episode={video_stats['episode_name']} "
+            f"vehicle={video_stats['requested_vehicle_id']} "
+            f"controlled={video_stats['controlled_vehicle_ids']} "
+            f"steps={video_stats['steps']} "
+            f"crash={video_stats['crash']} offroad={video_stats['offroad']}"
+        )
     if bc_stats:
         print(
             "BC final: "

@@ -233,8 +233,8 @@ def _make_matched_eval_env(
     env_cfg["expert_test_mode"] = True
     env_cfg["truncate_to_trajectory_length"] = False
     env_cfg["complete_controlled_vehicles_at_road_end"] = False
-    env_cfg["disable_controlled_vehicle_collisions"] = not bool(cfg.enable_collision)
-    env_cfg["terminate_when_all_controlled_crashed"] = bool(cfg.terminate_when_all_controlled_crashed)
+    env_cfg["disable_controlled_vehicle_collisions"] = False
+    env_cfg["terminate_when_all_controlled_crashed"] = True
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
     env_cfg["crash_controlled_vehicles_offroad"] = True
     return gym.make(ENV_ID, config=env_cfg)
@@ -268,8 +268,8 @@ def _make_matched_eval_all_vehicle_env(
     env_cfg["expert_test_mode"] = True
     env_cfg["truncate_to_trajectory_length"] = False
     env_cfg["complete_controlled_vehicles_at_road_end"] = False
-    env_cfg["disable_controlled_vehicle_collisions"] = not bool(cfg.enable_collision)
-    env_cfg["terminate_when_all_controlled_crashed"] = bool(cfg.terminate_when_all_controlled_crashed)
+    env_cfg["disable_controlled_vehicle_collisions"] = False
+    env_cfg["terminate_when_all_controlled_crashed"] = True
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
     env_cfg["crash_controlled_vehicles_offroad"] = True
     return gym.make(ENV_ID, config=env_cfg)
@@ -308,8 +308,8 @@ def _make_matched_eval_selected_vehicle_env(
     env_cfg["expert_test_mode"] = True
     env_cfg["truncate_to_trajectory_length"] = False
     env_cfg["complete_controlled_vehicles_at_road_end"] = False
-    env_cfg["disable_controlled_vehicle_collisions"] = not bool(cfg.enable_collision)
-    env_cfg["terminate_when_all_controlled_crashed"] = bool(cfg.terminate_when_all_controlled_crashed)
+    env_cfg["disable_controlled_vehicle_collisions"] = False
+    env_cfg["terminate_when_all_controlled_crashed"] = True
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
     env_cfg["crash_controlled_vehicles_offroad"] = True
     return gym.make(ENV_ID, config=env_cfg)

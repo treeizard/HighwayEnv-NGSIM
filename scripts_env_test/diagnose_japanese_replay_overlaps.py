@@ -14,10 +14,6 @@ from typing import Any, Callable, Iterable
 import numpy as np
 
 
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-
 from highway_env import utils  # noqa: E402
 from highway_env.envs import ngsim_env as ngsim_env_module  # noqa: E402
 from highway_env.envs.ngsim_env import NGSimEnv  # noqa: E402
@@ -46,7 +42,7 @@ Mapper = Callable[[Any, str, float, int], tuple[str, str, int] | None]
 @dataclass(frozen=True)
 class ScanConfig:
     scene: str = "japanese"
-    episode_root: str = "highway_env/data/processed_20s"
+    episode_root: str = "data/highway_env/processed_20s"
     prebuilt_split: str = "train"
     episode_name: str = "t1577840400000"
     ego_vehicle_id: int | None = 2586
@@ -65,11 +61,11 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Diagnose active vehicle polygon overlaps in NGSIM/Japanese replay scenes. "
             "Run with the local conda environment, e.g. "
-            "`conda run -n ngsim_env python scripts_env_test/diagnose_japanese_replay_overlaps.py`."
+            "`conda run -n ngsim_env python -m scripts_env_test.diagnose_japanese_replay_overlaps`."
         )
     )
     parser.add_argument("--scene", default="japanese")
-    parser.add_argument("--episode-root", default="highway_env/data/processed_20s")
+    parser.add_argument("--episode-root", default="data/highway_env/processed_20s")
     parser.add_argument("--prebuilt-split", choices=["train", "val", "test"], default="train")
     parser.add_argument("--episode-name", default="t1577840400000")
     parser.add_argument("--ego-vehicle-id", type=int, default=2586)

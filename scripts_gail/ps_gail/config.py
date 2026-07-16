@@ -17,11 +17,12 @@ class PSGAILConfig:
     expert_data: str = "expert_data/ngsim_ps_traj_expert_discrete_54902119" # Define the path of the expert data. 
     run_name: str = "simple_ps_gail"
     resume_checkpoint: str = ""
+    initial_policy_checkpoint: str = ""
     allow_airl_resume_without_reward: bool = False
     scene: str = "us-101"
     action_mode: str = "discrete"
     continuous_action_dim: int = 2 # -> [acceleration_norm, steering_norm]
-    episode_root: str = "highway_env/data/processed_20s"
+    episode_root: str = "data/highway_env/processed_20s"
     prebuilt_split: str = "train"
     seed: int = 0
 
@@ -46,6 +47,10 @@ class PSGAILConfig:
     evaluation_cache_envs: bool = True # keep evaluation envs alive inside persistent eval workers.
     evaluation_max_cached_envs_per_worker: int = 0 # 0 means unlimited per-worker eval env cache.
     max_expert_samples: int = 100_000
+    expert_lane_change_fraction: float = 0.20
+    expert_lane_change_min_lateral_displacement: float = 2.0
+    expert_lane_change_min_abs_steer: float = 0.08
+    expert_lane_change_min_steer_fraction: float = 0.05
     trajectory_frame: str = "relative" # Parameters that can be utilized for state-only GAIL
     max_surrounding: str | int = "all"
     control_all_vehicles: bool = False
@@ -77,6 +82,9 @@ class PSGAILConfig:
     psro_current_policy_fraction: float = 0.65
     enable_collision: bool = True
     terminate_when_all_controlled_crashed: bool = True
+    collision_mode_schedule: str = ""
+    collision_mixed_on_fraction: float = 0.5
+    collision_proxy_penalty_coef: float = 1.0
     allow_idm: bool = True
 
     # Sensor Parameters. These values define the observation space and what information is available to the policy;
@@ -247,6 +255,7 @@ class PSGAILConfig:
     wandb_group: str = ""
     wandb_tags: str = ""
     wandb_watch: bool = False
+    wandb_compact_metrics: bool = True
 
 
 def checkpoint_video_interval(cfg: PSGAILConfig) -> int:

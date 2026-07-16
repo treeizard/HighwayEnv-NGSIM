@@ -9,17 +9,12 @@ environment or training logic.
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 from typing import Any
 
 import cv2
 import gymnasium as gym
 import numpy as np
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 from highway_env.imitation.expert_dataset import register_ngsim_env
 
@@ -70,7 +65,7 @@ def make_config(args: argparse.Namespace) -> dict[str, Any]:
         "scene_dataset_collection_mode": True,
         "expert_test_mode": False,
         "discrete_expert_policy": "planner",
-        "episode_root": "highway_env/data/processed_20s",
+        "episode_root": "data/highway_env/processed_20s",
         "prebuilt_split": str(args.split),
         "simulation_period": simulation_period,
         "ego_vehicle_ID": args.ego_id,

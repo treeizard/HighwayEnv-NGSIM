@@ -13,7 +13,7 @@ reader = ngsim_data(scene)
 reader.read_from_csv(path)
 reader.clean()
 
-save_path = 'highway_env/data/processed/'+scene
+save_path = 'data/highway_env/processed/'+scene
 if not os.path.exists(save_path):
     os.makedirs(save_path)
 reader.dump(folder=save_path)

@@ -3,10 +3,6 @@ import sys
 import numpy as np
 
 # Ensure highway_env is importable
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
-
 from highway_env.ngsim_utils.data.trajectory_gen import (
     build_all_trajectories_for_scene,
     trajectory_has_min_continuous_occupancy,
@@ -60,7 +56,7 @@ def build_prebuilt_split(
 
 
 def main():
-    episode_root = "highway_env/data/processed_20s"
+    episode_root = "data/highway_env/processed_20s"
     scene = "us-101"
 
     for train_val_div in ("train", "val", "test"):

@@ -46,6 +46,7 @@ from .rewards import (
     _transition_array,
     action_conditioned_features,
     combine_primary_env_challenge_rewards,
+    collision_proxy_pressure_from_metric,
     compute_returns_and_advantages,
     discriminator_input_mode,
     discriminator_reward,
@@ -56,6 +57,76 @@ from .rewards import (
     shape_adversarial_rewards,
 )
 from .types import AgentTransition, RolloutBatch
+
+
+def _collision_proxy_enabled(cfg: PSGAILConfig) -> bool:
+    return (
+        not bool(getattr(cfg, "enable_collision", True))
+        and float(getattr(cfg, "collision_proxy_penalty_coef", 0.0)) > 0.0
+    )
+
+
+def _collision_mode(cfg: PSGAILConfig) -> str:
+    return str(getattr(cfg, "collision_mode_schedule", "") or "").lower()
+
+
+def _collision_mixed_fraction(cfg: PSGAILConfig) -> float:
+    return min(1.0, max(0.0, float(getattr(cfg, "collision_mixed_on_fraction", 0.5))))
+
+
+def _collision_variant_cfg(cfg: PSGAILConfig, *, collision_on: bool) -> PSGAILConfig:
+    return replace(
+        cfg,
+        enable_collision=bool(collision_on),
+        terminate_when_all_controlled_crashed=bool(collision_on),
+        collision_mode_schedule="mixed_on" if collision_on else "mixed_off",
+    )
+
+
+def _mixed_worker_collision_on(cfg: PSGAILConfig, worker_idx: int, active_workers: int) -> bool:
+    fraction = _collision_mixed_fraction(cfg)
+    if fraction <= 0.0:
+        return False
+    if fraction >= 1.0:
+        return True
+    active_workers = max(1, int(active_workers))
+    if active_workers == 1:
+        return True
+    on_workers = int(round(fraction * active_workers))
+    on_workers = min(active_workers - 1, max(1, on_workers))
+    return int(worker_idx) < on_workers
+
+
+def _mixed_rollout_specs(
+    cfg: PSGAILConfig,
+    *,
+    total_steps: int,
+    total_episodes: int,
+) -> list[tuple[bool, int, int]]:
+    fraction = _collision_mixed_fraction(cfg)
+    if fraction <= 0.0:
+        return [(False, int(total_steps), int(total_episodes))]
+    if fraction >= 1.0:
+        return [(True, int(total_steps), int(total_episodes))]
+    if bool(getattr(cfg, "rollout_full_episodes", True)):
+        total_episodes = max(1, int(total_episodes))
+        if total_episodes == 1:
+            on_episodes = off_episodes = 1
+        else:
+            on_episodes = min(total_episodes - 1, max(1, int(round(total_episodes * fraction))))
+            off_episodes = max(1, total_episodes - on_episodes)
+        max_episode_steps = max(1, int(cfg.max_episode_steps))
+        return [
+            (True, on_episodes * max_episode_steps, on_episodes),
+            (False, off_episodes * max_episode_steps, off_episodes),
+        ]
+    total_steps = max(2, int(total_steps))
+    on_steps = min(total_steps - 1, max(1, int(round(total_steps * fraction))))
+    off_steps = max(1, total_steps - on_steps)
+    return [
+        (True, on_steps, max(1, int(round(int(cfg.rollout_min_episodes) * fraction)))),
+        (False, off_steps, max(1, int(cfg.rollout_min_episodes) - 1)),
+    ]
 
 class _RolloutPerfProfiler:
     enabled = os.environ.get("HIGHWAY_ENV_OBS_PROFILE", "").lower() in {"1", "true", "yes", "on"}
@@ -325,6 +396,8 @@ def refresh_rollout_rewards(
         gail_rewards_raw=combined_raw_gail_rewards,
         gail_rewards_normalized=normalized_gail_rewards,
         env_penalties=rollout.env_penalties,
+        collision_proxy_pressures=rollout.collision_proxy_pressures,
+        collision_proxy_penalties=rollout.collision_proxy_penalties,
         returns=returns,
         advantages=advantages,
         generator_features=rollout.generator_features,
@@ -364,6 +437,7 @@ def refresh_rollout_rewards(
         episode_names=rollout.episode_names,
         mean_controlled_vehicles=rollout.mean_controlled_vehicles,
         mean_road_vehicles=rollout.mean_road_vehicles,
+        collision_physics_enabled_fraction=rollout.collision_physics_enabled_fraction,
     )
 
 def collect_rollout(
@@ -432,6 +506,7 @@ def collect_rollout(
     psro_current_decisions = 0
     psro_archive_decisions = 0
     challenge_enabled = bool(getattr(cfg, "enable_player_challenge_reward", False))
+    collision_proxy_enabled = _collision_proxy_enabled(cfg)
     challenge_risk_state: dict[tuple[int, int], tuple[float, float]] = {}
     challenge_beta = min(0.999, max(0.0, float(getattr(cfg, "challenge_risk_ema_beta", 0.95))))
 
@@ -563,7 +638,7 @@ def collect_rollout(
         offroad_flags = info.get("controlled_vehicle_offroad", [])
         interaction_metrics = (
             list(info.get("controlled_vehicle_interaction_metrics", []) or [])
-            if challenge_enabled
+            if challenge_enabled or collision_proxy_enabled
             else []
         )
         episode_had_crash = bool(episode_had_crash or any(bool(flag) for flag in crash_flags))
@@ -580,12 +655,25 @@ def collect_rollout(
                 env_penalty -= float(cfg.collision_penalty)
             if offroad:
                 env_penalty -= float(cfg.offroad_penalty)
+            metric = interaction_metrics[i] if i < len(interaction_metrics) else None
+            collision_proxy_pressure = 0.0
+            collision_proxy_penalty = 0.0
+            if collision_proxy_enabled:
+                collision_proxy_pressure, _proxy_ttc, _proxy_gap = collision_proxy_pressure_from_metric(
+                    metric,
+                    cfg,
+                )
+                collision_proxy_penalty = (
+                    float(cfg.collision_penalty)
+                    * float(getattr(cfg, "collision_proxy_penalty_coef", 1.0))
+                    * float(collision_proxy_pressure)
+                )
+                env_penalty -= float(collision_proxy_penalty)
             prev_crash_ema, prev_offroad_ema = challenge_risk_state.get(key, (0.0, 0.0))
             crash_ema = challenge_beta * prev_crash_ema + (1.0 - challenge_beta) * float(crashed)
             offroad_ema = challenge_beta * prev_offroad_ema + (1.0 - challenge_beta) * float(offroad)
             challenge_risk_state[key] = (float(crash_ema), float(offroad_ema))
             if challenge_enabled:
-                metric = interaction_metrics[i] if i < len(interaction_metrics) else None
                 pressure, ttc_target, gap_target = player_challenge_pressure_from_metric(metric, cfg)
                 payoff = player_challenge_payoff(
                     pressure,
@@ -614,6 +702,8 @@ def collect_rollout(
                     trajectory_state=trajectory_states[i].copy(),
                     scene_index=int(scene_index),
                     env_penalty=float(env_penalty),
+                    collision_proxy_pressure=float(collision_proxy_pressure),
+                    collision_proxy_penalty=float(collision_proxy_penalty),
                     crashed=crashed,
                     offroad=offroad,
                     challenge_pressure=float(pressure),
@@ -678,6 +768,14 @@ def collect_rollout(
     )
     dones = np.asarray([tr.done for tr in transitions], dtype=bool)
     env_penalties = np.asarray([tr.env_penalty for tr in transitions], dtype=np.float32)
+    collision_proxy_pressures = np.asarray(
+        [tr.collision_proxy_pressure for tr in transitions],
+        dtype=np.float32,
+    )
+    collision_proxy_penalties = np.asarray(
+        [tr.collision_proxy_penalty for tr in transitions],
+        dtype=np.float32,
+    )
     transition_scene_indices = np.asarray([tr.scene_index for tr in transitions], dtype=np.int64)
     crashed = np.asarray([tr.crashed for tr in transitions], dtype=bool)
     offroad = np.asarray([tr.offroad for tr in transitions], dtype=bool)
@@ -732,6 +830,8 @@ def collect_rollout(
         gail_rewards_raw=np.zeros(len(transitions), dtype=np.float32),
         gail_rewards_normalized=np.zeros(len(transitions), dtype=np.float32),
         env_penalties=env_penalties,
+        collision_proxy_pressures=collision_proxy_pressures,
+        collision_proxy_penalties=collision_proxy_penalties,
         returns=returns,
         advantages=advantages,
         generator_features=gen_features,
@@ -774,6 +874,7 @@ def collect_rollout(
         episode_names=tuple(sorted(name for name in episode_names if name)),
         mean_controlled_vehicles=float(np.mean(controlled_counts)) if controlled_counts else 0.0,
         mean_road_vehicles=float(np.mean(road_vehicle_counts)) if road_vehicle_counts else 0.0,
+        collision_physics_enabled_fraction=float(bool(getattr(cfg, "enable_collision", True))),
         psro_active=bool(archive_policies and psro_archive_decisions > 0),
         psro_current_decisions=int(psro_current_decisions),
         psro_archive_decisions=int(psro_archive_decisions),
@@ -844,6 +945,20 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
     env_penalties = np.concatenate([batch.env_penalties for batch in batches], axis=0).astype(
         np.float32
     )
+    collision_proxy_pressures = np.concatenate(
+        [
+            _transition_array(batch.collision_proxy_pressures, batch.num_agent_steps, dtype=np.float32)
+            for batch in batches
+        ],
+        axis=0,
+    ).astype(np.float32)
+    collision_proxy_penalties = np.concatenate(
+        [
+            _transition_array(batch.collision_proxy_penalties, batch.num_agent_steps, dtype=np.float32)
+            for batch in batches
+        ],
+        axis=0,
+    ).astype(np.float32)
     old_values = np.concatenate([batch.old_values for batch in batches], axis=0).astype(np.float32)
     dones = np.concatenate([batch.dones for batch in batches], axis=0).astype(bool)
     merged_trajectory_ids = np.concatenate(trajectory_ids, axis=0).astype(np.int32)
@@ -881,6 +996,8 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
         gail_rewards_raw=gail_rewards_raw,
         gail_rewards_normalized=gail_rewards_normalized,
         env_penalties=env_penalties,
+        collision_proxy_pressures=collision_proxy_pressures,
+        collision_proxy_penalties=collision_proxy_penalties,
         returns=returns,
         advantages=advantages,
         generator_features=np.concatenate([batch.generator_features for batch in batches], axis=0).astype(
@@ -1006,6 +1123,12 @@ def merge_rollout_batches(batches: list[RolloutBatch], cfg: PSGAILConfig) -> Rol
         ),
         mean_controlled_vehicles=float(np.mean([batch.mean_controlled_vehicles for batch in batches])),
         mean_road_vehicles=float(np.mean([batch.mean_road_vehicles for batch in batches])),
+        collision_physics_enabled_fraction=float(
+            np.average(
+                [float(getattr(batch, "collision_physics_enabled_fraction", 0.0)) for batch in batches],
+                weights=[max(1, batch.num_agent_steps) for batch in batches],
+            )
+        ),
         psro_active=any(bool(batch.psro_active) for batch in batches),
         psro_current_decisions=sum(int(batch.psro_current_decisions) for batch in batches),
         psro_archive_decisions=sum(int(batch.psro_archive_decisions) for batch in batches),
@@ -1180,6 +1303,16 @@ def subsample_rollout_for_training(
     dones = rollout.dones[selected_indices].astype(bool, copy=False)
     returns, advantages = compute_returns_and_advantages(rewards, old_values, dones, trajectory_ids, cfg)
     env_penalties = rollout.env_penalties[selected_indices].astype(np.float32, copy=False)
+    collision_proxy_pressures = _transition_array(
+        rollout.collision_proxy_pressures,
+        rollout.num_agent_steps,
+        dtype=np.float32,
+    )[selected_indices].astype(np.float32, copy=False)
+    collision_proxy_penalties = _transition_array(
+        rollout.collision_proxy_penalties,
+        rollout.num_agent_steps,
+        dtype=np.float32,
+    )[selected_indices].astype(np.float32, copy=False)
     gail_rewards_raw = rollout.gail_rewards_raw[selected_indices].astype(np.float32, copy=False)
     gail_rewards_normalized = rollout.gail_rewards_normalized[selected_indices].astype(
         np.float32,
@@ -1216,6 +1349,8 @@ def subsample_rollout_for_training(
         gail_rewards_raw=gail_rewards_raw,
         gail_rewards_normalized=gail_rewards_normalized,
         env_penalties=env_penalties,
+        collision_proxy_pressures=collision_proxy_pressures,
+        collision_proxy_penalties=collision_proxy_penalties,
         returns=returns,
         advantages=advantages,
         generator_features=rollout.generator_features[selected_indices].astype(np.float32, copy=False),
@@ -1294,6 +1429,7 @@ def subsample_rollout_for_training(
         episode_names=rollout.episode_names,
         mean_controlled_vehicles=rollout.mean_controlled_vehicles,
         mean_road_vehicles=rollout.mean_road_vehicles,
+        collision_physics_enabled_fraction=rollout.collision_physics_enabled_fraction,
         psro_active=rollout.psro_active,
         psro_current_decisions=rollout.psro_current_decisions,
         psro_archive_decisions=rollout.psro_archive_decisions,
@@ -1364,6 +1500,7 @@ def _rollout_worker(
     policy_obs_dim: int,
     critic_obs_dim: int,
     worker_id: int,
+    active_workers: int,
     rollout_steps: int,
     rollout_min_episodes: int,
 ) -> RolloutBatch:
@@ -1373,8 +1510,17 @@ def _rollout_worker(
     np.random.seed(worker_seed)
     torch.manual_seed(worker_seed)
 
+    local_worker_idx = int(worker_id) % max(1, int(active_workers))
+    base_cfg = (
+        _collision_variant_cfg(
+            cfg,
+            collision_on=_mixed_worker_collision_on(cfg, local_worker_idx, int(active_workers)),
+        )
+        if _collision_mode(cfg) == "mixed"
+        else cfg
+    )
     worker_cfg = replace(
-        cfg,
+        base_cfg,
         rollout_steps=int(rollout_steps),
         rollout_min_episodes=int(rollout_min_episodes),
         seed=worker_seed,
@@ -1436,6 +1582,44 @@ def collect_rollouts(
     total_steps = max(1, int(cfg.rollout_steps))
     rollout_seed = int(cfg.seed) + int(seed_offset)
     if num_workers == 1:
+        if _collision_mode(cfg) == "mixed":
+            from ..envs import make_training_env
+
+            total_episodes = _target_rollout_episodes(cfg)
+            specs = _mixed_rollout_specs(
+                cfg,
+                total_steps=total_steps,
+                total_episodes=total_episodes,
+            )
+            batches: list[RolloutBatch] = []
+            for variant_idx, (collision_on, variant_steps, variant_episodes) in enumerate(specs):
+                variant_cfg = replace(
+                    _collision_variant_cfg(cfg, collision_on=bool(collision_on)),
+                    rollout_steps=int(variant_steps),
+                    rollout_min_episodes=int(variant_episodes),
+                )
+                variant_env = env if variant_idx == 0 and bool(collision_on) else make_training_env(variant_cfg)
+                try:
+                    batches.append(
+                        collect_rollout(
+                            variant_env,
+                            policy,
+                            variant_cfg,
+                            device,
+                            seed=rollout_seed + variant_idx * 100_003,
+                            archive_policy_state_dicts=archive_policy_state_dicts,
+                            policy_obs_dim=int(policy_obs_dim),
+                            critic_obs_dim=(
+                                int(critic_obs_dim)
+                                if critic_obs_dim is not None
+                                else central_critic_observation_dim(int(policy_obs_dim), variant_cfg)
+                            ),
+                        )
+                    )
+                finally:
+                    if variant_env is not env:
+                        variant_env.close()
+            return merge_rollout_batches(batches, cfg)
         return collect_rollout(
             env,
             policy,
@@ -1497,6 +1681,7 @@ def collect_rollouts(
                 int(policy_obs_dim),
                 int(critic_obs_dim),
                 int(seed_offset) + worker_id,
+                int(active_workers),
                 int(worker_steps[worker_id]),
                 int(worker_episodes[worker_id]),
             )

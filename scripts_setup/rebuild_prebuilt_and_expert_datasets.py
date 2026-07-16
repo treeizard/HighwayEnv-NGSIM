@@ -11,16 +11,13 @@ from pathlib import Path
 import numpy as np
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from highway_env.imitation.expert_dataset import (  # noqa: E402
     build_expert_dataset,
     default_observation_config,
 )
 from scripts_setup.build_data_time import build_prebuilt_split  # noqa: E402
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_US_RAW = (
     "raw_data/Next_Generation_Simulation__NGSIM__Vehicle_Trajectories_and_Supporting_Data.csv"
@@ -35,7 +32,7 @@ def parse_args() -> argparse.Namespace:
             "expert datasets using 1/3 train-val-test splits by default."
         )
     )
-    parser.add_argument("--episode-root", default="highway_env/data/processed_20s")
+    parser.add_argument("--episode-root", default="data/highway_env/processed_20s")
     parser.add_argument("--expert-out-root", default="expert_data/rebuilt")
     parser.add_argument("--us-raw-csv", default=DEFAULT_US_RAW)
     parser.add_argument("--japanese-input-npy", default=DEFAULT_JP_RAW)
@@ -96,7 +93,8 @@ def rebuild_us_processed_and_prebuilt(args: argparse.Namespace) -> None:
     run_command(
         [
             sys.executable,
-            "scripts_setup/dump_data_time_ngsim.py",
+            "-m",
+            "scripts_setup.dump_data_time_ngsim",
             args.us_raw_csv,
             "--scene",
             args.us_scene,
@@ -130,7 +128,8 @@ def rebuild_japanese_prebuilt(args: argparse.Namespace) -> None:
     run_command(
         [
             sys.executable,
-            "scripts_setup/build_prebuilt_japanese.py",
+            "-m",
+            "scripts_setup.build_prebuilt_japanese",
             "--input_npy",
             args.japanese_input_npy,
             "--episode_root",

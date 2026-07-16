@@ -11,10 +11,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-
 from highway_env.ngsim_utils.core.constants import METERS_PER_FOOT  # noqa: E402
 
 
@@ -27,12 +23,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--us-root",
-        default="highway_env/data/processed_20s",
+        default="data/highway_env/processed_20s",
         help="Episode root containing us-101/prebuilt/trajectory_<split>.npy.",
     )
     parser.add_argument(
         "--japanese-root",
-        default="highway_env/data/processed_10s",
+        default="data/highway_env/processed_10s",
         help="Episode root containing japanese/prebuilt/trajectory_<split>.npy.",
     )
     parser.add_argument(

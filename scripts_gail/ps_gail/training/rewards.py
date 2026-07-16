@@ -121,6 +121,29 @@ def player_challenge_pressure_from_metric(
     pressure = (ttc_weight * float(ttc_pressure) + gap_weight * float(gap_pressure)) / weight_sum
     return float(np.clip(pressure, 0.0, 1.0)), float(ttc_target), float(gap_target)
 
+
+def collision_proxy_pressure_from_metric(
+    metric: dict[str, object] | None,
+    cfg: PSGAILConfig,
+) -> tuple[float, float, float]:
+    """Return a safety pressure that remains punitive below TTC/gap floors."""
+    if metric is None:
+        return 0.0, 0.0, 0.0
+    ttc_target = _metric_float(metric, "ttc_target", 0.0)
+    ttc_floor = _metric_float(metric, "ttc_floor", 0.0)
+    gap_target = _metric_float(metric, "gap_target", 0.0)
+    gap_floor = _metric_float(metric, "gap_floor", 0.0)
+    min_ttc = _metric_float(metric, "min_ttc", float("inf"))
+    min_gap = _metric_float(metric, "min_gap", float("inf"))
+    if bool(metric.get("crashed", False)):
+        return 1.0, float(ttc_target), float(gap_target)
+    if np.isfinite(min_gap) and min_gap <= max(0.0, float(gap_floor)):
+        return 1.0, float(ttc_target), float(gap_target)
+    if np.isfinite(min_ttc) and min_ttc <= max(0.0, float(ttc_floor)):
+        return 1.0, float(ttc_target), float(gap_target)
+    pressure, _ttc_target, _gap_target = player_challenge_pressure_from_metric(metric, cfg)
+    return float(pressure), float(ttc_target), float(gap_target)
+
 def player_challenge_payoff(
     pressure: float,
     *,
@@ -359,6 +382,7 @@ __all__ = [
     '_transition_array',
     '_metric_float',
     'player_challenge_pressure_from_metric',
+    'collision_proxy_pressure_from_metric',
     'player_challenge_payoff',
     'player_challenge_bonus',
     'combine_primary_env_challenge_rewards',

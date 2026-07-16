@@ -11,6 +11,7 @@ import pytest
 import torch
 from torch.distributions import Categorical
 
+
 try:
     import gymnasium  # noqa: F401
 except ModuleNotFoundError:
@@ -227,6 +228,8 @@ def _minimal_rollout(
             if env_penalties is not None
             else np.zeros(n, dtype=np.float32)
         ),
+        collision_proxy_pressures=np.zeros(n, dtype=np.float32),
+        collision_proxy_penalties=np.zeros(n, dtype=np.float32),
         returns=returns.astype(np.float32),
         advantages=advantages.astype(np.float32),
         generator_features=(
@@ -2455,6 +2458,29 @@ def test_absolute_controlled_vehicle_curriculum_is_shared_by_ps_gail_and_airl():
     assert all(item.control_all_vehicles is False for item in round_cfgs)
 
 
+def test_ps_gail_collision_mode_schedule_keeps_mixed_termination_enabled():
+    cfg = PSGAILConfig(collision_mode_schedule="1:2:soft;3:4:mixed;5:6:full")
+
+    round_cfgs = [ps_gail_config_for_round(cfg, round_idx) for round_idx in range(1, 7)]
+
+    assert [(item.enable_collision, item.terminate_when_all_controlled_crashed) for item in round_cfgs] == [
+        (False, False),
+        (False, False),
+        (True, True),
+        (True, True),
+        (True, True),
+        (True, True),
+    ]
+    assert [item.collision_mode_schedule for item in round_cfgs] == [
+        "soft",
+        "soft",
+        "mixed",
+        "mixed",
+        "full",
+        "full",
+    ]
+
+
 def test_constant_rollout_target_agent_steps_remains_supported():
     cfg = PSGAILConfig(
         controlled_vehicle_curriculum=True,
@@ -2554,7 +2580,7 @@ def _parser_flag_set(*, airl: bool = False) -> set[str]:
 def _python_flags_from_slurm_script(script: Path, train_target_pattern: str) -> set[str]:
     text = script.read_text(encoding="utf-8")
     match = re.search(
-        rf"python\s+\"{train_target_pattern}\"\s+\\(?P<body>.*?)(?:\n\s*(?:if|echo|$))",
+        rf'python\s+(?:-m\s+)?"?{train_target_pattern}"?\s+\\(?P<body>.*?)(?:\n\s*(?:if|echo|$))',
         text,
         flags=re.DOTALL,
     )
@@ -2570,23 +2596,23 @@ def test_primary_slurm_scripts_only_pass_known_training_flags():
     root = Path(__file__).resolve().parents[1]
     cases = [
         (
-            root / "slurum/script_pretrain/train_gail_continuous_gpu_32c_stage1_50veh.bash",
-            r"\$\{REPODIR\}/scripts_gail/train_simple_ps_gail\.py",
+            root / "hpc/slurm/script_pretrain/train_gail_continuous_gpu_32c_stage1_50veh.bash",
+            r"scripts_gail\.train_simple_ps_gail",
             _parser_flag_set(),
         ),
         (
-            root / "slurum/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
-            r"\$\{REPODIR\}/scripts_gail/train_simple_ps_gail\.py",
+            root / "hpc/slurm/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
+            r"scripts_gail\.train_simple_ps_gail",
             _parser_flag_set(),
         ),
         (
-            root / "slurum/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash",
-            r"\$\{AIRL_TRAIN_SCRIPT\}",
+            root / "hpc/slurm/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash",
+            r"\$\{AIRL_TRAIN_MODULE\}",
             _parser_flag_set(airl=True),
         ),
         (
-            root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
-            r"\$\{AIRL_TRAIN_SCRIPT\}",
+            root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
+            r"\$\{AIRL_TRAIN_MODULE\}",
             _parser_flag_set(airl=True),
         ),
     ]
@@ -2633,16 +2659,16 @@ def test_expert_dataset_doc_describes_ngsim_continuous_action_contract():
 def test_paper_slurm_scripts_keep_scene_and_expert_budget_explicit():
     root = Path(__file__).resolve().parents[1]
     scripts = [
-        root / "slurum/script_pretrain/train_gail_continuous_gpu_32c_stage1_50veh.bash",
-        root / "slurum/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
-        root / "slurum/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash",
-        root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
+        root / "hpc/slurm/script_pretrain/train_gail_continuous_gpu_32c_stage1_50veh.bash",
+        root / "hpc/slurm/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
+        root / "hpc/slurm/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash",
+        root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
     ]
 
     for script in scripts:
         text = script.read_text(encoding="utf-8")
         assert 'SCENE="${SCENE:-us-101}"' in text
-        assert 'EPISODE_ROOT="${EPISODE_ROOT:-${REPODIR}/highway_env/data/processed_20s}"' in text
+        assert 'EPISODE_ROOT="${EPISODE_ROOT:-${VFI_HIGHWAY_DATA_ROOT}/processed_20s}"' in text
         assert 'PREBUILT_SPLIT="${PREBUILT_SPLIT:-train}"' in text
         assert 'MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-0}"' in text
         assert '--scene "${SCENE}"' in text
@@ -2655,8 +2681,8 @@ def test_paper_slurm_scripts_keep_scene_and_expert_budget_explicit():
 def test_paper_airl_slurm_scripts_pin_shaped_reward_mode():
     root = Path(__file__).resolve().parents[1]
     scripts = [
-        root / "slurum/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash",
-        root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
+        root / "hpc/slurm/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash",
+        root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
     ]
 
     for script in scripts:
@@ -2669,10 +2695,10 @@ def test_paper_airl_slurm_scripts_pin_shaped_reward_mode():
 def test_paper_airl_slurm_scripts_default_to_gradual_vehicle_schedules():
     root = Path(__file__).resolve().parents[1]
     airl_stage1 = (
-        root / "slurum/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash"
+        root / "hpc/slurm/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash"
     ).read_text(encoding="utf-8")
     airl_stage2 = (
-        root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash"
+        root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash"
     ).read_text(encoding="utf-8")
 
     assert 'CONTROLLED_VEHICLE_SCHEDULE_PROFILE="${CONTROLLED_VEHICLE_SCHEDULE_PROFILE:-gradual}"' in airl_stage1
@@ -2688,14 +2714,14 @@ def test_paper_airl_slurm_scripts_default_to_gradual_vehicle_schedules():
 def test_paper_finetune_slurm_scripts_auto_resolve_ckpt_folder():
     root = Path(__file__).resolve().parents[1]
     gail = (
-        root / "slurum/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash"
+        root / "hpc/slurm/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash"
     ).read_text(encoding="utf-8")
     airl = (
-        root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash"
+        root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash"
     ).read_text(encoding="utf-8")
 
-    assert 'CKPT_ROOT="${CKPT_ROOT:-${REPODIR}/ckpt}"' in gail
-    assert 'CKPT_ROOT="${CKPT_ROOT:-${REPODIR}/ckpt}"' in airl
+    assert 'CKPT_ROOT="${CKPT_ROOT:-${VFI_CHECKPOINT_ROOT}}"' in gail
+    assert 'CKPT_ROOT="${CKPT_ROOT:-${VFI_CHECKPOINT_ROOT}}"' in airl
     assert 'CKPT_DATASET="${CKPT_DATASET:-}"' in gail
     assert 'CKPT_DATASET="${CKPT_DATASET:-}"' in airl
     assert '"${CKPT_ROOT}/${CKPT_DATASET}/gail/final_pretrain.pt"' in gail
@@ -2715,16 +2741,16 @@ def test_paper_finetune_slurm_scripts_auto_resolve_ckpt_folder():
 def test_paper_slurm_scripts_use_low_nonzero_entropy():
     root = Path(__file__).resolve().parents[1]
     airl_stage1 = (
-        root / "slurum/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash"
+        root / "hpc/slurm/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash"
     ).read_text(encoding="utf-8")
     airl_stage2 = (
-        root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash"
+        root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash"
     ).read_text(encoding="utf-8")
     gail_stage1 = (
-        root / "slurum/script_pretrain/train_gail_continuous_gpu_32c_stage1_50veh.bash"
+        root / "hpc/slurm/script_pretrain/train_gail_continuous_gpu_32c_stage1_50veh.bash"
     ).read_text(encoding="utf-8")
     gail_stage2 = (
-        root / "slurum/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash"
+        root / "hpc/slurm/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash"
     ).read_text(encoding="utf-8")
 
     assert 'WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.001}"' in airl_stage1
@@ -2789,8 +2815,8 @@ def test_finetune_schedule_reaches_full_load_by_round_100_and_holds():
 def test_finetune_slurm_scripts_use_200_round_stage2_schedules():
     root = Path(__file__).resolve().parents[1]
     scripts = [
-        root / "slurum/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
-        root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
+        root / "hpc/slurm/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
+        root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
     ]
     expected_vehicle_schedule = (
         "0:40:50:70;40:80:70:90;80:100:90:100;100:200:100:100"
@@ -2813,8 +2839,8 @@ def test_finetune_slurm_scripts_use_200_round_stage2_schedules():
 def test_finetune_slurm_scripts_keep_stage2_safety_penalties_consistent():
     root = Path(__file__).resolve().parents[1]
     scripts = [
-        root / "slurum/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
-        root / "slurum/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
+        root / "hpc/slurm/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
+        root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
     ]
 
     for script in scripts:
@@ -2828,8 +2854,8 @@ def test_finetune_slurm_scripts_keep_stage2_safety_penalties_consistent():
 def test_full_training_submitters_export_stage2_safety_penalties():
     root = Path(__file__).resolve().parents[1]
     scripts = [
-        root / "slurum/script_full_training/submit_gail_pretrain_finetune_5day.bash",
-        root / "slurum/script_full_training/submit_airl_pretrain_finetune_5day.bash",
+        root / "hpc/slurm/script_full_training/submit_gail_pretrain_finetune_5day.bash",
+        root / "hpc/slurm/script_full_training/submit_airl_pretrain_finetune_5day.bash",
     ]
 
     for script in scripts:
@@ -2958,8 +2984,8 @@ def test_best_checkpoint_payload_carries_validation_metadata_and_model_state_key
 
 def test_stage2_scripts_require_final_pretrain_resume_by_default():
     root = Path(__file__).resolve().parents[1]
-    gail_script = root / "slurum" / "script_finetune" / "train_gail_continuous_gpu_32c_stage2_100veh.bash"
-    airl_script = root / "slurum" / "script_finetune" / "train_airl_continuous_gpu_32c_stage2_100veh.bash"
+    gail_script = root / "hpc" / "slurm" / "script_finetune" / "train_gail_continuous_gpu_32c_stage2_100veh.bash"
+    airl_script = root / "hpc" / "slurm" / "script_finetune" / "train_airl_continuous_gpu_32c_stage2_100veh.bash"
     for script in (gail_script, airl_script):
         text = script.read_text(encoding="utf-8")
         assert 'ALLOW_NON_BEST_RESUME="${ALLOW_NON_BEST_RESUME:-false}"' in text

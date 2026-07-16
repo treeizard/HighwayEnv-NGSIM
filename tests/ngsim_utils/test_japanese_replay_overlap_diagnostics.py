@@ -45,7 +45,7 @@ def test_japanese_lane3_boundary_comparison_matches_road_315_boundary():
 def test_known_japanese_seed_3165_3167_overlap_state_is_explicit():
     config = ScanConfig(
         scene="japanese",
-        episode_root="highway_env/data/processed_20s",
+        episode_root="data/highway_env/processed_20s",
         prebuilt_split="train",
         episode_name="t1577840400000",
         ego_vehicle_id=2586,
@@ -80,7 +80,7 @@ def test_known_japanese_seed_3165_3167_overlap_state_is_explicit():
 def test_pair_geometry_window_compares_current_motion_and_lane3_boundary_variants():
     config = ScanConfig(
         scene="japanese",
-        episode_root="highway_env/data/processed_20s",
+        episode_root="data/highway_env/processed_20s",
         prebuilt_split="train",
         episode_name="t1577840400000",
         ego_vehicle_id=2586,

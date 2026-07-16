@@ -15,10 +15,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-
 from scripts_gail.ps_gail.config import PSGAILConfig, should_save_checkpoint_video
 from scripts_gail.ps_gail.data import load_expert_transition_data
 from scripts_gail.ps_gail.envs import make_training_env

@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 from pathlib import Path
 import datetime as dt
 import gc
@@ -35,14 +34,11 @@ import gc
 import numpy as np
 import pandas as pd
 
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RAW_DATA_DIR = PROJECT_ROOT / "raw_data"
-
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-if str(RAW_DATA_DIR) not in sys.path:
-    sys.path.insert(0, str(RAW_DATA_DIR))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_ROOT = Path(
+    os.environ.get("VFI_DATA_ROOT", PROJECT_ROOT / "highway_env" / "data")
+).expanduser().resolve()
+RAW_DATA_DIR = DATA_ROOT / "raw"
 
 from highway_env.data.curvature_remap import estimate_curvature_remap
 from highway_env.ngsim_utils.data.trajectory_gen import (
@@ -63,12 +59,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--input_npy",
-        default="raw_data/morinomiya_filtered_800.npy",
+        default=str(RAW_DATA_DIR / "morinomiya_filtered_800.npy"),
         help="Filtered Morinomiya .npy produced by the raw_data preprocessing pipeline.",
     )
     parser.add_argument(
         "--episode_root",
-        default="highway_env/data/processed_20s",
+        default=str(DATA_ROOT / "processed_20s"),
         help="Root output folder that will contain <scene>/prebuilt/*.npy.",
     )
     parser.add_argument(
@@ -259,7 +255,7 @@ def parse_datetime_jst(values) -> pd.Series:
         errors="coerce",
         utc=True,
     )
-    return parsed.dt.tz_convert(JST_TIMEZONE)
+    return parsed.dt.tz_convert(JST_TIMEZONE).astype("datetime64[ns, Asia/Tokyo]")
 
 
 def parse_morinomiya_clock_datetime(values) -> pd.Series:
@@ -285,10 +281,11 @@ def parse_morinomiya_clock_datetime(values) -> pd.Series:
         + seconds * 1_000
         + millis
     )
-    return MORINOMIYA_START_JST.normalize() + pd.to_timedelta(
+    parsed = MORINOMIYA_START_JST.normalize() + pd.to_timedelta(
         total_ms.where(valid),
         unit="ms",
     )
+    return parsed.astype("datetime64[ns, Asia/Tokyo]")
 
 
 def load_filtered_morinomiya(

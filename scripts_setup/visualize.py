@@ -11,10 +11,6 @@ from PIL import Image
 # ---------------------------------------------------------------------
 # Make project importable
 # ---------------------------------------------------------------------
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
-
 register(
     id="NGSim-US101-v0",
     entry_point="highway_env.envs.ngsim_env:NGSimEnv",

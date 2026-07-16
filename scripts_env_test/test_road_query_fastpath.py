@@ -12,10 +12,6 @@ import numpy as np
 from gymnasium.envs.registration import register, registry
 
 
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-
 
 ENV_ID = "NGSim-US101-v0"
 if ENV_ID not in registry:
@@ -74,7 +70,7 @@ def build_config(scene: str, args: argparse.Namespace) -> dict[str, Any]:
         "simulation_frequency": 10,
         "policy_frequency": 10,
         "max_episode_steps": max(10, int(args.steps) + 2),
-        "episode_root": "highway_env/data/processed_20s",
+        "episode_root": "data/highway_env/processed_20s",
         "prebuilt_split": "train",
         "max_surrounding": args.max_surrounding,
         "expert_test_mode": False,

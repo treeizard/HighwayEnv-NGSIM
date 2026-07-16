@@ -47,7 +47,7 @@ control setup.
 Run a quick demonstration:
 
 ```bash
-MPLCONFIGDIR=/tmp python scripts_gail/train_simple_ps_gail.py \
+MPLCONFIGDIR=/tmp python -m scripts_gail.train_simple_ps_gail \
   --expert-data expert_data/ngsim_ps_traj_expert_discrete_54902119 \
   --total-rounds 10 \
   --rollout-steps 200 \
@@ -59,7 +59,7 @@ MPLCONFIGDIR=/tmp python scripts_gail/train_simple_ps_gail.py \
 Enable Weights & Biases logging:
 
 ```bash
-python scripts_gail/train_simple_ps_gail.py \
+python -m scripts_gail.train_simple_ps_gail \
   --wandb-mode online \
   --wandb-project highwayenv-ps-gail \
   --wandb-tags ps-gail,collision,idm \
@@ -72,7 +72,7 @@ Use `--wandb-mode offline` on a cluster node without internet, or keep the defau
 For a tiny smoke test:
 
 ```bash
-MPLCONFIGDIR=/tmp python scripts_gail/train_simple_ps_gail.py \
+MPLCONFIGDIR=/tmp python -m scripts_gail.train_simple_ps_gail \
   --total-rounds 1 \
   --rollout-steps 2 \
   --max-expert-samples 128 \
@@ -87,6 +87,6 @@ MPLCONFIGDIR=/tmp python scripts_gail/train_simple_ps_gail.py \
 Check the dual-discriminator setup on SLURM:
 
 ```bash
-sbatch slurum/check_build_ps_gail_dual_disc_expert.bash
-sbatch slurum/check_train_simple_ps_gail_dual_disc_gpu_32c.bash
+sbatch hpc/slurm/script_pretrain/train_gail_continuous_gpu_32c_stage1_50veh.bash
+sbatch hpc/slurm/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash
 ```

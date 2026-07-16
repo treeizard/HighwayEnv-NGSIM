@@ -54,7 +54,14 @@ def make_training_env(cfg: PSGAILConfig, *, render_mode: str | None = None) -> g
     )
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
     env_cfg["crash_controlled_vehicles_offroad"] = True
-    env_cfg["enable_interaction_metrics"] = bool(getattr(cfg, "enable_player_challenge_reward", False))
+    needs_collision_proxy_metrics = (
+        not bool(getattr(cfg, "enable_collision", True))
+        and float(getattr(cfg, "collision_proxy_penalty_coef", 0.0)) > 0.0
+    )
+    env_cfg["enable_interaction_metrics"] = bool(
+        getattr(cfg, "enable_player_challenge_reward", False)
+        or needs_collision_proxy_metrics
+    )
     env_cfg["interaction_ttc_target"] = float(getattr(cfg, "challenge_ttc_target", 0.0))
     env_cfg["interaction_ttc_margin"] = float(getattr(cfg, "challenge_ttc_margin", 0.75))
     env_cfg["interaction_ttc_floor"] = float(getattr(cfg, "challenge_ttc_floor", 0.0))

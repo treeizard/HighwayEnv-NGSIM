@@ -21,7 +21,7 @@ def trajectory_smoothing(trajectory):
 
 def build_trajecotry(scene, period, vehicle_ID):
     ng = ngsim_data(scene)
-    ng.load('highway_env/data/processed/'+scene)
+    ng.load('data/highway_env/processed/'+scene)
     records = ng.vr_dict
     vehicles = ng.veh_dict
     snapshots = ng.snap_dict

@@ -25,10 +25,6 @@ import numpy as np
 from tqdm.auto import tqdm
 
 
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-
 
 from highway_env.imitation.expert_dataset import (  # noqa: E402
     ENV_ID,
@@ -68,7 +64,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--scene", type=str, default="us-101")
-    parser.add_argument("--episode-root", type=str, default="highway_env/data/processed_20s")
+    parser.add_argument("--episode-root", type=str, default="data/highway_env/processed_20s")
     parser.add_argument("--prebuilt-split", choices=["train", "val", "test"], default="train")
     parser.add_argument(
         "--out",

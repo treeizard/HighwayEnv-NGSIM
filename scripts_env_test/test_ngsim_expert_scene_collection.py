@@ -15,10 +15,6 @@ from gymnasium.wrappers import RecordVideo
 from tqdm.auto import tqdm
 
 
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-
 from highway_env.imitation.expert_dataset import ENV_ID, build_env_config, register_ngsim_env  # noqa: E402
 from highway_env.ngsim_utils.vehicles.replay import NGSIMVehicle  # noqa: E402
 from highway_env.vehicle.behavior import IDMVehicle  # noqa: E402
@@ -33,7 +29,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--scene", default="us-101")
-    parser.add_argument("--episode-root", default="highway_env/data/processed_20s")
+    parser.add_argument("--episode-root", default="data/highway_env/processed_20s")
     parser.add_argument("--prebuilt-split", choices=["train", "val", "test"], default="train")
     parser.add_argument("--episode-name", default=None)
     parser.add_argument("--episodes", type=int, default=10)
