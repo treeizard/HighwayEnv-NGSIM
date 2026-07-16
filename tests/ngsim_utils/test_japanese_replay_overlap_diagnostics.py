@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -16,6 +18,23 @@ from scripts_env_test.diagnose_japanese_replay_overlaps import (  # noqa: E402
     inspect_pair_geometry_window,
     run_env_overlap_scan,
 )
+
+
+def japanese_episode_root() -> str:
+    configured_root = os.environ.get("VFI_HIGHWAY_DATA_ROOT")
+    candidates = []
+    if configured_root:
+        candidates.append(Path(configured_root) / "processed_20s")
+    candidates.append(Path("data/highway_env/processed_20s"))
+    candidates.extend(
+        parent / "data/highway_env/processed_20s"
+        for parent in Path(__file__).resolve().parents
+    )
+
+    for candidate in candidates:
+        if (candidate / "japanese/prebuilt/veh_ids_train.npy").is_file():
+            return str(candidate.resolve())
+    pytest.skip("Japanese prebuilt replay fixture is not available")
 
 
 def test_inactive_zero_footprint_vehicle_is_excluded_from_overlap_and_render_risk():
@@ -45,7 +64,7 @@ def test_japanese_lane3_boundary_comparison_matches_road_315_boundary():
 def test_known_japanese_seed_3165_3167_overlap_state_is_explicit():
     config = ScanConfig(
         scene="japanese",
-        episode_root="data/highway_env/processed_20s",
+        episode_root=japanese_episode_root(),
         prebuilt_split="train",
         episode_name="t1577840400000",
         ego_vehicle_id=2586,
@@ -80,7 +99,7 @@ def test_known_japanese_seed_3165_3167_overlap_state_is_explicit():
 def test_pair_geometry_window_compares_current_motion_and_lane3_boundary_variants():
     config = ScanConfig(
         scene="japanese",
-        episode_root="data/highway_env/processed_20s",
+        episode_root=japanese_episode_root(),
         prebuilt_split="train",
         episode_name="t1577840400000",
         ego_vehicle_id=2586,
