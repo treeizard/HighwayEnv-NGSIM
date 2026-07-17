@@ -29,6 +29,10 @@ modules and do not require `PYTHONPATH` changes.
 - `hpc/slurm/`: Linux HPC launchers.
 - `tests/`: fork-owned unit and integration tests.
 
+The validation-first recurrent IQ-Learn workflow, evidence, and promotion gates
+are documented in the study memory
+[`IQ_LEARN_VALIDATION.md`](../../memory/autoregressive_policy_comparison/IQ_LEARN_VALIDATION.md).
+
 ## Data setup
 
 ### NGSIM data

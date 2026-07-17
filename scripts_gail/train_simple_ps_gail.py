@@ -630,6 +630,36 @@ def behavior_clone_pretrain(
     }
 
 
+def _collision_only_flags(
+    crash_flags: list[object] | tuple[object, ...],
+    offroad_flags: list[object] | tuple[object, ...],
+) -> list[bool]:
+    """Separate vehicle-collision flags from off-road crashes.
+
+    NGSimEnv deliberately marks an off-road controlled vehicle as ``crashed``.
+    A raw crash flag is therefore not a collision-only measurement.
+    """
+    count = max(len(crash_flags), len(offroad_flags))
+    return [
+        bool(crash_flags[idx]) and not bool(offroad_flags[idx] if idx < len(offroad_flags) else False)
+        for idx in range(count)
+        if idx < len(crash_flags)
+    ]
+
+
+def _collision_proxy_flags(interaction_metrics: list[object] | tuple[object, ...]) -> list[bool]:
+    """Return counterfactual bumper-overlap flags while collision physics is off."""
+    flags: list[bool] = []
+    for raw_metric in interaction_metrics:
+        metric = raw_metric if isinstance(raw_metric, dict) else {}
+        try:
+            min_gap = float(metric.get("min_gap", float("inf")))
+        except (TypeError, ValueError):
+            min_gap = float("inf")
+        flags.append(bool(np.isfinite(min_gap) and min_gap <= 0.0))
+    return flags
+
+
 def evaluate_policy_survival(
     policy: torch.nn.Module,
     cfg: PSGAILConfig,
@@ -644,6 +674,8 @@ def evaluate_policy_survival(
     env = None
     lengths: list[int] = []
     crash_episodes = 0
+    collision_episodes = 0
+    collision_proxy_episodes = 0
     offroad_episodes = 0
     controlled_counts: list[int] = []
     road_counts: list[int] = []
@@ -664,6 +696,8 @@ def evaluate_policy_survival(
                     else None
                 )
                 episode_had_crash = False
+                episode_had_collision = False
+                episode_had_collision_proxy = False
                 episode_had_offroad = False
                 length = 0
                 for _step in range(max(1, int(cfg.max_episode_steps))):
@@ -694,14 +728,24 @@ def evaluate_policy_survival(
                         )
                     obs, _reward, terminated, truncated, info = env.step(action)
                     length += 1
-                    crash_flags = info.get("controlled_vehicle_crashes", [])
-                    offroad_flags = info.get("controlled_vehicle_offroad", [])
+                    crash_flags = list(info.get("controlled_vehicle_crashes", []) or [])
+                    offroad_flags = list(info.get("controlled_vehicle_offroad", []) or [])
+                    collision_flags = _collision_only_flags(crash_flags, offroad_flags)
+                    collision_proxy_flags = _collision_proxy_flags(
+                        list(info.get("controlled_vehicle_interaction_metrics", []) or [])
+                    )
                     episode_had_crash = bool(episode_had_crash or any(bool(flag) for flag in crash_flags))
+                    episode_had_collision = bool(episode_had_collision or any(collision_flags))
+                    episode_had_collision_proxy = bool(
+                        episode_had_collision_proxy or any(collision_proxy_flags)
+                    )
                     episode_had_offroad = bool(episode_had_offroad or any(bool(flag) for flag in offroad_flags))
                     if terminated or truncated:
                         break
                 lengths.append(length)
                 crash_episodes += int(episode_had_crash)
+                collision_episodes += int(episode_had_collision)
+                collision_proxy_episodes += int(episode_had_collision_proxy)
                 offroad_episodes += int(episode_had_offroad)
     finally:
         if env is not None:
@@ -714,8 +758,12 @@ def evaluate_policy_survival(
         "bc_eval/min_episode_length": float(np.min(lengths)) if lengths else 0.0,
         "bc_eval/max_episode_length": float(np.max(lengths)) if lengths else 0.0,
         "bc_eval/crash_episodes": float(crash_episodes),
+        "bc_eval/collision_episodes": float(collision_episodes),
+        "bc_eval/collision_proxy_episodes": float(collision_proxy_episodes),
         "bc_eval/offroad_episodes": float(offroad_episodes),
         "bc_eval/crash_episode_fraction": float(crash_episodes / eval_episodes),
+        "bc_eval/collision_episode_fraction": float(collision_episodes / eval_episodes),
+        "bc_eval/collision_proxy_episode_fraction": float(collision_proxy_episodes / eval_episodes),
         "bc_eval/offroad_episode_fraction": float(offroad_episodes / eval_episodes),
         "bc_eval/mean_controlled_vehicles": float(np.mean(controlled_counts)) if controlled_counts else 0.0,
         "bc_eval/mean_road_vehicles": float(np.mean(road_counts)) if road_counts else 0.0,
