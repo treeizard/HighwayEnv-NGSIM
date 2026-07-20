@@ -24,21 +24,8 @@ import matplotlib.pyplot as plt
 from highway_env.data.ngsim import *
 from typing import Any, Dict
 from highway_env.ngsim_utils.core.constants import FEET_PER_METER
-"""
-def trajectory_smoothing(trajectory):
-    trajectory = np.array(trajectory)
-    x = trajectory[:,0]
-    y = trajectory[:,1]
-    speed = trajectory[:,2]
-    lane = trajectory[:,3]
 
-    window_length = 21 if len(x[np.nonzero(x)]) >= 21 else len(x[np.nonzero(x)]) if len(x[np.nonzero(x)]) % 2 !=0 else len(x[np.nonzero(x)])-1
-    x[np.nonzero(x)] = signal.savgol_filter(x[np.nonzero(x)], window_length=window_length, polyorder=3) # window size used for filtering, order of fitted polynomial
-    y[np.nonzero(y)] = signal.savgol_filter(y[np.nonzero(y)], window_length=window_length, polyorder=3)
-    speed[np.nonzero(speed)] = signal.savgol_filter(speed[np.nonzero(speed)], window_length=window_length, polyorder=3)
-   
-    return [[float(x), float(y), float(s), int(l)] for x, y, s, l in zip(x, y, speed, lane)]
-"""
+
 def trajectory_smoothing(trajectory):
     """
     trajectory: array-like of shape (T, 4) with columns [x, y, speed, lane]
