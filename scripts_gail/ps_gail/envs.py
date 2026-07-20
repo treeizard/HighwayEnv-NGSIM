@@ -53,6 +53,11 @@ def make_training_env(cfg: PSGAILConfig, *, render_mode: str | None = None) -> g
         cfg.terminate_when_all_controlled_crashed
     )
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
+    env_cfg["road_query_mode"] = str(getattr(cfg, "road_query_mode", "legacy"))
+    env_cfg["collision_check_mode"] = str(getattr(cfg, "collision_check_mode", "legacy"))
+    env_cfg["record_replay_diagnostics"] = bool(
+        getattr(cfg, "record_replay_diagnostics", True)
+    )
     env_cfg["crash_controlled_vehicles_offroad"] = True
     needs_collision_proxy_metrics = (
         not bool(getattr(cfg, "enable_collision", True))

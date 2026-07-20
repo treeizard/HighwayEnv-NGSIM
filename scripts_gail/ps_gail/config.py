@@ -41,6 +41,9 @@ class PSGAILConfig:
     rollout_target_episode_safety_factor: float = 1.25
     rollout_training_subsample: bool = True
     rollout_training_agent_steps: int = 0
+    rollout_cache_envs: bool = True # reuse structurally identical envs in persistent workers.
+    rollout_max_cached_envs_per_worker: int = 2 # bounded LRU; 0 keeps every structural variant.
+    rollout_profile: bool = False # print worker cache/build/load timing for each rollout task.
 
     # Threads/Training parameters. These values define the training setup and optimization parameters;
     num_rollout_workers: int = 1 # number of actives worker that will be rolling out trajectories in parallel.
@@ -89,6 +92,11 @@ class PSGAILConfig:
     collision_mixed_on_fraction: float = 0.5
     collision_proxy_penalty_coef: float = 1.0
     allow_idm: bool = True
+    # Exact simulator backends. Legacy defaults preserve old CLI behaviour;
+    # campaign manifests opt into the parity-tested fast paths explicitly.
+    road_query_mode: str = "legacy"
+    collision_check_mode: str = "legacy"
+    record_replay_diagnostics: bool = True
 
     # Sensor Parameters. These values define the observation space and what information is available to the policy;
     # changing them can modify the state representation and thus the learning problem itself.
@@ -274,6 +282,10 @@ class PSGAILConfig:
     wandb_tags: str = ""
     wandb_watch: bool = False
     wandb_compact_metrics: bool = True
+
+    # Stable campaign identity. Empty keeps legacy scene-based domain inference.
+    study_domain: str = ""
+    run_root: str = "" # empty preserves each trainer's historical output root.
 
 
 def checkpoint_video_interval(cfg: PSGAILConfig) -> int:

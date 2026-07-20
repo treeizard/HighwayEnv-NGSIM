@@ -118,6 +118,11 @@ def best_checkpoint_payload(
 ) -> dict[str, Any]:
     """Attach best-validation metadata to a normal trainer checkpoint payload."""
     payload = dict(base_payload)
+    method = str(payload.get("method") or "").strip().lower()
+    if method:
+        from .checkpoints import set_checkpoint_kind
+
+        payload = set_checkpoint_kind(payload, f"{method}_best")
     payload.update(
         {
             "best_round": int(round_idx),

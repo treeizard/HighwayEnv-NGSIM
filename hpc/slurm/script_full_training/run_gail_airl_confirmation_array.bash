@@ -7,18 +7,10 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
-#SBATCH --array=0-19
 #SBATCH --output=logs/slurm/gail_airl_confirm_%A_%a.out
 #SBATCH --error=logs/slurm/gail_airl_confirm_%A_%a.err
 
 set -euo pipefail
 
-REPODIR="${REPODIR:-$(pwd)}"
-STUDY_MANIFEST="${STUDY_MANIFEST:?Set STUDY_MANIFEST to confirmation trials.json}"
-PYTHON_BIN="${PYTHON_BIN:-python}"
-
-cd "${REPODIR}"
-"${PYTHON_BIN}" -m scripts_gail.run_gail_airl_study_trial \
-    --manifest "${STUDY_MANIFEST}" \
-    --trial-index "${SLURM_ARRAY_TASK_ID}" \
-    --python "${PYTHON_BIN}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec bash "${SCRIPT_DIR}/run_gail_airl_method_array.bash"

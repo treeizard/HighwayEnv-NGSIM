@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical, Independent, Normal
 
 from scripts_gail.ps_gail.config import PSGAILConfig, should_save_checkpoint_video
+from scripts_gail.ps_gail.checkpoints import atomic_torch_save, checkpoint_metadata
 from scripts_gail.ps_gail.data import (
     fit_feature_standardizer,
     load_expert_policy_and_disc_data,
@@ -311,8 +312,10 @@ def gail_checkpoint_payload(
     expert_metadata: dict[str, object],
     cfg: PSGAILConfig,
     round_cfg: PSGAILConfig,
+    checkpoint_kind: str = "gail_round",
 ) -> dict[str, object]:
     return {
+        **checkpoint_metadata(cfg, method="gail", checkpoint_kind=checkpoint_kind),
         "round": int(round_idx),
         "policy_state_dict": policy.state_dict(),
         "discriminator_state_dict": discriminator.state_dict(),
@@ -811,7 +814,8 @@ def main() -> None:
     torch.manual_seed(cfg.seed)
     device = resolve_device(cfg.device)
 
-    run_dir = os.path.abspath(os.path.join("logs", "simple_ps_gail", cfg.run_name))
+    run_root = str(cfg.run_root).strip() or os.path.join("logs", "simple_ps_gail")
+    run_dir = os.path.abspath(os.path.join(run_root, cfg.run_name))
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
     write_run_manifest(run_dir, cfg, trainer="gail")
@@ -1268,8 +1272,9 @@ def main() -> None:
                     warnings.warn(message, RuntimeWarning, stacklevel=2)
             monitor.log({**bc_stats, **bc_eval_stats}, step=0)
             bc_path = os.path.join(ckpt_dir, "bc_pretrained.pt")
-            torch.save(
+            atomic_torch_save(
                 {
+                    **checkpoint_metadata(cfg, method="gail", checkpoint_kind="gail_bc_pretrained"),
                     "round": 0,
                     "policy_state_dict": policy.state_dict(),
                     "expert_metadata": checkpoint_expert_metadata(expert_metadata),
@@ -1318,7 +1323,7 @@ def main() -> None:
                 last_validation_metrics = dict(initial_metrics)
                 monitor.log(initial_metrics, step=0)
                 if bool(getattr(cfg, "save_best_checkpoint", True)) and np.isfinite(initial_score):
-                    torch.save(
+                    atomic_torch_save(
                         best_checkpoint_payload(
                             gail_checkpoint_payload(
                                 round_idx=0,
@@ -2059,7 +2064,7 @@ def main() -> None:
                     if improved:
                         best_validation_score = float(val_score)
                         best_validation_round = int(round_idx)
-                        torch.save(
+                        atomic_torch_save(
                             best_checkpoint_payload(
                                 gail_checkpoint_payload(
                                     round_idx=round_idx,
@@ -2115,7 +2120,7 @@ def main() -> None:
 
             if cfg.checkpoint_every > 0 and round_idx % int(cfg.checkpoint_every) == 0:
                 checkpoint_path = os.path.join(ckpt_dir, f"round_{round_idx:04d}.pt")
-                torch.save(
+                atomic_torch_save(
                     gail_checkpoint_payload(
                         round_idx=round_idx,
                         policy=policy,
@@ -2159,7 +2164,7 @@ def main() -> None:
         final_round = int(cfg.total_rounds)
         final_round_cfg = config_for_round(cfg, final_round)
         final_path = os.path.join(run_dir, "final.pt")
-        torch.save(
+        atomic_torch_save(
             gail_checkpoint_payload(
                 round_idx=final_round,
                 policy=policy,
@@ -2172,6 +2177,7 @@ def main() -> None:
                 expert_metadata=expert_metadata,
                 cfg=cfg,
                 round_cfg=final_round_cfg,
+                checkpoint_kind="gail_final",
             ),
             final_path,
         )

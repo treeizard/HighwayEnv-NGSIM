@@ -5,7 +5,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from dataclasses import replace
@@ -23,7 +23,6 @@ from ..data import (
     scene_snapshot_features,
     transform_sequence_features,
 )
-from ..models import make_actor_critic
 from ..observations import flatten_agent_observations, policy_observations_from_flat
 
 from .policy import (
@@ -57,6 +56,14 @@ from .rewards import (
     shape_adversarial_rewards,
 )
 from .types import AgentTransition, RolloutBatch
+
+
+_ROLLOUT_POLICY_CACHE: dict[tuple[object, ...], nn.Module] = {}
+_ROLLOUT_ENV_CACHE: OrderedDict[tuple[object, ...], gym.Env] = OrderedDict()
+_ROLLOUT_POLICY_CACHE_HITS = 0
+_ROLLOUT_POLICY_CACHE_MISSES = 0
+_ROLLOUT_ENV_CACHE_HITS = 0
+_ROLLOUT_ENV_CACHE_MISSES = 0
 
 
 def _collision_proxy_enabled(cfg: PSGAILConfig) -> bool:
@@ -156,6 +163,144 @@ class _RolloutPerfProfiler:
             total_ms = 1000.0 * float(cls.totals[name])
             parts.append(f"{name}={total_ms / count:.3f}ms avg ({total_ms:.1f}ms/{count})")
         print("[rollout_profile] " + " ".join(parts), flush=True)
+
+
+def _rollout_policy_cache_key(
+    cfg: PSGAILConfig,
+    policy_obs_dim: int,
+    critic_obs_dim: int,
+) -> tuple[object, ...]:
+    """Key actor construction state while deliberately excluding mutable weights."""
+    return (
+        str(cfg.policy_model),
+        int(policy_obs_dim),
+        int(critic_obs_dim),
+        int(cfg.hidden_size),
+        str(cfg.action_mode),
+        int(cfg.continuous_action_dim),
+        int(cfg.transformer_layers),
+        int(cfg.transformer_heads),
+        float(cfg.transformer_dropout),
+        bool(getattr(cfg, "transformer_temporal_module", False)),
+        int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
+        int(getattr(cfg, "transformer_temporal_layers", 1)),
+        int(getattr(cfg, "transformer_memory_tokens", 8)),
+        int(getattr(cfg, "transformer_memory_context_length", 32)),
+        bool(getattr(cfg, "transformer_use_causal_attention", True)),
+        bool(centralized_critic_enabled(cfg)),
+        str(getattr(cfg, "central_critic_pooling", "flat")),
+        int(getattr(cfg, "central_critic_max_vehicles", 64)),
+        int(getattr(cfg, "central_critic_attention_heads", 4)),
+    )
+
+
+def _cached_rollout_policy(
+    cfg: PSGAILConfig,
+    policy_state_dict: dict[str, torch.Tensor],
+    policy_obs_dim: int,
+    critic_obs_dim: int,
+) -> tuple[nn.Module, bool]:
+    """Reuse actor allocation in a persistent worker and refresh only its weights."""
+    global _ROLLOUT_POLICY_CACHE_HITS, _ROLLOUT_POLICY_CACHE_MISSES
+    key = _rollout_policy_cache_key(cfg, policy_obs_dim, critic_obs_dim)
+    policy = _ROLLOUT_POLICY_CACHE.get(key)
+    cache_hit = policy is not None
+    if policy is None:
+        policy = _make_policy_from_state_dict(
+            policy_state_dict,
+            cfg,
+            int(policy_obs_dim),
+            int(critic_obs_dim),
+            torch.device("cpu"),
+        )
+        _ROLLOUT_POLICY_CACHE[key] = policy
+        _ROLLOUT_POLICY_CACHE_MISSES += 1
+    else:
+        policy.load_state_dict(policy_state_dict)
+        policy.eval()
+        _ROLLOUT_POLICY_CACHE_HITS += 1
+    return policy, cache_hit
+
+
+def _rollout_env_cache_key(cfg: PSGAILConfig) -> tuple[object, ...]:
+    """Key every field consumed by ``make_training_env`` and its observation contract."""
+    return (
+        str(cfg.scene),
+        os.path.abspath(str(cfg.episode_root)),
+        str(cfg.prebuilt_split),
+        str(cfg.action_mode),
+        float(cfg.percentage_controlled_vehicles),
+        bool(cfg.control_all_vehicles),
+        str(cfg.max_surrounding),
+        int(cfg.cells),
+        float(cfg.maximum_range),
+        int(cfg.simulation_frequency),
+        int(cfg.policy_frequency),
+        int(cfg.max_episode_steps),
+        bool(cfg.enable_collision),
+        bool(cfg.terminate_when_all_controlled_crashed),
+        bool(cfg.allow_idm),
+        str(getattr(cfg, "road_query_mode", "legacy")),
+        str(getattr(cfg, "collision_check_mode", "legacy")),
+        bool(getattr(cfg, "record_replay_diagnostics", True)),
+        bool(getattr(cfg, "enable_player_challenge_reward", False)),
+        float(getattr(cfg, "collision_proxy_penalty_coef", 0.0)),
+        float(getattr(cfg, "challenge_ttc_target", 0.0)),
+        float(getattr(cfg, "challenge_ttc_margin", 0.75)),
+        float(getattr(cfg, "challenge_ttc_floor", 0.0)),
+        float(getattr(cfg, "challenge_gap_target", 0.0)),
+        float(getattr(cfg, "challenge_gap_floor", 0.0)),
+    )
+
+
+def _cached_rollout_env(cfg: PSGAILConfig) -> tuple[gym.Env, bool]:
+    """Return a worker-local LRU environment; callers reset it with their task seed."""
+    global _ROLLOUT_ENV_CACHE_HITS, _ROLLOUT_ENV_CACHE_MISSES
+    from ..envs import make_training_env
+
+    if not bool(getattr(cfg, "rollout_cache_envs", True)):
+        _ROLLOUT_ENV_CACHE_MISSES += 1
+        return make_training_env(cfg), False
+    key = _rollout_env_cache_key(cfg)
+    env = _ROLLOUT_ENV_CACHE.get(key)
+    if env is not None:
+        _ROLLOUT_ENV_CACHE.move_to_end(key)
+        _ROLLOUT_ENV_CACHE_HITS += 1
+        return env, True
+    env = make_training_env(cfg)
+    _ROLLOUT_ENV_CACHE[key] = env
+    _ROLLOUT_ENV_CACHE_MISSES += 1
+    max_cached = max(0, int(getattr(cfg, "rollout_max_cached_envs_per_worker", 2)))
+    while max_cached > 0 and len(_ROLLOUT_ENV_CACHE) > max_cached:
+        _old_key, old_env = _ROLLOUT_ENV_CACHE.popitem(last=False)
+        old_env.close()
+    return env, False
+
+
+def rollout_worker_cache_stats() -> dict[str, int]:
+    """Expose worker-local cache counters for profiling and focused tests."""
+    return {
+        "policy_hits": int(_ROLLOUT_POLICY_CACHE_HITS),
+        "policy_misses": int(_ROLLOUT_POLICY_CACHE_MISSES),
+        "env_hits": int(_ROLLOUT_ENV_CACHE_HITS),
+        "env_misses": int(_ROLLOUT_ENV_CACHE_MISSES),
+        "policies": len(_ROLLOUT_POLICY_CACHE),
+        "envs": len(_ROLLOUT_ENV_CACHE),
+    }
+
+
+def clear_rollout_worker_caches() -> None:
+    """Close cached environments. Primarily useful for deterministic tests."""
+    global _ROLLOUT_POLICY_CACHE_HITS, _ROLLOUT_POLICY_CACHE_MISSES
+    global _ROLLOUT_ENV_CACHE_HITS, _ROLLOUT_ENV_CACHE_MISSES
+    for env in _ROLLOUT_ENV_CACHE.values():
+        env.close()
+    _ROLLOUT_ENV_CACHE.clear()
+    _ROLLOUT_POLICY_CACHE.clear()
+    _ROLLOUT_POLICY_CACHE_HITS = 0
+    _ROLLOUT_POLICY_CACHE_MISSES = 0
+    _ROLLOUT_ENV_CACHE_HITS = 0
+    _ROLLOUT_ENV_CACHE_MISSES = 0
 
 def _actions_to_rollout_array(transitions: list[AgentTransition], cfg: PSGAILConfig) -> np.ndarray:
     if _is_continuous(cfg):
@@ -453,7 +598,9 @@ def collect_rollout(
     policy.eval()
     rollout_seed = int(cfg.seed if seed is None else seed)
     rng = np.random.default_rng(rollout_seed + 7919)
+    reset_started = time.perf_counter()
     obs, _ = env.reset(seed=rollout_seed)
+    _RolloutPerfProfiler.record("env_reset", time.perf_counter() - reset_started)
     started = time.perf_counter()
     obs_agents = policy_observations_from_flat(flatten_agent_observations(obs))
     _RolloutPerfProfiler.record("flatten_observation", time.perf_counter() - started)
@@ -620,7 +767,9 @@ def collect_rollout(
         _RolloutPerfProfiler.record("policy_inference", time.perf_counter() - started)
 
         action_tuple = _actions_to_env_tuple(actions, cfg)
+        step_started = time.perf_counter()
         next_obs, _env_reward, terminated, truncated, info = env.step(action_tuple)
+        _RolloutPerfProfiler.record("env_step", time.perf_counter() - step_started)
         started = time.perf_counter()
         next_obs_agents = policy_observations_from_flat(flatten_agent_observations(next_obs))
         _RolloutPerfProfiler.record("flatten_observation", time.perf_counter() - started)
@@ -644,6 +793,7 @@ def collect_rollout(
         episode_had_crash = bool(episode_had_crash or any(bool(flag) for flag in crash_flags))
         episode_had_offroad = bool(episode_had_offroad or any(bool(flag) for flag in offroad_flags))
 
+        pack_started = time.perf_counter()
         for i, key in enumerate(keys):
             if int(policy_sources[i]) != 0:
                 continue
@@ -720,6 +870,7 @@ def collect_rollout(
                     ),
                 )
             )
+        _RolloutPerfProfiler.record("transition_pack", time.perf_counter() - pack_started)
 
         env_steps += 1
         if done:
@@ -740,7 +891,9 @@ def collect_rollout(
             episode_steps = 0
             episode_had_crash = False
             episode_had_offroad = False
+            reset_started = time.perf_counter()
             obs, _ = env.reset()
+            _RolloutPerfProfiler.record("env_reset", time.perf_counter() - reset_started)
             episode_names.add(str(getattr(env.unwrapped, "episode_name", "")))
         else:
             obs = next_obs
@@ -753,6 +906,7 @@ def collect_rollout(
     if not transitions:
         raise RuntimeError("Rollout produced no trainable current-policy transitions.")
 
+    finalize_started = time.perf_counter()
     policy_obs = np.stack([tr.policy_observation for tr in transitions], axis=0).astype(np.float32)
     next_policy_obs = np.stack([tr.next_policy_observation for tr in transitions], axis=0).astype(np.float32)
     critic_obs = np.stack([tr.critic_observation for tr in transitions], axis=0).astype(np.float32)
@@ -815,6 +969,7 @@ def collect_rollout(
     )
     rewards = np.zeros(len(transitions), dtype=np.float32)
     returns, advantages = compute_returns_and_advantages(rewards, old_values, dones, trajectory_ids, cfg)
+    _RolloutPerfProfiler.record("batch_finalize", time.perf_counter() - finalize_started)
     return RolloutBatch(
         policy_observations=policy_obs,
         next_policy_observations=next_policy_obs,
@@ -1504,7 +1659,11 @@ def _rollout_worker(
     rollout_steps: int,
     rollout_min_episodes: int,
 ) -> RolloutBatch:
+    if bool(getattr(cfg, "rollout_profile", False)):
+        _RolloutPerfProfiler.enabled = True
     threads = max(1, int(cfg.rollout_worker_threads))
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[name] = str(threads)
     torch.set_num_threads(threads)
     worker_seed = int(cfg.seed) + int(worker_id)
     np.random.seed(worker_seed)
@@ -1526,35 +1685,20 @@ def _rollout_worker(
         seed=worker_seed,
         device="cpu",
     )
-    policy = make_actor_critic(
-        cfg.policy_model,
+    policy_started = time.perf_counter()
+    policy, policy_cache_hit = _cached_rollout_policy(
+        worker_cfg,
+        policy_state_dict,
         int(policy_obs_dim),
-        int(cfg.hidden_size),
-        action_mode=str(cfg.action_mode),
-        continuous_action_dim=int(cfg.continuous_action_dim),
-        transformer_layers=int(cfg.transformer_layers),
-        transformer_heads=int(cfg.transformer_heads),
-        transformer_dropout=float(cfg.transformer_dropout),
-        transformer_temporal_module=bool(getattr(cfg, "transformer_temporal_module", False)),
-        transformer_temporal_kernel_size=int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
-        transformer_temporal_layers=int(getattr(cfg, "transformer_temporal_layers", 1)),
-        transformer_memory_tokens=int(getattr(cfg, "transformer_memory_tokens", 8)),
-        transformer_memory_context_length=int(getattr(cfg, "transformer_memory_context_length", 32)),
-        transformer_use_causal_attention=bool(getattr(cfg, "transformer_use_causal_attention", True)),
-        centralized_critic=centralized_critic_enabled(cfg),
-        critic_obs_dim=int(critic_obs_dim),
-        central_critic_pooling=str(getattr(cfg, "central_critic_pooling", "flat")),
-        central_critic_max_vehicles=int(getattr(cfg, "central_critic_max_vehicles", 64)),
-        central_critic_attention_heads=int(getattr(cfg, "central_critic_attention_heads", 4)),
+        int(critic_obs_dim),
     )
-    policy.load_state_dict(policy_state_dict)
-    policy.to(torch.device("cpu"))
-
-    from ..envs import make_training_env
-
-    env = make_training_env(worker_cfg)
+    policy_seconds = time.perf_counter() - policy_started
+    env_started = time.perf_counter()
+    env, env_cache_hit = _cached_rollout_env(worker_cfg)
+    env_seconds = time.perf_counter() - env_started
     try:
-        return collect_rollout(
+        collect_started = time.perf_counter()
+        batch = collect_rollout(
             env,
             policy,
             worker_cfg,
@@ -1564,8 +1708,25 @@ def _rollout_worker(
             policy_obs_dim=int(policy_obs_dim),
             critic_obs_dim=int(critic_obs_dim),
         )
+        collect_seconds = time.perf_counter() - collect_started
+        if bool(getattr(cfg, "rollout_profile", False)):
+            stats = rollout_worker_cache_stats()
+            _RolloutPerfProfiler.report()
+            print(
+                "[rollout_worker_profile] "
+                f"worker={worker_id} policy_cache_hit={int(policy_cache_hit)} "
+                f"env_cache_hit={int(env_cache_hit)} policy_load_seconds={policy_seconds:.6f} "
+                f"env_acquire_seconds={env_seconds:.6f} collect_seconds={collect_seconds:.6f} "
+                f"env_steps={batch.num_env_steps} agent_steps={batch.num_agent_steps} "
+                f"env_steps_per_second={batch.num_env_steps / max(collect_seconds, 1.0e-9):.3f} "
+                f"agent_steps_per_second={batch.num_agent_steps / max(collect_seconds, 1.0e-9):.3f} "
+                f"cache={stats}",
+                flush=True,
+            )
+        return batch
     finally:
-        env.close()
+        if not bool(getattr(worker_cfg, "rollout_cache_envs", True)):
+            env.close()
 
 def collect_rollouts(
     env: gym.Env,
@@ -1705,6 +1866,12 @@ def make_evaluation_executor(cfg: PSGAILConfig) -> ProcessPoolExecutor | None:
 
 __all__ = [
     '_RolloutPerfProfiler',
+    '_rollout_policy_cache_key',
+    '_cached_rollout_policy',
+    '_rollout_env_cache_key',
+    '_cached_rollout_env',
+    'rollout_worker_cache_stats',
+    'clear_rollout_worker_caches',
     '_actions_to_rollout_array',
     '_assign_psro_sources',
     '_mixed_policy_actions',
