@@ -58,6 +58,9 @@ def make_training_env(cfg: PSGAILConfig, *, render_mode: str | None = None) -> g
     env_cfg["record_replay_diagnostics"] = bool(
         getattr(cfg, "record_replay_diagnostics", True)
     )
+    env_cfg["sensor_road_edge_mode"] = str(
+        getattr(cfg, "sensor_road_edge_mode", "per_vehicle")
+    )
     env_cfg["crash_controlled_vehicles_offroad"] = True
     needs_collision_proxy_metrics = (
         not bool(getattr(cfg, "enable_collision", True))

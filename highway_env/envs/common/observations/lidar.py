@@ -117,12 +117,14 @@ class LidarObservation(ObservationType):
         self,
         obstacle_entries: list[_ObstacleEntry] | None = None,
         obstacle_index: _ObstacleSpatialIndex | None = None,
+        edge_dists: np.ndarray | None = None,
     ) -> np.ndarray:
         traced = self.trace(
             self.observer_vehicle.position,
             self.observer_vehicle.velocity,
             obstacle_entries=obstacle_entries,
             obstacle_index=obstacle_index,
+            edge_dists=edge_dists,
         )
         started = time.perf_counter()
         obs = traced.copy()
@@ -188,6 +190,7 @@ class LidarObservation(ObservationType):
         origin_velocity: np.ndarray,
         obstacle_entries: list[_ObstacleEntry] | None = None,
         obstacle_index: _ObstacleSpatialIndex | None = None,
+        edge_dists: np.ndarray | None = None,
     ) -> np.ndarray:
         self.origin = np.array(origin, dtype=float).copy()
 
@@ -212,13 +215,20 @@ class LidarObservation(ObservationType):
 
         # Precompute per-ray road edge distance
         started = time.perf_counter()
-        edge_dists = self._distance_to_road_edges_batch(
-            origin=self.origin,
-            directions=self._directions,
-            max_range=self.maximum_range,
-            coarse_step=self.coarse_step,
-            refine_iters=self.refine_iters,
-        )
+        if edge_dists is None:
+            edge_dists = self._distance_to_road_edges_batch(
+                origin=self.origin,
+                directions=self._directions,
+                max_range=self.maximum_range,
+                coarse_step=self.coarse_step,
+                refine_iters=self.refine_iters,
+            )
+        else:
+            edge_dists = np.asarray(edge_dists, dtype=np.float32)
+            if edge_dists.shape != (self.cells,):
+                raise ValueError(
+                    f"edge_dists must have shape ({self.cells},), got {edge_dists.shape}"
+                )
         _ObservationProfiler.record("lidar_road_edge", time.perf_counter() - started)
 
         # Initialize grid distances
@@ -781,6 +791,81 @@ class LidarObservation(ObservationType):
             lo = np.where(mid_on, mid, lo)
             hi = np.where(mid_on, hi, mid)
         distances[crossing_indices] = lo
+        return np.clip(distances, 0.0, max_range).astype(np.float32)
+
+    def _distance_to_road_edges_many(
+        self,
+        origins: np.ndarray,
+        directions: np.ndarray,
+        max_range: float,
+        coarse_step: float,
+        refine_iters: int,
+    ) -> np.ndarray:
+        """Evaluate the exact batched road-edge sensor for several origins.
+
+        This is the multi-origin form of :meth:`_distance_to_road_edges_batch`.
+        It intentionally uses the same sample locations, lane predicate, first
+        crossing rule, and binary refinement; only the Python scheduling is
+        shared across controlled vehicles.
+        """
+        origins = np.asarray(origins, dtype=float).reshape(-1, 2)
+        directions = np.asarray(directions, dtype=float).reshape(-1, 2)
+        max_range = float(max_range)
+        coarse_step = float(coarse_step)
+        refine_iters = int(refine_iters)
+        if origins.shape[0] == 0 or directions.shape[0] == 0:
+            return np.zeros((origins.shape[0], directions.shape[0]), dtype=np.float32)
+
+        norms = np.linalg.norm(directions, axis=1, keepdims=True) + 1.0e-12
+        directions = directions / norms
+        if coarse_step <= 0.0:
+            coarse_step = max_range
+        steps = np.arange(coarse_step, max_range + 1.0e-9, coarse_step, dtype=float)
+        if steps.size == 0 or steps[-1] < max_range:
+            steps = np.concatenate([steps, np.asarray([max_range], dtype=float)])
+        else:
+            steps[-1] = min(float(steps[-1]), max_range)
+
+        origin_on_road = self._on_road_many(origins)
+        distances = np.zeros((origins.shape[0], directions.shape[0]), dtype=float)
+        active_origins = np.flatnonzero(origin_on_road)
+        if active_origins.size == 0:
+            return distances.astype(np.float32)
+
+        active_points = (
+            origins[active_origins, None, None, :]
+            + steps[None, :, None, None] * directions[None, None, :, :]
+        )
+        on_road = self._on_road_many(active_points.reshape(-1, 2)).reshape(
+            active_origins.size,
+            steps.shape[0],
+            directions.shape[0],
+        )
+        first_off = np.argmax(~on_road, axis=1)
+        has_off = np.any(~on_road, axis=1)
+        active_distances = np.full(
+            (active_origins.size, directions.shape[0]), max_range, dtype=float
+        )
+        crossing_active, crossing_directions = np.nonzero(has_off)
+        if crossing_active.size:
+            step_indices = first_off[crossing_active, crossing_directions]
+            hi = steps[step_indices].astype(float, copy=True)
+            lo = np.where(
+                step_indices > 0,
+                steps[np.maximum(step_indices - 1, 0)],
+                0.0,
+            ).astype(float, copy=True)
+            crossing_origins = origins[active_origins[crossing_active]]
+            crossing_dirs = directions[crossing_directions]
+            for _ in range(refine_iters):
+                mid = 0.5 * (lo + hi)
+                mid_points = crossing_origins + mid.reshape(-1, 1) * crossing_dirs
+                mid_on = self._on_road_many(mid_points)
+                lo = np.where(mid_on, mid, lo)
+                hi = np.where(mid_on, hi, mid)
+            active_distances[crossing_active, crossing_directions] = lo
+
+        distances[active_origins] = active_distances
         return np.clip(distances, 0.0, max_range).astype(np.float32)
 
     def _distance_to_road_edge(

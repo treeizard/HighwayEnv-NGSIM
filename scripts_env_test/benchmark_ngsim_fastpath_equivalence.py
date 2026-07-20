@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +24,24 @@ OUTCOME_INFO_KEYS = (
     "controlled_vehicle_offroad",
     "alive_controlled_vehicle_ids",
 )
+
+
+def _source_code_identity() -> dict[str, Any]:
+    repo = Path(__file__).resolve().parents[1]
+
+    def git(*arguments: str) -> str:
+        return subprocess.check_output(
+            ("git", "-C", str(repo), *arguments), text=True
+        ).strip()
+
+    digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    return {
+        "repo": str(repo),
+        "revision": git("rev-parse", "HEAD"),
+        "tree": git("rev-parse", "HEAD^{tree}"),
+        "clean": not bool(git("status", "--porcelain", "--untracked-files=all")),
+        "benchmark_file_sha256": digest,
+    }
 
 
 def _positive_int(value: str) -> int:
@@ -78,6 +98,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--collision-cell-size", type=_positive_float, default=12.0)
     parser.add_argument("--collision-min-entities", type=int, default=32)
     parser.add_argument("--observation-atol", type=_nonnegative_float, default=0.0)
+    parser.add_argument(
+        "--sensor-reference",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Compare the shared training sensor with the original per-agent "
+            "MultiAgentObservation implementation at reset."
+        ),
+    )
     parser.add_argument(
         "--mode-order",
         choices=("alternate", "legacy-first", "optimized-first"),
@@ -156,6 +185,7 @@ def build_mode_config(
             "collision_broadphase_cell_size": float(args.collision_cell_size),
             "collision_broadphase_min_entities": int(args.collision_min_entities),
             "record_replay_diagnostics": mode == "legacy",
+            "sensor_road_edge_mode": "per_vehicle" if mode == "legacy" else "batched",
         }
     )
     return config
@@ -414,6 +444,44 @@ def _safe_ratio(numerator: float, denominator: float) -> float | None:
     return float(numerator / denominator) if denominator > 0.0 else None
 
 
+def compare_reference_sensor(
+    env: Any,
+    shared_observation: Any,
+    *,
+    atol: float,
+) -> dict[str, Any]:
+    """Compare the shared sensor to the original per-agent implementation."""
+    from highway_env.envs.common.observations.classic import MultiAgentObservation
+
+    base = env.unwrapped
+    configured = dict(base.config.get("observation") or {})
+    inner = configured.get("observation_config")
+    if configured.get("type") != "MultiAgentObservation" or not isinstance(inner, dict):
+        raise RuntimeError("Sensor reference requires a configured MultiAgentObservation.")
+
+    build_started = time.perf_counter()
+    reference_observer = MultiAgentObservation(base, observation_config=inner)
+    build_seconds = time.perf_counter() - build_started
+    reference_started = time.perf_counter()
+    reference_observation = reference_observer.observe()
+    reference_seconds = time.perf_counter() - reference_started
+    shared_started = time.perf_counter()
+    repeated_shared = base.observation_type.observe()
+    shared_seconds = time.perf_counter() - shared_started
+    reset_comparison = compare_values(shared_observation, reference_observation, atol=atol)
+    repeat_comparison = compare_values(repeated_shared, reference_observation, atol=atol)
+    return {
+        "implementation": "MultiAgentObservation(LidarCameraObservations per agent)",
+        "passed": bool(reset_comparison["equal"] and repeat_comparison["equal"]),
+        "reference_build_seconds": float(build_seconds),
+        "reference_observe_seconds": float(reference_seconds),
+        "shared_observe_seconds": float(shared_seconds),
+        "shared_speedup_x": _safe_ratio(reference_seconds, shared_seconds),
+        "reset_comparison": reset_comparison,
+        "repeat_comparison": repeat_comparison,
+    }
+
+
 def run_case(
     args: argparse.Namespace,
     *,
@@ -461,6 +529,15 @@ def run_case(
                 atol=float(args.observation_atol),
             ),
             step="reset",
+        )
+        sensor_reference = (
+            compare_reference_sensor(
+                envs["optimized"],
+                observations["optimized"],
+                atol=float(args.observation_atol),
+            )
+            if bool(args.sensor_reference)
+            else {"implementation": None, "passed": True, "skipped": True}
         )
 
         legacy_count = int(modes["legacy"]["initial_controlled_vehicles"])
@@ -553,6 +630,7 @@ def run_case(
             setup_parity["equal"]
             and observation_parity["equal"]
             and outcome_parity["equal"]
+            and sensor_reference["passed"]
         )
         return {
             "requested_vehicle_count": int(requested_vehicle_count),
@@ -563,6 +641,7 @@ def run_case(
                 "setup": setup_parity,
                 "observations": observation_parity,
                 "outcomes": outcome_parity,
+                "sensor_reference": sensor_reference,
             },
             "optimized_speedup": {
                 "step_p50_x": _safe_ratio(
@@ -596,6 +675,7 @@ def build_report(args: argparse.Namespace, cases: Sequence[dict[str, Any]]) -> d
         "schema_version": SCHEMA_VERSION,
         "benchmark": "ngsim_exact_fastpath_equivalence",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source_code": _source_code_identity(),
         "config": {
             "scene": str(args.scene),
             "episode_root": str(args.episode_root),
@@ -609,6 +689,7 @@ def build_report(args: argparse.Namespace, cases: Sequence[dict[str, Any]]) -> d
             "render_mode": None,
             "show_trajectories": False,
             "observation_atol": float(args.observation_atol),
+            "sensor_reference": bool(args.sensor_reference),
             "cold_cache_scope": "NGSimEnv in-process caches",
         },
         "parity_passed": parity_passed,

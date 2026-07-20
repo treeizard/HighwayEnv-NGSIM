@@ -27,6 +27,10 @@ ROLLOUT_WORKER_THREADS="${ROLLOUT_WORKER_THREADS:-2}"
 EVALUATION_WORKER_THREADS="${EVALUATION_WORKER_THREADS:-2}"
 CANARY_COUNT="${CANARY_COUNT:-4}"
 DRY_RUN="${DRY_RUN:-false}"
+SIMULATOR_PROFILE="${SIMULATOR_PROFILE:-legacy}"
+BLOCKING_JOB_IDS="${BLOCKING_JOB_IDS:-58391443}"
+ALLOW_BLOCKING_JOB_OVERLAP="${ALLOW_BLOCKING_JOB_OVERLAP:-false}"
+ALLOW_TEST_SQUEUE_FIXTURE="${ALLOW_TEST_SQUEUE_FIXTURE:-false}"
 
 case "${METHOD}" in
     gail|airl) ;;
@@ -34,13 +38,54 @@ case "${METHOD}" in
 esac
 case "${LAUNCH_PROFILE}" in
     canary) concurrency=2; default_cpus=16; default_mem=64G; default_workers=8 ;;
-    production) concurrency=4; default_cpus=32; default_mem=128G; default_workers=16 ;;
+    production)
+        concurrency=4
+        : "${CPUS_PER_TASK:?Production requires benchmark-selected CPUS_PER_TASK}"
+        : "${MEMORY_PER_TASK:?Production requires benchmark-selected MEMORY_PER_TASK}"
+        : "${NUM_ROLLOUT_WORKERS:?Production requires benchmark-selected NUM_ROLLOUT_WORKERS}"
+        : "${EVALUATION_NUM_WORKERS:?Production requires benchmark-selected EVALUATION_NUM_WORKERS}"
+        default_cpus="${CPUS_PER_TASK}"
+        default_mem="${MEMORY_PER_TASK}"
+        default_workers="${NUM_ROLLOUT_WORKERS}"
+        ;;
     *) echo "LAUNCH_PROFILE must be canary or production, got: ${LAUNCH_PROFILE}" >&2; exit 2 ;;
 esac
 CPUS_PER_TASK="${CPUS_PER_TASK:-${default_cpus}}"
 MEMORY_PER_TASK="${MEMORY_PER_TASK:-${default_mem}}"
 NUM_ROLLOUT_WORKERS="${NUM_ROLLOUT_WORKERS:-${default_workers}}"
 EVALUATION_NUM_WORKERS="${EVALUATION_NUM_WORKERS:-${default_workers}}"
+
+if [ "${SIMULATOR_PROFILE}" = "optimized" ]; then
+    echo "Optimized submissions require the two-domain live parity gate in submit_gail_airl_final_two_stage.bash." >&2
+    exit 4
+fi
+
+blocking_states=""
+active_blockers=""
+for job_id in ${BLOCKING_JOB_IDS//,/ }; do
+    [ -n "${job_id}" ] || continue
+    if [ "${DRY_RUN}" = "true" ] && [ "${ALLOW_TEST_SQUEUE_FIXTURE}" = "true" ]; then
+        state="TEST_FIXTURE_NOT_ACTIVE"
+    elif command -v squeue >/dev/null 2>&1; then
+        state="$(squeue -h -j "${job_id}" -o '%T' | paste -sd, -)"
+        state="${state:-NOT_FOUND}"
+    elif [ "${DRY_RUN}" = "true" ]; then
+        state="UNKNOWN_DRY_RUN"
+    else
+        echo "squeue is required to enforce the active-job freeze." >&2
+        exit 127
+    fi
+    blocking_states="${blocking_states}${blocking_states:+;}${job_id}=${state}"
+    if [[ ",${state}," == *",RUNNING,"* ]] || [[ ",${state}," == *",PENDING,"* ]]; then
+        active_blockers="${active_blockers}${active_blockers:+,}${job_id}=${state}"
+    fi
+done
+if [ -n "${active_blockers}" ]; then
+    if [ "${DRY_RUN}" != "true" ] || [ "${ALLOW_BLOCKING_JOB_OVERLAP}" != "true" ]; then
+        echo "Active-job freeze: refusing overlap with ${active_blockers}." >&2
+        exit 4
+    fi
+fi
 
 case "${REPODIR}/" in
     "${VFI_PROJECT_ROOT}/"*)
@@ -79,7 +124,8 @@ cd "${REPODIR}"
     --rollout-worker-threads "${ROLLOUT_WORKER_THREADS}" \
     --evaluation-num-workers "${EVALUATION_NUM_WORKERS}" \
     --evaluation-worker-threads "${EVALUATION_WORKER_THREADS}" \
-    --cpus-per-task "${CPUS_PER_TASK}"
+    --cpus-per-task "${CPUS_PER_TASK}" \
+    --simulator-profile "${SIMULATOR_PROFILE}"
 
 trial_count="$("${PYTHON_BIN}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["trial_count"])' "${method_manifest}")"
 if [ "${trial_count}" -le 0 ]; then
@@ -106,6 +152,30 @@ echo "method=${METHOD} profile=${LAUNCH_PROFILE} trials=${trial_count} array=${a
 echo "source=${REPODIR}"
 echo "manifest=${method_manifest}"
 echo "run_root=${run_root}/${run_prefix}/${METHOD}"
+echo "blocking_job_states=${blocking_states} overlap_override=${ALLOW_BLOCKING_JOB_OVERLAP}"
+export METHOD LAUNCH_PROFILE SIMULATOR_PROFILE blocking_states ALLOW_BLOCKING_JOB_OVERLAP
+export SOURCE_REVISION method_manifest run_root run_prefix
+"${PYTHON_BIN}" - "${submission_dir}/submission_metadata.json" <<'PY'
+import json, os, sys
+states = []
+for item in filter(None, os.environ.get("blocking_states", "").split(";")):
+    job_id, state = item.split("=", 1)
+    states.append({"job_id": job_id, "state": state})
+with open(sys.argv[1], "x", encoding="utf-8") as handle:
+    json.dump({
+        "schema_version": 1,
+        "method": os.environ["METHOD"],
+        "launch_profile": os.environ["LAUNCH_PROFILE"],
+        "simulator_profile": os.environ["SIMULATOR_PROFILE"],
+        "source_revision": os.environ["SOURCE_REVISION"],
+        "manifest": os.environ["method_manifest"],
+        "run_root": os.environ["run_root"],
+        "run_prefix": os.environ["run_prefix"],
+        "blocking_jobs_checked": states,
+        "blocking_overlap_override": os.environ["ALLOW_BLOCKING_JOB_OVERLAP"] == "true",
+    }, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
 if [ "${DRY_RUN}" = "true" ]; then
     printf '%q ' "${command[@]}"
     printf '\n'

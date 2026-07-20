@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from scripts_env_test import benchmark_ngsim_fastpath_equivalence as benchmark
+from scripts_env_test import audit_ngsim_fastpath_evidence as evidence_audit
 from scripts_env_test.benchmark_ngsim_fastpath_equivalence import (
     _mode_order,
     build_mode_config,
@@ -24,8 +26,71 @@ def test_parser_defaults_are_headless_dry_and_cover_scale_points() -> None:
     assert args.action_pattern == "zero"
     assert args.output == ""
     assert args.strict_parity is True
+    assert args.sensor_reference is True
     assert _mode_order(args, 0) == ("legacy", "optimized")
     assert _mode_order(args, 1) == ("optimized", "legacy")
+
+
+def test_native_domain_reports_aggregate_into_source_bound_release_evidence(tmp_path, monkeypatch):
+    repo = Path(__file__).resolve().parents[1]
+    monkeypatch.setattr(
+        evidence_audit,
+        "_git",
+        lambda _repo, *args: "" if args[0] == "status" else ("revision" if args[-1] == "HEAD" else "tree"),
+    )
+    reports = {}
+    for scene in ("us-101", "japanese"):
+        episode_root = tmp_path / scene
+        episode_root.mkdir()
+        cases = []
+        for vehicles in (50, 100):
+            cases.append(
+                {
+                    "requested_vehicle_count": vehicles,
+                    "parity": {
+                        "passed": True,
+                        "setup": {"equal": True},
+                        "observations": {"equal": True, "max_abs_diff": 0.0},
+                        "outcomes": {"equal": True},
+                        "sensor_reference": {
+                            "passed": True,
+                            "shared_speedup_x": 1.5,
+                            "reset_comparison": {"max_abs_diff": 0.0},
+                            "repeat_comparison": {"max_abs_diff": 0.0},
+                        },
+                    },
+                    "modes": {
+                        "legacy": {"initial_controlled_vehicles": vehicles},
+                        "optimized": {"initial_controlled_vehicles": vehicles},
+                    },
+                    "optimized_speedup": {"agent_steps_per_second_x": 1.25},
+                }
+            )
+        report = {
+            "schema_version": 1,
+            "benchmark": "ngsim_exact_fastpath_equivalence",
+            "source_code": {
+                "repo": str(repo), "revision": "revision", "tree": "tree", "clean": True
+            },
+            "config": {
+                "scene": scene, "episode_root": str(episode_root), "split": "train",
+                "observation_atol": 0.0,
+                "sensor_reference": True,
+            },
+            "parity_passed": True,
+            "cases": cases,
+        }
+        path = tmp_path / f"{scene}.json"
+        path.write_text(json.dumps(report))
+        reports[scene] = path
+    evidence = evidence_audit.aggregate(
+        reports=reports, source_repo=repo, minimum_100_vehicle_speedup=1.1
+    )
+    assert evidence["status"] == "passed"
+    assert evidence["source_code"]["revision"] == "revision"
+    assert {(row["scene"], row["controlled_vehicles"]) for row in evidence["cases"]} == {
+        ("us-101", 50), ("us-101", 100), ("japanese", 50), ("japanese", 100)
+    }
 
 
 def test_parser_accepts_custom_counts_and_rejects_invalid_frequency() -> None:
@@ -68,9 +133,11 @@ def test_mode_configs_only_change_exact_fast_path_switches() -> None:
     assert legacy["road_query_mode"] == "legacy"
     assert legacy["collision_check_mode"] == "legacy"
     assert legacy["record_replay_diagnostics"] is True
+    assert legacy["sensor_road_edge_mode"] == "per_vehicle"
     assert optimized["road_query_mode"] == "spatial"
     assert optimized["collision_check_mode"] == "broadphase"
     assert optimized["record_replay_diagnostics"] is False
+    assert optimized["sensor_road_edge_mode"] == "batched"
 
     ignored = {
         "road_query_mode",
@@ -79,6 +146,7 @@ def test_mode_configs_only_change_exact_fast_path_switches() -> None:
         "collision_broadphase_cell_size",
         "collision_broadphase_min_entities",
         "record_replay_diagnostics",
+        "sensor_road_edge_mode",
     }
     assert {key: value for key, value in legacy.items() if key not in ignored} == {
         key: value for key, value in optimized.items() if key not in ignored
@@ -198,7 +266,9 @@ def test_case_result_pipeline_uses_matched_actions_without_dataset(monkeypatch) 
         return env, np.zeros((2, 3), dtype=np.float32), metadata
 
     monkeypatch.setattr(benchmark, "_create_mode_env", fake_create_mode_env)
-    args = parse_args(["--vehicle-counts", "2", "--steps", "3"])
+    args = parse_args(
+        ["--vehicle-counts", "2", "--steps", "3", "--no-sensor-reference"]
+    )
 
     case = benchmark.run_case(
         args,

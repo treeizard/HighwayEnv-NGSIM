@@ -46,6 +46,10 @@ def observation_factory(env: AbstractEnv, config: dict) -> ObservationType:
             env,
             lidar=shared_cfg.get("lidar"),
             camera=shared_cfg.get("camera"),
+            batch_road_edges=(
+                str(env.config.get("sensor_road_edge_mode", "per_vehicle")).lower()
+                in {"batched", "optimized"}
+            ),
         )
     elif config["type"] == "MultiAgentObservation":
         return MultiAgentObservation(env, **config)

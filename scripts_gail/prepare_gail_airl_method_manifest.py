@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import tempfile
+import subprocess
 from typing import Any
 
 
@@ -29,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evaluation-num-workers", type=int, default=16)
     parser.add_argument("--evaluation-worker-threads", type=int, default=2)
     parser.add_argument("--cpus-per-task", type=int, default=32)
+    parser.add_argument("--simulator-profile", choices=("legacy", "optimized"), default="legacy")
     return parser.parse_args()
 
 
@@ -121,13 +123,34 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 "rollout_cache_envs": True,
                 "rollout_max_cached_envs_per_worker": 2,
                 "rollout_profile": True,
-                "road_query_mode": "spatial",
-                "collision_check_mode": "broadphase",
-                "record_replay_diagnostics": False,
+                "evaluation_max_cached_envs_per_worker": 4,
             }
         )
+        simulator_profile = str(getattr(args, "simulator_profile", "legacy"))
+        if simulator_profile == "optimized":
+            arguments.update(
+                road_query_mode="spatial",
+                collision_check_mode="broadphase",
+                record_replay_diagnostics=False,
+                sensor_road_edge_mode="batched",
+            )
+        else:
+            arguments.update(
+                road_query_mode="legacy",
+                collision_check_mode="legacy",
+                record_replay_diagnostics=True,
+                sensor_road_edge_mode="per_vehicle",
+            )
         if args.study_domain:
-            arguments["study_domain"] = str(args.study_domain).strip().lower()
+            requested_domain = str(args.study_domain).strip().lower()
+            configured_scene = str(arguments.get("scene") or "us-101").strip().lower()
+            expected_scene = "japanese" if requested_domain == "japanese" else "us-101"
+            if requested_domain not in {"us", "japanese"} or configured_scene != expected_scene:
+                raise ValueError(
+                    "study-domain must agree with the trial scene; refusing identity relabel: "
+                    f"domain={requested_domain!r}, scene={configured_scene!r}"
+                )
+            arguments["study_domain"] = requested_domain
         row.update(index=index, method=args.method, run_name=run_name, arguments=arguments)
         prepared.append(row)
 
@@ -138,21 +161,40 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         source_files = (
             "scripts_gail/train_simple_ps_gail.py",
             "scripts_gail/train_simple_airl.py",
+            "scripts_gail/ps_gail/config.py",
             "scripts_gail/ps_gail/training/rollouts.py",
+            "scripts_gail/ps_gail/training/evaluation.py",
             "scripts_gail/ps_gail/checkpoints.py",
+            "scripts_gail/ps_gail/health.py",
             "scripts_gail/ps_gail/envs.py",
             "scripts_gail/run_gail_airl_study_trial.py",
             "highway_env/envs/ngsim_env.py",
+            "highway_env/envs/common/observations/base.py",
+            "highway_env/envs/common/observations/camera.py",
+            "highway_env/envs/common/observations/factory.py",
+            "highway_env/envs/common/observations/lidar.py",
+            "highway_env/ngsim_utils/vehicles/replay.py",
             "highway_env/road/road.py",
         )
         source_code = {
             "repo": str(source_repo),
-            "revision": str(getattr(args, "source_revision", "") or ""),
+            "revision": subprocess.check_output(
+                ("git", "-C", str(source_repo), "rev-parse", "HEAD"), text=True
+            ).strip(),
+            "tree": subprocess.check_output(
+                ("git", "-C", str(source_repo), "rev-parse", "HEAD^{tree}"), text=True
+            ).strip(),
+            "require_clean_worktree": True,
             "files_sha256": {
                 relative: _sha256(source_repo / relative)
                 for relative in source_files
             },
         }
+        requested_revision = str(getattr(args, "source_revision", "") or "")
+        if requested_revision and requested_revision != source_code["revision"]:
+            raise RuntimeError(
+                f"Requested source revision is not checked out: {requested_revision} != {source_code['revision']}"
+            )
     payload = {
         "schema_version": 2,
         "method": args.method,
@@ -164,6 +206,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         "run_root": str(run_root),
         "run_prefix": prefix,
         "resource_geometry": geometry,
+        "simulator_profile": str(getattr(args, "simulator_profile", "legacy")),
         "trials": prepared,
     }
     _atomic_json(output, payload)

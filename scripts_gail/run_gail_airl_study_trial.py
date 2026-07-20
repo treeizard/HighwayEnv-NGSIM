@@ -7,6 +7,8 @@ import argparse
 import hashlib
 import json
 import os
+from pathlib import PurePosixPath
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -30,7 +32,15 @@ def load_trial(path: str, index: int) -> StudyTrial:
     rows = payload.get("trials") or []
     if index < 0 or index >= len(rows):
         raise IndexError(f"trial-index {index} outside [0, {len(rows) - 1}].")
-    return StudyTrial(**rows[index])
+    trial = StudyTrial(**rows[index])
+    if int(trial.index) != int(index):
+        raise RuntimeError(f"Manifest row/index mismatch: row {index} records {trial.index}.")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", str(trial.trial_id)):
+        raise RuntimeError(f"Unsafe trial_id in manifest: {trial.trial_id!r}")
+    run_name = PurePosixPath(str(trial.run_name))
+    if not str(run_name) or run_name.is_absolute() or ".." in run_name.parts:
+        raise RuntimeError(f"Unsafe run_name in manifest: {trial.run_name!r}")
+    return trial
 
 
 def verify_source_lock(path: str) -> None:
@@ -44,6 +54,29 @@ def verify_source_lock(path: str) -> None:
     recorded_repo = Path(str(source.get("repo") or "")).resolve()
     if recorded_repo != expected_repo:
         raise RuntimeError(f"Manifest source repo mismatch: {recorded_repo} != {expected_repo}")
+    recorded_revision = str(source.get("revision") or "")
+    if recorded_revision:
+        actual_revision = subprocess.check_output(
+            ("git", "-C", str(expected_repo), "rev-parse", "HEAD"), text=True
+        ).strip()
+        if actual_revision != recorded_revision:
+            raise RuntimeError(
+                f"Manifest source revision mismatch: {actual_revision} != {recorded_revision}"
+            )
+    recorded_tree = str(source.get("tree") or "")
+    if recorded_tree:
+        actual_tree = subprocess.check_output(
+            ("git", "-C", str(expected_repo), "rev-parse", "HEAD^{tree}"), text=True
+        ).strip()
+        if actual_tree != recorded_tree:
+            raise RuntimeError(f"Manifest source tree mismatch: {actual_tree} != {recorded_tree}")
+    if bool(source.get("require_clean_worktree", False)):
+        dirty = subprocess.check_output(
+            ("git", "-C", str(expected_repo), "status", "--porcelain", "--untracked-files=all"),
+            text=True,
+        ).strip()
+        if dirty:
+            raise RuntimeError("Manifest requires a clean isolated source worktree.")
     for relative, expected in hashes.items():
         digest = hashlib.sha256()
         with (expected_repo / relative).open("rb") as handle:
@@ -70,6 +103,10 @@ def main() -> None:
         if not run_root.is_absolute():
             raise RuntimeError(f"Trial {trial.trial_id} requires an absolute --run-root.")
         run_dir = (run_root / str(trial.run_name)).resolve()
+        try:
+            run_dir.relative_to(run_root.resolve())
+        except ValueError as exc:
+            raise RuntimeError(f"Trial {trial.trial_id} output escapes run-root: {run_dir}") from exc
         if run_dir.exists():
             raise FileExistsError(f"Refusing to overwrite existing trial output: {run_dir}")
         rollout_workers = int(trial.arguments.get("num_rollout_workers", 0))

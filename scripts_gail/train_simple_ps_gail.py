@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
+import signal
 import sys
 import time
 import warnings
@@ -14,7 +16,14 @@ import torch.nn.functional as F
 from torch.distributions import Categorical, Independent, Normal
 
 from scripts_gail.ps_gail.config import PSGAILConfig, should_save_checkpoint_video
-from scripts_gail.ps_gail.checkpoints import atomic_torch_save, checkpoint_metadata
+from scripts_gail.ps_gail.checkpoints import (
+    atomic_torch_save,
+    checkpoint_metadata,
+    exact_training_state,
+    restore_exact_training_state,
+    resume_config_hash,
+    verify_resume_checkpoint,
+)
 from scripts_gail.ps_gail.data import (
     fit_feature_standardizer,
     load_expert_policy_and_disc_data,
@@ -77,6 +86,26 @@ from scripts_gail.ps_gail.validation import (
 from scripts_gail.ps_gail.vendi import safe_sequence_window_mask, vendi_score
 
 
+_GRACEFUL_STOP_REQUESTED = False
+
+
+def install_graceful_checkpoint_signal_handler() -> None:
+    global _GRACEFUL_STOP_REQUESTED
+    _GRACEFUL_STOP_REQUESTED = False
+
+    def _request_checkpoint(_signum: int, _frame: object) -> None:
+        global _GRACEFUL_STOP_REQUESTED
+        _GRACEFUL_STOP_REQUESTED = True
+        print("SIGUSR1 received; an exact checkpoint will be written after this round.", flush=True)
+
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, _request_checkpoint)
+
+
+def graceful_checkpoint_requested() -> bool:
+    return bool(_GRACEFUL_STOP_REQUESTED)
+
+
 def env_signature(cfg: PSGAILConfig) -> tuple[object, ...]:
     return (
         str(cfg.action_mode),
@@ -93,6 +122,68 @@ def env_signature(cfg: PSGAILConfig) -> tuple[object, ...]:
 
 def policy_archive_snapshot(policy: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu().clone() for key, value in policy.state_dict().items()}
+
+
+def restore_policy_archive(raw_archive: object) -> list[dict[str, torch.Tensor]]:
+    return [
+        {
+            str(key): torch.as_tensor(value).detach().cpu().clone()
+            for key, value in dict(raw_state).items()
+        }
+        for raw_state in list(raw_archive or [])
+    ]
+
+
+def materialize_resume_best_checkpoint(
+    resume_checkpoint: str,
+    target_best_path: str,
+    *,
+    best_validation_score: float,
+    save_best_checkpoint: bool,
+    cfg: PSGAILConfig,
+    method: str,
+) -> bool:
+    """Verify and re-emit the prior lean best with stage-2 official identity."""
+    if not save_best_checkpoint or not np.isfinite(float(best_validation_score)):
+        return False
+    if os.path.isfile(target_best_path):
+        return False
+    resume_dir = os.path.dirname(os.path.abspath(resume_checkpoint))
+    candidates = [os.path.join(resume_dir, "best.pt")]
+    if os.path.basename(resume_dir) == "checkpoints":
+        candidates.append(os.path.join(os.path.dirname(resume_dir), "best.pt"))
+    for candidate in candidates:
+        if os.path.abspath(candidate) == os.path.abspath(target_best_path):
+            return False
+        if os.path.isfile(candidate):
+            source_sha = verify_resume_checkpoint(candidate)
+            try:
+                payload = torch.load(candidate, map_location="cpu", weights_only=False)
+            except TypeError:
+                payload = torch.load(candidate, map_location="cpu")
+            if not isinstance(payload, dict) or "policy_state_dict" not in payload:
+                raise RuntimeError(f"Prior best checkpoint is not a policy payload: {candidate}")
+            prior_identity = dict(payload.get("study_cell") or payload.get("trial_identity") or {})
+            payload.pop("training_state", None)
+            payload.pop("trial_identity", None)
+            payload.update(
+                checkpoint_metadata(
+                    cfg,
+                    method=method,
+                    checkpoint_kind=f"{method}_best",
+                )
+            )
+            payload["carried_forward_from"] = {
+                "checkpoint": os.path.abspath(candidate),
+                "checkpoint_sha256": source_sha,
+                "study_cell": prior_identity,
+            }
+            atomic_torch_save(payload, target_best_path, refuse_overwrite=True)
+            return True
+    raise FileNotFoundError(
+        "Exact continuation has a finite restored best score but no verified prior best.pt "
+        f"beside resume checkpoint {resume_checkpoint}."
+    )
 
 
 def append_policy_archive(
@@ -313,8 +404,9 @@ def gail_checkpoint_payload(
     cfg: PSGAILConfig,
     round_cfg: PSGAILConfig,
     checkpoint_kind: str = "gail_round",
+    training_state: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         **checkpoint_metadata(cfg, method="gail", checkpoint_kind=checkpoint_kind),
         "round": int(round_idx),
         "policy_state_dict": policy.state_dict(),
@@ -332,6 +424,9 @@ def gail_checkpoint_payload(
         "config": vars(cfg),
         "round_config": vars(round_cfg),
     }
+    if training_state is not None:
+        payload["training_state"] = training_state
+    return payload
 
 
 def training_risk_warnings(cfg: PSGAILConfig) -> list[str]:
@@ -810,6 +905,8 @@ def main() -> None:
             "Sequence-discriminator training now uses a single sequential discriminator. "
             "Disable --enable-scene-discriminator for sequential GAIL."
         )
+    install_graceful_checkpoint_signal_handler()
+    random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     device = resolve_device(cfg.device)
@@ -984,11 +1081,16 @@ def main() -> None:
         )
         resume_checkpoint = str(getattr(cfg, "resume_checkpoint", "") or "").strip()
         initial_policy_checkpoint = str(getattr(cfg, "initial_policy_checkpoint", "") or "").strip()
+        resume_payload: dict[str, object] | None = None
         if resume_checkpoint and initial_policy_checkpoint:
             raise ValueError("Use either --resume-checkpoint or --initial-policy-checkpoint, not both.")
         if resume_checkpoint:
             if not os.path.isfile(resume_checkpoint):
                 raise FileNotFoundError(f"resume_checkpoint does not exist: {resume_checkpoint}")
+            verify_resume_checkpoint(
+                resume_checkpoint,
+                allow_unverified=bool(cfg.allow_unverified_resume_checkpoint),
+            )
             try:
                 checkpoint = torch.load(resume_checkpoint, map_location=device, weights_only=False)
             except TypeError:
@@ -1014,6 +1116,7 @@ def main() -> None:
                 primary_discriminator_normalizer = checkpoint["discriminator_feature_normalizer"]
             if checkpoint.get("scene_discriminator_feature_normalizer") is not None:
                 scene_discriminator_normalizer = checkpoint["scene_discriminator_feature_normalizer"]
+            resume_payload = checkpoint
             print(
                 "resumed_checkpoint="
                 f"{os.path.abspath(resume_checkpoint)} "
@@ -1228,7 +1331,7 @@ def main() -> None:
         if cfg.max_episode_steps_schedule:
             print(f"max_episode_steps_schedule={cfg.max_episode_steps_schedule}")
 
-        if int(cfg.bc_pretrain_epochs) > 0:
+        if int(cfg.bc_pretrain_epochs) > 0 and resume_payload is None:
             if expert_transitions is None:
                 raise RuntimeError("BC pretraining requires action-conditioned expert transition data.")
             bc_stats = behavior_clone_pretrain(policy, expert_transitions, cfg, device)
@@ -1301,7 +1404,119 @@ def main() -> None:
         final_test_metrics: dict[str, float] = {}
         best_path = os.path.join(run_dir, "best.pt")
         last_validation_stress_round = 0
-        if bool(getattr(cfg, "evaluate_initial_policy", True)) and int(cfg.validation_episodes) > 0:
+        previous_controlled_vehicles = None
+        last_vehicle_jump_round = None
+        health_monitor = TrainingHealthMonitor()
+        optimizer_handles = {
+            "policy": policy_optimizer,
+            "discriminator": disc_optimizer,
+            "scene_discriminator": scene_disc_optimizer,
+        }
+
+        def capture_gail_training_state(completed_round: int) -> dict[str, object]:
+            return exact_training_state(
+                completed_round=completed_round,
+                optimizers=optimizer_handles,
+                trainer_state={
+                    "best_validation_score": float(best_validation_score),
+                    "best_validation_round": int(best_validation_round),
+                    "initial_validation_metrics": dict(initial_validation_metrics),
+                    "last_validation_metrics": dict(last_validation_metrics),
+                    "final_stress_metrics": dict(final_stress_metrics),
+                    "final_test_metrics": dict(final_test_metrics),
+                    "last_validation_stress_round": int(last_validation_stress_round),
+                    "previous_controlled_vehicles": previous_controlled_vehicles,
+                    "last_vehicle_jump_round": last_vehicle_jump_round,
+                    "health_monitor": health_monitor.state_dict(),
+                    "primary_discriminator_replay": [item.copy() for item in primary_discriminator_replay],
+                    "scene_discriminator_replay": [item.copy() for item in scene_discriminator_replay],
+                    "psro_policy_archive": restore_policy_archive(psro_policy_archive),
+                    "last_checkpoint_video_path": last_checkpoint_video_path,
+                    "last_checkpoint_video_round": int(last_checkpoint_video_round),
+                },
+            )
+
+        start_round = 1
+        completed_round = 0
+        if resume_payload is not None:
+            restored = restore_exact_training_state(
+                resume_payload,
+                optimizers=optimizer_handles,
+                expected_resume_config_hash=resume_config_hash(cfg),
+                expected_method="gail",
+                allow_legacy_model_only=bool(cfg.allow_legacy_model_only_resume),
+            )
+            if restored is not None:
+                runtime = dict(restored["trainer_state"])
+                required_runtime = {
+                    "best_validation_score",
+                    "best_validation_round",
+                    "initial_validation_metrics",
+                    "last_validation_metrics",
+                    "final_stress_metrics",
+                    "final_test_metrics",
+                    "last_validation_stress_round",
+                    "previous_controlled_vehicles",
+                    "last_vehicle_jump_round",
+                    "health_monitor",
+                    "primary_discriminator_replay",
+                    "scene_discriminator_replay",
+                    "psro_policy_archive",
+                }
+                missing_runtime = sorted(required_runtime.difference(runtime))
+                if missing_runtime:
+                    raise RuntimeError(f"GAIL exact-resume state is incomplete: {missing_runtime}")
+                start_round = int(restored["start_round"])
+                completed_round = int(restored["completed_round"])
+                expected_resume_round = int(getattr(cfg, "expected_resume_round", 0))
+                if expected_resume_round > 0 and completed_round != expected_resume_round:
+                    raise RuntimeError(
+                        "GAIL resume boundary mismatch: "
+                        f"completed_round={completed_round}, expected={expected_resume_round}"
+                    )
+                best_validation_score = float(runtime["best_validation_score"])
+                best_validation_round = int(runtime["best_validation_round"])
+                initial_validation_metrics = dict(runtime["initial_validation_metrics"])
+                last_validation_metrics = dict(runtime["last_validation_metrics"])
+                final_stress_metrics = dict(runtime["final_stress_metrics"])
+                final_test_metrics = dict(runtime["final_test_metrics"])
+                last_validation_stress_round = int(runtime["last_validation_stress_round"])
+                previous_controlled_vehicles = runtime["previous_controlled_vehicles"]
+                last_vehicle_jump_round = runtime["last_vehicle_jump_round"]
+                health_monitor.load_state_dict(dict(runtime["health_monitor"]))
+                primary_discriminator_replay = [
+                    np.asarray(item, dtype=np.float32).copy()
+                    for item in list(runtime["primary_discriminator_replay"])
+                ]
+                scene_discriminator_replay = [
+                    np.asarray(item, dtype=np.float32).copy()
+                    for item in list(runtime["scene_discriminator_replay"])
+                ]
+                psro_policy_archive = restore_policy_archive(runtime["psro_policy_archive"])
+                last_checkpoint_video_path = runtime.get("last_checkpoint_video_path")
+                last_checkpoint_video_round = int(runtime.get("last_checkpoint_video_round", 0))
+                print(
+                    "exact_resume="
+                    f"completed_round={completed_round} start_round={start_round} "
+                    f"best={best_validation_score:.4f}@{best_validation_round}"
+                )
+                if materialize_resume_best_checkpoint(
+                    resume_checkpoint,
+                    best_path,
+                    best_validation_score=best_validation_score,
+                    save_best_checkpoint=bool(getattr(cfg, "save_best_checkpoint", True)),
+                    cfg=cfg,
+                    method="gail",
+                ):
+                    monitor.save(best_path)
+
+        if resume_payload is None and bool(getattr(cfg, "psro_lite", False)):
+            append_policy_archive(psro_policy_archive, policy, cfg)
+        if (
+            resume_payload is None
+            and bool(getattr(cfg, "evaluate_initial_policy", True))
+            and int(cfg.validation_episodes) > 0
+        ):
             initial_cfg = config_for_round(cfg, 1)
             initial_metrics = evaluate_policy_matched_trajectories(
                 policy,
@@ -1351,7 +1566,6 @@ def main() -> None:
                     + f" best={best_validation_score:.4f}@0"
                 )
         if bool(getattr(cfg, "psro_lite", False)):
-            append_policy_archive(psro_policy_archive, policy, cfg)
             print(
                 "psro_lite="
                 f"enabled archive_every={cfg.psro_archive_every} "
@@ -1359,11 +1573,16 @@ def main() -> None:
                 f"after_jump_rounds={cfg.psro_mixture_after_jump_rounds} "
                 f"current_fraction={cfg.psro_current_policy_fraction:.3f}"
             )
-        previous_controlled_vehicles = None
-        last_vehicle_jump_round = None
-        health_monitor = TrainingHealthMonitor()
+        stop_after_round = int(getattr(cfg, "stop_after_round", 0))
+        if stop_after_round < 0 or stop_after_round > int(cfg.total_rounds):
+            raise ValueError("stop_after_round must be zero or within total_rounds.")
+        end_round = stop_after_round if stop_after_round > 0 else int(cfg.total_rounds)
+        if start_round > end_round:
+            raise RuntimeError(
+                f"Resume checkpoint completed round {completed_round}, beyond requested end round {end_round}."
+            )
 
-        for round_idx in range(1, int(cfg.total_rounds) + 1):
+        for round_idx in range(start_round, end_round + 1):
             round_cfg = config_for_round(cfg, round_idx)
             if previous_controlled_vehicles is not None and (
                 float(round_cfg.percentage_controlled_vehicles)
@@ -2018,6 +2237,7 @@ def main() -> None:
                 metrics,
                 step=round_idx,
             )
+            pending_best: tuple[dict[str, float], float, float] | None = None
             if int(getattr(cfg, "validation_every", 0)) > 0 and round_idx % int(cfg.validation_every) == 0:
                 val_metrics = evaluate_policy_matched_trajectories(
                     policy,
@@ -2064,29 +2284,7 @@ def main() -> None:
                     if improved:
                         best_validation_score = float(val_score)
                         best_validation_round = int(round_idx)
-                        atomic_torch_save(
-                            best_checkpoint_payload(
-                                gail_checkpoint_payload(
-                                    round_idx=round_idx,
-                                    policy=policy,
-                                    discriminator=discriminator,
-                                    scene_discriminator=scene_discriminator,
-                                    sequence_only_discriminator=sequence_only_discriminator,
-                                    primary_discriminator_normalizer=primary_discriminator_normalizer,
-                                    scene_discriminator_normalizer=scene_discriminator_normalizer,
-                                    discriminator_name=discriminator_name,
-                                    expert_metadata=expert_metadata,
-                                    cfg=cfg,
-                                    round_cfg=round_cfg,
-                                ),
-                                round_idx=round_idx,
-                                validation_metrics=val_metrics,
-                                validation_score=val_score,
-                                validation_cost=val_cost,
-                            ),
-                            best_path,
-                        )
-                        monitor.save(best_path)
+                        pending_best = (dict(val_metrics), float(val_score), float(val_cost))
                     print(
                         matched_validation_summary("validation", f"{round_idx:04d}", val_metrics)
                         + f" best={best_validation_score:.4f}@{best_validation_round}"
@@ -2118,25 +2316,6 @@ def main() -> None:
                     print(matched_validation_summary("validation_stress", f"{round_idx:04d}", stress_metrics))
                     last_validation_stress_round = int(round_idx)
 
-            if cfg.checkpoint_every > 0 and round_idx % int(cfg.checkpoint_every) == 0:
-                checkpoint_path = os.path.join(ckpt_dir, f"round_{round_idx:04d}.pt")
-                atomic_torch_save(
-                    gail_checkpoint_payload(
-                        round_idx=round_idx,
-                        policy=policy,
-                        discriminator=discriminator,
-                        scene_discriminator=scene_discriminator,
-                        sequence_only_discriminator=sequence_only_discriminator,
-                        primary_discriminator_normalizer=primary_discriminator_normalizer,
-                        scene_discriminator_normalizer=scene_discriminator_normalizer,
-                        discriminator_name=discriminator_name,
-                        expert_metadata=expert_metadata,
-                        cfg=cfg,
-                        round_cfg=round_cfg,
-                    ),
-                    checkpoint_path,
-                )
-                monitor.save(checkpoint_path)
             if should_save_checkpoint_video(round_cfg, round_idx):
                 video_path = save_checkpoint_video(
                     policy,
@@ -2161,8 +2340,144 @@ def main() -> None:
             ):
                 append_policy_archive(psro_policy_archive, policy, cfg)
 
-        final_round = int(cfg.total_rounds)
+            completed_round = int(round_idx)
+            if pending_best is not None:
+                saved_metrics, saved_score, saved_cost = pending_best
+                atomic_torch_save(
+                    best_checkpoint_payload(
+                        gail_checkpoint_payload(
+                            round_idx=round_idx,
+                            policy=policy,
+                            discriminator=discriminator,
+                            scene_discriminator=scene_discriminator,
+                            sequence_only_discriminator=sequence_only_discriminator,
+                            primary_discriminator_normalizer=primary_discriminator_normalizer,
+                            scene_discriminator_normalizer=scene_discriminator_normalizer,
+                            discriminator_name=discriminator_name,
+                            expert_metadata=expert_metadata,
+                            cfg=cfg,
+                            round_cfg=round_cfg,
+                        ),
+                        round_idx=round_idx,
+                        validation_metrics=saved_metrics,
+                        validation_score=saved_score,
+                        validation_cost=saved_cost,
+                    ),
+                    best_path,
+                )
+                monitor.save(best_path)
+            if cfg.checkpoint_every > 0 and round_idx % int(cfg.checkpoint_every) == 0:
+                checkpoint_path = os.path.join(ckpt_dir, f"round_{round_idx:04d}.pt")
+                atomic_torch_save(
+                    gail_checkpoint_payload(
+                        round_idx=round_idx,
+                        policy=policy,
+                        discriminator=discriminator,
+                        scene_discriminator=scene_discriminator,
+                        sequence_only_discriminator=sequence_only_discriminator,
+                        primary_discriminator_normalizer=primary_discriminator_normalizer,
+                        scene_discriminator_normalizer=scene_discriminator_normalizer,
+                        discriminator_name=discriminator_name,
+                        expert_metadata=expert_metadata,
+                        cfg=cfg,
+                        round_cfg=round_cfg,
+                    ),
+                    checkpoint_path,
+                )
+                monitor.save(checkpoint_path)
+
+                resume_latest_path = os.path.join(run_dir, "resume_latest.pt")
+                atomic_torch_save(
+                    gail_checkpoint_payload(
+                        round_idx=round_idx,
+                        policy=policy,
+                        discriminator=discriminator,
+                        scene_discriminator=scene_discriminator,
+                        sequence_only_discriminator=sequence_only_discriminator,
+                        primary_discriminator_normalizer=primary_discriminator_normalizer,
+                        scene_discriminator_normalizer=scene_discriminator_normalizer,
+                        discriminator_name=discriminator_name,
+                        expert_metadata=expert_metadata,
+                        cfg=cfg,
+                        round_cfg=round_cfg,
+                        checkpoint_kind="gail_resume_latest",
+                        training_state=capture_gail_training_state(round_idx),
+                    ),
+                    resume_latest_path,
+                )
+
+            if graceful_checkpoint_requested():
+                signal_path = os.path.join(run_dir, "resume_latest.pt")
+                atomic_torch_save(
+                    gail_checkpoint_payload(
+                        round_idx=round_idx,
+                        policy=policy,
+                        discriminator=discriminator,
+                        scene_discriminator=scene_discriminator,
+                        sequence_only_discriminator=sequence_only_discriminator,
+                        primary_discriminator_normalizer=primary_discriminator_normalizer,
+                        scene_discriminator_normalizer=scene_discriminator_normalizer,
+                        discriminator_name=discriminator_name,
+                        expert_metadata=expert_metadata,
+                        cfg=cfg,
+                        round_cfg=round_cfg,
+                        checkpoint_kind="gail_signal_boundary",
+                        training_state=capture_gail_training_state(round_idx),
+                    ),
+                    signal_path,
+                )
+                monitor.save(signal_path)
+                print(f"signal_boundary_checkpoint={signal_path} completed_round={round_idx}")
+                raise SystemExit(99)
+
+        final_round = int(completed_round)
         final_round_cfg = config_for_round(cfg, final_round)
+        is_stage_boundary = final_round < int(cfg.total_rounds)
+        if is_stage_boundary:
+            stage_boundary_path = os.path.join(run_dir, "resume_latest.pt")
+            atomic_torch_save(
+                gail_checkpoint_payload(
+                    round_idx=final_round,
+                    policy=policy,
+                    discriminator=discriminator,
+                    scene_discriminator=scene_discriminator,
+                    sequence_only_discriminator=sequence_only_discriminator,
+                    primary_discriminator_normalizer=primary_discriminator_normalizer,
+                    scene_discriminator_normalizer=scene_discriminator_normalizer,
+                    discriminator_name=discriminator_name,
+                    expert_metadata=expert_metadata,
+                    cfg=cfg,
+                    round_cfg=final_round_cfg,
+                    checkpoint_kind="gail_stage_boundary",
+                    training_state=capture_gail_training_state(final_round),
+                ),
+                stage_boundary_path,
+            )
+            monitor.save(stage_boundary_path)
+            print(
+                f"stage_boundary_checkpoint={stage_boundary_path} "
+                f"completed_round={final_round} next_round={final_round + 1}"
+            )
+            return
+        resume_latest_path = os.path.join(run_dir, "resume_latest.pt")
+        atomic_torch_save(
+            gail_checkpoint_payload(
+                round_idx=final_round,
+                policy=policy,
+                discriminator=discriminator,
+                scene_discriminator=scene_discriminator,
+                sequence_only_discriminator=sequence_only_discriminator,
+                primary_discriminator_normalizer=primary_discriminator_normalizer,
+                scene_discriminator_normalizer=scene_discriminator_normalizer,
+                discriminator_name=discriminator_name,
+                expert_metadata=expert_metadata,
+                cfg=cfg,
+                round_cfg=final_round_cfg,
+                checkpoint_kind="gail_resume_latest",
+                training_state=capture_gail_training_state(final_round),
+            ),
+            resume_latest_path,
+        )
         final_path = os.path.join(run_dir, "final.pt")
         atomic_torch_save(
             gail_checkpoint_payload(

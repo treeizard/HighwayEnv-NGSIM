@@ -19,6 +19,10 @@ class PSGAILConfig:
     resume_checkpoint: str = ""
     initial_policy_checkpoint: str = ""
     allow_airl_resume_without_reward: bool = False
+    allow_legacy_model_only_resume: bool = False
+    allow_unverified_resume_checkpoint: bool = False
+    stop_after_round: int = 0 # execution boundary only; 0 runs through total_rounds.
+    expected_resume_round: int = 0 # fail-closed orchestration assertion; 0 accepts any exact boundary.
     scene: str = "us-101"
     action_mode: str = "discrete"
     continuous_action_dim: int = 2 # -> [acceleration_norm, steering_norm]
@@ -51,7 +55,7 @@ class PSGAILConfig:
     evaluation_num_workers: int = 1 # persistent evaluation workers; 0 keeps old main-process serial eval.
     evaluation_worker_threads: int = 2 # native CPU threads available inside each evaluation worker.
     evaluation_cache_envs: bool = True # keep evaluation envs alive inside persistent eval workers.
-    evaluation_max_cached_envs_per_worker: int = 0 # 0 means unlimited per-worker eval env cache.
+    evaluation_max_cached_envs_per_worker: int = 4 # finite LRU bound; 0 explicitly opts into unlimited.
     max_expert_samples: int = 100_000
     expert_lane_change_fraction: float = 0.20
     expert_lane_change_min_lateral_displacement: float = 2.0
@@ -97,6 +101,7 @@ class PSGAILConfig:
     road_query_mode: str = "legacy"
     collision_check_mode: str = "legacy"
     record_replay_diagnostics: bool = True
+    sensor_road_edge_mode: str = "per_vehicle"
 
     # Sensor Parameters. These values define the observation space and what information is available to the policy;
     # changing them can modify the state representation and thus the learning problem itself.
@@ -285,6 +290,8 @@ class PSGAILConfig:
 
     # Stable campaign identity. Empty keeps legacy scene-based domain inference.
     study_domain: str = ""
+    study_cell_index: int = -1
+    study_stage: int = 0 # 0 for non-final trials; final campaign stages are 1 or 2.
     run_root: str = "" # empty preserves each trainer's historical output root.
 
 

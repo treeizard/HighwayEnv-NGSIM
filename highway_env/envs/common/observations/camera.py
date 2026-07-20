@@ -45,11 +45,13 @@ class SharedMultiAgentLidarCameraObservations(ObservationType):
         env: AbstractEnv,
         lidar: dict | None = None,
         camera: dict | None = None,
+        batch_road_edges: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(env, **kwargs)
         self.lidar_observation = LidarObservation(env, **(lidar or {}))
         self.camera_observation = LaneCameraObservation(env, **(camera or {}))
+        self.batch_road_edges = bool(batch_road_edges)
 
     @staticmethod
     def _ego_state_space() -> spaces.Box:
@@ -90,12 +92,30 @@ class SharedMultiAgentLidarCameraObservations(ObservationType):
         obstacle_index = _ObstacleSpatialIndex(obstacle_entries)
         _ObservationProfiler.record("shared_obstacle_index_build", time.perf_counter() - index_started)
         vehicles = list(self.env.controlled_vehicles)
-        query_started = time.perf_counter()
         origins = np.asarray([vehicle.position for vehicle in vehicles], dtype=float)
+        if self.batch_road_edges:
+            edge_started = time.perf_counter()
+            edge_distances: list[np.ndarray | None] | np.ndarray = (
+                self.lidar_observation._distance_to_road_edges_many(
+                    origins=origins,
+                    directions=self.lidar_observation._directions,
+                    max_range=self.lidar_observation.maximum_range,
+                    coarse_step=self.lidar_observation.coarse_step,
+                    refine_iters=self.lidar_observation.refine_iters,
+                )
+            )
+            _ObservationProfiler.record(
+                "shared_lidar_road_edge_many", time.perf_counter() - edge_started
+            )
+        else:
+            edge_distances = [None] * len(vehicles)
+        query_started = time.perf_counter()
         candidate_entries = obstacle_index.query_many(origins, self.lidar_observation.maximum_range)
         _ObservationProfiler.record("shared_obstacle_candidate_query", time.perf_counter() - query_started)
         observations = []
-        for vehicle, vehicle_obstacle_entries in zip(vehicles, candidate_entries):
+        for vehicle, vehicle_obstacle_entries, vehicle_edge_distances in zip(
+            vehicles, candidate_entries, edge_distances, strict=True
+        ):
             self.lidar_observation.observer_vehicle = vehicle
             self.camera_observation.observer_vehicle = vehicle
             ego_state = self._build_ego_state(vehicle)
@@ -103,6 +123,7 @@ class SharedMultiAgentLidarCameraObservations(ObservationType):
                 (
                     self.lidar_observation.observe(
                         obstacle_entries=vehicle_obstacle_entries,
+                        edge_dists=vehicle_edge_distances,
                     ),
                     self.camera_observation.observe(),
                     ego_state,

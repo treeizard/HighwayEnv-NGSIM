@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import asdict
 import math
 
 from .config import PSGAILConfig
@@ -14,6 +15,17 @@ class TrainingHealthMonitor:
     discriminator_saturation: int = 0
     reward_collapse: int = 0
     validation_regressions: int = 0
+
+    def state_dict(self) -> dict[str, int]:
+        return {key: int(value) for key, value in asdict(self).items()}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        required = set(asdict(self))
+        missing = sorted(required.difference(state))
+        if missing:
+            raise RuntimeError(f"Training health state is incomplete: {missing}")
+        for key in required:
+            setattr(self, key, int(state[key]))
 
     def observe(
         self,

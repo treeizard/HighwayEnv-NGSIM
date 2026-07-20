@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 import time
 import warnings
@@ -16,7 +17,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from scripts_gail.ps_gail.config import PSGAILConfig, should_save_checkpoint_video
-from scripts_gail.ps_gail.checkpoints import atomic_torch_save, checkpoint_metadata
+from scripts_gail.ps_gail.checkpoints import (
+    atomic_torch_save,
+    checkpoint_metadata,
+    exact_training_state,
+    restore_exact_training_state,
+    resume_config_hash,
+    verify_resume_checkpoint,
+)
 from scripts_gail.ps_gail.data import load_expert_transition_data
 from scripts_gail.ps_gail.envs import make_training_env
 from scripts_gail.ps_gail.experiment import (
@@ -62,7 +70,11 @@ from scripts_gail.train_simple_ps_gail import (
     append_policy_archive,
     behavior_clone_pretrain,
     evaluate_policy_survival,
+    graceful_checkpoint_requested,
+    install_graceful_checkpoint_signal_handler,
+    materialize_resume_best_checkpoint,
     policy_archive_snapshot,
+    restore_policy_archive,
     training_risk_warnings,
 )
 
@@ -226,6 +238,34 @@ def append_airl_replay(
     del replay[:-replay_rounds]
 
 
+def airl_replay_state_dict(replay: list[AIRLReplayEntry]) -> list[dict[str, np.ndarray]]:
+    return [
+        {
+            "observations": entry.observations.copy(),
+            "actions": entry.actions.copy(),
+            "next_observations": entry.next_observations.copy(),
+            "dones": entry.dones.copy(),
+            "trajectory_ids": entry.trajectory_ids.copy(),
+            "timesteps": entry.timesteps.copy(),
+        }
+        for entry in replay
+    ]
+
+
+def restore_airl_replay(raw_replay: object) -> list[AIRLReplayEntry]:
+    return [
+        AIRLReplayEntry(
+            observations=np.asarray(row["observations"], dtype=np.float32).copy(),
+            actions=np.asarray(row["actions"], dtype=np.float32).copy(),
+            next_observations=np.asarray(row["next_observations"], dtype=np.float32).copy(),
+            dones=np.asarray(row["dones"], dtype=bool).copy(),
+            trajectory_ids=np.asarray(row["trajectory_ids"], dtype=object).copy(),
+            timesteps=np.asarray(row["timesteps"], dtype=np.int64).copy(),
+        )
+        for row in list(raw_replay or [])
+    ]
+
+
 def concat_airl_replay(
     rollout: RolloutBatch,
     replay: list[AIRLReplayEntry],
@@ -339,8 +379,9 @@ def airl_checkpoint_payload(
     cfg: PSGAILConfig,
     round_cfg: PSGAILConfig,
     checkpoint_kind: str = "airl_round",
+    training_state: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         **checkpoint_metadata(cfg, method="airl", checkpoint_kind=checkpoint_kind),
         "round": int(round_idx),
         "policy_state_dict": policy.state_dict(),
@@ -349,6 +390,9 @@ def airl_checkpoint_payload(
         "config": vars(cfg),
         "round_config": vars(round_cfg),
     }
+    if training_state is not None:
+        payload["training_state"] = training_state
+    return payload
 
 
 def load_airl_resume_checkpoint(
@@ -358,9 +402,13 @@ def load_airl_resume_checkpoint(
     reward_model: torch.nn.Module,
     device: torch.device,
     allow_missing_reward_state: bool = False,
+    verify_integrity: bool = False,
+    allow_unverified: bool = False,
 ) -> dict[str, object]:
     if not os.path.isfile(resume_checkpoint):
         raise FileNotFoundError(f"resume_checkpoint does not exist: {resume_checkpoint}")
+    if verify_integrity:
+        verify_resume_checkpoint(resume_checkpoint, allow_unverified=allow_unverified)
     try:
         checkpoint = torch.load(resume_checkpoint, map_location=device, weights_only=False)
     except TypeError:
@@ -1200,6 +1248,8 @@ def main() -> None:
             "AIRL does not implement the auxiliary sequence discriminator. "
             "Disable --enable-sequence-discriminator for AIRL runs."
         )
+    install_graceful_checkpoint_signal_handler()
+    random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     device = resolve_device(cfg.device)
@@ -1270,6 +1320,7 @@ def main() -> None:
             raise ValueError(
                 "Use only one of --resume-checkpoint and --initial-policy-checkpoint."
             )
+        resume_payload: dict[str, object] | None = None
         if resume_checkpoint:
             checkpoint = load_airl_resume_checkpoint(
                 resume_checkpoint=resume_checkpoint,
@@ -1277,7 +1328,10 @@ def main() -> None:
                 reward_model=reward_model,
                 device=device,
                 allow_missing_reward_state=bool(cfg.allow_airl_resume_without_reward),
+                verify_integrity=True,
+                allow_unverified=bool(cfg.allow_unverified_resume_checkpoint),
             )
+            resume_payload = checkpoint
             print(
                 "resumed_checkpoint="
                 f"{os.path.abspath(resume_checkpoint)} "
@@ -1400,7 +1454,7 @@ def main() -> None:
         if cfg.max_episode_steps_schedule:
             print(f"max_episode_steps_schedule={cfg.max_episode_steps_schedule}")
 
-        if int(cfg.bc_pretrain_epochs) > 0:
+        if int(cfg.bc_pretrain_epochs) > 0 and resume_payload is None:
             bc_stats = behavior_clone_pretrain(policy, expert, cfg, device)
             bc_eval_stats = evaluate_policy_survival(
                 policy,
@@ -1470,7 +1524,124 @@ def main() -> None:
         final_test_metrics: dict[str, float] = {}
         best_path = os.path.join(run_dir, "best.pt")
         last_validation_stress_round = 0
-        if bool(getattr(cfg, "evaluate_initial_policy", True)) and int(cfg.validation_episodes) > 0:
+        previous_controlled_vehicles = None
+        last_vehicle_jump_round = None
+        health_monitor = TrainingHealthMonitor()
+        optimizer_handles = {
+            "policy": policy_optimizer,
+            "reward": reward_optimizer,
+        }
+
+        def capture_airl_training_state(completed_round: int) -> dict[str, object]:
+            return exact_training_state(
+                completed_round=completed_round,
+                optimizers=optimizer_handles,
+                trainer_state={
+                    "best_validation_score": float(best_validation_score),
+                    "best_validation_round": int(best_validation_round),
+                    "initial_validation_metrics": dict(initial_validation_metrics),
+                    "last_validation_metrics": dict(last_validation_metrics),
+                    "final_stress_metrics": dict(final_stress_metrics),
+                    "final_test_metrics": dict(final_test_metrics),
+                    "last_validation_stress_round": int(last_validation_stress_round),
+                    "previous_controlled_vehicles": previous_controlled_vehicles,
+                    "last_vehicle_jump_round": last_vehicle_jump_round,
+                    "health_monitor": health_monitor.state_dict(),
+                    "airl_replay": airl_replay_state_dict(airl_replay),
+                    "psro_policy_archive": restore_policy_archive(psro_policy_archive),
+                    "last_checkpoint_video_path": last_checkpoint_video_path,
+                    "last_checkpoint_video_round": int(last_checkpoint_video_round),
+                    "trainer_parameters": {
+                        "reward_batch_size": int(reward_batch_size),
+                        "airl_log_prob_batch_size": int(airl_log_prob_batch_size),
+                    },
+                },
+            )
+
+        start_round = 1
+        completed_round = 0
+        if resume_payload is not None:
+            restored = restore_exact_training_state(
+                resume_payload,
+                optimizers=optimizer_handles,
+                expected_resume_config_hash=resume_config_hash(cfg),
+                expected_method="airl",
+                allow_legacy_model_only=bool(cfg.allow_legacy_model_only_resume),
+            )
+            if restored is not None:
+                runtime = dict(restored["trainer_state"])
+                required_runtime = {
+                    "best_validation_score",
+                    "best_validation_round",
+                    "initial_validation_metrics",
+                    "last_validation_metrics",
+                    "final_stress_metrics",
+                    "final_test_metrics",
+                    "last_validation_stress_round",
+                    "previous_controlled_vehicles",
+                    "last_vehicle_jump_round",
+                    "health_monitor",
+                    "airl_replay",
+                    "psro_policy_archive",
+                    "trainer_parameters",
+                }
+                missing_runtime = sorted(required_runtime.difference(runtime))
+                if missing_runtime:
+                    raise RuntimeError(f"AIRL exact-resume state is incomplete: {missing_runtime}")
+                stored_parameters = dict(runtime["trainer_parameters"])
+                expected_parameters = {
+                    "reward_batch_size": int(reward_batch_size),
+                    "airl_log_prob_batch_size": int(airl_log_prob_batch_size),
+                }
+                if stored_parameters != expected_parameters:
+                    raise RuntimeError(
+                        "AIRL trainer parameter mismatch on exact resume: "
+                        f"{stored_parameters} != {expected_parameters}"
+                    )
+                start_round = int(restored["start_round"])
+                completed_round = int(restored["completed_round"])
+                expected_resume_round = int(getattr(cfg, "expected_resume_round", 0))
+                if expected_resume_round > 0 and completed_round != expected_resume_round:
+                    raise RuntimeError(
+                        "AIRL resume boundary mismatch: "
+                        f"completed_round={completed_round}, expected={expected_resume_round}"
+                    )
+                best_validation_score = float(runtime["best_validation_score"])
+                best_validation_round = int(runtime["best_validation_round"])
+                initial_validation_metrics = dict(runtime["initial_validation_metrics"])
+                last_validation_metrics = dict(runtime["last_validation_metrics"])
+                final_stress_metrics = dict(runtime["final_stress_metrics"])
+                final_test_metrics = dict(runtime["final_test_metrics"])
+                last_validation_stress_round = int(runtime["last_validation_stress_round"])
+                previous_controlled_vehicles = runtime["previous_controlled_vehicles"]
+                last_vehicle_jump_round = runtime["last_vehicle_jump_round"]
+                health_monitor.load_state_dict(dict(runtime["health_monitor"]))
+                airl_replay = restore_airl_replay(runtime["airl_replay"])
+                psro_policy_archive = restore_policy_archive(runtime["psro_policy_archive"])
+                last_checkpoint_video_path = runtime.get("last_checkpoint_video_path")
+                last_checkpoint_video_round = int(runtime.get("last_checkpoint_video_round", 0))
+                print(
+                    "exact_resume="
+                    f"completed_round={completed_round} start_round={start_round} "
+                    f"best={best_validation_score:.4f}@{best_validation_round}"
+                )
+                if materialize_resume_best_checkpoint(
+                    resume_checkpoint,
+                    best_path,
+                    best_validation_score=best_validation_score,
+                    save_best_checkpoint=bool(getattr(cfg, "save_best_checkpoint", True)),
+                    cfg=cfg,
+                    method="airl",
+                ):
+                    monitor.save(best_path)
+
+        if resume_payload is None and bool(getattr(cfg, "psro_lite", False)):
+            append_policy_archive(psro_policy_archive, policy, cfg)
+        if (
+            resume_payload is None
+            and bool(getattr(cfg, "evaluate_initial_policy", True))
+            and int(cfg.validation_episodes) > 0
+        ):
             initial_cfg = config_for_round(cfg, 1)
             initial_metrics = evaluate_policy_matched_trajectories(
                 policy,
@@ -1515,7 +1686,6 @@ def main() -> None:
                     + f" best={best_validation_score:.4f}@0"
                 )
         if bool(getattr(cfg, "psro_lite", False)):
-            append_policy_archive(psro_policy_archive, policy, cfg)
             print(
                 "psro_lite="
                 f"enabled archive_every={cfg.psro_archive_every} "
@@ -1523,10 +1693,15 @@ def main() -> None:
                 f"after_jump_rounds={cfg.psro_mixture_after_jump_rounds} "
                 f"current_fraction={cfg.psro_current_policy_fraction:.3f}"
             )
-        previous_controlled_vehicles = None
-        last_vehicle_jump_round = None
-        health_monitor = TrainingHealthMonitor()
-        for round_idx in range(1, int(cfg.total_rounds) + 1):
+        stop_after_round = int(getattr(cfg, "stop_after_round", 0))
+        if stop_after_round < 0 or stop_after_round > int(cfg.total_rounds):
+            raise ValueError("stop_after_round must be zero or within total_rounds.")
+        end_round = stop_after_round if stop_after_round > 0 else int(cfg.total_rounds)
+        if start_round > end_round:
+            raise RuntimeError(
+                f"Resume checkpoint completed round {completed_round}, beyond requested end round {end_round}."
+            )
+        for round_idx in range(start_round, end_round + 1):
             round_started = time.perf_counter()
             round_cfg = config_for_round(cfg, round_idx)
             round_cfg.continuous_action_dim = cfg.continuous_action_dim
@@ -1921,6 +2096,7 @@ def main() -> None:
                 elif stat_key.startswith("transformer_"):
                     metrics[f"policy/{stat_key}"] = float(stat_value)
             monitor.log(metrics, step=round_idx)
+            pending_best: tuple[dict[str, float], float, float] | None = None
             if int(getattr(cfg, "validation_every", 0)) > 0 and round_idx % int(cfg.validation_every) == 0:
                 val_metrics = evaluate_policy_matched_trajectories(
                     policy,
@@ -1967,24 +2143,7 @@ def main() -> None:
                     if improved:
                         best_validation_score = float(val_score)
                         best_validation_round = int(round_idx)
-                        atomic_torch_save(
-                            best_checkpoint_payload(
-                                airl_checkpoint_payload(
-                                    round_idx=round_idx,
-                                    policy=policy,
-                                    reward_model=reward_model,
-                                    expert_metadata=expert.metadata,
-                                    cfg=cfg,
-                                    round_cfg=round_cfg,
-                                ),
-                                round_idx=round_idx,
-                                validation_metrics=val_metrics,
-                                validation_score=val_score,
-                                validation_cost=val_cost,
-                            ),
-                            best_path,
-                        )
-                        monitor.save(best_path)
+                        pending_best = (dict(val_metrics), float(val_score), float(val_cost))
                     print(
                         matched_validation_summary("validation", f"{round_idx:04d}", val_metrics)
                         + f" best={best_validation_score:.4f}@{best_validation_round}"
@@ -2014,6 +2173,40 @@ def main() -> None:
                     monitor.log(stress_metrics, step=round_idx)
                     print(matched_validation_summary("validation_stress", f"{round_idx:04d}", stress_metrics))
                     last_validation_stress_round = int(round_idx)
+            if should_save_checkpoint_video(round_cfg, round_idx):
+                video_path = save_checkpoint_video(policy, round_cfg, run_dir=run_dir, round_idx=round_idx, device=device)
+                if video_path is not None:
+                    last_checkpoint_video_path = video_path
+                    last_checkpoint_video_round = round_idx
+                    monitor.log_video("checkpoint/policy_video", video_path, step=round_idx, fps=int(round_cfg.policy_frequency))
+            if (
+                bool(getattr(cfg, "psro_lite", False))
+                and int(getattr(cfg, "psro_archive_every", 0)) > 0
+                and round_idx % int(cfg.psro_archive_every) == 0
+            ):
+                append_policy_archive(psro_policy_archive, policy, cfg)
+
+            completed_round = int(round_idx)
+            if pending_best is not None:
+                saved_metrics, saved_score, saved_cost = pending_best
+                atomic_torch_save(
+                    best_checkpoint_payload(
+                        airl_checkpoint_payload(
+                            round_idx=round_idx,
+                            policy=policy,
+                            reward_model=reward_model,
+                            expert_metadata=expert.metadata,
+                            cfg=cfg,
+                            round_cfg=round_cfg,
+                        ),
+                        round_idx=round_idx,
+                        validation_metrics=saved_metrics,
+                        validation_score=saved_score,
+                        validation_cost=saved_cost,
+                    ),
+                    best_path,
+                )
+                monitor.save(best_path)
             if cfg.checkpoint_every > 0 and round_idx % int(cfg.checkpoint_every) == 0:
                 checkpoint_path = os.path.join(ckpt_dir, f"round_{round_idx:04d}.pt")
                 atomic_torch_save(
@@ -2028,21 +2221,79 @@ def main() -> None:
                     checkpoint_path,
                 )
                 monitor.save(checkpoint_path)
-            if should_save_checkpoint_video(round_cfg, round_idx):
-                video_path = save_checkpoint_video(policy, round_cfg, run_dir=run_dir, round_idx=round_idx, device=device)
-                if video_path is not None:
-                    last_checkpoint_video_path = video_path
-                    last_checkpoint_video_round = round_idx
-                    monitor.log_video("checkpoint/policy_video", video_path, step=round_idx, fps=int(round_cfg.policy_frequency))
-            if (
-                bool(getattr(cfg, "psro_lite", False))
-                and int(getattr(cfg, "psro_archive_every", 0)) > 0
-                and round_idx % int(cfg.psro_archive_every) == 0
-            ):
-                append_policy_archive(psro_policy_archive, policy, cfg)
 
-        final_round = int(cfg.total_rounds)
+                resume_latest_path = os.path.join(run_dir, "resume_latest.pt")
+                atomic_torch_save(
+                    airl_checkpoint_payload(
+                        round_idx=round_idx,
+                        policy=policy,
+                        reward_model=reward_model,
+                        expert_metadata=expert.metadata,
+                        cfg=cfg,
+                        round_cfg=round_cfg,
+                        checkpoint_kind="airl_resume_latest",
+                        training_state=capture_airl_training_state(round_idx),
+                    ),
+                    resume_latest_path,
+                )
+
+            if graceful_checkpoint_requested():
+                signal_path = os.path.join(run_dir, "resume_latest.pt")
+                atomic_torch_save(
+                    airl_checkpoint_payload(
+                        round_idx=round_idx,
+                        policy=policy,
+                        reward_model=reward_model,
+                        expert_metadata=expert.metadata,
+                        cfg=cfg,
+                        round_cfg=round_cfg,
+                        checkpoint_kind="airl_signal_boundary",
+                        training_state=capture_airl_training_state(round_idx),
+                    ),
+                    signal_path,
+                )
+                monitor.save(signal_path)
+                print(f"signal_boundary_checkpoint={signal_path} completed_round={round_idx}")
+                raise SystemExit(99)
+
+        final_round = int(completed_round)
         final_round_cfg = config_for_round(cfg, final_round)
+        is_stage_boundary = final_round < int(cfg.total_rounds)
+        if is_stage_boundary:
+            stage_boundary_path = os.path.join(run_dir, "resume_latest.pt")
+            atomic_torch_save(
+                airl_checkpoint_payload(
+                    round_idx=final_round,
+                    policy=policy,
+                    reward_model=reward_model,
+                    expert_metadata=expert.metadata,
+                    cfg=cfg,
+                    round_cfg=final_round_cfg,
+                    checkpoint_kind="airl_stage_boundary",
+                    training_state=capture_airl_training_state(final_round),
+                ),
+                stage_boundary_path,
+            )
+            monitor.save(stage_boundary_path)
+            print(
+                f"stage_boundary_checkpoint={stage_boundary_path} "
+                f"completed_round={final_round} next_round={final_round + 1}"
+            )
+            return
+        resume_latest_path = os.path.join(run_dir, "resume_latest.pt")
+        atomic_torch_save(
+            airl_checkpoint_payload(
+                round_idx=final_round,
+                policy=policy,
+                reward_model=reward_model,
+                expert_metadata=expert.metadata,
+                cfg=cfg,
+                round_cfg=final_round_cfg,
+                checkpoint_kind="airl_resume_latest",
+                training_state=capture_airl_training_state(final_round),
+            ),
+            resume_latest_path,
+        )
         final_path = os.path.join(run_dir, "final.pt")
         atomic_torch_save(
             airl_checkpoint_payload(

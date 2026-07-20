@@ -159,6 +159,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 "collision_broadphase_cell_size": 12.0,
                 "collision_broadphase_min_entities": 32,
                 "record_replay_diagnostics": True,
+                "sensor_road_edge_mode": "per_vehicle",  # "per_vehicle" or "batched"
                 "seed": None,
                 "expert_test_mode": False,
                 "discrete_expert_policy": "planner",
@@ -468,6 +469,13 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         if collision_mode not in {"legacy", "broadphase", "optimized"}:
             raise ValueError(
                 "collision_check_mode must be one of: legacy, broadphase, optimized"
+            )
+        sensor_mode = str(
+            self.config.get("sensor_road_edge_mode", "per_vehicle")
+        ).lower()
+        if sensor_mode not in {"per_vehicle", "batched", "optimized"}:
+            raise ValueError(
+                "sensor_road_edge_mode must be one of: per_vehicle, batched, optimized"
             )
         net = self._NETWORK_CACHE.get(self.scene)
         if net is None:

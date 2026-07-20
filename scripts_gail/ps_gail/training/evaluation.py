@@ -198,6 +198,20 @@ def _evaluation_training_count_episode_specs(
         raise RuntimeError(f"No training-count evaluation episodes found for split={split!r}.")
     return specs
 
+
+def _apply_simulator_runtime_options(
+    env_cfg: dict[str, object],
+    cfg: PSGAILConfig,
+) -> None:
+    env_cfg["road_query_mode"] = str(getattr(cfg, "road_query_mode", "legacy"))
+    env_cfg["collision_check_mode"] = str(getattr(cfg, "collision_check_mode", "legacy"))
+    env_cfg["record_replay_diagnostics"] = bool(
+        getattr(cfg, "record_replay_diagnostics", True)
+    )
+    env_cfg["sensor_road_edge_mode"] = str(
+        getattr(cfg, "sensor_road_edge_mode", "per_vehicle")
+    )
+
 def _make_matched_eval_env(
     cfg: PSGAILConfig,
     *,
@@ -237,6 +251,7 @@ def _make_matched_eval_env(
     env_cfg["terminate_when_all_controlled_crashed"] = True
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
     env_cfg["crash_controlled_vehicles_offroad"] = True
+    _apply_simulator_runtime_options(env_cfg, cfg)
     return gym.make(ENV_ID, config=env_cfg)
 
 def _make_matched_eval_all_vehicle_env(
@@ -272,6 +287,7 @@ def _make_matched_eval_all_vehicle_env(
     env_cfg["terminate_when_all_controlled_crashed"] = True
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
     env_cfg["crash_controlled_vehicles_offroad"] = True
+    _apply_simulator_runtime_options(env_cfg, cfg)
     return gym.make(ENV_ID, config=env_cfg)
 
 def _make_matched_eval_selected_vehicle_env(
@@ -312,6 +328,7 @@ def _make_matched_eval_selected_vehicle_env(
     env_cfg["terminate_when_all_controlled_crashed"] = True
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
     env_cfg["crash_controlled_vehicles_offroad"] = True
+    _apply_simulator_runtime_options(env_cfg, cfg)
     return gym.make(ENV_ID, config=env_cfg)
 
 def _deterministic_policy_action_tuple(
@@ -715,6 +732,10 @@ def _matched_eval_env_cache_key(
         bool(cfg.enable_collision),
         bool(cfg.terminate_when_all_controlled_crashed),
         bool(cfg.allow_idm),
+        str(getattr(cfg, "road_query_mode", "legacy")),
+        str(getattr(cfg, "collision_check_mode", "legacy")),
+        bool(getattr(cfg, "record_replay_diagnostics", True)),
+        str(getattr(cfg, "sensor_road_edge_mode", "per_vehicle")),
     )
 
 def _get_matched_eval_env(
@@ -786,11 +807,30 @@ def _get_matched_eval_env(
     )
     _EVAL_ENV_CACHE[key] = env
     _EVAL_ENV_CACHE_MISSES += 1
-    max_cached = max(0, int(getattr(cfg, "evaluation_max_cached_envs_per_worker", 0)))
+    max_cached = max(0, int(getattr(cfg, "evaluation_max_cached_envs_per_worker", 4)))
     while max_cached > 0 and len(_EVAL_ENV_CACHE) > max_cached:
         _old_key, old_env = _EVAL_ENV_CACHE.popitem(last=False)
         old_env.close()
-    return env, True
+    return env, False
+
+
+def evaluation_worker_cache_stats() -> dict[str, int]:
+    return {
+        "env_cache_size": len(_EVAL_ENV_CACHE),
+        "env_cache_hits": int(_EVAL_ENV_CACHE_HITS),
+        "env_cache_misses": int(_EVAL_ENV_CACHE_MISSES),
+        "policy_cache_size": len(_EVAL_POLICY_CACHE),
+    }
+
+
+def clear_evaluation_worker_caches() -> None:
+    global _EVAL_ENV_CACHE_HITS, _EVAL_ENV_CACHE_MISSES
+    for env in _EVAL_ENV_CACHE.values():
+        env.close()
+    _EVAL_ENV_CACHE.clear()
+    _EVAL_POLICY_CACHE.clear()
+    _EVAL_ENV_CACHE_HITS = 0
+    _EVAL_ENV_CACHE_MISSES = 0
 
 def _matched_eval_worker(
     cfg: PSGAILConfig,
@@ -1434,6 +1474,7 @@ __all__ = [
     '_evaluation_episode_names',
     '_normalize_evaluation_vehicle_mode',
     '_evaluation_training_count_episode_specs',
+    '_apply_simulator_runtime_options',
     '_make_matched_eval_env',
     '_make_matched_eval_all_vehicle_env',
     '_make_matched_eval_selected_vehicle_env',
@@ -1453,6 +1494,8 @@ __all__ = [
     '_cached_eval_policy',
     '_matched_eval_env_cache_key',
     '_get_matched_eval_env',
+    'evaluation_worker_cache_stats',
+    'clear_evaluation_worker_caches',
     '_matched_eval_worker',
     '_evaluate_policy_matched_all_vehicle_episodes',
     'evaluate_policy_matched_trajectories',
