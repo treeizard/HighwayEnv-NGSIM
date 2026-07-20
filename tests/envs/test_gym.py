@@ -93,6 +93,25 @@ def test_env_reset_options(env_spec: str = "highway-v0"):
     assert env.config["duration"] == update_duration
 
 
+def test_reset_can_skip_only_the_redundant_pre_scene_space_build(monkeypatch):
+    env = gym.make("parking-v0", config={"reuse_pre_reset_spaces": True}).unwrapped
+    original = env.define_spaces
+    calls = []
+
+    def counted_define_spaces():
+        calls.append(len(env.controlled_vehicles))
+        return original()
+
+    monkeypatch.setattr(env, "define_spaces", counted_define_spaces)
+    env.reset(seed=1)
+    assert len(calls) == 1
+
+    calls.clear()
+    env.reset(seed=2, options={"config": {"duration": 5}})
+    assert len(calls) == 2
+    env.close()
+
+
 @pytest.mark.parametrize(
     "env_spec",
     [

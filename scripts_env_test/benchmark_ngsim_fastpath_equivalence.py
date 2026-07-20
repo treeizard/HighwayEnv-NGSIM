@@ -84,6 +84,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scene", default="us-101", choices=("us-101", "i-80", "japanese"))
     parser.add_argument("--episode-root", default="data/highway_env/processed_20s")
     parser.add_argument("--split", default="train", choices=("train", "val", "test"))
+    parser.add_argument(
+        "--episode-name",
+        default="",
+        help="Optional fixed episode; use a verified high-occupancy episode for 100-vehicle evidence.",
+    )
     parser.add_argument("--vehicle-counts", nargs="+", type=_positive_int, default=[1, 10, 50, 100])
     parser.add_argument("--max-surrounding", type=_max_surrounding, default="all")
     parser.add_argument("--steps", type=_positive_int, default=50)
@@ -168,6 +173,11 @@ def build_mode_config(
         max_episode_steps=int(args.steps),
         show_trajectories=False,
         seed=None,
+        simulation_period=(
+            {"episode_name": str(args.episode_name)}
+            if str(args.episode_name).strip()
+            else None
+        ),
         scene_dataset_collection_mode=False,
         allow_idm=True,
         clip_controlled_vehicles_to_available=True,
@@ -186,6 +196,7 @@ def build_mode_config(
             "collision_broadphase_min_entities": int(args.collision_min_entities),
             "record_replay_diagnostics": mode == "legacy",
             "sensor_road_edge_mode": "per_vehicle" if mode == "legacy" else "batched",
+            "reuse_pre_reset_spaces": mode != "legacy",
         }
     )
     return config
@@ -680,6 +691,7 @@ def build_report(args: argparse.Namespace, cases: Sequence[dict[str, Any]]) -> d
             "scene": str(args.scene),
             "episode_root": str(args.episode_root),
             "split": str(args.split),
+            "episode_name": str(args.episode_name),
             "vehicle_counts": [int(value) for value in args.vehicle_counts],
             "max_surrounding": args.max_surrounding,
             "steps": int(args.steps),

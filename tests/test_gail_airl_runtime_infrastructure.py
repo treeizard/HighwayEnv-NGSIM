@@ -59,12 +59,14 @@ def test_training_env_propagates_explicit_exact_fast_modes(monkeypatch):
             collision_check_mode="broadphase",
             record_replay_diagnostics=False,
             sensor_road_edge_mode="batched",
+            reuse_pre_reset_spaces=True,
         )
     )
     assert captured["road_query_mode"] == "spatial"
     assert captured["collision_check_mode"] == "broadphase"
     assert captured["record_replay_diagnostics"] is False
     assert captured["sensor_road_edge_mode"] == "batched"
+    assert captured["reuse_pre_reset_spaces"] is True
 
 
 def test_rollout_worker_reuses_policy_and_refreshes_weights():
@@ -276,6 +278,7 @@ def test_method_manifest_filters_bounds_resources_and_refuses_outputs(tmp_path):
         row["arguments"]["sensor_road_edge_mode"] == "per_vehicle"
         for row in payload["trials"]
     )
+    assert all(not row["arguments"]["reuse_pre_reset_spaces"] for row in payload["trials"])
     with pytest.raises(FileExistsError, match="method manifest"):
         prepare(args)
 
@@ -432,6 +435,7 @@ def test_all_matched_evaluation_constructors_propagate_simulator_modes(monkeypat
         collision_check_mode="broadphase",
         record_replay_diagnostics=False,
         sensor_road_edge_mode="batched",
+        reuse_pre_reset_spaces=True,
     )
     evaluation._make_matched_eval_env(
         cfg, split="val", episode_name="episode", vehicle_id=1
@@ -448,6 +452,7 @@ def test_all_matched_evaluation_constructors_propagate_simulator_modes(monkeypat
         assert env_cfg["collision_check_mode"] == "broadphase"
         assert env_cfg["record_replay_diagnostics"] is False
         assert env_cfg["sensor_road_edge_mode"] == "batched"
+        assert env_cfg["reuse_pre_reset_spaces"] is True
 
 
 def _build_final_manifest_fixture(tmp_path):

@@ -102,6 +102,7 @@ class PSGAILConfig:
     collision_check_mode: str = "legacy"
     record_replay_diagnostics: bool = True
     sensor_road_edge_mode: str = "per_vehicle"
+    reuse_pre_reset_spaces: bool = False
 
     # Sensor Parameters. These values define the observation space and what information is available to the policy;
     # changing them can modify the state representation and thus the learning problem itself.

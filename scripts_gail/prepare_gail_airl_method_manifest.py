@@ -133,6 +133,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 collision_check_mode="broadphase",
                 record_replay_diagnostics=False,
                 sensor_road_edge_mode="batched",
+                reuse_pre_reset_spaces=True,
             )
         else:
             arguments.update(
@@ -140,6 +141,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 collision_check_mode="legacy",
                 record_replay_diagnostics=True,
                 sensor_road_edge_mode="per_vehicle",
+                reuse_pre_reset_spaces=False,
             )
         if args.study_domain:
             requested_domain = str(args.study_domain).strip().lower()
@@ -169,6 +171,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             "scripts_gail/ps_gail/envs.py",
             "scripts_gail/run_gail_airl_study_trial.py",
             "highway_env/envs/ngsim_env.py",
+            "highway_env/envs/common/abstract.py",
             "highway_env/envs/common/observations/base.py",
             "highway_env/envs/common/observations/camera.py",
             "highway_env/envs/common/observations/factory.py",

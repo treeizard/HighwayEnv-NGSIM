@@ -76,6 +76,7 @@ def test_native_domain_reports_aggregate_into_source_bound_release_evidence(tmp_
                 "scene": scene, "episode_root": str(episode_root), "split": "train",
                 "observation_atol": 0.0,
                 "sensor_reference": True,
+                "episode_name": "high_occupancy_episode",
             },
             "parity_passed": True,
             "cases": cases,
@@ -84,7 +85,10 @@ def test_native_domain_reports_aggregate_into_source_bound_release_evidence(tmp_
         path.write_text(json.dumps(report))
         reports[scene] = path
     evidence = evidence_audit.aggregate(
-        reports=reports, source_repo=repo, minimum_100_vehicle_speedup=1.1
+        reports=reports,
+        source_repo=repo,
+        minimum_100_vehicle_speedup=1.1,
+        minimum_large_case_vehicles=50,
     )
     assert evidence["status"] == "passed"
     assert evidence["source_code"]["revision"] == "revision"
@@ -98,6 +102,8 @@ def test_parser_accepts_custom_counts_and_rejects_invalid_frequency() -> None:
         [
             "--scene",
             "japanese",
+            "--episode-name",
+            "t1577840980000",
             "--vehicle-counts",
             "3",
             "17",
@@ -113,6 +119,7 @@ def test_parser_accepts_custom_counts_and_rejects_invalid_frequency() -> None:
         ]
     )
     assert args.vehicle_counts == [3, 17]
+    assert args.episode_name == "t1577840980000"
     assert args.max_surrounding == 25
     assert args.steps == 7
     assert args.strict_parity is False
@@ -134,10 +141,12 @@ def test_mode_configs_only_change_exact_fast_path_switches() -> None:
     assert legacy["collision_check_mode"] == "legacy"
     assert legacy["record_replay_diagnostics"] is True
     assert legacy["sensor_road_edge_mode"] == "per_vehicle"
+    assert legacy["reuse_pre_reset_spaces"] is False
     assert optimized["road_query_mode"] == "spatial"
     assert optimized["collision_check_mode"] == "broadphase"
     assert optimized["record_replay_diagnostics"] is False
     assert optimized["sensor_road_edge_mode"] == "batched"
+    assert optimized["reuse_pre_reset_spaces"] is True
 
     ignored = {
         "road_query_mode",
@@ -147,6 +156,7 @@ def test_mode_configs_only_change_exact_fast_path_switches() -> None:
         "collision_broadphase_min_entities",
         "record_replay_diagnostics",
         "sensor_road_edge_mode",
+        "reuse_pre_reset_spaces",
     }
     assert {key: value for key, value in legacy.items() if key not in ignored} == {
         key: value for key, value in optimized.items() if key not in ignored

@@ -107,6 +107,10 @@ class AbstractEnv(gym.Env):
             "offscreen_rendering": os.environ.get("OFFSCREEN_RENDERING", "0") == "1",
             "manual_control": False,
             "real_time_rendering": False,
+            # Keep the historical two-space-build reset by default. Static-action
+            # environments may opt in to reuse the already validated action type
+            # before rebuilding spaces against the newly created scene.
+            "reuse_pre_reset_spaces": False,
         }
 
     def configure(self, config: dict) -> None:
@@ -200,10 +204,16 @@ class AbstractEnv(gym.Env):
         :return: the observation of the reset state
         """
         super().reset(seed=seed, options=options)
-        if options and "config" in options:
+        config_changed = bool(options and "config" in options)
+        if config_changed:
             self.configure(options["config"])
         self.update_metadata()
-        self.define_spaces()  # First, to set the controlled vehicle class depending on action space
+        if (
+            not bool(self.config.get("reuse_pre_reset_spaces", False))
+            or self.action_type is None
+            or config_changed
+        ):
+            self.define_spaces()  # First, to set the controlled vehicle class depending on action space
         self.time = self.steps = 0
         self.done = False
         self._reset()

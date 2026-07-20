@@ -211,6 +211,9 @@ def _apply_simulator_runtime_options(
     env_cfg["sensor_road_edge_mode"] = str(
         getattr(cfg, "sensor_road_edge_mode", "per_vehicle")
     )
+    env_cfg["reuse_pre_reset_spaces"] = bool(
+        getattr(cfg, "reuse_pre_reset_spaces", False)
+    )
 
 def _make_matched_eval_env(
     cfg: PSGAILConfig,
@@ -736,6 +739,7 @@ def _matched_eval_env_cache_key(
         str(getattr(cfg, "collision_check_mode", "legacy")),
         bool(getattr(cfg, "record_replay_diagnostics", True)),
         str(getattr(cfg, "sensor_road_edge_mode", "per_vehicle")),
+        bool(getattr(cfg, "reuse_pre_reset_spaces", False)),
     )
 
 def _get_matched_eval_env(

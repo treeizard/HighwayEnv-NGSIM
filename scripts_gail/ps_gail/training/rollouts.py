@@ -244,6 +244,7 @@ def _rollout_env_cache_key(cfg: PSGAILConfig) -> tuple[object, ...]:
         str(getattr(cfg, "collision_check_mode", "legacy")),
         bool(getattr(cfg, "record_replay_diagnostics", True)),
         str(getattr(cfg, "sensor_road_edge_mode", "per_vehicle")),
+        bool(getattr(cfg, "reuse_pre_reset_spaces", False)),
         bool(getattr(cfg, "enable_player_challenge_reward", False)),
         float(getattr(cfg, "collision_proxy_penalty_coef", 0.0)),
         float(getattr(cfg, "challenge_ttc_target", 0.0)),

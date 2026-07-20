@@ -42,6 +42,7 @@ SOURCE_LOCK_FILES = (
     "scripts_gail/ps_gail/training/evaluation.py",
     "scripts_gail/run_gail_airl_study_trial.py",
     "highway_env/envs/ngsim_env.py",
+    "highway_env/envs/common/abstract.py",
     "highway_env/envs/common/observations/base.py",
     "highway_env/envs/common/observations/camera.py",
     "highway_env/envs/common/observations/factory.py",
@@ -295,12 +296,14 @@ def _simulator_arguments(profile: str) -> dict[str, Any]:
             "collision_check_mode": "broadphase",
             "record_replay_diagnostics": False,
             "sensor_road_edge_mode": "batched",
+            "reuse_pre_reset_spaces": True,
         }
     return {
         "road_query_mode": "legacy",
         "collision_check_mode": "legacy",
         "record_replay_diagnostics": True,
         "sensor_road_edge_mode": "per_vehicle",
+        "reuse_pre_reset_spaces": False,
     }
 
 

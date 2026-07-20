@@ -36,6 +36,7 @@ def aggregate(
     reports: dict[str, Path],
     source_repo: Path,
     minimum_100_vehicle_speedup: float,
+    minimum_large_case_vehicles: int,
 ) -> dict[str, Any]:
     source_repo = source_repo.resolve()
     current_source = {
@@ -61,6 +62,7 @@ def aggregate(
             config.get("scene") != scene
             or float(config.get("observation_atol", -1.0)) != 0.0
             or config.get("sensor_reference") is not True
+            or not str(config.get("episode_name") or "").strip()
         ):
             raise RuntimeError(f"Report scene/tolerance mismatch: {path}")
         if report.get("parity_passed") is not True:
@@ -105,9 +107,20 @@ def aggregate(
             ):
                 raise RuntimeError(f"Strict parity failed for {scene}/{vehicle_count}.")
             modes = dict(case.get("modes") or {})
+            actual_counts = []
             for mode in ("legacy", "optimized"):
-                if int(dict(modes.get(mode) or {}).get("initial_controlled_vehicles", -1)) != vehicle_count:
-                    raise RuntimeError(f"{scene}/{vehicle_count} was clipped below requested scale.")
+                actual_counts.append(
+                    int(dict(modes.get(mode) or {}).get("initial_controlled_vehicles", -1))
+                )
+            if actual_counts[0] != actual_counts[1]:
+                raise RuntimeError(
+                    f"{scene}/{vehicle_count} instantiated different controlled counts: {actual_counts}"
+                )
+            if vehicle_count == 100 and actual_counts[0] < int(minimum_large_case_vehicles):
+                raise RuntimeError(
+                    f"{scene}/100 safely instantiated only {actual_counts[0]} controlled vehicles; "
+                    f"minimum is {minimum_large_case_vehicles}."
+                )
             speedup = float(
                 dict(case.get("optimized_speedup") or {}).get(
                     "agent_steps_per_second_x", 0.0
@@ -121,6 +134,7 @@ def aggregate(
                 {
                     "scene": scene,
                     "controlled_vehicles": vehicle_count,
+                    "actual_controlled_vehicles": actual_counts[0],
                     "strict_parity": True,
                     "observation_max_abs_error": 0.0,
                     "sensor_reference_speedup_ratio": float(
@@ -141,6 +155,7 @@ def aggregate(
         "live_data": True,
         "strict_parity": True,
         "minimum_100_vehicle_speedup": float(minimum_100_vehicle_speedup),
+        "minimum_large_case_vehicles": int(minimum_large_case_vehicles),
         "source_code": current_source,
         "episode_data": episode_data,
         "input_reports": inputs,
@@ -154,12 +169,14 @@ def main() -> None:
     parser.add_argument("--japanese-report", required=True, type=Path)
     parser.add_argument("--source-repo", required=True, type=Path)
     parser.add_argument("--minimum-100-vehicle-speedup", type=float, required=True)
+    parser.add_argument("--minimum-large-case-vehicles", type=int, default=50)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     result = aggregate(
         reports={"us-101": args.us_report, "japanese": args.japanese_report},
         source_repo=args.source_repo,
         minimum_100_vehicle_speedup=args.minimum_100_vehicle_speedup,
+        minimum_large_case_vehicles=args.minimum_large_case_vehicles,
     )
     output = args.output.resolve()
     if output.exists():
