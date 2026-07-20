@@ -121,12 +121,11 @@ def test_submission_uses_one_reporting_serial_bc_job():
     assert submit.count("sbatch --parsable") == 1
     assert "--dependency" not in submit
     assert "#SBATCH --array" not in runner
-    assert 'DOMAINS=(us japanese)' in runner
-    assert 'LAYERS=(2 3)' in runner
-    assert 'SEEDS=(0 1 2)' in runner
-    assert "--capability-failure-mode error" not in runner
-    assert "--capability-failure-mode report" in runner
-    assert "--evaluation-split test" in runner
-    assert "--no-evaluation-enable-collision" in runner
+    assert "scripts_gail.run_bc_domain_depth_matrix" in runner
+    assert 'manifest.get("loader_calls") != {"us": 1, "japanese": 1}' in runner
+    assert "configs/bc_recovery_recipe.json" in runner
+    assert "--checkpoint-archive-root" in runner
     assert 'BC_STUDY_MODEL_LIMIT' in runner
-    assert "--no-render-video" in runner
+    assert "for domain in us japanese" in runner
+    assert "for depth in 2 3" in runner
+    assert "for seed in 0 1 2" in runner

@@ -3,7 +3,7 @@
 #SBATCH --account=bt60
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:L40S:1
-#SBATCH --time=1-00:00:00
+#SBATCH --time=5-00:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
@@ -15,6 +15,25 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export REPODIR="${REPODIR:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
 source "${REPODIR}/hpc/slurm/project_env.bash"
+
+assert_sha256() {
+    local expected="$1"
+    local path="$2"
+    if [ -n "${expected}" ]; then
+        local actual
+        actual="$(sha256sum "${path}" | awk '{print $1}')"
+        if [ "${actual}" != "${expected}" ]; then
+            echo "Submission-locked source changed: ${path}" >&2
+            echo "expected ${expected}, got ${actual}" >&2
+            exit 2
+        fi
+    fi
+}
+
+assert_sha256 "${BC_EXPECTED_MATRIX_SHA256:-}" "${REPODIR}/scripts_gail/run_bc_domain_depth_matrix.py"
+assert_sha256 "${BC_EXPECTED_TRAINER_SHA256:-}" "${REPODIR}/scripts_gail/train_recurrent_bc_policy.py"
+assert_sha256 "${BC_EXPECTED_RECURRENT_BC_SHA256:-}" "${REPODIR}/scripts_gail/ps_gail/recurrent_bc.py"
+assert_sha256 "${BC_EXPECTED_MODELS_SHA256:-}" "${REPODIR}/scripts_gail/ps_gail/models.py"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
@@ -33,22 +52,70 @@ conda activate "${VFI_CONDA_ENV:-ngsim_env}"
 
 US_EXPERT="${VFI_DATA_ROOT}/expert/ngsim_ps_unified_expert_continuous_55145982"
 JAPANESE_EXPERT="${VFI_DATA_ROOT}/expert/japanese/continuous_v1/train"
-for expert_data in "${US_EXPERT}" "${JAPANESE_EXPERT}"; do
-    if [ ! -f "${expert_data}/manifest.json" ]; then
-        echo "Missing completed expert dataset: ${expert_data}/manifest.json" >&2
-        exit 2
-    fi
+LOCKED_RECIPE="${BC_LOCKED_RECIPE:-${VFI_PROJECT_ROOT}/configs/bc_recovery_recipe.json}"
+for required in "${US_EXPERT}/manifest.json" "${JAPANESE_EXPERT}/manifest.json" "${LOCKED_RECIPE}"; do
+    test -s "${required}"
 done
+assert_sha256 "${BC_EXPECTED_RECIPE_SHA256:-}" "${LOCKED_RECIPE}"
 
-if ! python - <<'PY'
+python - <<'PY'
 import torch
 if not torch.cuda.is_available():
     raise SystemExit("CUDA is unavailable in the BC study environment")
-print(f"CUDA smoke device: {torch.cuda.get_device_name(0)}")
+print(f"BC matrix device: {torch.cuda.get_device_name(0)}")
 PY
-then
-    echo "GPU prerequisite check failed" >&2
-    exit 3
+
+if [ "${BC_PRODUCTION_SUBMISSION:-0}" = "1" ]; then
+    STUDY_RUN_ID="${SLURM_JOB_ID:?Production BC workflow requires a Slurm job id}"
+    POLICY_ROOT="${VFI_RESULTS_ROOT}/runs/policies/bc/domain_depth_recovered_${STUDY_RUN_ID}"
+    ACTIVATION_ROOT="${VFI_RESULTS_ROOT}/test_runs/bc_interpretability_smoke/domain_depth_recovered_${STUDY_RUN_ID}"
+    CHECKPOINT_ARCHIVE_ROOT="${VFI_CHECKPOINT_ROOT}/bc/autoregressive_policy_comparison"
+    REGISTRY_ROOT="${VFI_RESULTS_ROOT}/runs/policy_registry/bc_domain_depth_recovered_${STUDY_RUN_ID}"
+    MODEL_LIMIT=12
+else
+    STUDY_RUN_ID="${BC_STUDY_RUN_ID:-${SLURM_JOB_ID:-local_$(date -u +%Y%m%dT%H%M%SZ)}}"
+    POLICY_ROOT="${BC_STUDY_POLICY_ROOT:-${VFI_RESULTS_ROOT}/runs/policies/bc/domain_depth_recovered_${STUDY_RUN_ID}}"
+    ACTIVATION_ROOT="${BC_STUDY_ACTIVATION_ROOT:-${VFI_RESULTS_ROOT}/test_runs/bc_interpretability_smoke/domain_depth_recovered_${STUDY_RUN_ID}}"
+    CHECKPOINT_ARCHIVE_ROOT="${BC_CHECKPOINT_ARCHIVE_ROOT:-${VFI_CHECKPOINT_ROOT}/bc/autoregressive_policy_comparison}"
+    REGISTRY_ROOT="${BC_STUDY_REGISTRY_ROOT:-${VFI_RESULTS_ROOT}/runs/policy_registry/bc_domain_depth_recovered_${STUDY_RUN_ID}}"
+    MODEL_LIMIT="${BC_STUDY_MODEL_LIMIT:-12}"
+fi
+
+cd "${REPODIR}"
+python -m scripts_gail.run_bc_domain_depth_matrix \
+    --recipe "${LOCKED_RECIPE}" \
+    --us-expert "${US_EXPERT}" \
+    --japanese-expert "${JAPANESE_EXPERT}" \
+    --episode-root "${VFI_HIGHWAY_DATA_ROOT}/processed_20s" \
+    --policy-root "${POLICY_ROOT}" \
+    --checkpoint-archive-root "${CHECKPOINT_ARCHIVE_ROOT}" \
+    --study-id "recovered_${STUDY_RUN_ID}" \
+    --model-limit "${MODEL_LIMIT}" \
+    --require-confirmation \
+    --device cuda
+
+MATRIX_MANIFEST="${POLICY_ROOT}/matrix_manifest.json"
+MATRIX_MANIFEST="${MATRIX_MANIFEST}" MODEL_LIMIT="${MODEL_LIMIT}" python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+manifest = json.loads(Path(os.environ["MATRIX_MANIFEST"]).read_text(encoding="utf-8"))
+if manifest.get("loader_calls") != {"us": 1, "japanese": 1}:
+    raise SystemExit(f"Expert data was not loaded exactly once per domain: {manifest.get('loader_calls')}")
+if int(manifest.get("model_count", -1)) != int(os.environ["MODEL_LIMIT"]):
+    raise SystemExit("Matrix model count does not match the requested limit")
+passed = int(manifest.get("metric_capability_passed_count", -1))
+if passed != int(os.environ["MODEL_LIMIT"]):
+    raise SystemExit(
+        f"Only {passed}/{os.environ['MODEL_LIMIT']} BC cells passed the locked learning gate; "
+        "preserving diagnostics but refusing activation collection and study promotion."
+    )
+PY
+
+if [ "${MODEL_LIMIT}" -lt 12 ]; then
+    echo "Completed requested load-once BC pilot cells: ${MODEL_LIMIT}"
+    exit 0
 fi
 
 run_activation_check() {
@@ -56,7 +123,6 @@ run_activation_check() {
     local expert_data="$2"
     local output_dir="$3"
     local layers="$4"
-    local max_transitions="$5"
 
     cd "${VFI_PROJECT_ROOT}"
     python -m interpretability.sae.cli.inspect_checkpoint \
@@ -69,198 +135,35 @@ run_activation_check() {
         --signal-target residual_policy_tokens \
         --layers "${layers}" \
         --split all \
-        --max-transitions "${max_transitions}" \
+        --max-transitions 64 \
         --max-files 2 \
         --max-vehicles-per-file 1 \
-        --shard-size "${max_transitions}" \
+        --shard-size 64 \
         --device cuda
     for layer in ${layers//,/ }; do
         test -s "${output_dir}/residual_layer_${layer}_policy_token/manifest.json"
     done
 }
 
-# Run a small but real train -> save -> reload -> activation-capture path first.
-SMOKE_RUN_ID="${SLURM_JOB_ID:-local_$(date -u +%Y%m%dT%H%M%SZ)}"
-SMOKE_ROOT="${BC_SMOKE_ROOT:-${VFI_RESULTS_ROOT}/test_runs/bc_pipeline_smoke/${SMOKE_RUN_ID}}"
-SMOKE_POLICY_DIR="${SMOKE_ROOT}/policy"
-SMOKE_ACTIVATION_DIR="${SMOKE_ROOT}/activations"
-if [ -e "${SMOKE_POLICY_DIR}/best.pt" ]; then
-    echo "Refusing to overwrite an existing smoke checkpoint: ${SMOKE_POLICY_DIR}/best.pt" >&2
-    exit 4
-fi
-
-cd "${REPODIR}"
-python -m scripts_gail.train_recurrent_bc_policy \
-    --expert-data "${US_EXPERT}" \
-    --out-dir "${SMOKE_POLICY_DIR}" \
-    --domain us \
-    --scene us-101 \
-    --episode-root "${VFI_HIGHWAY_DATA_ROOT}/processed_20s" \
-    --prebuilt-split train \
-    --seed 0 \
-    --data-seed 20260716 \
-    --split-seed 20260716 \
-    --max-expert-samples "${BC_SMOKE_MAX_EXPERT_SAMPLES:-4096}" \
-    --epochs "${BC_SMOKE_EPOCHS:-1}" \
-    --early-stopping-patience 0 \
-    --min-validation-skill -1000000 \
-    --max-validation-mae 1000000 \
-    --hidden-size 32 \
-    --transformer-layers 2 \
-    --transformer-heads 4 \
-    --transformer-dropout 0.0 \
-    --memory-tokens 2 \
-    --memory-context-length 8 \
-    --sequence-length 8 \
-    --sequences-per-batch 8 \
-    --micro-batch-sequences 4 \
-    --evaluation-episodes 1 \
-    --evaluation-split test \
-    --no-evaluation-enable-collision \
-    --min-rollout-steps 1000000 \
-    --max-crash-fraction 1 \
-    --max-offroad-fraction 1 \
-    --no-render-video \
-    --capability-failure-mode report \
-    --device cuda
-
-test -s "${SMOKE_POLICY_DIR}/best.pt"
-test -s "${SMOKE_POLICY_DIR}/best.pt.sha256"
-SMOKE_SUMMARY="${SMOKE_POLICY_DIR}/summary.json" python - <<'PY'
-import json
-import os
-from pathlib import Path
-
-summary = json.loads(Path(os.environ["SMOKE_SUMMARY"]).read_text(encoding="utf-8"))
-if not summary.get("metric_capability_passed"):
-    raise SystemExit("Smoke model did not pass its permissive offline metric gate")
-if not summary.get("checkpoint_saved"):
-    raise SystemExit("Smoke checkpoint was not saved")
-evaluation = summary.get("held_out_evaluation") or {}
-if evaluation.get("prebuilt_split") != "test":
-    raise SystemExit("Smoke evaluation did not use the test split")
-if evaluation.get("collision_physics_enabled") is not False:
-    raise SystemExit("Smoke evaluation did not disable collision physics")
-metrics = evaluation.get("metrics") or {}
-if "bc_eval/collision_episode_fraction" not in metrics:
-    raise SystemExit("Smoke evaluation did not record collision-only rate")
-if "bc_eval/collision_proxy_episode_fraction" not in metrics:
-    raise SystemExit("Smoke evaluation did not record collision-proxy rate")
-PY
-run_activation_check "${SMOKE_POLICY_DIR}/best.pt" "${US_EXPERT}" "${SMOKE_ACTIVATION_DIR}" "0,1" 16
-echo "End-to-end GPU smoke test passed: ${SMOKE_ROOT}"
-
-if [ "${BC_STUDY_SMOKE_ONLY:-0}" = "1" ]; then
-    exit 0
-fi
-
-STUDY_RUN_ID="${BC_STUDY_RUN_ID:-${SLURM_JOB_ID:-local_$(date -u +%Y%m%dT%H%M%SZ)}}"
-POLICY_ROOT="${BC_STUDY_POLICY_ROOT:-${VFI_RESULTS_ROOT}/runs/policies/bc/domain_depth_${STUDY_RUN_ID}}"
-ACTIVATION_ROOT="${BC_STUDY_ACTIVATION_ROOT:-${VFI_RESULTS_ROOT}/test_runs/bc_interpretability_smoke/domain_depth_${STUDY_RUN_ID}}"
-DOMAINS=(us japanese)
-LAYERS=(2 3)
-SEEDS=(0 1 2)
-MODEL_LIMIT="${BC_STUDY_MODEL_LIMIT:-12}"
-if [ "${MODEL_LIMIT}" -lt 1 ] || [ "${MODEL_LIMIT}" -gt 12 ]; then
-    echo "BC_STUDY_MODEL_LIMIT must be between 1 and 12; got ${MODEL_LIMIT}" >&2
-    exit 6
-fi
-completed_models=0
-
-for domain in "${DOMAINS[@]}"; do
-    if [ "${domain}" = "us" ]; then
-        scene="us-101"
+for domain in us japanese; do
+    if [ "${domain}" = us ]; then
         expert_data="${US_EXPERT}"
     else
-        scene="japanese"
         expert_data="${JAPANESE_EXPERT}"
     fi
-    for transformer_layers in "${LAYERS[@]}"; do
-        if [ "${transformer_layers}" -eq 2 ]; then
+    for depth in 2 3; do
+        if [ "${depth}" -eq 2 ]; then
             capture_layers="0,1"
         else
             capture_layers="0,1,2"
         fi
-        for policy_seed in "${SEEDS[@]}"; do
-            relative="${domain}/recurrent_transformer_${transformer_layers}layer/policy_seed_${policy_seed}"
-            run_dir="${POLICY_ROOT}/${relative}"
-            activation_dir="${ACTIVATION_ROOT}/${relative}"
-            if [ -e "${run_dir}/best.pt" ]; then
-                echo "Refusing to overwrite an existing study checkpoint: ${run_dir}/best.pt" >&2
-                exit 5
-            fi
-
-            echo "Training domain=${domain} layers=${transformer_layers} seed=${policy_seed}"
-            cd "${REPODIR}"
-            python -m scripts_gail.train_recurrent_bc_policy \
-                --expert-data "${expert_data}" \
-                --out-dir "${run_dir}" \
-                --domain "${domain}" \
-                --scene "${scene}" \
-                --episode-root "${VFI_HIGHWAY_DATA_ROOT}/processed_20s" \
-                --prebuilt-split train \
-                --seed "${policy_seed}" \
-                --data-seed "${DATA_SEED:-20260716}" \
-                --split-seed "${SPLIT_SEED:-20260716}" \
-                --max-expert-samples "${MAX_EXPERT_SAMPLES:-300000}" \
-                --epochs "${BC_EPOCHS:-50}" \
-                --learning-rate "${BC_LEARNING_RATE:-0.0003}" \
-                --weight-decay "${BC_WEIGHT_DECAY:-0.00001}" \
-                --early-stopping-patience "${EARLY_STOPPING_PATIENCE:-10}" \
-                --min-validation-skill "${MIN_VALIDATION_SKILL:-0.05}" \
-                --max-validation-mae "${MAX_VALIDATION_MAE:-0.35}" \
-                --hidden-size "${HIDDEN_SIZE:-256}" \
-                --transformer-layers "${transformer_layers}" \
-                --transformer-heads "${TRANSFORMER_HEADS:-4}" \
-                --transformer-dropout "${TRANSFORMER_DROPOUT:-0.1}" \
-                --memory-tokens "${MEMORY_TOKENS:-8}" \
-                --memory-context-length "${MEMORY_CONTEXT_LENGTH:-32}" \
-                --sequence-length "${SEQUENCE_LENGTH:-32}" \
-                --sequences-per-batch "${SEQUENCES_PER_BATCH:-16}" \
-                --micro-batch-sequences "${MICRO_BATCH_SEQUENCES:-16}" \
-                --evaluation-episodes "${EVALUATION_EPISODES:-3}" \
-                --evaluation-split test \
-                --no-evaluation-enable-collision \
-                --min-rollout-steps "${MIN_ROLLOUT_STEPS:-100}" \
-                --max-crash-fraction "${MAX_CRASH_FRACTION:-0.34}" \
-                --max-offroad-fraction "${MAX_OFFROAD_FRACTION:-0.34}" \
-                --no-render-video \
-                --capability-failure-mode report \
-                --device cuda
-
-            test -s "${run_dir}/summary.json"
-            test -s "${run_dir}/best.pt"
-            test -s "${run_dir}/best.pt.sha256"
-            BC_SUMMARY="${run_dir}/summary.json" python - <<'PY'
-import json
-import os
-from pathlib import Path
-
-summary = json.loads(Path(os.environ["BC_SUMMARY"]).read_text(encoding="utf-8"))
-evaluation = summary.get("held_out_evaluation") or {}
-if evaluation.get("prebuilt_split") != "test":
-    raise SystemExit("BC evaluation did not use the test split")
-if evaluation.get("collision_physics_enabled") is not False:
-    raise SystemExit("BC evaluation did not disable collision physics")
-metrics = evaluation.get("metrics") or {}
-if "bc_eval/collision_episode_fraction" not in metrics:
-    raise SystemExit("BC evaluation did not record collision-only rate")
-if "bc_eval/collision_proxy_episode_fraction" not in metrics:
-    raise SystemExit("BC evaluation did not record collision-proxy rate")
-PY
+        for seed in 0 1 2; do
+            relative="${domain}/recurrent_transformer_${depth}layer/policy_seed_${seed}"
             run_activation_check \
-                "${run_dir}/best.pt" \
+                "${POLICY_ROOT}/${relative}/best.pt" \
                 "${expert_data}" \
-                "${activation_dir}" \
-                "${capture_layers}" \
-                64
-            completed_models=$((completed_models + 1))
-            if [ "${completed_models}" -eq "${MODEL_LIMIT}" ]; then
-                if [ "${MODEL_LIMIT}" -lt 12 ]; then
-                    echo "Completed requested BC pilot models: ${MODEL_LIMIT}"
-                    exit 0
-                fi
-            fi
+                "${ACTIVATION_ROOT}/${relative}" \
+                "${capture_layers}"
         done
     done
 done
@@ -273,10 +176,10 @@ python -m scripts_gail.finalize_bc_domain_depth_study \
     --out "${STUDY_MANIFEST}"
 
 cd "${VFI_PROJECT_ROOT}"
-REGISTRY_ROOT="${BC_STUDY_REGISTRY_ROOT:-${VFI_RESULTS_ROOT}/runs/policy_registry/bc_domain_depth_${STUDY_RUN_ID}}"
 python -m workflows.analysis.build_policy_checkpoint_registry \
     --policy-root "${POLICY_ROOT}" \
     --sae-root "${VFI_RESULTS_ROOT}/runs/sae" \
     --out "${REGISTRY_ROOT}"
 
-echo "Completed single-job BC study: ${STUDY_MANIFEST}"
+echo "Completed load-once serial BC study: ${STUDY_MANIFEST}"
+echo "Qualified checkpoint archive: ${CHECKPOINT_ARCHIVE_ROOT}/recovered_${STUDY_RUN_ID}"

@@ -25,6 +25,9 @@ class PSGAILConfig:
     episode_root: str = "data/highway_env/processed_20s"
     prebuilt_split: str = "train"
     seed: int = 0
+    # Explicit experiment identity. ``auto`` preserves legacy CLI behaviour;
+    # named variants lock the objective/reward contract in experiment runs.
+    algorithm_variant: str = "auto"
 
     # Training/Roll out parameters. These values define the amount of simulated rollouts;
     # changing them can modify how training is to be conducted
@@ -103,6 +106,7 @@ class PSGAILConfig:
     transformer_layers: int = 2
     transformer_heads: int = 4
     transformer_dropout: float = 0.1
+    transformer_norm_first: bool = False
     transformer_temporal_module: bool = False
     transformer_temporal_kernel_size: int = 5
     transformer_temporal_layers: int = 1
@@ -142,6 +146,15 @@ class PSGAILConfig:
     gamma_schedule: str = ""
     gae_lambda: float = 0.95
     clip_range: float = 0.2
+    # Stop remaining PPO epochs once the measured epoch KL exceeds this value.
+    # A non-positive value preserves the historical fixed-epoch behaviour.
+    target_kl: float = 0.0
+    abort_on_health_failure: bool = False
+    health_kl_patience: int = 2
+    health_discriminator_patience: int = 5
+    health_reward_std_patience: int = 5
+    health_min_reward_std: float = 1.0e-3
+    health_min_action_std: float = 1.0e-3
     clip_range_schedule: str = ""
     ppo_epochs: int = 6
     batch_size: int = 1024
@@ -193,6 +206,7 @@ class PSGAILConfig:
     entropy_coef: float = 0.015
     entropy_coef_schedule: str = ""
     value_coef: float = 0.5
+    value_clip_range: float = 0.2
     max_grad_norm: float = 0.5
     normalize_gail_reward: bool = True
     allow_wgan_reward_normalization: bool = False
@@ -227,6 +241,7 @@ class PSGAILConfig:
     checkpoint_video_scaling: float = 5.5
     validation_every: int = 20
     validation_episodes: int = 4
+    evaluate_initial_policy: bool = True
     validation_prebuilt_split: str = "val"
     validation_vehicle_mode: str = "training_count"
     validation_control_all_vehicles: bool = False
@@ -235,6 +250,8 @@ class PSGAILConfig:
     validation_stress_vehicle_mode: str = "all"
     save_best_checkpoint: bool = True
     validation_min_delta: float = 0.0
+    validation_max_score_drop: float = 0.0
+    validation_regression_patience: int = 0
     validation_score_horizon_seconds: int = 20
     validation_score_position_weight: float = 1.0
     validation_score_speed_weight: float = 0.5
@@ -244,6 +261,7 @@ class PSGAILConfig:
     validation_score_hard_brake_weight: float = 2.0
     test_episodes: int = 4
     test_prebuilt_split: str = "test"
+    test_vehicle_mode: str = "single"
     test_control_all_vehicles: bool = False
     evaluation_horizons_seconds: str = "1,5,10,20"
     hard_brake_accel_threshold: float = -3.0

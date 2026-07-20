@@ -189,6 +189,7 @@ def build_policy_for_env(cfg: PSGAILConfig, env: gym.Env, device: torch.device) 
         transformer_layers=int(cfg.transformer_layers),
         transformer_heads=int(cfg.transformer_heads),
         transformer_dropout=float(cfg.transformer_dropout),
+        transformer_norm_first=bool(cfg.transformer_norm_first),
         transformer_memory_tokens=int(cfg.transformer_memory_tokens),
         transformer_memory_context_length=int(cfg.transformer_memory_context_length),
         transformer_use_causal_attention=bool(cfg.transformer_use_causal_attention),

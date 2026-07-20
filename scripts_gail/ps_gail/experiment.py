@@ -1,0 +1,219 @@
+"""Experiment identity, provenance, and machine-readable result helpers."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+from typing import Any
+
+import numpy as np
+
+from .config import PSGAILConfig
+
+
+ALGORITHM_VARIANTS = {
+    "gail_bce",
+    "gail_wgan_gp",
+    "airl_bce",
+    "airl_wgan_gp",
+}
+
+
+def resolve_algorithm_variant(cfg: PSGAILConfig, *, trainer: str) -> PSGAILConfig:
+    """Validate and apply an explicit algorithm objective contract."""
+    trainer = str(trainer).strip().lower()
+    if trainer not in {"gail", "airl"}:
+        raise ValueError(f"trainer must be 'gail' or 'airl', got {trainer!r}.")
+    variant = str(getattr(cfg, "algorithm_variant", "auto") or "auto").strip().lower()
+    if variant == "auto":
+        return cfg
+    if variant not in ALGORITHM_VARIANTS:
+        raise ValueError(
+            f"Unsupported algorithm_variant={variant!r}; expected one of "
+            f"{sorted(ALGORITHM_VARIANTS)} or 'auto'."
+        )
+    if not variant.startswith(f"{trainer}_"):
+        raise ValueError(f"{trainer} trainer cannot run algorithm_variant={variant!r}.")
+    if variant == "gail_bce":
+        return replace(
+            cfg,
+            algorithm_variant=variant,
+            discriminator_loss="bce",
+            normalize_gail_reward=False,
+            allow_wgan_reward_normalization=False,
+        )
+    if variant == "gail_wgan_gp":
+        return replace(cfg, algorithm_variant=variant, discriminator_loss="wgan_gp")
+    if variant == "airl_bce":
+        return replace(
+            cfg,
+            algorithm_variant=variant,
+            discriminator_loss="airl_bce",
+            airl_policy_reward_mode="discriminator",
+            normalize_gail_reward=False,
+            allow_wgan_reward_normalization=False,
+        )
+    return replace(cfg, algorithm_variant=variant, discriminator_loss="wgan_gp")
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def config_hash(cfg: PSGAILConfig) -> str:
+    encoded = json.dumps(_jsonable(vars(cfg)), sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _git_metadata() -> dict[str, Any]:
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        return {"revision": revision, "dirty": dirty}
+    except (OSError, subprocess.CalledProcessError):
+        return {"revision": None, "dirty": None}
+
+
+def _path_provenance(path: str) -> dict[str, Any]:
+    expanded = os.path.abspath(os.path.expanduser(str(path))) if path else ""
+    return {
+        "path": expanded,
+        "exists": bool(expanded and os.path.exists(expanded)),
+        "kind": "directory" if expanded and os.path.isdir(expanded) else "file",
+    }
+
+
+def write_run_manifest(run_dir: str, cfg: PSGAILConfig, *, trainer: str) -> str:
+    """Write immutable-at-start run identity before expensive data loading."""
+    os.makedirs(run_dir, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "trainer": str(trainer),
+        "algorithm_variant": str(cfg.algorithm_variant),
+        "seed": int(cfg.seed),
+        "config_hash": config_hash(cfg),
+        "config": _jsonable(vars(cfg)),
+        "data": {
+            "expert": _path_provenance(cfg.expert_data),
+            "episode_root": _path_provenance(cfg.episode_root),
+            "prebuilt_split": str(cfg.prebuilt_split),
+            "validation_split": str(cfg.validation_prebuilt_split),
+            "test_split": str(cfg.test_prebuilt_split),
+        },
+        "initialization": {
+            "initial_policy_checkpoint": _path_provenance(cfg.initial_policy_checkpoint),
+            "resume_checkpoint": _path_provenance(cfg.resume_checkpoint),
+            "bc_pretrain_epochs": int(cfg.bc_pretrain_epochs),
+        },
+        "collision": {
+            "enable_collision": bool(cfg.enable_collision),
+            "schedule": str(cfg.collision_mode_schedule),
+            "mixed_on_fraction": float(cfg.collision_mixed_on_fraction),
+            "proxy_penalty_coef": float(cfg.collision_proxy_penalty_coef),
+        },
+        "runtime": {
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "git": _git_metadata(),
+        },
+    }
+    path = os.path.join(run_dir, "run_manifest.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+    return path
+
+
+def write_evaluation_summary(
+    run_dir: str,
+    cfg: PSGAILConfig,
+    *,
+    trainer: str,
+    best_validation_score: float,
+    best_validation_round: int,
+    final_validation_metrics: dict[str, float] | None,
+    stress_metrics: dict[str, float] | None,
+    test_metrics: dict[str, float] | None,
+    initial_validation_metrics: dict[str, float] | None = None,
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "trainer": str(trainer),
+        "algorithm_variant": str(cfg.algorithm_variant),
+        "seed": int(cfg.seed),
+        "config_hash": config_hash(cfg),
+        "best_validation_score": _jsonable(float(best_validation_score)),
+        "best_validation_round": int(best_validation_round),
+        "initial_validation": _jsonable(initial_validation_metrics or {}),
+        "final_validation": _jsonable(final_validation_metrics or {}),
+        "validation_stress": _jsonable(stress_metrics or {}),
+        "test": _jsonable(test_metrics or {}),
+    }
+    path = os.path.join(run_dir, "evaluation_summary.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+    return path
+
+
+def write_training_failure(
+    run_dir: str,
+    cfg: PSGAILConfig,
+    *,
+    trainer: str,
+    round_idx: int,
+    reasons: list[str],
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "trainer": str(trainer),
+        "algorithm_variant": str(cfg.algorithm_variant),
+        "seed": int(cfg.seed),
+        "config_hash": config_hash(cfg),
+        "round": int(round_idx),
+        "reasons": list(reasons),
+    }
+    path = os.path.join(run_dir, "training_failure.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+    return path
+
+
+__all__ = [
+    "ALGORITHM_VARIANTS",
+    "config_hash",
+    "resolve_algorithm_variant",
+    "write_evaluation_summary",
+    "write_run_manifest",
+    "write_training_failure",
+]

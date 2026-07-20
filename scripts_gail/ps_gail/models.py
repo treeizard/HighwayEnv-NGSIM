@@ -263,6 +263,7 @@ class TransformerActorCritic(nn.Module):
         num_layers: int = 2,
         num_heads: int = 4,
         dropout: float = 0.1,
+        norm_first: bool = False,
         temporal_module: bool = False,
         temporal_kernel_size: int = 5,
         temporal_layers: int = 1,
@@ -294,6 +295,7 @@ class TransformerActorCritic(nn.Module):
             dropout=float(dropout),
             activation="gelu",
             batch_first=True,
+            norm_first=bool(norm_first),
         )
         self.encoder = nn.TransformerEncoder(
             encoder_layer,
@@ -413,6 +415,7 @@ class RecurrentTransformerActorCritic(nn.Module):
         num_layers: int = 2,
         num_heads: int = 4,
         dropout: float = 0.1,
+        norm_first: bool = False,
         memory_tokens: int = 8,
         memory_context_length: int = 32,
         use_causal_attention: bool = True,
@@ -430,6 +433,7 @@ class RecurrentTransformerActorCritic(nn.Module):
         self.memory_tokens = max(1, int(memory_tokens))
         self.memory_context_length = max(1, int(memory_context_length))
         self.use_causal_attention = bool(use_causal_attention)
+        self.norm_first = bool(norm_first)
         self.centralized_critic = bool(centralized_critic)
         self.critic_obs_dim = int(critic_obs_dim if critic_obs_dim is not None else obs_dim)
 
@@ -482,6 +486,7 @@ class RecurrentTransformerActorCritic(nn.Module):
             dropout=float(dropout),
             activation="gelu",
             batch_first=True,
+            norm_first=self.norm_first,
         )
         self.encoder = nn.TransformerEncoder(
             encoder_layer,
@@ -714,6 +719,7 @@ def make_actor_critic(
     transformer_layers: int = 2,
     transformer_heads: int = 4,
     transformer_dropout: float = 0.1,
+    transformer_norm_first: bool = False,
     transformer_temporal_module: bool = False,
     transformer_temporal_kernel_size: int = 5,
     transformer_temporal_layers: int = 1,
@@ -748,6 +754,7 @@ def make_actor_critic(
             num_layers=transformer_layers,
             num_heads=transformer_heads,
             dropout=transformer_dropout,
+            norm_first=transformer_norm_first,
             temporal_module=transformer_temporal_module,
             temporal_kernel_size=transformer_temporal_kernel_size,
             temporal_layers=transformer_temporal_layers,
@@ -766,6 +773,7 @@ def make_actor_critic(
             num_layers=transformer_layers,
             num_heads=transformer_heads,
             dropout=transformer_dropout,
+            norm_first=transformer_norm_first,
             memory_tokens=transformer_memory_tokens,
             memory_context_length=transformer_memory_context_length,
             use_causal_attention=transformer_use_causal_attention,

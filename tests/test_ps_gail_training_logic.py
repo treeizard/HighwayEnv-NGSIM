@@ -120,6 +120,7 @@ from scripts_gail.ps_gail.trainer import (
     central_critic_observation_dim,
     central_critic_observations,
     combine_primary_env_challenge_rewards,
+    discriminator_reward,
     policy_distribution_and_values,
     policy_distribution_values_memory,
     player_challenge_bonus,
@@ -133,6 +134,7 @@ from scripts_gail.ps_gail.trainer import (
     update_discriminator,
     update_policy,
 )
+from scripts_gail.ps_gail.training.ppo import _clipped_value_loss
 from scripts_gail.train_simple_ps_gail import behavior_clone_pretrain
 from scripts_gail.train_simple_ps_gail import config_for_round as ps_gail_config_for_round
 from scripts_gail.train_simple_ps_gail import parse_args as ps_gail_parse_args
@@ -148,6 +150,18 @@ from scripts_gail.train_simple_airl import parse_args as airl_parse_args
 from scripts_gail.train_simple_airl import refresh_airl_rewards
 from scripts_gail.train_simple_airl import update_reward_model
 from scripts_gail.train_simple_iq_learn import convergence_reached, convergence_score
+
+
+def test_ppo_value_clipping_penalizes_large_critic_step():
+    values = torch.tensor([5.0])
+    returns = torch.tensor([10.0])
+    old_values = torch.tensor([0.0])
+
+    unclipped = _clipped_value_loss(values, returns, old_values, 0.0)
+    clipped = _clipped_value_loss(values, returns, old_values, 0.2)
+
+    assert unclipped.item() == pytest.approx(25.0)
+    assert clipped.item() == pytest.approx(96.04)
 
 
 def _minimal_rollout(
@@ -550,6 +564,41 @@ def test_centralized_critic_uses_separate_observation_path():
     assert values_a.shape == (5,)
     torch.testing.assert_close(logits_a, logits_b)
     assert not torch.allclose(values_a, values_b)
+
+
+def test_ppo_target_kl_stops_remaining_epochs():
+    torch.manual_seed(5)
+    np.random.seed(5)
+    cfg = PSGAILConfig(
+        batch_size=8,
+        ppo_epochs=10,
+        learning_rate=0.1,
+        entropy_coef=0.0,
+        target_kl=1.0e-8,
+    )
+    policy = make_actor_critic("mlp", obs_dim=3, hidden_size=16)
+    observations = torch.randn(32, 3)
+    policy.eval()
+    with torch.no_grad():
+        logits, values = policy(observations)
+        dist = Categorical(logits=logits)
+        actions = dist.sample()
+        old_log_probs = dist.log_prob(actions)
+    rollout = _minimal_rollout(
+        observations=observations.numpy(),
+        actions=actions.numpy().astype(np.int64),
+        old_log_probs=old_log_probs.numpy(),
+        old_values=values.numpy(),
+        returns=(values.numpy() + 1.0).astype(np.float32),
+        advantages=np.ones(32, dtype=np.float32),
+    )
+    optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.learning_rate)
+
+    stats = update_policy(policy, optimizer, rollout, cfg, torch.device("cpu"))
+
+    assert stats["ppo_early_stopped_kl"] == 1.0
+    assert 1.0 <= stats["ppo_epochs_completed"] < float(cfg.ppo_epochs)
+    assert stats["target_kl"] == cfg.target_kl
 
 
 def test_attention_centralized_critic_pools_vehicle_set_without_changing_actor():
@@ -1640,6 +1689,29 @@ def test_airl_wgan_uses_shaped_logits_without_rollout_normalization_or_generic_c
     np.testing.assert_allclose(refreshed.rewards, [-15.0, -10.0, -20.0], rtol=1e-6)
 
 
+def test_gail_reward_is_monotonic_in_expert_logit_for_bce_and_wgan():
+    class FirstFeature(torch.nn.Module):
+        def forward(self, features: torch.Tensor) -> torch.Tensor:
+            return features[:, 0]
+
+    features = np.asarray([[-2.0], [0.0], [2.0]], dtype=np.float32)
+    bce_rewards = discriminator_reward(
+        FirstFeature(),
+        features,
+        torch.device("cpu"),
+        loss_type="bce",
+    )
+    wgan_rewards = discriminator_reward(
+        FirstFeature(),
+        features,
+        torch.device("cpu"),
+        loss_type="wgan_gp",
+    )
+
+    assert np.all(np.diff(bce_rewards) > 0.0)
+    np.testing.assert_allclose(wgan_rewards, features[:, 0])
+
+
 def test_airl_policy_reward_mode_exposes_old_log_prob_feedback_loop():
     class ConstantAIRLReward(torch.nn.Module):
         def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -1816,6 +1888,11 @@ def test_airl_reward_components_match_raw_and_shaped_logits():
     )
     torch.testing.assert_close(current_potential, reward_model.potential(obs).squeeze(-1))
     torch.testing.assert_close(next_potential, reward_model.potential(next_obs).squeeze(-1))
+    terminal = dones.bool()
+    torch.testing.assert_close(
+        shaped[terminal],
+        raw[terminal] - current_potential[terminal],
+    )
 
 
 def test_recurrent_airl_log_probs_replay_expert_memory_context():
@@ -2678,7 +2755,7 @@ def test_paper_slurm_scripts_keep_scene_and_expert_budget_explicit():
         assert '--max-expert-samples "${MAX_EXPERT_SAMPLES}"' in text
 
 
-def test_paper_airl_slurm_scripts_pin_shaped_reward_mode():
+def test_paper_airl_slurm_scripts_pin_canonical_discriminator_reward_mode():
     root = Path(__file__).resolve().parents[1]
     scripts = [
         root / "hpc/slurm/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash",
@@ -2687,7 +2764,8 @@ def test_paper_airl_slurm_scripts_pin_shaped_reward_mode():
 
     for script in scripts:
         text = script.read_text(encoding="utf-8")
-        assert 'AIRL_POLICY_REWARD_MODE="${AIRL_POLICY_REWARD_MODE:-shaped}"' in text
+        assert 'ALGORITHM_VARIANT="${ALGORITHM_VARIANT:-airl_bce}"' in text
+        assert 'AIRL_POLICY_REWARD_MODE="${AIRL_POLICY_REWARD_MODE:-discriminator}"' in text
         assert '--airl-policy-reward-mode "${AIRL_POLICY_REWARD_MODE}"' in text
     assert "ALLOW_AIRL_RESUME_WITHOUT_REWARD" in scripts[1].read_text(encoding="utf-8")
 
@@ -2754,14 +2832,11 @@ def test_paper_slurm_scripts_use_low_nonzero_entropy():
     ).read_text(encoding="utf-8")
 
     assert 'WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.001}"' in airl_stage1
-    assert 'ENTROPY_COEF="${ENTROPY_COEF:-0.001}"' in airl_stage1
+    assert 'ENTROPY_COEF="${ENTROPY_COEF:-0.003}"' in airl_stage1
     assert 'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"' in airl_stage1
-    assert (
-        'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-'
-        '0:50:0.001:0.0005;50:100:0.0005:0.0001;100:200:0.0001:0.0001}"'
-    ) in airl_stage2
+    assert 'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"' in airl_stage2
     assert 'WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.0015}"' in gail_stage1
-    assert 'ENTROPY_COEF="${ENTROPY_COEF:-0.0015}"' in gail_stage1
+    assert 'ENTROPY_COEF="${ENTROPY_COEF:-0.002}"' in gail_stage1
     assert 'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"' in gail_stage1
     assert 'WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.001}"' in gail_stage2
     assert 'ENTROPY_COEF="${ENTROPY_COEF:-0.001}"' in gail_stage2
@@ -2825,7 +2900,7 @@ def test_finetune_slurm_scripts_use_200_round_stage2_schedules():
         "0:40:10000:18000;40:80:18000:30000;"
         "80:100:30000:40000;100:200:40000:40000"
     )
-    expected_gamma_schedule = "0:50:0.95:0.97;50:100:0.97:0.99;100:200:0.99:0.99"
+    expected_gamma_schedule = 'GAMMA_SCHEDULE="${GAMMA_SCHEDULE:-1:${TOTAL_ROUNDS}:0.99:0.99}"'
 
     for script in scripts:
         text = script.read_text(encoding="utf-8")

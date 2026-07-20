@@ -21,6 +21,26 @@ from .policy import (
 from .types import RolloutBatch
 
 
+def _clipped_value_loss(
+    values: torch.Tensor,
+    returns: torch.Tensor,
+    old_values: torch.Tensor,
+    clip_range: float,
+) -> torch.Tensor:
+    """PPO value loss with the same trust-region idea used by the actor."""
+    if float(clip_range) <= 0.0:
+        return F.mse_loss(values, returns)
+    clipped_values = old_values + torch.clamp(
+        values - old_values,
+        -float(clip_range),
+        float(clip_range),
+    )
+    return torch.maximum(
+        torch.square(values - returns),
+        torch.square(clipped_values - returns),
+    ).mean()
+
+
 def _recurrent_rollout_chunks(
     rollout: RolloutBatch,
     *,
@@ -67,6 +87,7 @@ def _update_recurrent_policy(
         else None
     )
     old_log_probs_tensor = torch.as_tensor(rollout.old_log_probs, dtype=torch.float32, device=cpu_device)
+    old_values_tensor = torch.as_tensor(rollout.old_values, dtype=torch.float32, device=cpu_device)
     returns_tensor = torch.as_tensor(rollout.returns, dtype=torch.float32, device=cpu_device)
     advantages_tensor = torch.as_tensor(rollout.advantages, dtype=torch.float32, device=cpu_device)
     log_std = getattr(policy, "log_std", None)
@@ -123,6 +144,9 @@ def _update_recurrent_policy(
     post_update_approx_kl = float("nan")
     post_update_ratio_mean = float("nan")
     post_update_ratio_std = float("nan")
+    target_kl = max(0.0, float(getattr(cfg, "target_kl", 0.0)))
+    epochs_completed = 0
+    early_stopped_kl = False
 
     def cpu_to_device(tensor: torch.Tensor) -> torch.Tensor:
         if device.type == "cuda":
@@ -178,6 +202,7 @@ def _update_recurrent_policy(
             actions = cpu_to_device(action_tensor[safe_index_tensor])
             old_log_probs = cpu_to_device(old_log_probs_tensor[safe_index_tensor])
             returns = cpu_to_device(returns_tensor[safe_index_tensor])
+            old_values = cpu_to_device(old_values_tensor[safe_index_tensor])
             advantages = cpu_to_device(advantages_tensor[safe_index_tensor])
             masks = (
                 cpu_to_device(action_mask_tensor[safe_index_tensor])
@@ -200,12 +225,27 @@ def _update_recurrent_policy(
             active_old_log_probs = old_log_probs[active]
             active_advantages = advantages[active]
             active_returns = returns[active]
+            active_old_values = old_values[active]
             active_values = values[active]
             log_ratio = active_log_probs - active_old_log_probs
             ratio = torch.exp(log_ratio)
             clipped_ratio = torch.clamp(ratio, 1.0 - cfg.clip_range, 1.0 + cfg.clip_range)
             policy_terms.append(-torch.min(ratio * active_advantages, clipped_ratio * active_advantages))
-            value_terms.append(torch.square(active_values - active_returns))
+            clip_range = float(getattr(cfg, "value_clip_range", 0.0))
+            if clip_range > 0.0:
+                clipped_values = active_old_values + torch.clamp(
+                    active_values - active_old_values,
+                    -clip_range,
+                    clip_range,
+                )
+                value_terms.append(
+                    torch.maximum(
+                        torch.square(active_values - active_returns),
+                        torch.square(clipped_values - active_returns),
+                    )
+                )
+            else:
+                value_terms.append(torch.square(active_values - active_returns))
             entropy_terms.append(dist.entropy()[active])
             approx_kl_terms.append((ratio - 1.0) - log_ratio)
             ratios.append(ratio)
@@ -230,6 +270,7 @@ def _update_recurrent_policy(
 
     try:
         for _epoch in range(int(cfg.ppo_epochs)):
+            epoch_kl_start = len(approx_kls)
             order = rng.permutation(len(chunks))
             shuffled = [chunks[int(index)] for index in order]
             for start in range(0, len(shuffled), seqs_per_batch):
@@ -303,6 +344,11 @@ def _update_recurrent_policy(
                 clip_fractions.append(weighted_clip_fraction)
                 ratio_means.append(weighted_ratio_mean)
                 ratio_stds.append(weighted_ratio_std)
+            epochs_completed += 1
+            epoch_kls = approx_kls[epoch_kl_start:]
+            if target_kl > 0.0 and epoch_kls and float(np.mean(epoch_kls)) > target_kl:
+                early_stopped_kl = True
+                break
 
         diagnostic_chunks = chunks[: min(len(chunks), max(1, seqs_per_batch))]
         if diagnostic_chunks:
@@ -353,6 +399,9 @@ def _update_recurrent_policy(
         "transformer_recurrent_sequence_length": float(
             int(getattr(cfg, "transformer_recurrent_sequence_length", 32))
         ),
+        "ppo_epochs_completed": float(epochs_completed),
+        "ppo_early_stopped_kl": float(int(early_stopped_kl)),
+        "target_kl": float(target_kl),
     }
     stats.update(recurrent_memory_stats(rollout))
     if device.type == "cuda":
@@ -400,6 +449,7 @@ def update_policy(
         else None
     )
     old_log_probs_tensor = torch.as_tensor(rollout.old_log_probs, dtype=torch.float32, device=cpu_device)
+    old_values_tensor = torch.as_tensor(rollout.old_values, dtype=torch.float32, device=cpu_device)
     returns_tensor = torch.as_tensor(rollout.returns, dtype=torch.float32, device=cpu_device)
     advantages_tensor = torch.as_tensor(rollout.advantages, dtype=torch.float32, device=cpu_device)
     bc_coef = max(0.0, float(getattr(cfg, "policy_bc_regularization_coef", 0.0)))
@@ -442,6 +492,9 @@ def update_policy(
     post_update_approx_kl = float("nan")
     post_update_ratio_mean = float("nan")
     post_update_ratio_std = float("nan")
+    target_kl = max(0.0, float(getattr(cfg, "target_kl", 0.0)))
+    epochs_completed = 0
+    early_stopped_kl = False
     batch_size = max(1, int(cfg.batch_size))
     num_samples = int(obs_tensor.shape[0])
     # Micro Batch and Mini Batch
@@ -463,6 +516,7 @@ def update_policy(
 
     try:
         for _ in range(int(cfg.ppo_epochs)):
+            epoch_kl_start = len(approx_kls)
             permutation = torch.randperm(num_samples)
             for start in range(0, num_samples, batch_size):
                 batch_idx = permutation[start : start + batch_size]
@@ -482,6 +536,7 @@ def update_policy(
                     obs = device_batch(obs_tensor, micro_idx)
                     actions = device_batch(action_tensor, micro_idx)
                     old_log_probs = device_batch(old_log_probs_tensor, micro_idx)
+                    old_values = device_batch(old_values_tensor, micro_idx)
                     returns = device_batch(returns_tensor, micro_idx)
                     advantages = device_batch(advantages_tensor, micro_idx)
                     critic_obs = device_batch(critic_obs_tensor, micro_idx)
@@ -501,7 +556,12 @@ def update_policy(
                         ratio * advantages,
                         clipped_ratio * advantages,
                     ).mean()
-                    value_loss = F.mse_loss(values, returns)
+                    value_loss = _clipped_value_loss(
+                        values,
+                        returns,
+                        old_values,
+                        float(getattr(cfg, "value_clip_range", 0.0)),
+                    )
                     entropy = dist.entropy().mean()
                     loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
                     bc_loss = None
@@ -543,6 +603,11 @@ def update_policy(
                 clip_fractions.append(weighted_clip_fraction)
                 ratio_means.append(weighted_ratio_mean)
                 ratio_stds.append(weighted_ratio_std)
+            epochs_completed += 1
+            epoch_kls = approx_kls[epoch_kl_start:]
+            if target_kl > 0.0 and epoch_kls and float(np.mean(epoch_kls)) > target_kl:
+                early_stopped_kl = True
+                break
 
         diagnostic_count = min(num_samples, max(batch_size, 4096))
         if diagnostic_count > 0:
@@ -605,9 +670,13 @@ def update_policy(
         "action_std_param_mean": final_action_std_mean,
         "log_std_delta": final_log_std_mean - initial_log_std_mean,
         "action_std_param_delta": final_action_std_mean - initial_action_std_mean,
+        "ppo_epochs_completed": float(epochs_completed),
+        "ppo_early_stopped_kl": float(int(early_stopped_kl)),
+        "target_kl": float(target_kl),
     }
 
 __all__ = [
+    '_clipped_value_loss',
     '_recurrent_rollout_chunks',
     '_update_recurrent_policy',
     'update_policy'

@@ -18,6 +18,13 @@ import torch.nn.functional as F
 from scripts_gail.ps_gail.config import PSGAILConfig, should_save_checkpoint_video
 from scripts_gail.ps_gail.data import load_expert_transition_data
 from scripts_gail.ps_gail.envs import make_training_env
+from scripts_gail.ps_gail.experiment import (
+    resolve_algorithm_variant,
+    write_evaluation_summary,
+    write_run_manifest,
+    write_training_failure,
+)
+from scripts_gail.ps_gail.health import TrainingHealthMonitor
 from scripts_gail.ps_gail.monitoring import WandbMonitor
 from scripts_gail.ps_gail.models import make_actor_critic
 from scripts_gail.ps_gail.models import make_relu_mlp
@@ -1171,6 +1178,7 @@ def parse_args() -> tuple[PSGAILConfig, int, int]:
 
 def main() -> None:
     cfg, reward_batch_size, airl_log_prob_batch_size = parse_args()
+    cfg = resolve_algorithm_variant(cfg, trainer="airl")
     if str(cfg.action_mode).lower() != "continuous":
         raise ValueError("This AIRL test trainer currently supports --action-mode continuous only.")
     airl_objective = str(cfg.discriminator_loss).lower()
@@ -1195,6 +1203,7 @@ def main() -> None:
     run_dir = os.path.abspath(os.path.join("logs", "airl", cfg.run_name))
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
+    write_run_manifest(run_dir, cfg, trainer="airl")
     monitor = WandbMonitor(cfg, run_dir)
     monitor.start()
 
@@ -1250,6 +1259,13 @@ def main() -> None:
             spectral_norm=bool(cfg.discriminator_spectral_norm),
         ).to(device)
         resume_checkpoint = str(getattr(cfg, "resume_checkpoint", "") or "").strip()
+        initial_policy_checkpoint = str(
+            getattr(cfg, "initial_policy_checkpoint", "") or ""
+        ).strip()
+        if resume_checkpoint and initial_policy_checkpoint:
+            raise ValueError(
+                "Use only one of --resume-checkpoint and --initial-policy-checkpoint."
+            )
         if resume_checkpoint:
             checkpoint = load_airl_resume_checkpoint(
                 resume_checkpoint=resume_checkpoint,
@@ -1262,6 +1278,35 @@ def main() -> None:
                 "resumed_checkpoint="
                 f"{os.path.abspath(resume_checkpoint)} "
                 f"round={checkpoint.get('round', 'unknown')}"
+            )
+        elif initial_policy_checkpoint:
+            if not os.path.isfile(initial_policy_checkpoint):
+                raise FileNotFoundError(
+                    f"initial_policy_checkpoint does not exist: {initial_policy_checkpoint}"
+                )
+            try:
+                checkpoint = torch.load(
+                    initial_policy_checkpoint,
+                    map_location=device,
+                    weights_only=False,
+                )
+            except TypeError:
+                checkpoint = torch.load(initial_policy_checkpoint, map_location=device)
+            policy_state = (
+                checkpoint.get("policy_state_dict")
+                if isinstance(checkpoint, dict)
+                else checkpoint
+            )
+            if policy_state is None:
+                raise RuntimeError(
+                    "Initial policy checkpoint is missing policy_state_dict: "
+                    f"{initial_policy_checkpoint}"
+                )
+            policy.load_state_dict(policy_state)
+            print(
+                "initialized_policy_checkpoint="
+                f"{os.path.abspath(initial_policy_checkpoint)} "
+                f"round={checkpoint.get('round', 'unknown') if isinstance(checkpoint, dict) else 'state_dict'}"
             )
         policy_optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.learning_rate)
         reward_optimizer = torch.optim.Adam(reward_model.parameters(), lr=cfg.disc_learning_rate)
@@ -1414,8 +1459,56 @@ def main() -> None:
         psro_policy_archive: list[dict[str, torch.Tensor]] = []
         best_validation_score = float("-inf")
         best_validation_round = 0
+        initial_validation_metrics: dict[str, float] = {}
+        last_validation_metrics: dict[str, float] = {}
+        final_stress_metrics: dict[str, float] = {}
+        final_test_metrics: dict[str, float] = {}
         best_path = os.path.join(run_dir, "best.pt")
         last_validation_stress_round = 0
+        if bool(getattr(cfg, "evaluate_initial_policy", True)) and int(cfg.validation_episodes) > 0:
+            initial_cfg = config_for_round(cfg, 1)
+            initial_metrics = evaluate_policy_matched_trajectories(
+                policy,
+                initial_cfg,
+                device,
+                split=str(getattr(cfg, "validation_prebuilt_split", "val")),
+                episodes=int(cfg.validation_episodes),
+                prefix="validation",
+                evaluation_executor=evaluation_executor,
+            )
+            if initial_metrics:
+                initial_metrics, initial_cost, initial_score = scored_validation_metrics(
+                    initial_metrics,
+                    cfg,
+                    prefix="validation",
+                )
+                initial_validation_metrics = dict(initial_metrics)
+                best_validation_score = float(initial_score)
+                last_validation_metrics = dict(initial_metrics)
+                monitor.log(initial_metrics, step=0)
+                if bool(getattr(cfg, "save_best_checkpoint", True)) and np.isfinite(initial_score):
+                    torch.save(
+                        best_checkpoint_payload(
+                            airl_checkpoint_payload(
+                                round_idx=0,
+                                policy=policy,
+                                reward_model=reward_model,
+                                expert_metadata=expert.metadata,
+                                cfg=cfg,
+                                round_cfg=initial_cfg,
+                            ),
+                            round_idx=0,
+                            validation_metrics=initial_metrics,
+                            validation_score=initial_score,
+                            validation_cost=initial_cost,
+                        ),
+                        best_path,
+                    )
+                    monitor.save(best_path)
+                print(
+                    matched_validation_summary("validation", "initial", initial_metrics)
+                    + f" best={best_validation_score:.4f}@0"
+                )
         if bool(getattr(cfg, "psro_lite", False)):
             append_policy_archive(psro_policy_archive, policy, cfg)
             print(
@@ -1427,6 +1520,7 @@ def main() -> None:
             )
         previous_controlled_vehicles = None
         last_vehicle_jump_round = None
+        health_monitor = TrainingHealthMonitor()
         for round_idx in range(1, int(cfg.total_rounds) + 1):
             round_started = time.perf_counter()
             round_cfg = config_for_round(cfg, round_idx)
@@ -1538,6 +1632,33 @@ def main() -> None:
                 expert_policy_observations=expert.policy_observations,
                 expert_actions=expert.actions_continuous_env,
             )
+            if bool(getattr(round_cfg, "abort_on_health_failure", False)):
+                health_reasons = health_monitor.observe(
+                    round_cfg,
+                    approx_kl=float(policy_stats["post_update_approx_kl"]),
+                    expert_accuracy=float(reward_stats["expert_acc"]),
+                    generator_accuracy=float(reward_stats["gen_acc"]),
+                    reward_std=float(np.std(rollout.gail_rewards_normalized)),
+                    action_std=float(policy_stats["action_std_param_mean"]),
+                    extra_metrics={
+                        "policy_loss": float(policy_stats["policy_loss"]),
+                        "value_loss": float(policy_stats["value_loss"]),
+                        "reward_model_loss": float(reward_stats["reward_loss"]),
+                        "mean_reward": float(np.mean(rollout.rewards)),
+                    },
+                )
+                if health_reasons:
+                    failure_path = write_training_failure(
+                        run_dir,
+                        cfg,
+                        trainer="airl",
+                        round_idx=round_idx,
+                        reasons=health_reasons,
+                    )
+                    monitor.save(failure_path)
+                    raise RuntimeError(
+                        f"Training health gate failed at round {round_idx}: {health_reasons}"
+                    )
             policy_seconds = time.perf_counter() - policy_started
             replay_append_started = time.perf_counter()
             append_airl_replay(airl_replay, rollout, round_cfg, round_idx=round_idx)
@@ -1581,6 +1702,8 @@ def main() -> None:
                 + (
                 f"lr={round_cfg.learning_rate:.2e}/{round_cfg.disc_learning_rate:.2e} "
                 f"kl={policy_stats['approx_kl']:.5f} entropy={policy_stats['entropy']:.4f} "
+                f"ppo_epochs={int(policy_stats['ppo_epochs_completed'])} "
+                f"kl_stop={int(policy_stats['ppo_early_stopped_kl'])} "
                 f"log_std={policy_stats['log_std_mean']:.3f} "
                 f"post_kl={policy_stats['post_update_approx_kl']:.5f} "
                 f"clip={policy_stats['clip_fraction']:.3f} "
@@ -1722,6 +1845,9 @@ def main() -> None:
                 "policy/bc_regularization_coef": policy_stats["bc_regularization_coef"],
                 "policy/entropy": policy_stats["entropy"],
                 "policy/approx_kl": policy_stats["approx_kl"],
+                "policy/ppo_epochs_completed": policy_stats["ppo_epochs_completed"],
+                "policy/ppo_early_stopped_kl": policy_stats["ppo_early_stopped_kl"],
+                "policy/target_kl": policy_stats["target_kl"],
                 "policy/post_update_approx_kl": policy_stats["post_update_approx_kl"],
                 "policy/clip_fraction": policy_stats["clip_fraction"],
                 "policy/ratio_mean": policy_stats["ratio_mean"],
@@ -1806,6 +1932,27 @@ def main() -> None:
                         cfg,
                         prefix="validation",
                     )
+                    validation_health_reasons = health_monitor.observe_validation(
+                        round_cfg,
+                        score=float(val_score),
+                        best_score=float(best_validation_score),
+                    )
+                    if validation_health_reasons and bool(
+                        getattr(round_cfg, "abort_on_health_failure", False)
+                    ):
+                        failure_path = write_training_failure(
+                            run_dir,
+                            cfg,
+                            trainer="airl",
+                            round_idx=round_idx,
+                            reasons=validation_health_reasons,
+                        )
+                        monitor.save(failure_path)
+                        raise RuntimeError(
+                            f"Validation health gate failed at round {round_idx}: "
+                            f"{validation_health_reasons}"
+                        )
+                    last_validation_metrics = dict(val_metrics)
                     monitor.log(val_metrics, step=round_idx)
                     improved = (
                         bool(getattr(cfg, "save_best_checkpoint", True))
@@ -1858,6 +2005,7 @@ def main() -> None:
                         cfg,
                         prefix="validation_stress",
                     )
+                    final_stress_metrics = dict(stress_metrics)
                     monitor.log(stress_metrics, step=round_idx)
                     print(matched_validation_summary("validation_stress", f"{round_idx:04d}", stress_metrics))
                     last_validation_stress_round = int(round_idx)
@@ -1942,6 +2090,7 @@ def main() -> None:
                     cfg,
                     prefix="validation_stress",
                 )
+                final_stress_metrics = dict(stress_metrics)
                 monitor.log(stress_metrics, step=final_round)
                 print(matched_validation_summary("validation_stress", "final", stress_metrics))
         if int(getattr(cfg, "test_episodes", 0)) > 0:
@@ -1955,6 +2104,7 @@ def main() -> None:
                 evaluation_executor=evaluation_executor,
             )
             if test_metrics:
+                final_test_metrics = dict(test_metrics)
                 monitor.log(test_metrics, step=final_round)
                 print(
                     f"[test final] "
@@ -1964,6 +2114,18 @@ def main() -> None:
                     f"offroad={test_metrics.get('test/vehicle_offroad_rate', test_metrics.get('test/offroad_duration_rate', 0.0)):.4f} "
                     f"hard_brake={test_metrics.get('test/hard_brake_rate', 0.0):.4f}"
                 )
+        summary_path = write_evaluation_summary(
+            run_dir,
+            cfg,
+            trainer="airl",
+            best_validation_score=best_validation_score,
+            best_validation_round=best_validation_round,
+            final_validation_metrics=last_validation_metrics,
+            stress_metrics=final_stress_metrics,
+            test_metrics=final_test_metrics,
+            initial_validation_metrics=initial_validation_metrics,
+        )
+        monitor.save(summary_path)
     finally:
         if rollout_executor is not None:
             rollout_executor.shutdown(wait=True, cancel_futures=True)

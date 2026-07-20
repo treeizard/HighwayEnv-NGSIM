@@ -24,7 +24,10 @@ from scripts_gail.pretrain_continuous_bc_policy import (
 )
 from scripts_gail.ps_gail.config import PSGAILConfig
 from scripts_gail.ps_gail.data import load_expert_transition_data
-from scripts_gail.ps_gail.recurrent_bc import train_recurrent_behavior_clone
+from scripts_gail.ps_gail.recurrent_bc import (
+    PreparedRecurrentBCData,
+    train_recurrent_behavior_clone,
+)
 from scripts_gail.ps_gail.trainer import resolve_device
 from scripts_gail.train_simple_ps_gail import evaluate_policy_survival
 
@@ -61,12 +64,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-validation-skill", type=float, default=0.05)
     parser.add_argument("--max-validation-mae", type=float, default=0.35)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    parser.add_argument(
+        "--learning-action-index",
+        type=int,
+        default=0,
+        help="Action dimension used by anti-collapse prediction-variance and correlation gates.",
+    )
+    parser.add_argument(
+        "--min-learning-action-std-ratio",
+        type=float,
+        default=0.0,
+        help="Minimum validation prediction/target standard-deviation ratio for the learning action.",
+    )
+    parser.add_argument(
+        "--min-learning-action-correlation",
+        type=float,
+        default=-1.0,
+        help="Minimum validation prediction/target correlation for the learning action.",
+    )
     parser.add_argument("--device", default="cuda")
 
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--transformer-layers", type=int, required=True, choices=[2, 3])
     parser.add_argument("--transformer-heads", type=int, default=4)
     parser.add_argument("--transformer-dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--transformer-norm-first",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use pre-norm transformer encoder blocks for optimization stability.",
+    )
+    parser.add_argument(
+        "--policy-head-init-std",
+        type=float,
+        default=-1.0,
+        help="Reinitialize the continuous policy head with this std; negative preserves framework initialization.",
+    )
     parser.add_argument("--memory-tokens", type=int, default=8)
     parser.add_argument("--memory-context-length", type=int, default=32)
     parser.add_argument("--sequence-length", type=int, default=32)
@@ -189,6 +222,7 @@ def make_config(args: argparse.Namespace) -> PSGAILConfig:
         transformer_layers=int(args.transformer_layers),
         transformer_heads=int(args.transformer_heads),
         transformer_dropout=float(args.transformer_dropout),
+        transformer_norm_first=bool(args.transformer_norm_first),
         transformer_memory_tokens=int(args.memory_tokens),
         transformer_memory_context_length=int(args.memory_context_length),
         transformer_recurrent_sequence_length=int(args.sequence_length),
@@ -233,6 +267,8 @@ def checkpoint_payload(
             "transformer_layers": int(cfg.transformer_layers),
             "transformer_heads": int(cfg.transformer_heads),
             "transformer_dropout": float(cfg.transformer_dropout),
+            "transformer_norm_first": bool(cfg.transformer_norm_first),
+            "policy_head_init_std": float(args.policy_head_init_std),
             "transformer_memory_tokens": int(cfg.transformer_memory_tokens),
             "transformer_memory_context_length": int(cfg.transformer_memory_context_length),
             "transformer_use_causal_attention": True,
@@ -295,8 +331,13 @@ def save_checkpoint_artifacts(
     return checkpoint_sha256
 
 
-def main() -> None:
-    args = parse_args()
+def run_training(
+    args: argparse.Namespace,
+    *,
+    transitions: Any | None = None,
+    prepared_data: PreparedRecurrentBCData | None = None,
+) -> dict[str, Any]:
+    """Run one BC cell, optionally reusing already-loaded and prepared data."""
     if args.checkpoint_purpose == "warm_start" and not (
         1 <= int(args.epochs) <= int(args.max_warmup_epochs)
     ):
@@ -332,12 +373,20 @@ def main() -> None:
         environment.close()
     cfg.continuous_action_dim = int(action_dim)
 
-    transitions = load_expert_transition_data(
-        str(args.expert_data),
-        max_samples=int(args.max_expert_samples),
-        seed=int(args.data_seed),
-        trajectory_frame="relative",
-    )
+    if float(args.policy_head_init_std) >= 0.0:
+        policy_head = getattr(policy, "policy_head", None)
+        if not isinstance(policy_head, torch.nn.Linear):
+            raise TypeError("Policy-head initialization requires a linear continuous policy head.")
+        torch.nn.init.normal_(policy_head.weight, mean=0.0, std=float(args.policy_head_init_std))
+        torch.nn.init.zeros_(policy_head.bias)
+
+    if transitions is None:
+        transitions = load_expert_transition_data(
+            str(args.expert_data),
+            max_samples=int(args.max_expert_samples),
+            seed=int(args.data_seed),
+            trajectory_frame="relative",
+        )
     if int(transitions.policy_observations.shape[1]) != int(obs_dim):
         raise RuntimeError(
             f"Expert and environment observation dimensions differ: "
@@ -368,6 +417,7 @@ def main() -> None:
         max_grad_norm=float(args.max_grad_norm),
         early_stopping_patience=int(args.early_stopping_patience),
         epoch_callback=lambda row: append_jsonl(metrics_path, row),
+        prepared_data=prepared_data,
     )
     policy.load_state_dict(result.best_state_dict, strict=True)
     policy.eval()
@@ -384,12 +434,42 @@ def main() -> None:
         "max_validation_mae": float(args.max_validation_mae),
         "validation_history": str(metrics_path),
         "validation_history_epochs": len(result.history),
+        "learning_rate": float(args.learning_rate),
+        "weight_decay": float(args.weight_decay),
+        "max_grad_norm": float(args.max_grad_norm),
+        "transformer_dropout": float(args.transformer_dropout),
+        "transformer_norm_first": bool(args.transformer_norm_first),
+        "policy_head_init_std": float(args.policy_head_init_std),
+        "early_stopping_patience": int(args.early_stopping_patience),
     }
 
+    learning_action_index = int(args.learning_action_index)
+    validation_std_ratios = result.summary["validation_prediction_std_ratio"]
+    validation_correlations = result.summary["validation_prediction_target_correlation"]
+    if not 0 <= learning_action_index < len(validation_std_ratios):
+        raise ValueError(
+            f"learning_action_index={learning_action_index} is outside the action dimension "
+            f"[0, {len(validation_std_ratios)})."
+        )
+    learning_action_std_ratio = float(validation_std_ratios[learning_action_index])
+    learning_action_correlation = float(validation_correlations[learning_action_index])
+    learning_signal_passed = bool(
+        learning_action_std_ratio >= float(args.min_learning_action_std_ratio)
+        and learning_action_correlation >= float(args.min_learning_action_correlation)
+    )
     metric_capability = bool(
         result.summary["validation_skill"] >= float(args.min_validation_skill)
         and result.summary["validation_mae"] <= float(args.max_validation_mae)
+        and learning_signal_passed
     )
+    summary["learning_signal_passed"] = learning_signal_passed
+    summary["learning_signal_gate"] = {
+        "action_index": learning_action_index,
+        "prediction_std_ratio": learning_action_std_ratio,
+        "minimum_prediction_std_ratio": float(args.min_learning_action_std_ratio),
+        "prediction_target_correlation": learning_action_correlation,
+        "minimum_prediction_target_correlation": float(args.min_learning_action_correlation),
+    }
     warm_start_passed = bool(
         args.checkpoint_purpose == "warm_start"
         and np.isfinite(result.summary["initial_validation_mse"])
@@ -422,7 +502,18 @@ def main() -> None:
             args=args,
             obs_dim=obs_dim,
             action_dim=action_dim,
-            training_summary=dict(result.summary),
+            training_summary={
+                **result.summary,
+                "learning_rate": float(args.learning_rate),
+                "weight_decay": float(args.weight_decay),
+                "max_grad_norm": float(args.max_grad_norm),
+                "transformer_dropout": float(args.transformer_dropout),
+                "transformer_norm_first": bool(args.transformer_norm_first),
+                "policy_head_init_std": float(args.policy_head_init_std),
+                "early_stopping_patience": int(args.early_stopping_patience),
+                "learning_signal_passed": learning_signal_passed,
+                "learning_signal_gate": dict(summary["learning_signal_gate"]),
+            },
             split_trajectory_ids=result.split_trajectory_ids,
             scenario=scenario,
         )
@@ -494,8 +585,18 @@ def main() -> None:
             f"(minimum {float(args.min_validation_skill):.4f}), "
             f"validation_mae={result.summary['validation_mae']:.4f} "
             f"(maximum {float(args.max_validation_mae):.4f}), "
+            f"action{learning_action_index}_std_ratio={learning_action_std_ratio:.4f} "
+            f"(minimum {float(args.min_learning_action_std_ratio):.4f}), "
+            f"action{learning_action_index}_correlation={learning_action_correlation:.4f} "
+            f"(minimum {float(args.min_learning_action_correlation):.4f}), "
             f"rollout_passed={rollout_capability}."
         )
+
+    return summary
+
+
+def main() -> None:
+    run_training(parse_args())
 
 if __name__ == "__main__":
     main()

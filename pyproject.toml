@@ -42,6 +42,8 @@ testing = [
     "pytest-cov"
 ]
 training = [
+    "setuptools<81",
+    "tensorboard>=2.16",
     "torch>=2.2",
     "wandb>=0.16"
 ]

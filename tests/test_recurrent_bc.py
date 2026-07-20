@@ -7,7 +7,9 @@ import torch
 
 from scripts_gail.ps_gail.models import make_actor_critic
 from scripts_gail.ps_gail.recurrent_bc import (
+    _batched_sequence_loss,
     build_sequence_windows,
+    prepare_recurrent_bc_data,
     split_trajectory_ids,
     train_recurrent_behavior_clone,
     trajectory_segments,
@@ -123,6 +125,11 @@ def test_recurrent_bc_learns_and_selects_a_capable_checkpoint():
     assert result.summary["configured_epochs"] == 8
     assert result.summary["completed_epochs"] == 8
     assert result.summary["validation_skill"] > 0.0
+    assert len(result.summary["validation_prediction_std"]) == 2
+    assert len(result.summary["validation_target_std"]) == 2
+    assert len(result.summary["validation_prediction_std_ratio"]) == 2
+    assert len(result.summary["validation_prediction_target_correlation"]) == 2
+    assert result.summary["validation_prediction_std_ratio"][0] > 0.0
     assert result.summary["test_mse"] < 0.6
     assert recorded_epochs == result.history
     assert len(recorded_epochs) == 8
@@ -130,5 +137,95 @@ def test_recurrent_bc_learns_and_selects_a_capable_checkpoint():
     assert all("validation_mae" in row for row in recorded_epochs)
     assert all("validation_skill" in row for row in recorded_epochs)
     assert all("validation_baseline_mse" in row for row in recorded_epochs)
+    assert all("validation_prediction_std_ratio" in row for row in recorded_epochs)
+    assert all("validation_prediction_target_correlation" in row for row in recorded_epochs)
+    assert all("gradient_norm_mean" in row for row in recorded_epochs)
+    assert all("gradient_clipped_fraction" in row for row in recorded_epochs)
     assert all(isinstance(row["is_best_so_far"], bool) for row in recorded_epochs)
     assert any(row["is_best_so_far"] for row in recorded_epochs)
+
+
+def test_prepared_data_reuses_exact_splits_windows_and_baseline():
+    transitions = synthetic_transitions(seed=8)
+    first = prepare_recurrent_bc_data(
+        transitions,
+        split_seed=19,
+        sequence_length=2,
+        train_fraction=0.75,
+        validation_fraction=0.125,
+        context_length=2,
+    )
+    second = prepare_recurrent_bc_data(
+        transitions,
+        split_seed=19,
+        sequence_length=2,
+        train_fraction=0.75,
+        validation_fraction=0.125,
+        context_length=2,
+    )
+    assert first.transitions is transitions
+    assert first.split_trajectory_ids == second.split_trajectory_ids
+    assert first.validation_baseline_mse == second.validation_baseline_mse
+    for split in ("train", "validation", "test"):
+        assert len(first.split_windows[split]) == len(second.split_windows[split])
+        for left, right in zip(first.split_windows[split], second.split_windows[split], strict=True):
+            np.testing.assert_array_equal(left.context_indices, right.context_indices)
+            np.testing.assert_array_equal(left.train_indices, right.train_indices)
+
+
+def test_micro_batches_preserve_full_batch_loss_and_gradients():
+    torch.manual_seed(12)
+    transitions = synthetic_transitions(seed=12)
+    prepared = prepare_recurrent_bc_data(
+        transitions,
+        split_seed=19,
+        sequence_length=2,
+        train_fraction=0.75,
+        validation_fraction=0.125,
+        context_length=2,
+    )
+    policy = make_actor_critic(
+        "recurrent_transformer",
+        obs_dim=4,
+        hidden_size=8,
+        action_mode="continuous",
+        continuous_action_dim=2,
+        transformer_layers=2,
+        transformer_heads=2,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=1,
+        transformer_memory_context_length=2,
+        transformer_use_causal_attention=True,
+    )
+    windows = prepared.split_windows["train"][:3]
+    full_loss, _mae, full_count = _batched_sequence_loss(
+        policy,
+        prepared.observations,
+        prepared.actions,
+        windows,
+        device=torch.device("cpu"),
+    )
+    full_loss.backward()
+    full_gradients = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in policy.named_parameters()
+        if parameter.grad is not None
+    }
+
+    policy.zero_grad(set_to_none=True)
+    split_loss = torch.zeros(())
+    for window in windows:
+        loss, _mae, count = _batched_sequence_loss(
+            policy,
+            prepared.observations,
+            prepared.actions,
+            [window],
+            device=torch.device("cpu"),
+        )
+        weighted = loss * (float(count) / float(full_count))
+        split_loss = split_loss + weighted.detach()
+        weighted.backward()
+
+    torch.testing.assert_close(split_loss, full_loss.detach(), rtol=1e-6, atol=1e-7)
+    for name, expected in full_gradients.items():
+        torch.testing.assert_close(policy.get_parameter(name).grad, expected, rtol=2e-5, atol=2e-6)
