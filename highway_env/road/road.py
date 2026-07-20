@@ -403,6 +403,10 @@ class Road:
         record_history: bool = False,
         use_query_fast_path: bool = False,
         query_cell_size: float = 25.0,
+        use_collision_broadphase: bool = False,
+        collision_cell_size: float = 12.0,
+        collision_broadphase_min_entities: int = 32,
+        record_replay_diagnostics: bool = True,
     ) -> None:
         """
         New road.
@@ -412,6 +416,12 @@ class Road:
         :param road_objects: the objects on the road including obstacles and landmarks
         :param np.random.RandomState np_random: a random number generator for vehicle behaviour
         :param record_history: whether the recent trajectories of vehicles should be recorded for display
+        :param use_query_fast_path: whether spatial road queries should replace full scans
+        :param query_cell_size: spatial-query grid cell size in metres
+        :param use_collision_broadphase: whether to prune exact collision checks with a spatial broadphase
+        :param collision_cell_size: collision broadphase grid cell size in metres
+        :param collision_broadphase_min_entities: minimum entity count before using the broadphase
+        :param record_replay_diagnostics: whether replay vehicles should accumulate diagnostic trajectories
         """
         self.network = network
         self.vehicles = vehicles or []
@@ -420,10 +430,23 @@ class Road:
         self.record_history = record_history
         self.use_query_fast_path = bool(use_query_fast_path)
         self.query_cell_size = float(query_cell_size)
+        if not np.isfinite(self.query_cell_size) or self.query_cell_size <= 0.0:
+            raise ValueError("query_cell_size must be a finite positive number")
+        self.use_collision_broadphase = bool(use_collision_broadphase)
+        self.collision_cell_size = float(collision_cell_size)
+        if not np.isfinite(self.collision_cell_size) or self.collision_cell_size <= 0.0:
+            raise ValueError("collision_cell_size must be a finite positive number")
+        self.collision_broadphase_min_entities = max(
+            0, int(collision_broadphase_min_entities)
+        )
+        self.record_replay_diagnostics = bool(record_replay_diagnostics)
         self._query_cache_dirty = True
         self._cached_counts = (-1, -1)
         self._spatial_index: dict[tuple[int, int], list[objects.RoadObject]] = {}
         self._edge_object_index: dict[tuple[str, str], list[objects.RoadObject]] = {}
+        self._query_cells_by_id: dict[int, tuple[int, int]] = {}
+        self._query_edges_by_id: dict[int, tuple[str, str]] = {}
+        self._query_object_order: dict[int, int] = {}
         self._edge_bounds_cache = self._collect_edge_bounds()
 
     def _invalidate_query_cache(self) -> None:
@@ -502,13 +525,19 @@ class Road:
 
         self._spatial_index = {}
         self._edge_object_index = {}
-        for obj in list(self.vehicles) + list(self.objects):
+        self._query_cells_by_id = {}
+        self._query_edges_by_id = {}
+        all_objects = list(self.vehicles) + list(self.objects)
+        self._query_object_order = {
+            id(obj): index for index, obj in enumerate(all_objects)
+        }
+        for obj in all_objects:
             position = getattr(obj, "position", None)
             if position is None or not np.all(np.isfinite(position)):
                 continue
-            self._spatial_index.setdefault(
-                self._cell_key(np.asarray(position, dtype=float)), []
-            ).append(obj)
+            cell = self._cell_key(np.asarray(position, dtype=float))
+            self._spatial_index.setdefault(cell, []).append(obj)
+            self._query_cells_by_id[id(obj)] = cell
 
             lane_index = getattr(obj, "lane_index", None)
             if lane_index is None or lane_index is np.nan:
@@ -518,9 +547,66 @@ class Road:
             except Exception:
                 continue
             self._edge_object_index.setdefault(edge, []).append(obj)
+            self._query_edges_by_id[id(obj)] = edge
 
         self._cached_counts = counts
         self._query_cache_dirty = False
+
+    @staticmethod
+    def _remove_identity(items: list[objects.RoadObject], target) -> None:
+        """Remove one object by identity without invoking array-valued equality."""
+        for index, item in enumerate(items):
+            if item is target:
+                items.pop(index)
+                return
+
+    def _update_query_cache_object(self, obj: objects.RoadObject) -> None:
+        """Keep a live query cache aligned after one entity moves."""
+        if not self.use_query_fast_path or self._query_cache_dirty:
+            return
+        if (len(self.vehicles), len(self.objects)) != self._cached_counts:
+            self._invalidate_query_cache()
+            return
+
+        object_id = id(obj)
+        old_cell = self._query_cells_by_id.pop(object_id, None)
+        if old_cell is not None:
+            bucket = self._spatial_index.get(old_cell, [])
+            self._remove_identity(bucket, obj)
+            if not bucket:
+                self._spatial_index.pop(old_cell, None)
+
+        old_edge = self._query_edges_by_id.pop(object_id, None)
+        if old_edge is not None:
+            bucket = self._edge_object_index.get(old_edge, [])
+            self._remove_identity(bucket, obj)
+            if not bucket:
+                self._edge_object_index.pop(old_edge, None)
+
+        position = getattr(obj, "position", None)
+        if position is None or not np.all(np.isfinite(position)):
+            return
+        cell = self._cell_key(np.asarray(position, dtype=float))
+        self._spatial_index.setdefault(cell, []).append(obj)
+        self._query_cells_by_id[object_id] = cell
+
+        lane_index = getattr(obj, "lane_index", None)
+        try:
+            edge = (lane_index[0], lane_index[1])
+        except (IndexError, TypeError):
+            return
+        self._edge_object_index.setdefault(edge, []).append(obj)
+        self._query_edges_by_id[object_id] = edge
+
+    def _in_legacy_object_order(
+        self, candidates: list[objects.RoadObject]
+    ) -> list[objects.RoadObject]:
+        """Match the vehicles-then-objects ordering used by legacy scans."""
+        missing_order = len(self._query_object_order)
+        return sorted(
+            candidates,
+            key=lambda obj: self._query_object_order.get(id(obj), missing_order),
+        )
 
     def _close_objects_to_legacy(
         self,
@@ -595,7 +681,7 @@ class Road:
                     if key not in seen:
                         seen.add(key)
                         candidates.append(obj)
-        return candidates
+        return self._in_legacy_object_order(candidates)
 
     def _neighbour_vehicles_legacy(
         self, vehicle: kinematics.Vehicle, lane_index: LaneIndex = None
@@ -671,7 +757,7 @@ class Road:
                 if key not in seen:
                     seen.add(key)
                     candidates.append(obj)
-        return candidates
+        return self._in_legacy_object_order(candidates)
 
     def close_objects_to(
         self,
@@ -739,6 +825,149 @@ class Road:
         for vehicle in self.vehicles:
             vehicle.act()
 
+        # Actions do not normally move entities. Marking the cache dirty here
+        # guarantees that the first query during dynamics starts from the exact
+        # pre-step state, even for a custom vehicle whose act() changes its pose.
+        self._invalidate_query_cache()
+
+    def _handle_collisions_legacy(self, dt: float) -> None:
+        """Run the original all-pairs collision loop in its original order."""
+        for i, vehicle in enumerate(self.vehicles):
+            for other in self.vehicles[i + 1 :]:
+                vehicle.handle_collisions(other, dt)
+            for other in self.objects:
+                vehicle.handle_collisions(other, dt)
+
+    @staticmethod
+    def _swept_entity_bounds(
+        entity: objects.RoadObject, dt: float
+    ) -> tuple[float, float, float, float] | None:
+        """Return a conservative AABB for the exact collision sweep."""
+        try:
+            position = np.asarray(entity.position, dtype=float)
+            velocity = np.asarray(entity.velocity, dtype=float)
+            heading = float(entity.heading)
+            length = float(entity.LENGTH)
+            width = float(entity.WIDTH)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if (
+            position.shape != (2,)
+            or velocity.shape != (2,)
+            or not np.all(np.isfinite(position))
+            or not np.all(np.isfinite(velocity))
+            or not np.isfinite(heading)
+            or not np.isfinite(length)
+            or not np.isfinite(width)
+            or length < 0.0
+            or width < 0.0
+        ):
+            return None
+
+        cos_heading = abs(float(np.cos(heading)))
+        sin_heading = abs(float(np.sin(heading)))
+        half_x = 0.5 * (cos_heading * length + sin_heading * width)
+        half_y = 0.5 * (sin_heading * length + cos_heading * width)
+        # Collision handling can reduce a vehicle's speed (and, for unusual
+        # signed-speed inputs, reverse its sign) before a later pair is checked.
+        # A symmetric displacement envelope remains conservative in that case.
+        displacement = np.abs(velocity * float(dt))
+        return (
+            float(position[0] - displacement[0] - half_x),
+            float(position[0] + displacement[0] + half_x),
+            float(position[1] - displacement[1] - half_y),
+            float(position[1] + displacement[1] + half_y),
+        )
+
+    @staticmethod
+    def _bounds_overlap(
+        first: tuple[float, float, float, float],
+        second: tuple[float, float, float, float],
+    ) -> bool:
+        return not (
+            first[1] < second[0]
+            or second[1] < first[0]
+            or first[3] < second[2]
+            or second[3] < first[2]
+        )
+
+    def _collision_candidate_indices(
+        self, dt: float
+    ) -> tuple[list[list[int]], list[list[int]]] | None:
+        """
+        Return exact-collision candidate indices, or None to request legacy fallback.
+
+        The grid only rejects pairs whose swept axis-aligned bounds cannot meet.
+        Candidate pairs are subsequently passed to the unchanged narrowphase.
+        """
+        vehicle_count = len(self.vehicles)
+        entities = list(self.vehicles) + list(self.objects)
+        if len(entities) < self.collision_broadphase_min_entities:
+            return None
+
+        bounds = [self._swept_entity_bounds(entity, dt) for entity in entities]
+        if any(item is None for item in bounds):
+            return None
+
+        grid: dict[tuple[int, int], list[int]] = {}
+        occupied_cells: list[list[tuple[int, int]]] = []
+        max_cells_per_entity = 4096
+        for entity_index, entity_bounds in enumerate(bounds):
+            assert entity_bounds is not None
+            min_cell_x = int(np.floor(entity_bounds[0] / self.collision_cell_size))
+            max_cell_x = int(np.floor(entity_bounds[1] / self.collision_cell_size))
+            min_cell_y = int(np.floor(entity_bounds[2] / self.collision_cell_size))
+            max_cell_y = int(np.floor(entity_bounds[3] / self.collision_cell_size))
+            cell_count = (max_cell_x - min_cell_x + 1) * (
+                max_cell_y - min_cell_y + 1
+            )
+            if cell_count > max_cells_per_entity:
+                return None
+            cells = [
+                (cell_x, cell_y)
+                for cell_x in range(min_cell_x, max_cell_x + 1)
+                for cell_y in range(min_cell_y, max_cell_y + 1)
+            ]
+            occupied_cells.append(cells)
+            for cell in cells:
+                grid.setdefault(cell, []).append(entity_index)
+
+        vehicle_candidates: list[list[int]] = [[] for _ in self.vehicles]
+        object_candidates: list[list[int]] = [[] for _ in self.vehicles]
+        for vehicle_index in range(vehicle_count):
+            nearby: set[int] = set()
+            for cell in occupied_cells[vehicle_index]:
+                nearby.update(grid[cell])
+            vehicle_bounds = bounds[vehicle_index]
+            assert vehicle_bounds is not None
+            for other_index in sorted(nearby):
+                if other_index <= vehicle_index:
+                    continue
+                other_bounds = bounds[other_index]
+                assert other_bounds is not None
+                if not self._bounds_overlap(vehicle_bounds, other_bounds):
+                    continue
+                if other_index < vehicle_count:
+                    vehicle_candidates[vehicle_index].append(other_index)
+                else:
+                    object_candidates[vehicle_index].append(
+                        other_index - vehicle_count
+                    )
+        return vehicle_candidates, object_candidates
+
+    def _handle_collisions_broadphase(self, dt: float) -> None:
+        candidates = self._collision_candidate_indices(dt)
+        if candidates is None:
+            self._handle_collisions_legacy(dt)
+            return
+
+        vehicle_candidates, object_candidates = candidates
+        for vehicle_index, vehicle in enumerate(self.vehicles):
+            for other_index in vehicle_candidates[vehicle_index]:
+                vehicle.handle_collisions(self.vehicles[other_index], dt)
+            for object_index in object_candidates[vehicle_index]:
+                vehicle.handle_collisions(self.objects[object_index], dt)
+
     def step(self, dt: float) -> None:
         """
         Step the dynamics of each entity on the road.
@@ -747,11 +976,11 @@ class Road:
         """
         for vehicle in self.vehicles:
             vehicle.step(dt)
-        for i, vehicle in enumerate(self.vehicles):
-            for other in self.vehicles[i + 1 :]:
-                vehicle.handle_collisions(other, dt)
-            for other in self.objects:
-                vehicle.handle_collisions(other, dt)
+            self._update_query_cache_object(vehicle)
+        if self.use_collision_broadphase:
+            self._handle_collisions_broadphase(dt)
+        else:
+            self._handle_collisions_legacy(dt)
         self._invalidate_query_cache()
 
     def neighbour_vehicles(

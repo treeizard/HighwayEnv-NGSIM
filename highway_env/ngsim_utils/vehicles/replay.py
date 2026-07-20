@@ -285,8 +285,13 @@ class NGSIMVehicle(IDMVehicle):
             self.WIDTH = 0.0
         self._update_diagonal()
 
+    def _records_replay_diagnostics(self) -> bool:
+        """Return the road-level diagnostics policy, preserving legacy defaults."""
+        return bool(getattr(self.road, "record_replay_diagnostics", True))
+
     def _record_position(self) -> None:
-        self.traj = np.vstack([self.traj, self.position.copy()])
+        if self._records_replay_diagnostics():
+            self.traj = np.vstack([self.traj, self.position.copy()])
 
     def _mark_for_removal(self) -> None:
         """Hide the vehicle and flag it for pruning from the road."""
@@ -591,12 +596,15 @@ class NGSIMVehicle(IDMVehicle):
             self._record_position()
             return
 
-        # Timer / histories
+        # Timer / optional diagnostic histories. These arrays are not consumed by
+        # dynamics, observations, rewards, or collision handling, and can be
+        # disabled for headless training without changing simulator state.
         self.timer += dt
-        self.heading_history.append(self.heading)
-        self.speed_history.append(self.speed)
-        self.crash_history.append(self.crashed)
-        self.overtaken_history.append(self.overtaken)
+        if self._records_replay_diagnostics():
+            self.heading_history.append(self.heading)
+            self.speed_history.append(self.speed)
+            self.crash_history.append(self.crashed)
+            self.overtaken_history.append(self.overtaken)
 
         front_vehicle, gap, desired_gap, relevant_front, handover_needed, handover_reason = self._front_gap_logic()
 

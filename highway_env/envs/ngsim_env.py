@@ -151,6 +151,14 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 "control_all_vehicles": False,
                 "max_surrounding": "all",
                 "show_trajectories": True,
+                # Exact simulator acceleration. Legacy modes remain the default
+                # so existing evaluation and interpretability jobs are unchanged.
+                "road_query_mode": "legacy",  # "legacy" or "spatial"
+                "road_query_cell_size": 25.0,
+                "collision_check_mode": "legacy",  # "legacy" or "broadphase"
+                "collision_broadphase_cell_size": 12.0,
+                "collision_broadphase_min_entities": 32,
+                "record_replay_diagnostics": True,
                 "seed": None,
                 "expert_test_mode": False,
                 "discrete_expert_policy": "planner",
@@ -449,6 +457,18 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         builder = ROAD_BUILDERS.get(self.scene)
         if builder is None:
             raise ValueError(f"Unsupported scene={self.scene!r}")
+        query_mode = str(self.config.get("road_query_mode", "legacy")).lower()
+        if query_mode not in {"legacy", "spatial", "optimized"}:
+            raise ValueError(
+                "road_query_mode must be one of: legacy, spatial, optimized"
+            )
+        collision_mode = str(
+            self.config.get("collision_check_mode", "legacy")
+        ).lower()
+        if collision_mode not in {"legacy", "broadphase", "optimized"}:
+            raise ValueError(
+                "collision_check_mode must be one of: legacy, broadphase, optimized"
+            )
         net = self._NETWORK_CACHE.get(self.scene)
         if net is None:
             net = builder()
@@ -458,6 +478,18 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             network=net,
             np_random=self.np_random,
             record_history=self.config["show_trajectories"],
+            use_query_fast_path=query_mode != "legacy",
+            query_cell_size=float(self.config.get("road_query_cell_size", 25.0)),
+            use_collision_broadphase=collision_mode != "legacy",
+            collision_cell_size=float(
+                self.config.get("collision_broadphase_cell_size", 12.0)
+            ),
+            collision_broadphase_min_entities=int(
+                self.config.get("collision_broadphase_min_entities", 32)
+            ),
+            record_replay_diagnostics=bool(
+                self.config.get("record_replay_diagnostics", True)
+            ),
         )
         self.road.debug_idm_handover = bool(self.config.get("debug_idm_handover", False))
         debug_ids = self.config.get("debug_idm_handover_ids")
