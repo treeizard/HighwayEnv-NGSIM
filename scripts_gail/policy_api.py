@@ -8,8 +8,8 @@ architecture contracts.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,6 @@ from scripts_gail.ps_gail.checkpoints import (
     shared_interpretable_transformer_architecture,
 )
 from scripts_gail.ps_gail.contracts import (
-    ContinuousActionContract,
     LANE_CAMERA_CELLS,
     LANE_CAMERA_FEATURE_DIM,
     LIDAR_FEATURE_DIM,
@@ -32,6 +31,7 @@ from scripts_gail.ps_gail.contracts import (
     PHYSICAL_ACTION_COLUMNS,
     POLICY_EGO_COLUMNS,
     RAW_EGO_COLUMNS,
+    ContinuousActionContract,
     infer_continuous_action_contract,
     runtime_continuous_action_contract,
 )
@@ -44,7 +44,6 @@ from scripts_gail.ps_gail.observations import (
     flatten_observation_value,
     policy_observations_from_flat,
 )
-
 
 PUBLIC_POLICY_API_VERSION = 1
 

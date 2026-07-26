@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from highway_env.imitation.expert_dataset import (
     ENV_ID,
-    SCHEMA_VERSION as EXPERT_DATASET_SCHEMA_VERSION,
     build_env_config,
     default_observation_config,
     register_ngsim_env,
+)
+from highway_env.imitation.expert_dataset import (
+    SCHEMA_VERSION as EXPERT_DATASET_SCHEMA_VERSION,
 )
 from highway_env.ngsim_utils.core.constants import (
     ACCELERATION_LIMIT_MPS2,
@@ -28,7 +30,6 @@ from highway_env.ngsim_utils.data.prebuilt import (
     load_prebuilt_data,
     refine_valid_ids_by_episode,
 )
-
 
 PUBLIC_RESEARCH_API_VERSION = 1
 
