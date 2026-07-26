@@ -859,7 +859,7 @@ def main() -> None:
     run_dir = os.path.abspath(os.path.join("logs", "iq_learn", cfg.run_name))
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
-    monitor = WandbMonitor(cfg, run_dir)
+    monitor = WandbMonitor(cfg, run_dir, trainer="iq_learn")
     monitor.start()
 
     env = None

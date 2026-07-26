@@ -410,29 +410,43 @@ def _scheduled_warmup_value(
     )
 
 
-def _vehicle_increase_warmup_round_idx(
+def _vehicle_increase_window_round_idx(
     cfg: PSGAILConfig,
     round_idx: int,
     current_controlled_vehicles: float,
+    window_rounds: int,
 ) -> int | None:
-    local_warmup_rounds = int(getattr(cfg, "vehicle_increase_warmup_rounds", 0))
-    if local_warmup_rounds <= 0:
+    window_rounds = int(window_rounds)
+    if window_rounds <= 0:
         return None
     round_idx = max(1, int(round_idx))
-    if round_idx <= local_warmup_rounds:
+    if round_idx <= window_rounds:
         return round_idx
 
     previous_controlled_vehicles = float(_scheduled_controlled_vehicles(cfg, round_idx - 1))
     if current_controlled_vehicles > previous_controlled_vehicles + 1.0e-9:
         return 1
 
-    earliest = max(2, round_idx - local_warmup_rounds + 1)
+    earliest = max(2, round_idx - window_rounds + 1)
     for candidate_round in range(round_idx - 1, earliest - 1, -1):
         current = float(_scheduled_controlled_vehicles(cfg, candidate_round))
         previous = float(_scheduled_controlled_vehicles(cfg, candidate_round - 1))
         if current > previous + 1.0e-9:
             return round_idx - candidate_round + 1
     return None
+
+
+def _vehicle_increase_warmup_round_idx(
+    cfg: PSGAILConfig,
+    round_idx: int,
+    current_controlled_vehicles: float,
+) -> int | None:
+    return _vehicle_increase_window_round_idx(
+        cfg,
+        round_idx,
+        current_controlled_vehicles,
+        int(getattr(cfg, "vehicle_increase_warmup_rounds", 0)),
+    )
 
 
 def _warmup_context(
@@ -476,6 +490,22 @@ def config_for_round(cfg: PSGAILConfig, round_idx: int) -> PSGAILConfig:
         cfg,
         round_idx,
     )
+    vehicle_increase_soft_collision_active = (
+        _vehicle_increase_window_round_idx(
+            cfg,
+            int(round_idx),
+            percentage_controlled_vehicles,
+            int(getattr(cfg, "vehicle_increase_soft_collision_rounds", 0)),
+        )
+        is not None
+    )
+    if vehicle_increase_soft_collision_active:
+        # The environment keeps vehicles/obstacles alive when collision physics
+        # is disabled. Rollout reward shaping still applies the configured
+        # collision-proxy penalty through interaction metrics.
+        enable_collision = False
+        terminate_when_all_controlled_crashed = False
+        collision_mode = "soft"
 
     warmup_rounds, warmup_round_idx = _warmup_context(
         cfg,
@@ -588,6 +618,9 @@ def config_for_round(cfg: PSGAILConfig, round_idx: int) -> PSGAILConfig:
         enable_collision=enable_collision,
         terminate_when_all_controlled_crashed=terminate_when_all_controlled_crashed,
         collision_mode_schedule=collision_mode,
+        vehicle_increase_soft_collision_active=(
+            vehicle_increase_soft_collision_active
+        ),
         learning_rate=learning_rate,
         disc_learning_rate=disc_learning_rate,
         entropy_coef=entropy_coef,

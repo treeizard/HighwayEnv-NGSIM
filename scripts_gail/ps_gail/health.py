@@ -102,5 +102,55 @@ class TrainingHealthMonitor:
             return ["validation_score_repeatedly_regressed"]
         return []
 
+    def observe_learning(
+        self,
+        cfg: PSGAILConfig,
+        *,
+        round_idx: int,
+        initial_score: float,
+        best_score: float,
+        best_round: int,
+    ) -> list[str]:
+        """Require measurable post-initialization improvement at a fixed round."""
+        gate_round = int(getattr(cfg, "health_learning_gate_round", 0))
+        if gate_round <= 0 or int(round_idx) < gate_round:
+            return []
+        if not math.isfinite(float(initial_score)) or not math.isfinite(float(best_score)):
+            return ["nonfinite:learning_gate_score"]
+        minimum_best_round = max(1, int(getattr(cfg, "health_min_best_round", 1)))
+        if int(best_round) < minimum_best_round:
+            return ["no_post_initialization_best_checkpoint"]
+        initial_cost = -float(initial_score)
+        best_cost = -float(best_score)
+        denominator = max(abs(initial_cost), 1.0e-12)
+        relative_improvement = (initial_cost - best_cost) / denominator
+        minimum_improvement = max(
+            0.0,
+            float(getattr(cfg, "health_min_relative_validation_improvement", 0.0)),
+        )
+        if relative_improvement + 1.0e-12 < minimum_improvement:
+            return ["validation_did_not_meet_learning_improvement_gate"]
+        return []
 
-__all__ = ["TrainingHealthMonitor"]
+
+def partition_health_reasons(reasons: list[str]) -> tuple[list[str], list[str]]:
+    """Separate fatal numerical/policy failures from adversarial diagnostics.
+
+    A highly accurate discriminator is evidence that expert and generator
+    distributions remain separable; by itself it is not evidence that
+    optimization is numerically invalid or that the policy has collapsed.
+    Reward variance, action variance, KL and held-out learning gates retain
+    fail-closed behaviour.  Saturation is therefore recorded as a warning and
+    allowed to recover.
+    """
+
+    warnings = [
+        str(reason) for reason in reasons if str(reason) == "discriminator_saturated"
+    ]
+    fatal = [
+        str(reason) for reason in reasons if str(reason) != "discriminator_saturated"
+    ]
+    return fatal, warnings
+
+
+__all__ = ["TrainingHealthMonitor", "partition_health_reasons"]

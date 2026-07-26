@@ -25,6 +25,79 @@ from scripts_gail.ps_gail.trainer import resolve_device
 
 CANDIDATES: tuple[dict[str, Any], ...] = (
     {
+        "candidate_id": "dense_temporal_transformer_2layer",
+        "policy_model": "recurrent_transformer",
+        "transformer_layers": 2,
+        "learning_rate": 3.0e-4,
+        "max_grad_norm": 5.0,
+        "transformer_dropout": 0.0,
+        "transformer_norm_first": True,
+        "transformer_observation_normalization": True,
+        "transformer_observation_tokenization": "dense_temporal",
+        "transformer_memory_tokens": 1,
+        "policy_head_init_std": 1.0e-2,
+        "action_loss_weights": [1.0, 1.0],
+        "action_loss_weighting": "inverse_variance",
+        "correlation_loss_weight": 0.0,
+        "variance_loss_weight": 0.0,
+        "training_min_prediction_std_ratios": [0.0, 0.0],
+        "selection_min_prediction_std_ratios": [0.25, 0.10],
+        "selection_min_prediction_correlations": [0.50, 0.20],
+    },
+    {
+        "candidate_id": "dense_temporal_transformer",
+        "policy_model": "recurrent_transformer",
+        "transformer_layers": 3,
+        "learning_rate": 3.0e-4,
+        "max_grad_norm": 5.0,
+        "transformer_dropout": 0.0,
+        "transformer_norm_first": True,
+        "transformer_observation_normalization": True,
+        "transformer_observation_tokenization": "dense_temporal",
+        "transformer_memory_tokens": 1,
+        "policy_head_init_std": 1.0e-2,
+        "action_loss_weights": [1.0, 1.0],
+        "action_loss_weighting": "inverse_variance",
+        "correlation_loss_weight": 0.0,
+        "variance_loss_weight": 0.0,
+        "training_min_prediction_std_ratios": [0.0, 0.0],
+        "selection_min_prediction_std_ratios": [0.25, 0.10],
+        "selection_min_prediction_correlations": [0.50, 0.20],
+    },
+    {
+        "candidate_id": "recovery_v3_simple_gru",
+        "policy_model": "recurrent_gru",
+        "learning_rate": 3.0e-4,
+        "max_grad_norm": 5.0,
+        "transformer_dropout": 0.0,
+        "transformer_norm_first": True,
+        "transformer_observation_normalization": True,
+        "policy_head_init_std": 1.0e-2,
+        "action_loss_weights": [1.0, 1.0],
+        "action_loss_weighting": "inverse_variance",
+        "correlation_loss_weight": 0.0,
+        "variance_loss_weight": 0.0,
+        "training_min_prediction_std_ratios": [0.0, 0.0],
+        "selection_min_prediction_std_ratios": [0.25, 0.10],
+        "selection_min_prediction_correlations": [0.50, 0.20],
+    },
+    {
+        "candidate_id": "recovery_v2_moment_prenorm",
+        "learning_rate": 3.0e-4,
+        "max_grad_norm": 5.0,
+        "transformer_dropout": 0.0,
+        "transformer_norm_first": True,
+        "transformer_observation_normalization": True,
+        "policy_head_init_std": 1.0e-2,
+        "action_loss_weights": [1.0, 1.0],
+        "action_loss_weighting": "inverse_variance",
+        "correlation_loss_weight": 0.05,
+        "variance_loss_weight": 0.05,
+        "training_min_prediction_std_ratios": [0.25, 0.10],
+        "selection_min_prediction_std_ratios": [0.25, 0.10],
+        "selection_min_prediction_correlations": [0.50, 0.20],
+    },
+    {
         "candidate_id": "baseline_no_early_stop",
         "learning_rate": 3.0e-4,
         "max_grad_norm": 0.5,
@@ -225,16 +298,22 @@ def diagnostic_view(
 
 def make_policy(candidate: dict[str, Any], *, obs_dim: int, action_dim: int, device: torch.device) -> torch.nn.Module:
     policy = make_actor_critic(
-        "recurrent_transformer",
+        str(candidate.get("policy_model", "recurrent_transformer")),
         obs_dim=obs_dim,
         hidden_size=256,
         action_mode="continuous",
         continuous_action_dim=action_dim,
-        transformer_layers=3,
+        transformer_layers=int(candidate.get("transformer_layers", 3)),
         transformer_heads=4,
         transformer_dropout=float(candidate["transformer_dropout"]),
         transformer_norm_first=bool(candidate["transformer_norm_first"]),
-        transformer_memory_tokens=8,
+        transformer_observation_normalization=bool(
+            candidate.get("transformer_observation_normalization", False)
+        ),
+        transformer_observation_tokenization=str(
+            candidate.get("transformer_observation_tokenization", "semantic")
+        ),
+        transformer_memory_tokens=int(candidate.get("transformer_memory_tokens", 8)),
         transformer_memory_context_length=32,
         transformer_use_causal_attention=True,
     ).to(device)
@@ -248,6 +327,8 @@ def make_policy(candidate: dict[str, Any], *, obs_dim: int, action_dim: int, dev
 def promotion_record(candidate: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
     std_ratio = float(summary["validation_prediction_std_ratio"][0])
     correlation = float(summary["validation_prediction_target_correlation"][0])
+    steering_std_ratio = float(summary["validation_prediction_std_ratio"][1])
+    steering_correlation = float(summary["validation_prediction_target_correlation"][1])
     skill = float(summary["validation_skill"])
     saturation = float(summary["validation_prediction_saturation_fraction"][0])
     metrics_finite = bool(np.isfinite([skill, std_ratio, correlation, saturation]).all())
@@ -256,10 +337,18 @@ def promotion_record(candidate: dict[str, Any], summary: dict[str, Any]) -> dict
         and skill >= 0.10
         and std_ratio >= 0.25
         and correlation >= 0.50
+        and steering_std_ratio >= 0.10
+        and steering_correlation >= 0.20
         and saturation <= 0.05
     )
     gate_margin = (
-        min(skill / 0.10, std_ratio / 0.25, correlation / 0.50)
+        min(
+            skill / 0.10,
+            std_ratio / 0.25,
+            correlation / 0.50,
+            steering_std_ratio / 0.10,
+            steering_correlation / 0.20,
+        )
         if metrics_finite and saturation <= 0.05
         else None
     )
@@ -270,6 +359,8 @@ def promotion_record(candidate: dict[str, Any], summary: dict[str, Any]) -> dict
         "validation_mae": float(summary["validation_mae"]),
         "acceleration_std_ratio": std_ratio,
         "acceleration_correlation": correlation,
+        "steering_std_ratio": steering_std_ratio,
+        "steering_correlation": steering_correlation,
         "acceleration_saturation_fraction": saturation,
         "metrics_finite": metrics_finite,
         "minimum_normalized_gate_margin": gate_margin,
@@ -278,6 +369,8 @@ def promotion_record(candidate: dict[str, Any], summary: dict[str, Any]) -> dict
         "completed_epochs": int(summary["completed_epochs"]),
         "last_gradient_clipped_fraction": float(summary["history"][-1]["gradient_clipped_fraction"]),
         "last_gradient_group_norm_mean": summary["history"][-1]["gradient_group_norm_mean"],
+        "effective_action_loss_weights": summary["action_loss_weights"],
+        "training_action_variance": summary["training_action_variance"],
         "promotion_passed": passed,
     }
 
@@ -406,12 +499,36 @@ def main() -> None:
             micro_batch_sequences=16,
             max_grad_norm=float(candidate["max_grad_norm"]),
             early_stopping_patience=0,
+            selection_min_validation_skill=0.10,
+            action_loss_weights=candidate.get("action_loss_weights"),
+            action_loss_weighting=str(
+                candidate.get("action_loss_weighting", "fixed")
+            ),
+            correlation_loss_weight=float(
+                candidate.get("correlation_loss_weight", 0.0)
+            ),
+            variance_loss_weight=float(
+                candidate.get("variance_loss_weight", 0.0)
+            ),
+            minimum_prediction_std_ratios=candidate.get(
+                "training_min_prediction_std_ratios"
+            ),
+            selection_min_prediction_std_ratios=candidate.get(
+                "selection_min_prediction_std_ratios"
+            ),
+            selection_min_prediction_correlations=candidate.get(
+                "selection_min_prediction_correlations"
+            ),
             epoch_callback=history.append,
         )
         summary = {**result.summary, "history": history}
         record = promotion_record(candidate, summary)
         records.append(record)
         write_json(out / str(candidate["candidate_id"]) / "summary.json", record)
+        write_json(
+            out / str(candidate["candidate_id"]) / "training_history.json",
+            history,
+        )
         del result, policy
         torch.cuda.empty_cache()
 

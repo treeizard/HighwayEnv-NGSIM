@@ -4,7 +4,24 @@ import json
 from pathlib import Path
 
 from scripts_gail.select_bc_3layer_tuning import select_tuning_candidate
-from scripts_gail.diagnose_bc_3layer import infer_diagnosis
+from scripts_gail.diagnose_bc_3layer import CANDIDATES, infer_diagnosis
+
+
+def test_recovery_candidate_matches_production_action_weighting():
+    recovery = next(
+        candidate
+        for candidate in CANDIDATES
+        if candidate["candidate_id"] == "recovery_v2_moment_prenorm"
+    )
+    assert recovery["action_loss_weights"] == [1.0, 1.0]
+    assert recovery["action_loss_weighting"] == "inverse_variance"
+    simple = next(
+        candidate
+        for candidate in CANDIDATES
+        if candidate["candidate_id"] == "recovery_v3_simple_gru"
+    )
+    assert simple["policy_model"] == "recurrent_gru"
+    assert simple["correlation_loss_weight"] == 0.0
 
 
 def write_summary(

@@ -398,6 +398,46 @@ Regression tests also cover the GAIL-specific choices:
 | Steering diagnostics | Monitoring-only action-distribution and diversity checks | `scripts_gail/ps_gail/steering_diagnostics.py` |
 | Matched validation/test metrics | External behavioral check against held-out trajectories | `scripts_gail/ps_gail/training/evaluation.py::evaluate_policy_matched_trajectories()` |
 
+## Locked US GAIL/AIRL Pilot
+
+The first deployment is intentionally limited to four models: GAIL and AIRL
+with recurrent-transformer depths 2 and 3. Depth 2 uses qualified US BC seed 0;
+depth 3 uses qualified US BC seed 1. Method comparisons are matched within a
+depth, while comparisons across depths are exploratory because the BC seeds
+differ.
+
+The campaign builder validates BC qualification summaries and locks the SHA-256
+of every initializer, expert manifest, US prebuilt split, and execution source
+file. It emits exactly four trials. The Slurm submitter emits exactly two
+independent jobs, one per method; each job requests two L40S GPUs and launches
+the two depths concurrently as exclusive one-GPU steps. There are no arrays,
+dependencies, requeues, automatic retries, or automatic trial expansions.
+
+Key operational anchors:
+
+- `scripts_gail/build_gail_airl_us_pilot.py` builds the immutable manifest.
+- `scripts_gail/run_gail_airl_us_local_smoke.py` validates all four trainer and
+  architecture paths on the local GPU before submission.
+- `hpc/slurm/script_full_training/submit_gail_airl_us_pilot.bash` refuses a
+  real submission unless BC job `58391443` is `COMPLETED`, the checkout is
+  clean, the local-GPU source fingerprint matches, CPU tests pass, and W&B
+  online credentials are present.
+- `hpc/slurm/script_full_training/run_gail_airl_us_pilot.bash` runs two depths
+  concurrently and stops both on a child or runtime-projection failure.
+- `scripts_gail/monitor_gail_airl_us_pilot_runtime.py` applies the conservative
+  round-20, 108-hour projection gate.
+- `scripts_gail/audit_gail_airl_us_pilot.py` requires all four round-600 models
+  to pass learning, horizon coverage, held-out cost, safety, action-variation,
+  policy-delta, reward-variance, checkpoint-integrity, and W&B-online checks.
+
+The parity-tested simulator fast paths measured exact full-step speedups of
+`1.387x` at 50 controlled US vehicles and `1.484x` at 100; sensor-only speedups
+were `2.736x` and `2.849x`. Because discriminator/reward and PPO work are not
+accelerated by the simulator changes, the expected end-to-end ranges are
+`1.20–1.35x` for GAIL and `1.18–1.25x` for AIRL. These are planning ranges, not
+claimed results; the durable per-round metrics and round-20 projection provide
+the live measurement.
+
 ## Literature Links
 
 - Ho and Ermon, [Generative Adversarial Imitation Learning](https://arxiv.org/abs/1606.03476), NeurIPS 2016.

@@ -56,7 +56,16 @@ class PSGAILConfig:
     evaluation_worker_threads: int = 2 # native CPU threads available inside each evaluation worker.
     evaluation_cache_envs: bool = True # keep evaluation envs alive inside persistent eval workers.
     evaluation_max_cached_envs_per_worker: int = 4 # finite LRU bound; 0 explicitly opts into unlimited.
+    # Preserve the historical matched-evaluation termination behaviour by
+    # default.  Scientific pilots can disable it so an early crash cannot
+    # shorten the scoring horizon and make trajectory error look better.
+    evaluation_terminate_when_all_controlled_crashed: bool = True
     max_expert_samples: int = 100_000
+    # Production comparisons require every expert file to declare the exact
+    # normalized-action decoder and policy sensor projection. Legacy
+    # prototypes can leave this false and are still checked against inferred
+    # physical action units.
+    require_explicit_data_contracts: bool = False
     expert_lane_change_fraction: float = 0.20
     expert_lane_change_min_lateral_displacement: float = 2.0
     expert_lane_change_min_abs_steer: float = 0.08
@@ -80,6 +89,10 @@ class PSGAILConfig:
     warmup_gail_reward_clip: float = 0.0
     warmup_final_reward_clip: float = 0.0
     vehicle_increase_warmup_rounds: int = 0
+    # Temporarily disable destructive collision physics after each discrete
+    # controlled-vehicle increase while retaining the collision-proxy penalty.
+    vehicle_increase_soft_collision_rounds: int = 0
+    vehicle_increase_soft_collision_active: bool = False
     rollout_target_agent_steps: int = 0
     initial_rollout_target_agent_steps: int = 0
     final_rollout_target_agent_steps: int = 0
@@ -121,6 +134,9 @@ class PSGAILConfig:
     transformer_heads: int = 4
     transformer_dropout: float = 0.1
     transformer_norm_first: bool = False
+    transformer_observation_normalization: bool = False
+    transformer_observation_tokenization: str = "semantic"
+    policy_head_init_std: float = -1.0
     transformer_temporal_module: bool = False
     transformer_temporal_kernel_size: int = 5
     transformer_temporal_layers: int = 1
@@ -169,6 +185,11 @@ class PSGAILConfig:
     health_reward_std_patience: int = 5
     health_min_reward_std: float = 1.0e-3
     health_min_action_std: float = 1.0e-3
+    # Optional fail-closed evidence that adversarial training improved on the
+    # evaluated initialization.  A zero gate round keeps legacy behaviour.
+    health_learning_gate_round: int = 0
+    health_min_best_round: int = 1
+    health_min_relative_validation_improvement: float = 0.0
     clip_range_schedule: str = ""
     ppo_epochs: int = 6
     batch_size: int = 1024
@@ -267,6 +288,13 @@ class PSGAILConfig:
     validation_max_score_drop: float = 0.0
     validation_regression_patience: int = 0
     validation_score_horizon_seconds: int = 20
+    # Strict scoring rejects missing requested-horizon evidence instead of
+    # falling back to the last pre-termination state.
+    validation_require_exact_horizon: bool = False
+    validation_min_horizon_coverage: float = 0.0
+    # ``duration`` preserves the historical collision-duration component;
+    # ``vehicle`` uses the unambiguous per-vehicle crash rate.
+    validation_score_crash_metric: str = "duration"
     validation_score_position_weight: float = 1.0
     validation_score_speed_weight: float = 0.5
     validation_score_lane_offset_weight: float = 2.0

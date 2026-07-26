@@ -65,6 +65,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transformer-layers", type=int, default=2)
     parser.add_argument("--transformer-heads", type=int, default=4)
     parser.add_argument("--transformer-dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--transformer-norm-first",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--transformer-observation-normalization",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--transformer-observation-tokenization",
+        choices=["semantic", "dense_temporal"],
+        default="semantic",
+    )
     parser.add_argument("--transformer-memory-tokens", type=int, default=8)
     parser.add_argument("--transformer-memory-context-length", type=int, default=32)
     parser.add_argument("--transformer-use-causal-attention", action=argparse.BooleanOptionalAction, default=True)
@@ -105,6 +120,13 @@ def cfg_from_args(args: argparse.Namespace) -> PSGAILConfig:
         transformer_layers=int(args.transformer_layers),
         transformer_heads=int(args.transformer_heads),
         transformer_dropout=float(args.transformer_dropout),
+        transformer_norm_first=bool(args.transformer_norm_first),
+        transformer_observation_normalization=bool(
+            args.transformer_observation_normalization
+        ),
+        transformer_observation_tokenization=str(
+            args.transformer_observation_tokenization
+        ),
         transformer_memory_tokens=int(args.transformer_memory_tokens),
         transformer_memory_context_length=int(args.transformer_memory_context_length),
         transformer_use_causal_attention=bool(args.transformer_use_causal_attention),
@@ -190,6 +212,12 @@ def build_policy_for_env(cfg: PSGAILConfig, env: gym.Env, device: torch.device) 
         transformer_heads=int(cfg.transformer_heads),
         transformer_dropout=float(cfg.transformer_dropout),
         transformer_norm_first=bool(cfg.transformer_norm_first),
+        transformer_observation_normalization=bool(
+            getattr(cfg, "transformer_observation_normalization", False)
+        ),
+        transformer_observation_tokenization=str(
+            getattr(cfg, "transformer_observation_tokenization", "semantic")
+        ),
         transformer_memory_tokens=int(cfg.transformer_memory_tokens),
         transformer_memory_context_length=int(cfg.transformer_memory_context_length),
         transformer_use_causal_attention=bool(cfg.transformer_use_causal_attention),
@@ -325,6 +353,13 @@ def save_checkpoint(
                 "transformer_layers": int(cfg.transformer_layers),
                 "transformer_heads": int(cfg.transformer_heads),
                 "transformer_dropout": float(cfg.transformer_dropout),
+                "transformer_norm_first": bool(cfg.transformer_norm_first),
+                "transformer_observation_normalization": bool(
+                    cfg.transformer_observation_normalization
+                ),
+                "transformer_observation_tokenization": str(
+                    cfg.transformer_observation_tokenization
+                ),
                 "transformer_memory_tokens": int(cfg.transformer_memory_tokens),
                 "transformer_memory_context_length": int(cfg.transformer_memory_context_length),
                 "transformer_use_causal_attention": bool(cfg.transformer_use_causal_attention),

@@ -9,6 +9,11 @@ from typing import Any
 
 import numpy as np
 
+from .contracts import (
+    assert_compatible_action_contracts,
+    assert_compatible_observation_contracts,
+    validate_expert_action_contract,
+)
 from .observations import policy_observations_from_flat
 
 
@@ -334,7 +339,8 @@ def _validate_action_conditioned_arrays(
     rewards: np.ndarray,
     vehicle_ids: np.ndarray,
     timesteps: np.ndarray,
-) -> None:
+    recorded_action_contract: dict[str, Any] | None = None,
+) -> dict[str, object] | None:
     n = int(observations.shape[0])
     length_fields = {
         "next_observations": next_observations,
@@ -393,6 +399,13 @@ def _validate_action_conditioned_arrays(
             )
         if not np.all(np.isfinite(actions_steering_acceleration)):
             raise ValueError(f"{file_path} {ACTION_STEERING_ACCELERATION_KEY} contains non-finite values.")
+        return validate_expert_action_contract(
+            actions_continuous_env,
+            actions_steering_acceleration,
+            recorded_contract=recorded_action_contract,
+            require_runtime_match=True,
+        )
+    return None
 
 
 def _uniform_file_sample_plan(
@@ -810,6 +823,8 @@ def load_expert_transition_data(
     vehicle_id_parts: list[np.ndarray] = []
     timestep_parts: list[np.ndarray] = []
     metadata_items: list[dict[str, Any]] = []
+    action_contracts: list[dict[str, object]] = []
+    observation_contracts: list[dict[str, Any]] = []
     samples_by_file: list[dict[str, Any]] = []
 
     for file_idx, file_path in enumerate(files):
@@ -845,7 +860,12 @@ def load_expert_transition_data(
                 [f"{file_idx}:{int(vehicle_id)}" for vehicle_id in vehicle_ids],
                 dtype=object,
             )
-            _validate_action_conditioned_arrays(
+            metadata_item = (
+                json.loads(str(data["metadata_json"].item()))
+                if "metadata_json" in data.files
+                else {}
+            )
+            inferred_action_contract = _validate_action_conditioned_arrays(
                 file_path,
                 observations=obs,
                 next_observations=next_obs,
@@ -856,9 +876,34 @@ def load_expert_transition_data(
                 rewards=rewards,
                 vehicle_ids=vehicle_ids,
                 timesteps=timesteps,
+                recorded_action_contract=(
+                    metadata_item.get("continuous_action_contract")
+                    if isinstance(
+                        metadata_item.get("continuous_action_contract"),
+                        dict,
+                    )
+                    else None
+                ),
             )
-            if "metadata_json" in data.files:
-                metadata_items.append(json.loads(str(data["metadata_json"].item())))
+            if inferred_action_contract is not None:
+                if action_contracts:
+                    assert_compatible_action_contracts(
+                        action_contracts[0],
+                        inferred_action_contract,
+                    )
+                action_contracts.append(inferred_action_contract)
+            observation_contract = metadata_item.get(
+                "policy_observation_contract"
+            )
+            if isinstance(observation_contract, dict):
+                if observation_contracts:
+                    assert_compatible_observation_contracts(
+                        observation_contracts[0],
+                        observation_contract,
+                    )
+                observation_contracts.append(observation_contract)
+            if metadata_item:
+                metadata_items.append(metadata_item)
 
             traj = normalize_trajectory_frame(traj, vehicle_ids, frame=trajectory_frame)
             if idx is not None:
@@ -935,6 +980,24 @@ def load_expert_transition_data(
         "actions_steering_acceleration_columns": list(ACTION_STEERING_ACCELERATION_COLUMNS)
         if actions_steering_acceleration is not None
         else None,
+        "continuous_action_contract": (
+            action_contracts[0] if action_contracts else None
+        ),
+        "continuous_action_contract_explicit": bool(
+            action_contracts
+            and len(action_contracts) == len(samples_by_file)
+            and all(
+                isinstance(item.get("continuous_action_contract"), dict)
+                for item in metadata_items
+            )
+        ),
+        "policy_observation_contract": (
+            observation_contracts[0] if observation_contracts else None
+        ),
+        "policy_observation_contract_explicit": bool(
+            observation_contracts
+            and len(observation_contracts) == len(samples_by_file)
+        ),
         "trajectory_frame": str(trajectory_frame).lower(),
         "trajectory_id_schema": "file_index:vehicle_id",
         "sampling": sampling_mode,

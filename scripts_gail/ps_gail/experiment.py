@@ -13,6 +13,7 @@ import subprocess
 from typing import Any
 
 import numpy as np
+import torch
 
 from .config import PSGAILConfig
 
@@ -139,6 +140,9 @@ def write_run_manifest(run_dir: str, cfg: PSGAILConfig, *, trainer: str) -> str:
             "schedule": str(cfg.collision_mode_schedule),
             "mixed_on_fraction": float(cfg.collision_mixed_on_fraction),
             "proxy_penalty_coef": float(cfg.collision_proxy_penalty_coef),
+            "vehicle_increase_soft_collision_rounds": int(
+                cfg.vehicle_increase_soft_collision_rounds
+            ),
         },
         "runtime": {
             "python": platform.python_version(),
@@ -164,9 +168,14 @@ def write_evaluation_summary(
     stress_metrics: dict[str, float] | None,
     test_metrics: dict[str, float] | None,
     initial_validation_metrics: dict[str, float] | None = None,
+    selected_validation_metrics: dict[str, float] | None = None,
+    initializer_test_metrics: dict[str, float] | None = None,
+    final_policy_test_metrics: dict[str, float] | None = None,
+    policy_relative_l2_delta: float | None = None,
+    selected_checkpoint: str = "best.pt",
 ) -> str:
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "trainer": str(trainer),
         "algorithm_variant": str(cfg.algorithm_variant),
         "seed": int(cfg.seed),
@@ -175,14 +184,53 @@ def write_evaluation_summary(
         "best_validation_round": int(best_validation_round),
         "initial_validation": _jsonable(initial_validation_metrics or {}),
         "final_validation": _jsonable(final_validation_metrics or {}),
+        "selected_checkpoint": str(selected_checkpoint),
+        "selected_validation": _jsonable(selected_validation_metrics or {}),
         "validation_stress": _jsonable(stress_metrics or {}),
+        "initializer_test": _jsonable(initializer_test_metrics or {}),
         "test": _jsonable(test_metrics or {}),
+        "final_policy_test": _jsonable(final_policy_test_metrics or {}),
+        "policy_relative_l2_delta": _jsonable(policy_relative_l2_delta),
     }
     path = os.path.join(run_dir, "evaluation_summary.json")
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
         handle.write("\n")
     return path
+
+
+def load_verified_policy_state(path: str) -> dict[str, torch.Tensor]:
+    """Load a policy state only after validating the checkpoint sidecar."""
+    from .checkpoints import verify_checkpoint_sidecar
+
+    verify_checkpoint_sidecar(path)
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    state = payload.get("policy_state_dict") if isinstance(payload, dict) else None
+    if not isinstance(state, dict) or not state:
+        raise RuntimeError(f"Checkpoint does not contain a policy state: {path}")
+    return {str(key): value.detach().cpu().clone() for key, value in state.items()}
+
+
+def policy_relative_l2_delta(
+    selected: dict[str, torch.Tensor],
+    initializer: dict[str, torch.Tensor],
+) -> float:
+    """Return a scale-normalized parameter distance for learning audits."""
+    if set(selected) != set(initializer):
+        raise RuntimeError("Selected and initializer policy state keys differ.")
+    squared_delta = 0.0
+    squared_reference = 0.0
+    for key in sorted(selected):
+        current = selected[key].detach().to(dtype=torch.float64, device="cpu")
+        reference = initializer[key].detach().to(dtype=torch.float64, device="cpu")
+        if current.shape != reference.shape:
+            raise RuntimeError(f"Policy tensor shape mismatch for {key}.")
+        squared_delta += float(torch.sum((current - reference) ** 2).item())
+        squared_reference += float(torch.sum(reference ** 2).item())
+    return float(np.sqrt(squared_delta) / max(np.sqrt(squared_reference), 1.0e-12))
 
 
 def write_training_failure(
@@ -212,6 +260,8 @@ def write_training_failure(
 __all__ = [
     "ALGORITHM_VARIANTS",
     "config_hash",
+    "load_verified_policy_state",
+    "policy_relative_l2_delta",
     "resolve_algorithm_variant",
     "write_evaluation_summary",
     "write_run_manifest",

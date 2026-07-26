@@ -6,8 +6,15 @@ from pathlib import Path
 import torch
 
 from scripts_gail.finalize_bc_domain_depth_study import finalize_study, sha256_file
-from scripts_gail.train_recurrent_bc_policy import append_jsonl, save_checkpoint_artifacts
+from scripts_gail.train_recurrent_bc_policy import (
+    append_jsonl,
+    save_checkpoint_artifacts,
+    training_artifact_is_complete,
+)
 from scripts_gail.train_simple_ps_gail import _collision_only_flags, _collision_proxy_flags
+from scripts_gail.ps_gail.validation import (
+    paper_driver_model_validation_overrides,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +48,41 @@ def test_validation_history_is_appended_one_epoch_at_a_time(tmp_path):
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     assert [row["epoch"] for row in rows] == [1.0, 2.0]
     assert [row["validation_skill"] for row in rows] == [0.1, 0.2]
+
+
+def test_training_artifact_completion_does_not_depend_on_rollout_quality(tmp_path):
+    for name in ("best.pt", "best.pt.sha256", "split_manifest.json"):
+        (tmp_path / name).write_text("artifact\n")
+    summary = {
+        "checkpoint_saved": True,
+        "checkpoint_sha256": "abc",
+        "initial_validation_mse": 0.4,
+        "validation_mse": 0.1,
+        "validation_mae": 0.2,
+        "validation_skill": 0.75,
+        "validation_prediction_std_ratio": [0.8, 0.2],
+        "validation_prediction_target_correlation": [0.9, 0.3],
+        "rollout_capability_passed": False,
+        "capability_passed": False,
+    }
+
+    assert training_artifact_is_complete(summary, tmp_path)
+
+
+def test_shared_paper_validation_controls_all_vehicles_without_early_termination():
+    contract = paper_driver_model_validation_overrides()
+
+    assert contract["validation_vehicle_mode"] == "all"
+    assert contract["test_vehicle_mode"] == "all"
+    assert contract["evaluation_terminate_when_all_controlled_crashed"] is False
+    assert contract["validation_require_exact_horizon"] is False
+    assert contract["validation_min_horizon_coverage"] == 0.0
+    assert contract["validation_score_crash_metric"] == "vehicle"
+    assert contract["evaluation_horizons_seconds"] == "1,5,10,20"
+    trainer = (ROOT / "scripts_gail/train_recurrent_bc_policy.py").read_text()
+    gail = (ROOT / "scripts_gail/ps_gail/pilot.py").read_text()
+    assert "paper_driver_model_validation_overrides()" in trainer
+    assert "paper_driver_model_validation_overrides()" in gail
 
 
 def test_finalizer_requires_all_checkpoints_and_collision_free_test_evaluations(tmp_path):
@@ -129,3 +171,16 @@ def test_submission_uses_one_reporting_serial_bc_job():
     assert "for domain in us japanese" in runner
     assert "for depth in 2 3" in runner
     assert "for seed in 0 1 2" in runner
+
+
+def test_aligned_bc_runner_completes_artifacts_and_treats_rollouts_as_descriptive():
+    runner = (
+        ROOT
+        / "hpc/slurm/script_full_training/run_bc_gail_aligned_accel5.bash"
+    ).read_text()
+
+    assert "--require-confirmation" not in runner
+    assert "--priority-cells-first" in runner
+    assert 'payload.get("training_artifact_complete_count", -1)' in runner
+    assert 'payload.get("capability_passed_count", -1)' not in runner
+    assert '"closed_loop_metrics_role": "descriptive_non_terminal"' in runner

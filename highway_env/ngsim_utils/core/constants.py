@@ -20,14 +20,34 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 # Dataset/unit conversion
 FEET_PER_METER = 3.281
 METERS_PER_FOOT = 1.0 / FEET_PER_METER
 
-# Vehicle/control limits
-ACCELERATION_RANGE = (-10.0, 10.0)
+# Vehicle/control limits. The original NGSIM controller and the US expert
+# collection both use a symmetric 5 m/s² limit. A June 2026 zero-centering
+# change accidentally coupled that fix to a wider ±10 m/s² range. Keep the
+# correct zero-centered mapping, restore the physical default to ±5 m/s², and
+# retain an explicit environment override for auditable legacy prototypes.
+_ACCELERATION_LIMIT_ENV = "NGSIM_ACCELERATION_LIMIT_MPS2"
+_raw_acceleration_limit = os.environ.get(_ACCELERATION_LIMIT_ENV, "5.0")
+try:
+    ACCELERATION_LIMIT_MPS2 = float(_raw_acceleration_limit)
+except ValueError as exc:
+    raise ValueError(
+        f"{_ACCELERATION_LIMIT_ENV} must be a finite positive number, "
+        f"got {_raw_acceleration_limit!r}."
+    ) from exc
+if not np.isfinite(ACCELERATION_LIMIT_MPS2) or ACCELERATION_LIMIT_MPS2 <= 0.0:
+    raise ValueError(
+        f"{_ACCELERATION_LIMIT_ENV} must be a finite positive number, "
+        f"got {ACCELERATION_LIMIT_MPS2!r}."
+    )
+ACCELERATION_RANGE = (-ACCELERATION_LIMIT_MPS2, ACCELERATION_LIMIT_MPS2)
 MIN_ACCEL = ACCELERATION_RANGE[0]
 MAX_ACCEL = ACCELERATION_RANGE[1]
 MAX_STEER = np.pi / 4

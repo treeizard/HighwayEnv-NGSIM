@@ -20,6 +20,49 @@ from .torch_utils import SquashedNormal
 from .types import RolloutBatch
 
 CENTRAL_CRITIC_CONTEXT_DIM = 4
+CONTINUOUS_UNSQUASH_EPS = 1.0e-6
+
+
+def fit_policy_observation_normalizer(
+    policy: nn.Module,
+    observations: np.ndarray,
+) -> dict[str, np.ndarray] | None:
+    """Fit the shared BC/GAIL observation standardizer from expert inputs."""
+    if not bool(getattr(policy, "observation_normalization", False)):
+        return None
+    values = np.asarray(observations, dtype=np.float32)
+    if values.ndim != 2 or values.shape[1] != int(getattr(policy, "obs_dim", -1)):
+        raise ValueError(
+            "Observation-normalizer data must be [samples, policy.obs_dim], "
+            f"got {values.shape}."
+        )
+    mean = values.mean(axis=0, dtype=np.float64).astype(np.float32)
+    std = values.std(axis=0, dtype=np.float64).astype(np.float32)
+    std = np.maximum(std, 1.0e-6).astype(np.float32, copy=False)
+    setter = getattr(policy, "set_observation_normalizer", None)
+    if not callable(setter):
+        raise TypeError(
+            "Policy enables observation normalization without a normalizer setter."
+        )
+    setter(mean, std)
+    return {"mean": mean, "std": std}
+
+
+def _continuous_distribution_location(
+    bounded_policy_action: torch.Tensor,
+) -> torch.Tensor:
+    """Recover actor logits so the stochastic policy is squashed exactly once.
+
+    Actor modules return ``tanh(logits)`` for deterministic BC/evaluation.
+    ``SquashedNormal`` applies its own tanh to samples, so using that bounded
+    action directly as the Gaussian location would silently apply tanh twice.
+    """
+    bounded = torch.clamp(
+        bounded_policy_action,
+        -1.0 + CONTINUOUS_UNSQUASH_EPS,
+        1.0 - CONTINUOUS_UNSQUASH_EPS,
+    )
+    return torch.atanh(bounded)
 
 def infer_policy_obs_dim(env: gym.Env) -> int:
     obs, _ = env.reset()
@@ -338,7 +381,8 @@ def policy_distribution_values_memory(
         if policy.log_std is None:
             raise RuntimeError("Continuous action mode requires policy.log_std.")
         std = torch.exp(policy.log_std).expand_as(policy_out)
-        return SquashedNormal(policy_out, std), values, new_memory if return_memory else None
+        location = _continuous_distribution_location(policy_out)
+        return SquashedNormal(location, std), values, new_memory if return_memory else None
     dist = Categorical(logits=_masked_discrete_logits(policy_out, action_masks))
     return dist, values, new_memory if return_memory else None
 
@@ -365,16 +409,21 @@ def policy_distribution_memory(
             return dist, new_memory if return_memory else None
         encoded, new_memory = policy._encode_actor(obs_tensor, memory, return_memory=True)
         policy_out = policy.policy_head(encoded)
-        if _is_continuous(cfg):
-            policy_out = torch.tanh(policy_out)
+        policy_out_is_raw = _is_continuous(cfg)
     else:
         policy_out = policy.actor(obs_tensor)
         new_memory = None
+        policy_out_is_raw = False
     if _is_continuous(cfg):
         if policy.log_std is None:
             raise RuntimeError("Continuous action mode requires policy.log_std.")
         std = torch.exp(policy.log_std).expand_as(policy_out)
-        return SquashedNormal(policy_out, std), new_memory if return_memory else None
+        location = (
+            policy_out
+            if policy_out_is_raw
+            else _continuous_distribution_location(policy_out)
+        )
+        return SquashedNormal(location, std), new_memory if return_memory else None
     dist = Categorical(logits=_masked_discrete_logits(policy_out, action_masks))
     return dist, new_memory if return_memory else None
 
@@ -395,6 +444,18 @@ def _make_policy_from_state_dict(
         transformer_layers=int(cfg.transformer_layers),
         transformer_heads=int(cfg.transformer_heads),
         transformer_dropout=float(cfg.transformer_dropout),
+        transformer_norm_first=bool(
+            getattr(cfg, "transformer_norm_first", False)
+        ),
+        transformer_observation_normalization=bool(
+            getattr(cfg, "transformer_observation_normalization", False)
+        ),
+        transformer_observation_tokenization=str(
+            getattr(cfg, "transformer_observation_tokenization", "semantic")
+        ),
+        policy_head_init_std=float(
+            getattr(cfg, "policy_head_init_std", -1.0)
+        ),
         transformer_temporal_module=bool(getattr(cfg, "transformer_temporal_module", False)),
         transformer_temporal_kernel_size=int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
         transformer_temporal_layers=int(getattr(cfg, "transformer_temporal_layers", 1)),

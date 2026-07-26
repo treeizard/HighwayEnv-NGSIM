@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "status": "locked",
+  "recipe_id": "bc_gail_aligned_accel5_v3_simple_gru",
+  "purpose": "Matched-domain BC recovery after job 58508548. Uses a conventional normalized GRU regressor and weighted MSE; preserves the data, action, split, evaluation, and two-action capability contracts.",
+  "architecture": {
+    "policy_model": "recurrent_gru",
+    "depths": [1],
+    "hidden_size": 256,
+    "transformer_heads": 4,
+    "transformer_dropout": 0.0,
+    "transformer_norm_first": true,
+    "transformer_observation_normalization": true,
+    "policy_head_init_std": 0.01,
+    "memory_tokens": 1,
+    "memory_context_length": 32
+  },
+  "optimization": {
+    "epochs": 50,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.00001,
+    "max_grad_norm": 5.0,
+    "early_stopping_patience": 10,
+    "sequence_length": 32,
+    "sequences_per_batch": 16,
+    "micro_batch_sequences": 4,
+    "action_loss_weights": [1.0, 1.0],
+    "action_loss_weighting": "inverse_variance",
+    "correlation_loss_weight": 0.0,
+    "variance_loss_weight": 0.0,
+    "training_min_prediction_std_ratios": [0.0, 0.0]
+  },
+  "data": {
+    "collection_id": "domain_matched_accel5_v2",
+    "continuous_action_columns": ["acceleration_norm", "steering_norm"],
+    "continuous_action_scales": [5.0, 0.7853981633974483],
+    "policy_observation_dim": 322,
+    "require_explicit_data_contracts": true,
+    "max_expert_samples": 300000,
+    "data_seed": 20260716,
+    "split_seed": 20260716,
+    "train_fraction": 0.8,
+    "validation_fraction": 0.1
+  },
+  "gates": {
+    "min_validation_skill": 0.05,
+    "max_validation_mae": 0.35,
+    "learning_action_index": 0,
+    "min_learning_action_std_ratio": 0.25,
+    "min_learning_action_correlation": 0.5,
+    "learning_action_indices": [0, 1],
+    "min_learning_action_std_ratios": [0.25, 0.1],
+    "min_learning_action_correlations": [0.5, 0.2]
+  },
+  "evaluation": {
+    "episodes": 12,
+    "split": "test",
+    "vehicle_mode": "single",
+    "enable_collision": true,
+    "gail_aligned_matched_trajectories": true,
+    "horizons_seconds": [1, 5, 10, 20],
+    "minimum_20s_horizon_coverage": 0.95,
+    "min_rollout_steps": 100,
+    "max_crash_fraction": 0.34,
+    "max_offroad_fraction": 0.34
+  },
+  "recovery_provenance": {
+    "replaces_recipe": "bc_gail_aligned_accel5_v1",
+    "failed_job": "58508548",
+    "root_cause": "The pooled-memory transformer collapsed to a near-constant conditional mean although the matched sequence data was learnable.",
+    "qualification": {
+      "us_validation_skill": 0.5433291807981399,
+      "us_action_correlations": [0.7615930811066026, 0.47162086791100366],
+      "japanese_validation_skill": 0.6490839261295153,
+      "japanese_action_correlations": [0.8058638773008024, 0.6819222089022947]
+    }
+  }
+}

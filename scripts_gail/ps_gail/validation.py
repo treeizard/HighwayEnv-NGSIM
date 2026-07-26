@@ -9,6 +9,31 @@ import numpy as np
 from .config import PSGAILConfig
 
 
+PAPER_DRIVER_MODEL_VALIDATION_FRAMEWORK = "shared_bc_gail_paper_metrics_v1"
+
+
+def paper_driver_model_validation_overrides() -> dict[str, Any]:
+    """Shared Bhattacharyya et al.-aligned BC/GAIL validation contract."""
+    return {
+        "validation_vehicle_mode": "all",
+        "test_vehicle_mode": "all",
+        "evaluation_horizons_seconds": "1,5,10,20",
+        "evaluation_terminate_when_all_controlled_crashed": False,
+        "validation_score_horizon_seconds": 20,
+        # Paper-style RMSE curves use the vehicles with expert reference
+        # available at each horizon. Coverage is reported, not thresholded.
+        "validation_require_exact_horizon": False,
+        "validation_min_horizon_coverage": 0.0,
+        "validation_score_crash_metric": "vehicle",
+        "validation_score_position_weight": 1.0,
+        "validation_score_speed_weight": 0.5,
+        "validation_score_lane_offset_weight": 2.0,
+        "validation_score_crash_weight": 25.0,
+        "validation_score_offroad_weight": 25.0,
+        "validation_score_hard_brake_weight": 2.0,
+    }
+
+
 def _finite_metric(
     metrics: dict[str, float],
     keys: tuple[str, ...],
@@ -31,37 +56,39 @@ def validation_cost_and_score(
 ) -> tuple[float, float, dict[str, float]]:
     """Return weighted validation cost, score, and component values."""
     horizon = int(getattr(cfg, "validation_score_horizon_seconds", 20))
+    strict_horizon = bool(getattr(cfg, "validation_require_exact_horizon", False))
+    crash_metric = str(getattr(cfg, "validation_score_crash_metric", "duration")).strip().lower()
+    if crash_metric not in {"duration", "vehicle"}:
+        raise ValueError(
+            "validation_score_crash_metric must be 'duration' or 'vehicle', "
+            f"got {crash_metric!r}."
+        )
+    position_keys = (f"{prefix}/rmse_position_{horizon}s",)
+    speed_keys = (f"{prefix}/rmse_speed_{horizon}s",)
+    lane_keys = (f"{prefix}/rmse_lane_offset_{horizon}s",)
+    if not strict_horizon:
+        position_keys += (f"{prefix}/rmse_position_final",)
+        speed_keys += (f"{prefix}/rmse_speed_final",)
+        lane_keys += (f"{prefix}/rmse_lane_offset_final",)
+    crash_keys = (
+        (
+            f"{prefix}/vehicle_crash_rate",
+            f"{prefix}/collision_rate",
+            f"{prefix}/collision_duration_rate",
+        )
+        if crash_metric == "vehicle"
+        else (
+            f"{prefix}/collision_duration_rate",
+            f"{prefix}/crash_agent_fraction",
+            f"{prefix}/vehicle_crash_rate",
+            f"{prefix}/collision_rate",
+        )
+    )
     components = {
-        "position_rmse": _finite_metric(
-            metrics,
-            (
-                f"{prefix}/rmse_position_{horizon}s",
-                f"{prefix}/rmse_position_final",
-            ),
-        ),
-        "speed_rmse": _finite_metric(
-            metrics,
-            (
-                f"{prefix}/rmse_speed_{horizon}s",
-                f"{prefix}/rmse_speed_final",
-            ),
-        ),
-        "lane_offset_rmse": _finite_metric(
-            metrics,
-            (
-                f"{prefix}/rmse_lane_offset_{horizon}s",
-                f"{prefix}/rmse_lane_offset_final",
-            ),
-        ),
-        "crash_agent_fraction": _finite_metric(
-            metrics,
-            (
-                f"{prefix}/crash_agent_fraction",
-                f"{prefix}/collision_duration_rate",
-                f"{prefix}/vehicle_crash_rate",
-                f"{prefix}/collision_rate",
-            ),
-        ),
+        "position_rmse": _finite_metric(metrics, position_keys),
+        "speed_rmse": _finite_metric(metrics, speed_keys),
+        "lane_offset_rmse": _finite_metric(metrics, lane_keys),
+        "crash_rate": _finite_metric(metrics, crash_keys),
         "vehicle_offroad_rate": _finite_metric(
             metrics,
             (
@@ -70,15 +97,27 @@ def validation_cost_and_score(
             ),
         ),
         "hard_brake_rate": _finite_metric(metrics, (f"{prefix}/hard_brake_rate",)),
+        "horizon_coverage": _finite_metric(
+            metrics,
+            (f"{prefix}/horizon_coverage_{horizon}s",),
+        ),
     }
-    if not all(np.isfinite(value) for value in components.values()):
+    required_components = {
+        key: value for key, value in components.items() if key != "horizon_coverage"
+    }
+    if not all(np.isfinite(value) for value in required_components.values()):
         return float("inf"), float("-inf"), components
+    minimum_coverage = max(0.0, float(getattr(cfg, "validation_min_horizon_coverage", 0.0)))
+    if strict_horizon:
+        coverage = float(components["horizon_coverage"])
+        if not np.isfinite(coverage) or coverage < minimum_coverage:
+            return float("inf"), float("-inf"), components
 
     cost = (
         float(getattr(cfg, "validation_score_position_weight", 1.0)) * components["position_rmse"]
         + float(getattr(cfg, "validation_score_speed_weight", 0.5)) * components["speed_rmse"]
         + float(getattr(cfg, "validation_score_lane_offset_weight", 2.0)) * components["lane_offset_rmse"]
-        + float(getattr(cfg, "validation_score_crash_weight", 25.0)) * components["crash_agent_fraction"]
+        + float(getattr(cfg, "validation_score_crash_weight", 25.0)) * components["crash_rate"]
         + float(getattr(cfg, "validation_score_offroad_weight", 25.0)) * components["vehicle_offroad_rate"]
         + float(getattr(cfg, "validation_score_hard_brake_weight", 2.0)) * components["hard_brake_rate"]
     )

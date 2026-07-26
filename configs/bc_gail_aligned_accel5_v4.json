@@ -1,0 +1,174 @@
+{
+  "schema_version": 1,
+  "status": "locked",
+  "recipe_id": "bc_gail_aligned_accel5_v4_shared_dense_temporal_transformer",
+  "purpose": "Matched US/Japanese BC policies using the exact recurrent-transformer architecture shared with GAIL and exposed for layerwise interpretability.",
+  "benchmark": {
+    "objective": "behavior_cloning_interpretability_reference",
+    "matrix_completion_gate": "all_training_artifacts_complete",
+    "interpretability_eligibility_gate": "offline_imitation_learning",
+    "shared_validation_framework": "shared_bc_gail_paper_metrics_v1",
+    "checkpoint_ranking_split": "val",
+    "checkpoint_ranking_score": "weighted_paper_metric_cost",
+    "offline_primary_metrics": [
+      "held_out_mse",
+      "held_out_mae",
+      "skill_vs_train_mean",
+      "per_action_prediction_std_ratio",
+      "per_action_prediction_target_correlation"
+    ],
+    "closed_loop_metrics_role": "descriptive_non_terminal",
+    "closed_loop_metrics": [
+      "position_rmse_by_horizon",
+      "speed_rmse_by_horizon",
+      "lane_offset_rmse_by_horizon",
+      "vehicle_crash_rate",
+      "vehicle_offroad_rate",
+      "hard_brake_agent_step_rate"
+    ],
+    "fatal_conditions": [
+      "non_finite_training",
+      "missing_or_corrupt_checkpoint",
+      "data_or_action_contract_mismatch",
+      "architecture_contract_mismatch",
+      "runtime_failure"
+    ]
+  },
+  "architecture_contract_id": "shared_dense_temporal_recurrent_transformer_v1",
+  "architecture": {
+    "policy_model": "recurrent_transformer",
+    "depths": [
+      2,
+      3
+    ],
+    "hidden_size": 256,
+    "transformer_heads": 4,
+    "transformer_dropout": 0.0,
+    "transformer_norm_first": true,
+    "transformer_observation_normalization": true,
+    "transformer_observation_tokenization": "dense_temporal",
+    "policy_head_init_std": 0.01,
+    "memory_tokens": 1,
+    "memory_context_length": 32
+  },
+  "optimization": {
+    "epochs": 50,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.00001,
+    "max_grad_norm": 5.0,
+    "early_stopping_patience": 10,
+    "sequence_length": 32,
+    "sequences_per_batch": 16,
+    "micro_batch_sequences": 16,
+    "action_loss_weights": [
+      1.0,
+      1.0
+    ],
+    "action_loss_weighting": "inverse_variance",
+    "correlation_loss_weight": 0.0,
+    "variance_loss_weight": 0.0,
+    "training_min_prediction_std_ratios": [
+      0.0,
+      0.0
+    ]
+  },
+  "data": {
+    "collection_id": "domain_matched_accel5_v2",
+    "continuous_action_columns": [
+      "acceleration_norm",
+      "steering_norm"
+    ],
+    "continuous_action_scales": [
+      5.0,
+      0.7853981633974483
+    ],
+    "policy_observation_dim": 322,
+    "require_explicit_data_contracts": true,
+    "max_expert_samples": 300000,
+    "data_seed": 20260716,
+    "split_seed": 20260716,
+    "train_fraction": 0.8,
+    "validation_fraction": 0.1
+  },
+  "gates": {
+    "min_validation_skill": 0.1,
+    "max_validation_mae": 0.35,
+    "learning_action_index": 0,
+    "min_learning_action_std_ratio": 0.25,
+    "min_learning_action_correlation": 0.5,
+    "learning_action_indices": [
+      0,
+      1
+    ],
+    "min_learning_action_std_ratios": [
+      0.25,
+      0.1
+    ],
+    "min_learning_action_correlations": [
+      0.5,
+      0.2
+    ]
+  },
+  "evaluation": {
+    "validation_episodes": 4,
+    "episodes": 12,
+    "split": "test",
+    "vehicle_mode": "all",
+    "enable_collision": true,
+    "terminate_on_collision": false,
+    "gail_aligned_matched_trajectories": true,
+    "horizons_seconds": [
+      1,
+      5,
+      10,
+      20
+    ],
+    "horizon_coverage_role": "reported_non_terminal",
+    "minimum_20s_horizon_coverage": 0.0,
+    "min_rollout_steps": 100,
+    "max_crash_fraction": 0.34,
+    "max_offroad_fraction": 0.34
+  },
+  "recovery_provenance": {
+    "replaces_recipes": [
+      "bc_gail_aligned_accel5_v1",
+      "bc_gail_aligned_accel5_v2",
+      "bc_gail_aligned_accel5_v3_simple_gru"
+    ],
+    "failed_job": "58508548",
+    "root_cause": "The sensor-token plus pooled-history transformer overfit small windows but collapsed to the conditional mean on representative held-out data. A GRU proved the data learnable but violated the shared BC/GAIL transformer goal.",
+    "design_change": "Keep the shared recurrent transformer and its 2/3 encoder blocks, but use one normalized observation token plus one token per recurrent timestep so both training methods and interpretability adapters operate on the same temporal residual stream.",
+    "local_gpu_qualification": {
+      "device": "NVIDIA L4",
+      "policy_seed": 0,
+      "train_windows": 2048,
+      "validation_windows": 256,
+      "test_windows": 256,
+      "epochs": 30,
+      "us": {
+        "2layer_validation_skill": 0.5180072690922558,
+        "2layer_acceleration_correlation": 0.736592607914496,
+        "2layer_steering_correlation": 0.39365444152750856,
+        "3layer_validation_skill": 0.49698034975892047,
+        "3layer_acceleration_correlation": 0.7187848692095126,
+        "3layer_steering_correlation": 0.3129307033025682
+      },
+      "japanese": {
+        "2layer_validation_skill": 0.40827220160280764,
+        "2layer_acceleration_correlation": 0.6407711934988259,
+        "2layer_steering_correlation": 0.4101813398293068,
+        "3layer_validation_skill": 0.37403246112830646,
+        "3layer_acceleration_correlation": 0.6181239253220732,
+        "3layer_steering_correlation": 0.2726215790995117
+      },
+      "evidence_level": "exploratory_engineering_qualification"
+    },
+    "unchanged_scientific_contracts": [
+      "matched_US_and_Japanese_collection",
+      "continuous_action_scaling",
+      "trajectory_level_split",
+      "two_action_capability_gates",
+      "collision_enabled_matched_evaluation"
+    ]
+  }
+}

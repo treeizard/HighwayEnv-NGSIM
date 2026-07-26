@@ -16,7 +16,9 @@ import torch.nn.functional as F
 from torch.distributions import Categorical, Independent, Normal
 
 from scripts_gail.ps_gail.config import PSGAILConfig, should_save_checkpoint_video
+from scripts_gail.ps_gail.contracts import validate_training_data_contracts
 from scripts_gail.ps_gail.checkpoints import (
+    assert_policy_architecture_matches_checkpoint,
     atomic_torch_save,
     checkpoint_metadata,
     exact_training_state,
@@ -34,12 +36,14 @@ from scripts_gail.ps_gail.data import (
 )
 from scripts_gail.ps_gail.envs import make_training_env
 from scripts_gail.ps_gail.experiment import (
+    load_verified_policy_state,
+    policy_relative_l2_delta,
     resolve_algorithm_variant,
     write_evaluation_summary,
     write_run_manifest,
     write_training_failure,
 )
-from scripts_gail.ps_gail.health import TrainingHealthMonitor
+from scripts_gail.ps_gail.health import TrainingHealthMonitor, partition_health_reasons
 from scripts_gail.ps_gail.monitoring import WandbMonitor
 from scripts_gail.ps_gail.models import (
     SceneDiscriminator,
@@ -64,6 +68,7 @@ from scripts_gail.ps_gail.trainer import (
     discriminator_input_mode,
     evaluation_thread_context,
     evaluate_policy_matched_trajectories,
+    fit_policy_observation_normalizer,
     infer_continuous_action_dim,
     infer_critic_obs_dim,
     infer_policy_obs_dim,
@@ -71,6 +76,7 @@ from scripts_gail.ps_gail.trainer import (
     make_rollout_executor,
     policy_action_dim,
     recurrent_policy_enabled,
+    _shift_recurrent_memory,
     refresh_rollout_rewards,
     resolve_device,
     set_optimizer_lr,
@@ -386,6 +392,18 @@ def checkpoint_expert_metadata(metadata: dict[str, object]) -> dict[str, object]
         "actions_steering_acceleration_columns": metadata.get(
             "actions_steering_acceleration_columns"
         ),
+        "continuous_action_contract": metadata.get(
+            "continuous_action_contract"
+        ),
+        "continuous_action_contract_explicit": metadata.get(
+            "continuous_action_contract_explicit"
+        ),
+        "policy_observation_contract": metadata.get(
+            "policy_observation_contract"
+        ),
+        "policy_observation_contract_explicit": metadata.get(
+            "policy_observation_contract_explicit"
+        ),
         "lane_change_sampling": metadata.get("lane_change_sampling"),
     }
 
@@ -487,6 +505,12 @@ def _policy_action_tuple(
             memory = policy.initial_memory(len(obs_agents), device=device, dtype=torch.float32)
         if recurrent_policy_enabled(policy):
             policy_out, _values, new_memory = policy(obs_tensor, memory=memory, return_memory=True)
+            if new_memory is not None:
+                new_memory = (
+                    new_memory.unsqueeze(1)
+                    if memory is None
+                    else _shift_recurrent_memory(memory, new_memory)
+                )
         else:
             policy_out, _values = policy(obs_tensor)
             new_memory = None
@@ -916,7 +940,7 @@ def main() -> None:
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
     write_run_manifest(run_dir, cfg, trainer="gail")
-    monitor = WandbMonitor(cfg, run_dir)
+    monitor = WandbMonitor(cfg, run_dir, trainer="gail")
     monitor.start()
 
     env = None
@@ -977,6 +1001,18 @@ def main() -> None:
                     lane_change_min_abs_steer=cfg.expert_lane_change_min_abs_steer,
                     lane_change_min_steer_fraction=cfg.expert_lane_change_min_steer_fraction,
                 )
+        if expert_transitions is not None:
+            data_contracts = validate_training_data_contracts(
+                expert_transitions.metadata,
+                lidar_cells=int(cfg.cells),
+                maximum_range=float(cfg.maximum_range),
+                require_explicit=bool(cfg.require_explicit_data_contracts),
+            )
+            expert_metadata.update(data_contracts)
+        elif bool(cfg.require_explicit_data_contracts):
+            raise RuntimeError(
+                "Explicit comparison contracts require action-conditioned expert transitions."
+            )
         expert_scene_features = None
         expert_scene_metadata = {}
         if bool(cfg.enable_scene_discriminator):
@@ -1022,6 +1058,18 @@ def main() -> None:
             transformer_layers=int(cfg.transformer_layers),
             transformer_heads=int(cfg.transformer_heads),
             transformer_dropout=float(cfg.transformer_dropout),
+            transformer_norm_first=bool(
+                getattr(cfg, "transformer_norm_first", False)
+            ),
+            transformer_observation_normalization=bool(
+                getattr(cfg, "transformer_observation_normalization", False)
+            ),
+            transformer_observation_tokenization=str(
+                getattr(cfg, "transformer_observation_tokenization", "semantic")
+            ),
+            policy_head_init_std=float(
+                getattr(cfg, "policy_head_init_std", -1.0)
+            ),
             transformer_temporal_module=bool(getattr(cfg, "transformer_temporal_module", False)),
             transformer_temporal_kernel_size=int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
             transformer_temporal_layers=int(getattr(cfg, "transformer_temporal_layers", 1)),
@@ -1034,6 +1082,7 @@ def main() -> None:
             central_critic_max_vehicles=int(cfg.central_critic_max_vehicles),
             central_critic_attention_heads=int(cfg.central_critic_attention_heads),
         ).to(device)
+        fit_policy_observation_normalizer(policy, expert_policy_obs)
         if sequence_only_discriminator:
             if expert_sequence_features is None:
                 raise RuntimeError("Sequence discriminator was enabled but no expert sequence features were loaded.")
@@ -1140,6 +1189,15 @@ def main() -> None:
                 raise RuntimeError(
                     f"Initial policy checkpoint is missing policy_state_dict: {initial_policy_checkpoint}"
                 )
+            if not isinstance(checkpoint, dict):
+                raise RuntimeError(
+                    "Initial BC policy checkpoint must include its architecture contract."
+                )
+            assert_policy_architecture_matches_checkpoint(
+                cfg,
+                checkpoint,
+                checkpoint_path=initial_policy_checkpoint,
+            )
             try:
                 policy.load_state_dict(policy_state)
             except RuntimeError as exc:
@@ -1389,6 +1447,9 @@ def main() -> None:
                 bc_path,
             )
             monitor.save(bc_path)
+        initializer_policy_state = (
+            policy_archive_snapshot(policy) if resume_payload is None else None
+        )
         rollout_executor = make_rollout_executor(cfg)
         evaluation_executor = make_evaluation_executor(cfg)
         last_checkpoint_video_path = None
@@ -1402,6 +1463,10 @@ def main() -> None:
         last_validation_metrics: dict[str, float] = {}
         final_stress_metrics: dict[str, float] = {}
         final_test_metrics: dict[str, float] = {}
+        selected_validation_metrics: dict[str, float] = {}
+        initializer_test_metrics: dict[str, float] = {}
+        final_policy_test_metrics: dict[str, float] = {}
+        selected_policy_relative_l2_delta: float | None = None
         best_path = os.path.join(run_dir, "best.pt")
         last_validation_stress_round = 0
         previous_controlled_vehicles = None
@@ -1583,6 +1648,7 @@ def main() -> None:
             )
 
         for round_idx in range(start_round, end_round + 1):
+            round_started = time.perf_counter()
             round_cfg = config_for_round(cfg, round_idx)
             if previous_controlled_vehicles is not None and (
                 float(round_cfg.percentage_controlled_vehicles)
@@ -1625,11 +1691,13 @@ def main() -> None:
                 archive_policy_state_dicts=psro_archive_for_round,
             )
             rollout_collect_seconds = max(1.0e-9, time.perf_counter() - rollout_started)
+            subsample_started = time.perf_counter()
             rollout = subsample_rollout_for_training(
                 collected_rollout,
                 round_cfg,
                 seed=int(round_cfg.seed) + int(round_idx) * 104729,
             )
+            subsample_seconds = time.perf_counter() - subsample_started
             rollout_was_subsampled = int(rollout.num_agent_steps) != int(collected_rollout.num_agent_steps)
             if sequence_only_discriminator and not rollout.sequence_features.size:
                 raise RuntimeError(
@@ -1647,6 +1715,7 @@ def main() -> None:
                 round_cfg,
                 seed=int(round_cfg.seed) + int(round_idx) * 65537,
             )
+            discriminator_started = time.perf_counter()
             disc_stats = update_discriminator(
                 discriminator,
                 disc_optimizer,
@@ -1680,7 +1749,9 @@ def main() -> None:
                     round_cfg,
                     device,
                 )
+            discriminator_seconds = time.perf_counter() - discriminator_started
             sequence_disc_stats = disc_stats if sequence_only_discriminator else {}
+            reward_refresh_started = time.perf_counter()
             rollout = refresh_rollout_rewards(
                 rollout,
                 None if sequence_only_discriminator else discriminator,
@@ -1696,6 +1767,8 @@ def main() -> None:
                     primary_discriminator_normalizer if sequence_only_discriminator else None
                 ),
             )
+            reward_refresh_seconds = time.perf_counter() - reward_refresh_started
+            policy_started = time.perf_counter()
             policy_stats = update_policy(
                 policy,
                 policy_optimizer,
@@ -1713,6 +1786,8 @@ def main() -> None:
                     else None
                 ),
             )
+            policy_seconds = time.perf_counter() - policy_started
+            health_warnings: list[str] = []
             if bool(getattr(round_cfg, "abort_on_health_failure", False)):
                 health_reasons = health_monitor.observe(
                     round_cfg,
@@ -1728,21 +1803,32 @@ def main() -> None:
                         "mean_reward": float(np.mean(rollout.rewards)),
                     },
                 )
-                if health_reasons:
+                fatal_health_reasons, health_warnings = partition_health_reasons(
+                    health_reasons
+                )
+                if health_warnings:
+                    print(
+                        f"[round {round_idx:04d}] recoverable health warning: "
+                        f"{health_warnings}",
+                        flush=True,
+                    )
+                if fatal_health_reasons:
                     failure_path = write_training_failure(
                         run_dir,
                         cfg,
                         trainer="gail",
                         round_idx=round_idx,
-                        reasons=health_reasons,
+                        reasons=fatal_health_reasons,
                     )
                     monitor.save(failure_path)
                     raise RuntimeError(
-                        f"Training health gate failed at round {round_idx}: {health_reasons}"
+                        "Training health gate failed at round "
+                        f"{round_idx}: {fatal_health_reasons}"
                     )
             append_array_replay(primary_discriminator_replay, current_primary_generator_features, round_cfg)
             if scene_discriminator is not None:
                 append_array_replay(scene_discriminator_replay, current_scene_generator_features, round_cfg)
+            round_seconds = time.perf_counter() - round_started
 
             print(
                 f"[round {round_idx:04d}] "
@@ -1888,6 +1974,7 @@ def main() -> None:
                 "psro/last_vehicle_jump_round": int(last_vehicle_jump_round or 0),
                 "rollout/scene_samples": int(len(rollout.scene_features)),
                 "rollout/sequence_samples": int(len(rollout.sequence_features)),
+                "rollout/mean_reward": float(rollout.rewards.mean()),
                 "rollout/mean_gail_reward": float(rollout.rewards.mean()),
                 "rollout/mean_raw_gail_reward": rollout.mean_raw_gail_reward,
                 "rollout/mean_normalized_gail_reward": rollout.mean_normalized_gail_reward,
@@ -2041,6 +2128,15 @@ def main() -> None:
                 "train/collision_mode_soft": int(str(getattr(round_cfg, "collision_mode_schedule", "")) == "soft"),
                 "train/collision_mode_mixed": int(str(getattr(round_cfg, "collision_mode_schedule", "")) == "mixed"),
                 "train/collision_mode_full": int(str(getattr(round_cfg, "collision_mode_schedule", "")) in {"full", ""}),
+                "train/vehicle_increase_soft_collision_active": int(
+                    bool(
+                        getattr(
+                            round_cfg,
+                            "vehicle_increase_soft_collision_active",
+                            False,
+                        )
+                    )
+                ),
                 "train/collision_proxy_penalty_coef": float(
                     getattr(round_cfg, "collision_proxy_penalty_coef", 0.0)
                 ),
@@ -2091,6 +2187,15 @@ def main() -> None:
                 ),
                 "train/transformer_temporal_module": int(
                     bool(getattr(round_cfg, "transformer_temporal_module", False))
+                ),
+                "perf/round_seconds": float(round_seconds),
+                "perf/collect_rollouts_seconds": float(rollout_collect_seconds),
+                "perf/subsample_rollout_seconds": float(subsample_seconds),
+                "perf/discriminator_update_seconds": float(discriminator_seconds),
+                "perf/reward_refresh_seconds": float(reward_refresh_seconds),
+                "perf/policy_update_seconds": float(policy_seconds),
+                "health/discriminator_saturation_warning": int(
+                    "discriminator_saturated" in health_warnings
                 ),
             }
             if sequence_discriminator is not None:
@@ -2285,6 +2390,30 @@ def main() -> None:
                         best_validation_score = float(val_score)
                         best_validation_round = int(round_idx)
                         pending_best = (dict(val_metrics), float(val_score), float(val_cost))
+                    learning_health_reasons = health_monitor.observe_learning(
+                        round_cfg,
+                        round_idx=round_idx,
+                        initial_score=float(
+                            initial_validation_metrics.get("validation/score", float("nan"))
+                        ),
+                        best_score=float(best_validation_score),
+                        best_round=int(best_validation_round),
+                    )
+                    if learning_health_reasons and bool(
+                        getattr(round_cfg, "abort_on_health_failure", False)
+                    ):
+                        failure_path = write_training_failure(
+                            run_dir,
+                            cfg,
+                            trainer="gail",
+                            round_idx=round_idx,
+                            reasons=learning_health_reasons,
+                        )
+                        monitor.save(failure_path)
+                        raise RuntimeError(
+                            f"Learning gate failed at round {round_idx}: "
+                            f"{learning_health_reasons}"
+                        )
                     print(
                         matched_validation_summary("validation", f"{round_idx:04d}", val_metrics)
                         + f" best={best_validation_score:.4f}@{best_validation_round}"
@@ -2539,8 +2668,42 @@ def main() -> None:
                 final_stress_metrics = dict(stress_metrics)
                 monitor.log(stress_metrics, step=final_round)
                 print(matched_validation_summary("validation_stress", "final", stress_metrics))
+        selected_checkpoint_name = "final.pt"
+        selected_policy_state = policy_archive_snapshot(policy)
+        if os.path.isfile(best_path):
+            selected_policy_state = load_verified_policy_state(best_path)
+            selected_checkpoint_name = "best.pt"
+        policy.load_state_dict(selected_policy_state)
+        if int(getattr(cfg, "validation_episodes", 0)) > 0:
+            raw_selected_validation = evaluate_policy_matched_trajectories(
+                policy,
+                final_round_cfg,
+                device,
+                split=str(getattr(cfg, "validation_prebuilt_split", "val")),
+                episodes=int(getattr(cfg, "validation_episodes", 0)),
+                prefix="validation",
+                evaluation_executor=evaluation_executor,
+            )
+            if raw_selected_validation:
+                selected_validation_metrics = {
+                    key.replace("validation/", "selected_validation/", 1): value
+                    for key, value in raw_selected_validation.items()
+                }
+                selected_validation_metrics, _selected_cost, _selected_score = (
+                    scored_validation_metrics(
+                        selected_validation_metrics,
+                        cfg,
+                        prefix="selected_validation",
+                    )
+                )
+                monitor.log(selected_validation_metrics, step=final_round)
+                print(
+                    matched_validation_summary(
+                        "selected_validation", "best", selected_validation_metrics
+                    )
+                )
         if int(getattr(cfg, "test_episodes", 0)) > 0:
-            test_metrics = evaluate_policy_matched_trajectories(
+            selected_test_metrics = evaluate_policy_matched_trajectories(
                 policy,
                 final_round_cfg,
                 device,
@@ -2549,17 +2712,51 @@ def main() -> None:
                 prefix="test",
                 evaluation_executor=evaluation_executor,
             )
-            if test_metrics:
-                final_test_metrics = dict(test_metrics)
-                monitor.log(test_metrics, step=final_round)
-                print(
-                    f"[test final] "
-                    f"episodes={test_metrics.get('test/episodes', 0):.0f} "
-                    f"rmse_pos_20s={test_metrics.get('test/rmse_position_20s', float('nan')):.4f} "
-                    f"collision={test_metrics.get('test/vehicle_crash_rate', test_metrics.get('test/collision_rate', 0.0)):.4f} "
-                    f"offroad={test_metrics.get('test/vehicle_offroad_rate', test_metrics.get('test/offroad_duration_rate', 0.0)):.4f} "
-                    f"hard_brake={test_metrics.get('test/hard_brake_rate', 0.0):.4f}"
+            if selected_test_metrics:
+                selected_test_metrics, _test_cost, _test_score = scored_validation_metrics(
+                    selected_test_metrics,
+                    cfg,
+                    prefix="test",
                 )
+                final_test_metrics = dict(selected_test_metrics)
+                monitor.log(selected_test_metrics, step=final_round)
+                print(
+                    f"[test selected] "
+                    f"episodes={selected_test_metrics.get('test/episodes', 0):.0f} "
+                    f"rmse_pos_20s={selected_test_metrics.get('test/rmse_position_20s', float('nan')):.4f} "
+                    f"collision={selected_test_metrics.get('test/vehicle_crash_rate', selected_test_metrics.get('test/collision_rate', 0.0)):.4f} "
+                    f"offroad={selected_test_metrics.get('test/vehicle_offroad_rate', selected_test_metrics.get('test/offroad_duration_rate', 0.0)):.4f} "
+                    f"hard_brake={selected_test_metrics.get('test/hard_brake_rate', 0.0):.4f}"
+                )
+            if initializer_policy_state is not None:
+                selected_policy_relative_l2_delta = policy_relative_l2_delta(
+                    selected_policy_state,
+                    initializer_policy_state,
+                )
+                policy.load_state_dict(initializer_policy_state)
+                raw_initializer_test = evaluate_policy_matched_trajectories(
+                    policy,
+                    final_round_cfg,
+                    device,
+                    split=str(getattr(cfg, "test_prebuilt_split", "test")),
+                    episodes=int(getattr(cfg, "test_episodes", 0)),
+                    prefix="test",
+                    evaluation_executor=evaluation_executor,
+                )
+                if raw_initializer_test:
+                    initializer_test_metrics = {
+                        key.replace("test/", "initializer_test/", 1): value
+                        for key, value in raw_initializer_test.items()
+                    }
+                    initializer_test_metrics, _initializer_cost, _initializer_score = (
+                        scored_validation_metrics(
+                            initializer_test_metrics,
+                            cfg,
+                            prefix="initializer_test",
+                        )
+                    )
+                    monitor.log(initializer_test_metrics, step=final_round)
+                policy.load_state_dict(selected_policy_state)
         summary_path = write_evaluation_summary(
             run_dir,
             cfg,
@@ -2570,6 +2767,11 @@ def main() -> None:
             stress_metrics=final_stress_metrics,
             test_metrics=final_test_metrics,
             initial_validation_metrics=initial_validation_metrics,
+            selected_validation_metrics=selected_validation_metrics,
+            initializer_test_metrics=initializer_test_metrics,
+            final_policy_test_metrics=final_policy_test_metrics,
+            policy_relative_l2_delta=selected_policy_relative_l2_delta,
+            selected_checkpoint=selected_checkpoint_name,
         )
         monitor.save(summary_path)
     finally:

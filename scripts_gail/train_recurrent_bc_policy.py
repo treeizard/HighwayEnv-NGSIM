@@ -23,16 +23,59 @@ from scripts_gail.pretrain_continuous_bc_policy import (
     render_selected_replay,
 )
 from scripts_gail.ps_gail.config import PSGAILConfig
+from scripts_gail.ps_gail.contracts import validate_training_data_contracts
 from scripts_gail.ps_gail.data import load_expert_transition_data
 from scripts_gail.ps_gail.recurrent_bc import (
     PreparedRecurrentBCData,
     train_recurrent_behavior_clone,
 )
-from scripts_gail.ps_gail.trainer import resolve_device
+from scripts_gail.ps_gail.trainer import (
+    evaluate_policy_matched_trajectories,
+    resolve_device,
+)
+from scripts_gail.ps_gail.validation import (
+    PAPER_DRIVER_MODEL_VALIDATION_FRAMEWORK,
+    paper_driver_model_validation_overrides,
+    scored_validation_metrics,
+)
 from scripts_gail.train_simple_ps_gail import evaluate_policy_survival
 
 
 CHECKPOINT_SCHEMA_VERSION = 1
+
+
+def _comma_separated_ints(value: str) -> list[int]:
+    return [int(item.strip()) for item in str(value).split(",") if item.strip()]
+
+
+def _comma_separated_floats(value: str) -> list[float]:
+    return [float(item.strip()) for item in str(value).split(",") if item.strip()]
+
+
+def training_artifact_is_complete(summary: dict[str, Any], out_dir: Path) -> bool:
+    """Return whether a BC run produced a finite, integrity-checkable artifact."""
+    finite_scalars = (
+        summary.get("initial_validation_mse"),
+        summary.get("validation_mse"),
+        summary.get("validation_mae"),
+    )
+    diagnostic_vectors = (
+        summary.get("validation_prediction_std_ratio"),
+        summary.get("validation_prediction_target_correlation"),
+    )
+    return bool(
+        summary.get("checkpoint_saved")
+        and str(summary.get("checkpoint_sha256") or "")
+        and (out_dir / "best.pt").is_file()
+        and (out_dir / "best.pt.sha256").is_file()
+        and (out_dir / "split_manifest.json").is_file()
+        and all(value is not None and np.isfinite(float(value)) for value in finite_scalars)
+        and all(
+            isinstance(values, (list, tuple))
+            and len(values) > 0
+            for values in diagnostic_vectors
+        )
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,6 +108,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-validation-mae", type=float, default=0.35)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument(
+        "--action-loss-weights",
+        type=_comma_separated_floats,
+        default=[1.0, 1.0],
+        help="Comma-separated BC optimization weights in [acceleration, steering] order.",
+    )
+    parser.add_argument(
+        "--action-loss-weighting",
+        choices=["fixed", "inverse_variance"],
+        default="fixed",
+        help=(
+            "Use fixed weights directly or divide them by each training-split "
+            "action variance before normalization."
+        ),
+    )
+    parser.add_argument(
+        "--correlation-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight on the per-micro-batch action correlation anti-collapse loss.",
+    )
+    parser.add_argument(
+        "--variance-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight on the one-sided prediction standard-deviation anti-collapse loss.",
+    )
+    parser.add_argument(
+        "--training-min-prediction-std-ratios",
+        type=_comma_separated_floats,
+        default=[],
+        help="Per-action training targets for the one-sided prediction variance loss.",
+    )
+    parser.add_argument(
         "--learning-action-index",
         type=int,
         default=0,
@@ -82,6 +158,29 @@ def parse_args() -> argparse.Namespace:
         default=-1.0,
         help="Minimum validation prediction/target correlation for the learning action.",
     )
+    parser.add_argument(
+        "--learning-action-indices",
+        type=_comma_separated_ints,
+        default=[],
+        help="Optional comma-separated action dimensions that must all pass.",
+    )
+    parser.add_argument(
+        "--min-learning-action-std-ratios",
+        type=_comma_separated_floats,
+        default=[],
+        help="Per-dimension minimum prediction/target standard-deviation ratios.",
+    )
+    parser.add_argument(
+        "--min-learning-action-correlations",
+        type=_comma_separated_floats,
+        default=[],
+        help="Per-dimension minimum prediction/target correlations.",
+    )
+    parser.add_argument(
+        "--require-explicit-data-contracts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--device", default="cuda")
 
     parser.add_argument("--hidden-size", type=int, default=256)
@@ -93,6 +192,21 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Use pre-norm transformer encoder blocks for optimization stability.",
+    )
+    parser.add_argument(
+        "--transformer-observation-normalization",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fit and persist a train-split-only standardizer for policy observations.",
+    )
+    parser.add_argument(
+        "--transformer-observation-tokenization",
+        choices=["semantic", "dense_temporal"],
+        default="semantic",
+        help=(
+            "Use sensor-wise current tokens or one normalized observation token "
+            "with transformer attention over temporal memory."
+        ),
     )
     parser.add_argument(
         "--policy-head-init-std",
@@ -110,6 +224,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-steps", type=int, default=200)
     parser.add_argument("--evaluation-episodes", type=int, default=3)
     parser.add_argument(
+        "--validation-evaluation-episodes",
+        type=int,
+        default=3,
+        help="All-vehicle validation episodes used for shared BC/GAIL ranking.",
+    )
+    parser.add_argument(
         "--evaluation-split",
         choices=["val", "test"],
         default="test",
@@ -121,6 +241,17 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Enable collision physics during post-training evaluation (disabled by default).",
     )
+    parser.add_argument(
+        "--matched-evaluation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also run the same fixed-horizon matched-trajectory evaluator used by GAIL.",
+    )
+    parser.add_argument(
+        "--evaluation-vehicle-mode",
+        choices=["single", "training_count", "all"],
+        default="single",
+    )
     parser.add_argument("--min-rollout-steps", type=int, default=100)
     parser.add_argument("--max-crash-fraction", type=float, default=0.34)
     parser.add_argument("--max-offroad-fraction", type=float, default=0.34)
@@ -129,9 +260,10 @@ def parse_args() -> argparse.Namespace:
         choices=["error", "report"],
         default="error",
         help=(
-            "error exits non-zero when the combined metric/rollout gate fails; "
-            "report records the rejection in summary.json and exits successfully. "
-            "Code and data failures always exit non-zero."
+            "For full policy training, error exits non-zero only when a finite "
+            "checkpoint artifact is not produced. Offline and closed-loop "
+            "quality are always reported. Warm starts retain their stabilization "
+            "gate. Code and data failures always exit non-zero."
         ),
     )
     return parser.parse_args()
@@ -198,15 +330,19 @@ def expert_provenance(path: Path) -> dict[str, Any]:
 
 
 def make_config(args: argparse.Namespace) -> PSGAILConfig:
+    policy_model = str(getattr(args, "policy_model", "recurrent_transformer"))
     return PSGAILConfig(
         expert_data=str(Path(args.expert_data).resolve()),
-        run_name=f"bc_{args.domain}_recurrent_transformer_{args.transformer_layers}layer_seed_{args.seed}",
+        run_name=f"bc_{args.domain}_{policy_model}_{args.transformer_layers}layer_seed_{args.seed}",
         scene=str(args.scene),
         action_mode="continuous",
         episode_root=str(Path(args.episode_root).resolve()),
         prebuilt_split=str(args.prebuilt_split),
         seed=int(args.seed),
         max_expert_samples=int(args.max_expert_samples),
+        require_explicit_data_contracts=bool(
+            args.require_explicit_data_contracts
+        ),
         trajectory_frame="relative",
         max_surrounding="all",
         control_all_vehicles=False,
@@ -217,18 +353,32 @@ def make_config(args: argparse.Namespace) -> PSGAILConfig:
         simulation_frequency=10,
         policy_frequency=10,
         max_episode_steps=200,
-        policy_model="recurrent_transformer",
+        road_query_mode="spatial",
+        collision_check_mode="broadphase",
+        record_replay_diagnostics=False,
+        sensor_road_edge_mode="batched",
+        reuse_pre_reset_spaces=True,
+        policy_model=policy_model,
         hidden_size=int(args.hidden_size),
         transformer_layers=int(args.transformer_layers),
         transformer_heads=int(args.transformer_heads),
         transformer_dropout=float(args.transformer_dropout),
         transformer_norm_first=bool(args.transformer_norm_first),
+        transformer_observation_normalization=bool(
+            args.transformer_observation_normalization
+        ),
+        transformer_observation_tokenization=str(
+            args.transformer_observation_tokenization
+        ),
         transformer_memory_tokens=int(args.memory_tokens),
         transformer_memory_context_length=int(args.memory_context_length),
         transformer_recurrent_sequence_length=int(args.sequence_length),
         transformer_recurrent_sequences_per_batch=int(args.sequences_per_batch),
         transformer_recurrent_micro_batch_sequences=int(args.micro_batch_sequences),
         transformer_use_causal_attention=True,
+        evaluation_num_workers=1,
+        evaluation_worker_threads=2,
+        **paper_driver_model_validation_overrides(),
         bc_pretrain_epochs=int(args.epochs),
         bc_pretrain_learning_rate=float(args.learning_rate),
         bc_pretrain_weight_decay=float(args.weight_decay),
@@ -244,6 +394,7 @@ def checkpoint_payload(
     obs_dim: int,
     action_dim: int,
     training_summary: dict[str, Any],
+    training_data_contract: dict[str, object],
     split_trajectory_ids: dict[str, list[str]],
     scenario: tuple[str | None, int | None],
 ) -> dict[str, Any]:
@@ -259,7 +410,7 @@ def checkpoint_payload(
         "policy_state_dict": policy.state_dict(),
         "config": vars(cfg),
         "policy_architecture": {
-            "policy_model": "recurrent_transformer",
+            "policy_model": str(cfg.policy_model),
             "obs_dim": int(obs_dim),
             "hidden_size": int(cfg.hidden_size),
             "action_mode": "continuous",
@@ -268,12 +419,25 @@ def checkpoint_payload(
             "transformer_heads": int(cfg.transformer_heads),
             "transformer_dropout": float(cfg.transformer_dropout),
             "transformer_norm_first": bool(cfg.transformer_norm_first),
+            "transformer_observation_normalization": bool(
+                cfg.transformer_observation_normalization
+            ),
+            "transformer_observation_tokenization": str(
+                cfg.transformer_observation_tokenization
+            ),
             "policy_head_init_std": float(args.policy_head_init_std),
             "transformer_memory_tokens": int(cfg.transformer_memory_tokens),
             "transformer_memory_context_length": int(cfg.transformer_memory_context_length),
             "transformer_use_causal_attention": True,
         },
         "bc_stats": training_summary,
+        "training_data_contract": training_data_contract,
+        "policy_output_action_contract": training_data_contract[
+            "continuous_action"
+        ],
+        "policy_observation_contract": training_data_contract[
+            "policy_observation"
+        ],
         "data_split": {
             "method": "trajectory_level",
             "seed": int(args.split_seed),
@@ -387,6 +551,12 @@ def run_training(
             seed=int(args.data_seed),
             trajectory_frame="relative",
         )
+    training_data_contract = validate_training_data_contracts(
+        transitions.metadata,
+        lidar_cells=int(cfg.cells),
+        maximum_range=float(cfg.maximum_range),
+        require_explicit=bool(args.require_explicit_data_contracts),
+    )
     if int(transitions.policy_observations.shape[1]) != int(obs_dim):
         raise RuntimeError(
             f"Expert and environment observation dimensions differ: "
@@ -416,6 +586,26 @@ def run_training(
         validation_fraction=float(args.validation_fraction),
         max_grad_norm=float(args.max_grad_norm),
         early_stopping_patience=int(args.early_stopping_patience),
+        selection_min_validation_skill=float(args.min_validation_skill),
+        action_loss_weights=list(args.action_loss_weights),
+        action_loss_weighting=str(args.action_loss_weighting),
+        correlation_loss_weight=float(args.correlation_loss_weight),
+        variance_loss_weight=float(args.variance_loss_weight),
+        minimum_prediction_std_ratios=(
+            list(args.training_min_prediction_std_ratios)
+            if args.training_min_prediction_std_ratios
+            else None
+        ),
+        selection_min_prediction_std_ratios=(
+            list(args.min_learning_action_std_ratios)
+            if args.min_learning_action_std_ratios
+            else None
+        ),
+        selection_min_prediction_correlations=(
+            list(args.min_learning_action_correlations)
+            if args.min_learning_action_correlations
+            else None
+        ),
         epoch_callback=lambda row: append_jsonl(metrics_path, row),
         prepared_data=prepared_data,
     )
@@ -439,23 +629,90 @@ def run_training(
         "max_grad_norm": float(args.max_grad_norm),
         "transformer_dropout": float(args.transformer_dropout),
         "transformer_norm_first": bool(args.transformer_norm_first),
+        "transformer_observation_normalization": bool(
+            args.transformer_observation_normalization
+        ),
+        "transformer_observation_tokenization": str(
+            args.transformer_observation_tokenization
+        ),
         "policy_head_init_std": float(args.policy_head_init_std),
         "early_stopping_patience": int(args.early_stopping_patience),
+        "configured_action_loss_weights": list(args.action_loss_weights),
+        "action_loss_weighting": str(args.action_loss_weighting),
+        "correlation_loss_weight": float(args.correlation_loss_weight),
+        "variance_loss_weight": float(args.variance_loss_weight),
+        "training_min_prediction_std_ratios": list(
+            args.training_min_prediction_std_ratios
+        ),
+        "training_data_contract": training_data_contract,
+        "policy_output_action_contract": training_data_contract[
+            "continuous_action"
+        ],
+        "policy_observation_contract": training_data_contract[
+            "policy_observation"
+        ],
     }
 
-    learning_action_index = int(args.learning_action_index)
     validation_std_ratios = result.summary["validation_prediction_std_ratio"]
     validation_correlations = result.summary["validation_prediction_target_correlation"]
-    if not 0 <= learning_action_index < len(validation_std_ratios):
+    learning_action_indices = (
+        list(args.learning_action_indices)
+        if args.learning_action_indices
+        else [int(args.learning_action_index)]
+    )
+    minimum_std_ratios = (
+        list(args.min_learning_action_std_ratios)
+        if args.min_learning_action_std_ratios
+        else [float(args.min_learning_action_std_ratio)]
+    )
+    minimum_correlations = (
+        list(args.min_learning_action_correlations)
+        if args.min_learning_action_correlations
+        else [float(args.min_learning_action_correlation)]
+    )
+    if not (
+        len(learning_action_indices)
+        == len(minimum_std_ratios)
+        == len(minimum_correlations)
+    ):
         raise ValueError(
-            f"learning_action_index={learning_action_index} is outside the action dimension "
-            f"[0, {len(validation_std_ratios)})."
+            "Learning action indices and per-action gate thresholds must have "
+            "the same length."
         )
-    learning_action_std_ratio = float(validation_std_ratios[learning_action_index])
-    learning_action_correlation = float(validation_correlations[learning_action_index])
-    learning_signal_passed = bool(
-        learning_action_std_ratio >= float(args.min_learning_action_std_ratio)
-        and learning_action_correlation >= float(args.min_learning_action_correlation)
+    action_names = ("acceleration_norm", "steering_norm")
+    learning_signal_gates: list[dict[str, object]] = []
+    for action_index, minimum_std_ratio, minimum_correlation in zip(
+        learning_action_indices,
+        minimum_std_ratios,
+        minimum_correlations,
+        strict=True,
+    ):
+        if not 0 <= int(action_index) < len(validation_std_ratios):
+            raise ValueError(
+                f"learning_action_index={action_index} is outside the action "
+                f"dimension [0, {len(validation_std_ratios)})."
+            )
+        std_ratio = float(validation_std_ratios[int(action_index)])
+        correlation = float(validation_correlations[int(action_index)])
+        passed = bool(
+            std_ratio >= float(minimum_std_ratio)
+            and correlation >= float(minimum_correlation)
+        )
+        learning_signal_gates.append(
+            {
+                "action_index": int(action_index),
+                "action_name": action_names[int(action_index)],
+                "prediction_std_ratio": std_ratio,
+                "minimum_prediction_std_ratio": float(minimum_std_ratio),
+                "prediction_target_correlation": correlation,
+                "minimum_prediction_target_correlation": float(
+                    minimum_correlation
+                ),
+                "passed": passed,
+            }
+        )
+    learning_signal_passed = all(
+        bool(gate["passed"]) for gate in learning_signal_gates
     )
     metric_capability = bool(
         result.summary["validation_skill"] >= float(args.min_validation_skill)
@@ -464,11 +721,25 @@ def run_training(
     )
     summary["learning_signal_passed"] = learning_signal_passed
     summary["learning_signal_gate"] = {
-        "action_index": learning_action_index,
-        "prediction_std_ratio": learning_action_std_ratio,
-        "minimum_prediction_std_ratio": float(args.min_learning_action_std_ratio),
-        "prediction_target_correlation": learning_action_correlation,
-        "minimum_prediction_target_correlation": float(args.min_learning_action_correlation),
+        "aggregation": "all_required_actions",
+        "actions": learning_signal_gates,
+        # Compatibility fields for older tuning/report readers. The ``actions``
+        # list is authoritative and all listed dimensions must pass.
+        "action_index": int(learning_signal_gates[0]["action_index"]),
+        "prediction_std_ratio": float(
+            learning_signal_gates[0]["prediction_std_ratio"]
+        ),
+        "minimum_prediction_std_ratio": float(
+            learning_signal_gates[0]["minimum_prediction_std_ratio"]
+        ),
+        "prediction_target_correlation": float(
+            learning_signal_gates[0]["prediction_target_correlation"]
+        ),
+        "minimum_prediction_target_correlation": float(
+            learning_signal_gates[0][
+                "minimum_prediction_target_correlation"
+            ]
+        ),
     }
     warm_start_passed = bool(
         args.checkpoint_purpose == "warm_start"
@@ -509,11 +780,27 @@ def run_training(
                 "max_grad_norm": float(args.max_grad_norm),
                 "transformer_dropout": float(args.transformer_dropout),
                 "transformer_norm_first": bool(args.transformer_norm_first),
+                "transformer_observation_normalization": bool(
+                    args.transformer_observation_normalization
+                ),
+                "transformer_observation_tokenization": str(
+                    args.transformer_observation_tokenization
+                ),
                 "policy_head_init_std": float(args.policy_head_init_std),
                 "early_stopping_patience": int(args.early_stopping_patience),
                 "learning_signal_passed": learning_signal_passed,
                 "learning_signal_gate": dict(summary["learning_signal_gate"]),
+                "configured_action_loss_weights": list(
+                    args.action_loss_weights
+                ),
+                "action_loss_weighting": str(args.action_loss_weighting),
+                "correlation_loss_weight": float(args.correlation_loss_weight),
+                "variance_loss_weight": float(args.variance_loss_weight),
+                "training_min_prediction_std_ratios": list(
+                    args.training_min_prediction_std_ratios
+                ),
             },
+            training_data_contract=training_data_contract,
             split_trajectory_ids=result.split_trajectory_ids,
             scenario=scenario,
         )
@@ -526,20 +813,121 @@ def run_training(
         enable_collision=bool(args.evaluation_enable_collision),
         bc_pretrain_eval_deterministic=True,
     )
-    survival_stats = evaluate_policy_survival(
-        policy,
-        evaluation_cfg,
-        device,
-        episodes=int(args.evaluation_episodes),
-        seed_offset=10_000,
-    )
-    summary["held_out_rollouts"] = survival_stats
-    summary["held_out_evaluation"] = {
-        "prebuilt_split": str(args.evaluation_split),
-        "collision_physics_enabled": bool(args.evaluation_enable_collision),
-        "episodes": int(args.evaluation_episodes),
-        "metrics": survival_stats,
-    }
+    survival_stats: dict[str, Any] = {}
+    matched_evaluation_passed = True
+    matched_evaluation_complete = not bool(args.matched_evaluation)
+    if bool(args.matched_evaluation):
+        # BC and GAIL use this exact fixed-horizon, collision-enabled evaluator
+        # and scoring function. Collision termination is ignored so poor BC
+        # behavior remains measurable through the requested horizon.
+        matched_cfg = replace(
+            evaluation_cfg,
+            enable_collision=True,
+            **paper_driver_model_validation_overrides(),
+        )
+        validation_stats = evaluate_policy_matched_trajectories(
+            policy,
+            matched_cfg,
+            device,
+            split="val",
+            episodes=int(args.validation_evaluation_episodes),
+            prefix="validation",
+        )
+        validation_stats, validation_cost, validation_score = (
+            scored_validation_metrics(
+                validation_stats,
+                matched_cfg,
+                prefix="validation",
+            )
+        )
+        test_stats = evaluate_policy_matched_trajectories(
+            policy,
+            matched_cfg,
+            device,
+            split="test",
+            episodes=int(args.evaluation_episodes),
+            prefix="test",
+        )
+        score_horizon = int(matched_cfg.validation_score_horizon_seconds)
+        validation_coverage = float(
+            validation_stats.get(
+                f"validation/horizon_coverage_{score_horizon}s",
+                float("nan"),
+            )
+        )
+        test_coverage = float(
+            test_stats.get(
+                f"test/horizon_coverage_{score_horizon}s",
+                float("nan"),
+            )
+        )
+        matched_evaluation_passed = bool(
+            np.isfinite(validation_score)
+            and np.isfinite(validation_coverage)
+            and validation_coverage
+            >= float(matched_cfg.validation_min_horizon_coverage)
+            and np.isfinite(test_coverage)
+            and test_coverage
+            >= float(matched_cfg.validation_min_horizon_coverage)
+        )
+        matched_evaluation_complete = bool(
+            validation_stats
+            and test_stats
+            and np.isfinite(validation_coverage)
+            and np.isfinite(test_coverage)
+        )
+        summary["gail_aligned_matched_evaluation"] = {
+            "validation_split": "val",
+            "test_split": "test",
+            "collision_physics_enabled": True,
+            "collision_termination_enabled": False,
+            "vehicle_mode": str(matched_cfg.test_vehicle_mode),
+            "validation_episodes": int(args.validation_evaluation_episodes),
+            "test_episodes": int(args.evaluation_episodes),
+            "score_horizon_seconds": score_horizon,
+            "minimum_horizon_coverage": float(
+                matched_cfg.validation_min_horizon_coverage
+            ),
+            "checkpoint_selection": {
+                "framework": PAPER_DRIVER_MODEL_VALIDATION_FRAMEWORK,
+                "validation_cost": float(validation_cost),
+                "validation_score": float(validation_score),
+                "components": {
+                    key: value
+                    for key, value in validation_stats.items()
+                    if key.startswith("validation/score_component_")
+                },
+            },
+            "validation_metrics": validation_stats,
+            "test_metrics": test_stats,
+            "passed": matched_evaluation_passed,
+        }
+        summary["paper_validation_cost"] = float(validation_cost)
+        summary["paper_validation_score"] = float(validation_score)
+        summary["held_out_rollouts"] = test_stats
+        summary["held_out_evaluation"] = {
+            "prebuilt_split": "test",
+            "collision_physics_enabled": True,
+            "collision_termination_enabled": False,
+            "vehicle_mode": str(matched_cfg.test_vehicle_mode),
+            "episodes": int(args.evaluation_episodes),
+            "metrics": test_stats,
+        }
+    else:
+        survival_stats = evaluate_policy_survival(
+            policy,
+            evaluation_cfg,
+            device,
+            episodes=int(args.evaluation_episodes),
+            seed_offset=10_000,
+        )
+        summary["held_out_rollouts"] = survival_stats
+        summary["held_out_evaluation"] = {
+            "prebuilt_split": str(args.evaluation_split),
+            "collision_physics_enabled": bool(args.evaluation_enable_collision),
+            "episodes": int(args.evaluation_episodes),
+            "metrics": survival_stats,
+        }
 
     rollout_stats: dict[str, Any] | None = None
     if bool(args.render_video):
@@ -558,19 +946,67 @@ def run_training(
         )
         summary["rollout"] = rollout_stats
 
-    rollout_capability = bool(
-        survival_stats
-        and float(survival_stats["bc_eval/mean_episode_length"]) >= float(args.min_rollout_steps)
-        and float(survival_stats["bc_eval/crash_episode_fraction"]) <= float(args.max_crash_fraction)
-        and float(survival_stats["bc_eval/offroad_episode_fraction"]) <= float(args.max_offroad_fraction)
+    rollout_capability = (
+        bool(matched_evaluation_passed)
+        if bool(args.matched_evaluation)
+        else bool(
+            survival_stats
+            and float(survival_stats["bc_eval/mean_episode_length"])
+            >= float(args.min_rollout_steps)
+            and float(survival_stats["bc_eval/crash_episode_fraction"])
+            <= float(args.max_crash_fraction)
+            and float(survival_stats["bc_eval/offroad_episode_fraction"])
+            <= float(args.max_offroad_fraction)
+        )
     )
     summary["rollout_capability_passed"] = rollout_capability
-    summary["capability_passed"] = bool(metric_capability and rollout_capability)
+    summary["matched_evaluation_passed"] = matched_evaluation_passed
+    summary["capability_passed"] = bool(
+        metric_capability
+        and rollout_capability
+        and matched_evaluation_passed
+    )
+    summary["closed_loop_quality_passed"] = bool(
+        rollout_capability and matched_evaluation_passed
+    )
+    summary["closed_loop_evaluation_complete"] = bool(
+        matched_evaluation_complete
+        if bool(args.matched_evaluation)
+        else survival_stats
+    )
+    summary["training_artifact_complete"] = training_artifact_is_complete(
+        summary,
+        out_dir,
+    )
+    summary["interpretability_baseline_eligible"] = bool(
+        summary["training_artifact_complete"] and metric_capability
+    )
+    summary["benchmark_contract"] = {
+        "objective": "behavior_cloning_interpretability_reference",
+        "matrix_completion_gate": "all_training_artifacts_complete",
+        "interpretability_eligibility_gate": "offline_imitation_learning",
+        "closed_loop_metrics_role": "descriptive_non_terminal",
+        "shared_validation_framework": PAPER_DRIVER_MODEL_VALIDATION_FRAMEWORK,
+        "validation_vehicle_mode": (
+            "all" if bool(args.matched_evaluation) else str(args.evaluation_vehicle_mode)
+        ),
+        "collision_termination_enabled": False,
+        "closed_loop_metrics_include": [
+            "position_rmse_by_horizon",
+            "speed_rmse_by_horizon",
+            "lane_offset_rmse_by_horizon",
+            "vehicle_crash_rate",
+            "vehicle_offroad_rate",
+            "hard_brake_agent_step_rate",
+        ],
+    }
     write_json(out_dir / "summary.json", summary)
 
     print(json.dumps(summary, indent=2, sort_keys=True))
     requested_gate_passed = (
-        warm_start_passed if args.checkpoint_purpose == "warm_start" else summary["capability_passed"]
+        warm_start_passed
+        if args.checkpoint_purpose == "warm_start"
+        else summary["training_artifact_complete"]
     )
     if not requested_gate_passed and args.capability_failure_mode == "error":
         if args.checkpoint_purpose == "warm_start":
@@ -580,16 +1016,8 @@ def run_training(
                 f"(minimum {float(args.min_warmup_relative_improvement):.4f})."
             )
         raise RuntimeError(
-            "BC capability gate failed: "
-            f"validation_skill={result.summary['validation_skill']:.4f} "
-            f"(minimum {float(args.min_validation_skill):.4f}), "
-            f"validation_mae={result.summary['validation_mae']:.4f} "
-            f"(maximum {float(args.max_validation_mae):.4f}), "
-            f"action{learning_action_index}_std_ratio={learning_action_std_ratio:.4f} "
-            f"(minimum {float(args.min_learning_action_std_ratio):.4f}), "
-            f"action{learning_action_index}_correlation={learning_action_correlation:.4f} "
-            f"(minimum {float(args.min_learning_action_correlation):.4f}), "
-            f"rollout_passed={rollout_capability}."
+            "BC training artifact is incomplete or non-finite. Closed-loop "
+            "quality metrics are descriptive and cannot trigger this error."
         )
 
     return summary

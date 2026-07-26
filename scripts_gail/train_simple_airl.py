@@ -17,7 +17,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from scripts_gail.ps_gail.config import PSGAILConfig, should_save_checkpoint_video
+from scripts_gail.ps_gail.contracts import validate_training_data_contracts
 from scripts_gail.ps_gail.checkpoints import (
+    assert_policy_architecture_matches_checkpoint,
     atomic_torch_save,
     checkpoint_metadata,
     exact_training_state,
@@ -28,12 +30,14 @@ from scripts_gail.ps_gail.checkpoints import (
 from scripts_gail.ps_gail.data import load_expert_transition_data
 from scripts_gail.ps_gail.envs import make_training_env
 from scripts_gail.ps_gail.experiment import (
+    load_verified_policy_state,
+    policy_relative_l2_delta,
     resolve_algorithm_variant,
     write_evaluation_summary,
     write_run_manifest,
     write_training_failure,
 )
-from scripts_gail.ps_gail.health import TrainingHealthMonitor
+from scripts_gail.ps_gail.health import TrainingHealthMonitor, partition_health_reasons
 from scripts_gail.ps_gail.monitoring import WandbMonitor
 from scripts_gail.ps_gail.models import make_actor_critic
 from scripts_gail.ps_gail.models import make_relu_mlp
@@ -45,6 +49,7 @@ from scripts_gail.ps_gail.trainer import (
     combine_primary_env_challenge_rewards,
     compute_returns_and_advantages,
     evaluate_policy_matched_trajectories,
+    fit_policy_observation_normalizer,
     infer_continuous_action_dim,
     infer_critic_obs_dim,
     infer_policy_obs_dim,
@@ -1258,7 +1263,7 @@ def main() -> None:
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
     write_run_manifest(run_dir, cfg, trainer="airl")
-    monitor = WandbMonitor(cfg, run_dir)
+    monitor = WandbMonitor(cfg, run_dir, trainer="airl")
     monitor.start()
 
     env = None
@@ -1270,6 +1275,12 @@ def main() -> None:
             max_samples=cfg.max_expert_samples,
             seed=cfg.seed,
             trajectory_frame=cfg.trajectory_frame,
+        )
+        validate_training_data_contracts(
+            expert.metadata,
+            lidar_cells=int(cfg.cells),
+            maximum_range=float(cfg.maximum_range),
+            require_explicit=bool(cfg.require_explicit_data_contracts),
         )
         env_cfg = config_for_round(cfg, 1)
         env = make_training_env(env_cfg)
@@ -1288,6 +1299,18 @@ def main() -> None:
             transformer_layers=int(cfg.transformer_layers),
             transformer_heads=int(cfg.transformer_heads),
             transformer_dropout=float(cfg.transformer_dropout),
+            transformer_norm_first=bool(
+                getattr(cfg, "transformer_norm_first", False)
+            ),
+            transformer_observation_normalization=bool(
+                getattr(cfg, "transformer_observation_normalization", False)
+            ),
+            transformer_observation_tokenization=str(
+                getattr(cfg, "transformer_observation_tokenization", "semantic")
+            ),
+            policy_head_init_std=float(
+                getattr(cfg, "policy_head_init_std", -1.0)
+            ),
             transformer_temporal_module=bool(getattr(cfg, "transformer_temporal_module", False)),
             transformer_temporal_kernel_size=int(getattr(cfg, "transformer_temporal_kernel_size", 5)),
             transformer_temporal_layers=int(getattr(cfg, "transformer_temporal_layers", 1)),
@@ -1300,6 +1323,10 @@ def main() -> None:
             central_critic_max_vehicles=int(cfg.central_critic_max_vehicles),
             central_critic_attention_heads=int(cfg.central_critic_attention_heads),
         ).to(device)
+        fit_policy_observation_normalizer(
+            policy,
+            expert.policy_observations,
+        )
         expert_trajectory_index = (
             _build_recurrent_trajectory_index(expert.trajectory_ids, expert.timesteps)
             if recurrent_policy_enabled(policy)
@@ -1360,6 +1387,15 @@ def main() -> None:
                     "Initial policy checkpoint is missing policy_state_dict: "
                     f"{initial_policy_checkpoint}"
                 )
+            if not isinstance(checkpoint, dict):
+                raise RuntimeError(
+                    "Initial BC policy checkpoint must include its architecture contract."
+                )
+            assert_policy_architecture_matches_checkpoint(
+                cfg,
+                checkpoint,
+                checkpoint_path=initial_policy_checkpoint,
+            )
             policy.load_state_dict(policy_state)
             print(
                 "initialized_policy_checkpoint="
@@ -1512,6 +1548,9 @@ def main() -> None:
             )
             monitor.save(bc_path)
 
+        initializer_policy_state = (
+            policy_archive_snapshot(policy) if resume_payload is None else None
+        )
         last_checkpoint_video_path = None
         last_checkpoint_video_round = 0
         airl_replay: list[AIRLReplayEntry] = []
@@ -1522,6 +1561,10 @@ def main() -> None:
         last_validation_metrics: dict[str, float] = {}
         final_stress_metrics: dict[str, float] = {}
         final_test_metrics: dict[str, float] = {}
+        selected_validation_metrics: dict[str, float] = {}
+        initializer_test_metrics: dict[str, float] = {}
+        final_policy_test_metrics: dict[str, float] = {}
+        selected_policy_relative_l2_delta: float | None = None
         best_path = os.path.join(run_dir, "best.pt")
         last_validation_stress_round = 0
         previous_controlled_vehicles = None
@@ -1812,6 +1855,7 @@ def main() -> None:
                 expert_policy_observations=expert.policy_observations,
                 expert_actions=expert.actions_continuous_env,
             )
+            health_warnings: list[str] = []
             if bool(getattr(round_cfg, "abort_on_health_failure", False)):
                 health_reasons = health_monitor.observe(
                     round_cfg,
@@ -1827,17 +1871,27 @@ def main() -> None:
                         "mean_reward": float(np.mean(rollout.rewards)),
                     },
                 )
-                if health_reasons:
+                fatal_health_reasons, health_warnings = partition_health_reasons(
+                    health_reasons
+                )
+                if health_warnings:
+                    print(
+                        f"[round {round_idx:04d}] recoverable health warning: "
+                        f"{health_warnings}",
+                        flush=True,
+                    )
+                if fatal_health_reasons:
                     failure_path = write_training_failure(
                         run_dir,
                         cfg,
                         trainer="airl",
                         round_idx=round_idx,
-                        reasons=health_reasons,
+                        reasons=fatal_health_reasons,
                     )
                     monitor.save(failure_path)
                     raise RuntimeError(
-                        f"Training health gate failed at round {round_idx}: {health_reasons}"
+                        "Training health gate failed at round "
+                        f"{round_idx}: {fatal_health_reasons}"
                     )
             policy_seconds = time.perf_counter() - policy_started
             replay_append_started = time.perf_counter()
@@ -2068,6 +2122,9 @@ def main() -> None:
                 "perf/airl_reward_update_seconds": float(reward_stats["reward_update_seconds"]),
                 "perf/airl_refresh_rewards_seconds": float(refresh_seconds),
                 "perf/policy_update_seconds": float(policy_seconds),
+                "health/discriminator_saturation_warning": int(
+                    "discriminator_saturated" in health_warnings
+                ),
                 "perf/airl_replay_append_seconds": float(replay_append_seconds),
                 "perf/airl_reward_train_samples": float(reward_stats["reward_train_samples"]),
                 "perf/airl_reward_batches_per_update": float(reward_stats["reward_batches_per_update"]),
@@ -2144,6 +2201,30 @@ def main() -> None:
                         best_validation_score = float(val_score)
                         best_validation_round = int(round_idx)
                         pending_best = (dict(val_metrics), float(val_score), float(val_cost))
+                    learning_health_reasons = health_monitor.observe_learning(
+                        round_cfg,
+                        round_idx=round_idx,
+                        initial_score=float(
+                            initial_validation_metrics.get("validation/score", float("nan"))
+                        ),
+                        best_score=float(best_validation_score),
+                        best_round=int(best_validation_round),
+                    )
+                    if learning_health_reasons and bool(
+                        getattr(round_cfg, "abort_on_health_failure", False)
+                    ):
+                        failure_path = write_training_failure(
+                            run_dir,
+                            cfg,
+                            trainer="airl",
+                            round_idx=round_idx,
+                            reasons=learning_health_reasons,
+                        )
+                        monitor.save(failure_path)
+                        raise RuntimeError(
+                            f"Learning gate failed at round {round_idx}: "
+                            f"{learning_health_reasons}"
+                        )
                     print(
                         matched_validation_summary("validation", f"{round_idx:04d}", val_metrics)
                         + f" best={best_validation_score:.4f}@{best_validation_round}"
@@ -2350,8 +2431,42 @@ def main() -> None:
                 final_stress_metrics = dict(stress_metrics)
                 monitor.log(stress_metrics, step=final_round)
                 print(matched_validation_summary("validation_stress", "final", stress_metrics))
+        selected_checkpoint_name = "final.pt"
+        selected_policy_state = policy_archive_snapshot(policy)
+        if os.path.isfile(best_path):
+            selected_policy_state = load_verified_policy_state(best_path)
+            selected_checkpoint_name = "best.pt"
+        policy.load_state_dict(selected_policy_state)
+        if int(getattr(cfg, "validation_episodes", 0)) > 0:
+            raw_selected_validation = evaluate_policy_matched_trajectories(
+                policy,
+                final_round_cfg,
+                device,
+                split=str(getattr(cfg, "validation_prebuilt_split", "val")),
+                episodes=int(getattr(cfg, "validation_episodes", 0)),
+                prefix="validation",
+                evaluation_executor=evaluation_executor,
+            )
+            if raw_selected_validation:
+                selected_validation_metrics = {
+                    key.replace("validation/", "selected_validation/", 1): value
+                    for key, value in raw_selected_validation.items()
+                }
+                selected_validation_metrics, _selected_cost, _selected_score = (
+                    scored_validation_metrics(
+                        selected_validation_metrics,
+                        cfg,
+                        prefix="selected_validation",
+                    )
+                )
+                monitor.log(selected_validation_metrics, step=final_round)
+                print(
+                    matched_validation_summary(
+                        "selected_validation", "best", selected_validation_metrics
+                    )
+                )
         if int(getattr(cfg, "test_episodes", 0)) > 0:
-            test_metrics = evaluate_policy_matched_trajectories(
+            selected_test_metrics = evaluate_policy_matched_trajectories(
                 policy,
                 final_round_cfg,
                 device,
@@ -2360,17 +2475,51 @@ def main() -> None:
                 prefix="test",
                 evaluation_executor=evaluation_executor,
             )
-            if test_metrics:
-                final_test_metrics = dict(test_metrics)
-                monitor.log(test_metrics, step=final_round)
-                print(
-                    f"[test final] "
-                    f"episodes={test_metrics.get('test/episodes', 0):.0f} "
-                    f"rmse_pos_20s={test_metrics.get('test/rmse_position_20s', float('nan')):.4f} "
-                    f"collision={test_metrics.get('test/vehicle_crash_rate', test_metrics.get('test/collision_rate', 0.0)):.4f} "
-                    f"offroad={test_metrics.get('test/vehicle_offroad_rate', test_metrics.get('test/offroad_duration_rate', 0.0)):.4f} "
-                    f"hard_brake={test_metrics.get('test/hard_brake_rate', 0.0):.4f}"
+            if selected_test_metrics:
+                selected_test_metrics, _test_cost, _test_score = scored_validation_metrics(
+                    selected_test_metrics,
+                    cfg,
+                    prefix="test",
                 )
+                final_test_metrics = dict(selected_test_metrics)
+                monitor.log(selected_test_metrics, step=final_round)
+                print(
+                    f"[test selected] "
+                    f"episodes={selected_test_metrics.get('test/episodes', 0):.0f} "
+                    f"rmse_pos_20s={selected_test_metrics.get('test/rmse_position_20s', float('nan')):.4f} "
+                    f"collision={selected_test_metrics.get('test/vehicle_crash_rate', selected_test_metrics.get('test/collision_rate', 0.0)):.4f} "
+                    f"offroad={selected_test_metrics.get('test/vehicle_offroad_rate', selected_test_metrics.get('test/offroad_duration_rate', 0.0)):.4f} "
+                    f"hard_brake={selected_test_metrics.get('test/hard_brake_rate', 0.0):.4f}"
+                )
+            if initializer_policy_state is not None:
+                selected_policy_relative_l2_delta = policy_relative_l2_delta(
+                    selected_policy_state,
+                    initializer_policy_state,
+                )
+                policy.load_state_dict(initializer_policy_state)
+                raw_initializer_test = evaluate_policy_matched_trajectories(
+                    policy,
+                    final_round_cfg,
+                    device,
+                    split=str(getattr(cfg, "test_prebuilt_split", "test")),
+                    episodes=int(getattr(cfg, "test_episodes", 0)),
+                    prefix="test",
+                    evaluation_executor=evaluation_executor,
+                )
+                if raw_initializer_test:
+                    initializer_test_metrics = {
+                        key.replace("test/", "initializer_test/", 1): value
+                        for key, value in raw_initializer_test.items()
+                    }
+                    initializer_test_metrics, _initializer_cost, _initializer_score = (
+                        scored_validation_metrics(
+                            initializer_test_metrics,
+                            cfg,
+                            prefix="initializer_test",
+                        )
+                    )
+                    monitor.log(initializer_test_metrics, step=final_round)
+                policy.load_state_dict(selected_policy_state)
         summary_path = write_evaluation_summary(
             run_dir,
             cfg,
@@ -2381,6 +2530,11 @@ def main() -> None:
             stress_metrics=final_stress_metrics,
             test_metrics=final_test_metrics,
             initial_validation_metrics=initial_validation_metrics,
+            selected_validation_metrics=selected_validation_metrics,
+            initializer_test_metrics=initializer_test_metrics,
+            final_policy_test_metrics=final_policy_test_metrics,
+            policy_relative_l2_delta=selected_policy_relative_l2_delta,
+            selected_checkpoint=selected_checkpoint_name,
         )
         monitor.save(summary_path)
     finally:

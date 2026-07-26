@@ -50,10 +50,12 @@ from .policy import (
     discrete_action_masks_from_env,
     policy_action_dim,
     recurrent_policy_enabled,
+    _shift_recurrent_memory,
 )
 
 _EVAL_POLICY_CACHE = {}
 _EVAL_ENV_CACHE = OrderedDict()
+_EVAL_PREBUILT_CACHE = {}
 _EVAL_ENV_CACHE_HITS = 0
 _EVAL_ENV_CACHE_MISSES = 0
 EpisodeSpec = tuple[int, str, tuple[int, ...] | None]
@@ -96,6 +98,28 @@ def _parse_evaluation_horizons(cfg: PSGAILConfig) -> list[int]:
             values.append(horizon)
     return values or [1, 5, 10, 20]
 
+
+def _evaluation_should_stop(
+    cfg: PSGAILConfig,
+    *,
+    terminated: bool,
+    truncated: bool,
+) -> bool:
+    """Apply the fixed-horizon policy used by matched evaluation.
+
+    The strict pilot sets ``evaluation_terminate_when_all_controlled_crashed``
+    to false so that a crash is recorded without erasing the requested
+    post-crash horizon. Gym still reports ``terminated`` after that crash; in
+    fixed-horizon mode evaluation therefore continues until the time-limit
+    truncation. Truncation is always respected.
+    """
+
+    return bool(truncated) or (
+        bool(terminated)
+        and bool(getattr(cfg, "evaluation_terminate_when_all_controlled_crashed", True))
+    )
+
+
 def _evaluation_scenarios(
     cfg: PSGAILConfig,
     *,
@@ -109,7 +133,7 @@ def _evaluation_scenarios(
         cfg.scene,
         str(split),
         min_occupancy=0.8,
-        cache={},
+        cache=_EVAL_PREBUILT_CACHE,
     )
     scenarios: list[tuple[str, int]] = []
     for episode_name in sorted(str(name) for name in episode_names):
@@ -134,7 +158,7 @@ def _evaluation_episode_names(
         cfg.scene,
         str(split),
         min_occupancy=0.8,
-        cache={},
+        cache=_EVAL_PREBUILT_CACHE,
     )
     names = sorted(str(name) for name in episode_names)
     if not names:
@@ -168,7 +192,7 @@ def _evaluation_training_count_episode_specs(
         cfg.scene,
         str(split),
         min_occupancy=0.8,
-        cache={},
+        cache=_EVAL_PREBUILT_CACHE,
     )
     names = sorted(str(name) for name in episode_names)
     if not names:
@@ -251,7 +275,9 @@ def _make_matched_eval_env(
     env_cfg["truncate_to_trajectory_length"] = False
     env_cfg["complete_controlled_vehicles_at_road_end"] = False
     env_cfg["disable_controlled_vehicle_collisions"] = False
-    env_cfg["terminate_when_all_controlled_crashed"] = True
+    env_cfg["terminate_when_all_controlled_crashed"] = bool(
+        getattr(cfg, "evaluation_terminate_when_all_controlled_crashed", True)
+    )
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
     env_cfg["crash_controlled_vehicles_offroad"] = True
     _apply_simulator_runtime_options(env_cfg, cfg)
@@ -287,7 +313,9 @@ def _make_matched_eval_all_vehicle_env(
     env_cfg["truncate_to_trajectory_length"] = False
     env_cfg["complete_controlled_vehicles_at_road_end"] = False
     env_cfg["disable_controlled_vehicle_collisions"] = False
-    env_cfg["terminate_when_all_controlled_crashed"] = True
+    env_cfg["terminate_when_all_controlled_crashed"] = bool(
+        getattr(cfg, "evaluation_terminate_when_all_controlled_crashed", True)
+    )
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
     env_cfg["crash_controlled_vehicles_offroad"] = True
     _apply_simulator_runtime_options(env_cfg, cfg)
@@ -328,7 +356,9 @@ def _make_matched_eval_selected_vehicle_env(
     env_cfg["truncate_to_trajectory_length"] = False
     env_cfg["complete_controlled_vehicles_at_road_end"] = False
     env_cfg["disable_controlled_vehicle_collisions"] = False
-    env_cfg["terminate_when_all_controlled_crashed"] = True
+    env_cfg["terminate_when_all_controlled_crashed"] = bool(
+        getattr(cfg, "evaluation_terminate_when_all_controlled_crashed", True)
+    )
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
     env_cfg["crash_controlled_vehicles_offroad"] = True
     _apply_simulator_runtime_options(env_cfg, cfg)
@@ -356,6 +386,12 @@ def _deterministic_policy_action_tuple(
                 memory=memory,
                 return_memory=True,
             )
+            if new_memory is not None:
+                new_memory = (
+                    new_memory.unsqueeze(1)
+                    if memory is None
+                    else _shift_recurrent_memory(memory, new_memory)
+                )
         else:
             policy_out, _values = policy(obs_tensor, critic_obs_tensor)
             new_memory = None
@@ -415,6 +451,17 @@ def _physical_accels_from_actions(action_tuple: tuple[object, ...], cfg: PSGAILC
         accels.append(denormalize_acceleration(np.clip(float(action_arr[0]), -1.0, 1.0)))
     return np.asarray(accels, dtype=np.float32)
 
+def _record_deterministic_continuous_actions(
+    action_values: list[list[float]],
+    action_tuple: tuple[object, ...],
+) -> None:
+    """Accumulate finite normalized actions for deterministic-policy audits."""
+    for action in action_tuple:
+        action_arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        for dim, values in enumerate(action_values):
+            if dim < action_arr.size and np.isfinite(action_arr[dim]):
+                values.append(float(action_arr[dim]))
+
 def _matched_eval_metrics(
     *,
     prefix: str,
@@ -440,6 +487,7 @@ def _matched_eval_metrics(
     controlled_vehicle_counts: list[int] | None = None,
     requested_controlled_vehicle_counts: list[int] | None = None,
     vehicle_ids: set[int] | None = None,
+    action_values: list[list[float]] | None = None,
     include_raw: bool = False,
 ) -> dict[str, float]:
     collision_duration_rate = float(collision_steps / total_steps) if total_steps else float("nan")
@@ -468,14 +516,24 @@ def _matched_eval_metrics(
         f"{prefix}/skipped_bad_reference": float(skipped_bad_reference),
         f"{prefix}/skipped_empty_rollout": float(skipped_empty_rollout),
         f"{prefix}/evaluated_steps": float(total_steps),
+        f"{prefix}/controlled_vehicle_agent_steps": float(total_steps),
         f"{prefix}/crash_agent_fraction": crash_agent_fraction,
         f"{prefix}/collision_duration_rate": collision_duration_rate,
+        f"{prefix}/collision_agent_step_rate": collision_duration_rate,
         f"{prefix}/collision_rate": vehicle_crash_rate if np.isfinite(vehicle_crash_rate) else collision_duration_rate,
         f"{prefix}/vehicle_crash_rate": vehicle_crash_rate,
+        f"{prefix}/crashed_controlled_vehicle_episodes": float(
+            crashed_vehicle_episodes or 0
+        ),
         f"{prefix}/offroad_agent_fraction": offroad_agent_fraction,
         f"{prefix}/offroad_duration_rate": offroad_duration_rate,
         f"{prefix}/vehicle_offroad_rate": vehicle_offroad_rate,
         f"{prefix}/hard_brake_rate": float(hard_brake_steps / total_steps) if total_steps else float("nan"),
+        f"{prefix}/hard_brake_agent_step_rate": (
+            float(hard_brake_steps / total_steps)
+            if total_steps
+            else float("nan")
+        ),
         f"{prefix}/mean_episode_length": float(np.mean(episode_lengths)) if episode_lengths else 0.0,
         f"{prefix}/terminated_episodes": float(terminated_episodes),
         f"{prefix}/truncated_episodes": float(truncated_episodes),
@@ -484,6 +542,9 @@ def _matched_eval_metrics(
         metrics[f"{prefix}/vehicles"] = float(vehicles)
     if vehicle_episodes is not None:
         metrics[f"{prefix}/vehicle_episodes"] = float(vehicle_episodes)
+        metrics[f"{prefix}/controlled_vehicle_rate_denominator"] = float(
+            vehicle_episodes
+        )
     if controlled_vehicle_counts is not None:
         metrics[f"{prefix}/mean_controlled_vehicles_per_episode"] = (
             float(np.mean(controlled_vehicle_counts)) if controlled_vehicle_counts else 0.0
@@ -492,10 +553,39 @@ def _matched_eval_metrics(
         metrics[f"{prefix}/mean_requested_controlled_vehicles_per_episode"] = float(
             np.mean(requested_controlled_vehicle_counts)
         )
+    for dim, values in enumerate(action_values or []):
+        array = np.asarray(values, dtype=np.float64)
+        metrics[f"{prefix}/deterministic_action_{dim}_mean"] = (
+            float(np.mean(array)) if array.size else float("nan")
+        )
+        metrics[f"{prefix}/deterministic_action_{dim}_std"] = (
+            float(np.std(array)) if array.size else float("nan")
+        )
+        metrics[f"{prefix}/deterministic_action_{dim}_count"] = float(array.size)
+        if dim == 0:
+            metrics[f"{prefix}/acceleration_action_mean"] = metrics[
+                f"{prefix}/deterministic_action_{dim}_mean"
+            ]
+            metrics[f"{prefix}/acceleration_action_std"] = metrics[
+                f"{prefix}/deterministic_action_{dim}_std"
+            ]
+        elif dim == 1:
+            metrics[f"{prefix}/steering_action_mean"] = metrics[
+                f"{prefix}/deterministic_action_{dim}_mean"
+            ]
+            metrics[f"{prefix}/steering_action_std"] = metrics[
+                f"{prefix}/deterministic_action_{dim}_std"
+            ]
     for horizon in horizons:
         for name, values in squared[horizon].items():
             metric_name = f"{prefix}/rmse_{name}_{horizon}s"
             metrics[metric_name] = float(np.sqrt(np.mean(values))) if values else float("nan")
+        position_count = len(squared[horizon].get("position", ()))
+        metrics[f"{prefix}/horizon_coverage_{horizon}s"] = (
+            float(position_count / vehicle_denominator)
+            if vehicle_denominator > 0
+            else float("nan")
+        )
     for name, values in final_squared.items():
         metric_name = f"{prefix}/rmse_{name}_final"
         metrics[metric_name] = float(np.sqrt(np.mean(values))) if values else float("nan")
@@ -515,6 +605,11 @@ def _matched_eval_metrics(
         metrics[f"__raw/{prefix}/vehicle_ids"] = tuple(
             sorted(int(value) for value in (vehicle_ids or set()))
         )
+        for dim, values in enumerate(action_values or []):
+            array = np.asarray(values, dtype=np.float64)
+            metrics[f"__raw/{prefix}/action_sum_{dim}"] = float(array.sum())
+            metrics[f"__raw/{prefix}/action_sumsq_{dim}"] = float(np.square(array).sum())
+            metrics[f"__raw/{prefix}/action_count_{dim}"] = float(array.size)
         for horizon in horizons:
             for name, values in squared[horizon].items():
                 arr = np.asarray(values, dtype=np.float64)
@@ -567,10 +662,16 @@ def _combine_matched_eval_metric_dicts(
     total_steps = float(metrics.get(f"{prefix}/evaluated_steps", 0.0))
     vehicle_episodes = float(metrics.get(f"{prefix}/vehicle_episodes", metrics.get(f"{prefix}/episodes", 0.0)))
     metrics[f"{prefix}/collision_duration_rate"] = collision_steps / total_steps if total_steps else float("nan")
+    metrics[f"{prefix}/collision_agent_step_rate"] = metrics[
+        f"{prefix}/collision_duration_rate"
+    ]
     metrics[f"{prefix}/crash_agent_fraction"] = metrics[f"{prefix}/collision_duration_rate"]
     metrics[f"{prefix}/offroad_duration_rate"] = offroad_steps / total_steps if total_steps else float("nan")
     metrics[f"{prefix}/offroad_agent_fraction"] = metrics[f"{prefix}/offroad_duration_rate"]
     metrics[f"{prefix}/hard_brake_rate"] = hard_brake_steps / total_steps if total_steps else float("nan")
+    metrics[f"{prefix}/hard_brake_agent_step_rate"] = metrics[
+        f"{prefix}/hard_brake_rate"
+    ]
     metrics[f"{prefix}/vehicle_crash_rate"] = (
         crashed_vehicle_episodes / vehicle_episodes if vehicle_episodes else float("nan")
     )
@@ -581,6 +682,11 @@ def _combine_matched_eval_metric_dicts(
         metrics[f"{prefix}/vehicle_crash_rate"]
         if np.isfinite(metrics[f"{prefix}/vehicle_crash_rate"])
         else metrics[f"{prefix}/collision_duration_rate"]
+    )
+    metrics[f"{prefix}/controlled_vehicle_agent_steps"] = total_steps
+    metrics[f"{prefix}/controlled_vehicle_rate_denominator"] = vehicle_episodes
+    metrics[f"{prefix}/crashed_controlled_vehicle_episodes"] = (
+        crashed_vehicle_episodes
     )
     for raw_name, metric_name in (
         ("policy_load_seconds", "eval_policy_load_seconds"),
@@ -616,12 +722,51 @@ def _combine_matched_eval_metric_dicts(
         if controlled_counts and vehicle_ids
         else metrics.get(f"{prefix}/episodes", 0.0)
     )
+    action_dims = sorted(
+        {
+            int(key.rsplit("_", 1)[1])
+            for part in parts
+            for key in part
+            if key.startswith(f"__raw/{prefix}/action_count_")
+        }
+    )
+    for dim in action_dims:
+        count = float(
+            sum(float(part.get(f"__raw/{prefix}/action_count_{dim}", 0.0)) for part in parts)
+        )
+        total = float(
+            sum(float(part.get(f"__raw/{prefix}/action_sum_{dim}", 0.0)) for part in parts)
+        )
+        total_squared = float(
+            sum(float(part.get(f"__raw/{prefix}/action_sumsq_{dim}", 0.0)) for part in parts)
+        )
+        mean = total / count if count else float("nan")
+        variance = max(0.0, total_squared / count - mean * mean) if count else float("nan")
+        metrics[f"{prefix}/deterministic_action_{dim}_mean"] = mean
+        metrics[f"{prefix}/deterministic_action_{dim}_std"] = (
+            float(np.sqrt(variance)) if count else float("nan")
+        )
+        metrics[f"{prefix}/deterministic_action_{dim}_count"] = count
+        semantic_name = "acceleration" if dim == 0 else ("steering" if dim == 1 else "")
+        if semantic_name:
+            metrics[f"{prefix}/{semantic_name}_action_mean"] = mean
+            metrics[f"{prefix}/{semantic_name}_action_std"] = metrics[
+                f"{prefix}/deterministic_action_{dim}_std"
+            ]
     names = ("x", "y", "position", "speed", "lane_offset")
     for horizon in horizons:
+        position_count = 0.0
         for name in names:
             sse = float(sum(float(part.get(f"__raw/{prefix}/sse_{name}_{horizon}s", 0.0)) for part in parts))
             count = float(sum(float(part.get(f"__raw/{prefix}/count_{name}_{horizon}s", 0.0)) for part in parts))
             metrics[f"{prefix}/rmse_{name}_{horizon}s"] = float(np.sqrt(sse / count)) if count else float("nan")
+            if name == "position":
+                position_count = count
+        metrics[f"{prefix}/horizon_coverage_{horizon}s"] = (
+            float(position_count / vehicle_episodes)
+            if vehicle_episodes > 0.0
+            else float("nan")
+        )
     for name in names:
         sse = float(sum(float(part.get(f"__raw/{prefix}/sse_{name}_final", 0.0)) for part in parts))
         count = float(sum(float(part.get(f"__raw/{prefix}/count_{name}_final", 0.0)) for part in parts))
@@ -733,7 +878,7 @@ def _matched_eval_env_cache_key(
         int(cfg.policy_frequency),
         int(cfg.max_episode_steps),
         bool(cfg.enable_collision),
-        bool(cfg.terminate_when_all_controlled_crashed),
+        bool(getattr(cfg, "evaluation_terminate_when_all_controlled_crashed", True)),
         bool(cfg.allow_idm),
         str(getattr(cfg, "road_query_mode", "legacy")),
         str(getattr(cfg, "collision_check_mode", "legacy")),
@@ -824,6 +969,7 @@ def evaluation_worker_cache_stats() -> dict[str, int]:
         "env_cache_hits": int(_EVAL_ENV_CACHE_HITS),
         "env_cache_misses": int(_EVAL_ENV_CACHE_MISSES),
         "policy_cache_size": len(_EVAL_POLICY_CACHE),
+        "prebuilt_split_cache_size": len(_EVAL_PREBUILT_CACHE),
     }
 
 
@@ -833,6 +979,7 @@ def clear_evaluation_worker_caches() -> None:
         env.close()
     _EVAL_ENV_CACHE.clear()
     _EVAL_POLICY_CACHE.clear()
+    _EVAL_PREBUILT_CACHE.clear()
     _EVAL_ENV_CACHE_HITS = 0
     _EVAL_ENV_CACHE_MISSES = 0
 
@@ -938,6 +1085,11 @@ def _evaluate_policy_matched_all_vehicle_episodes(
     truncated_episodes = 0
     crashed_vehicle_episodes = 0
     offroad_vehicle_episodes = 0
+    action_values: list[list[float]] = (
+        [[] for _ in range(max(0, int(cfg.continuous_action_dim)))]
+        if _is_continuous(cfg)
+        else []
+    )
     eval_policy_seconds = 0.0
     eval_step_seconds = 0.0
     eval_reset_seconds = 0.0
@@ -1038,6 +1190,7 @@ def _evaluate_policy_matched_all_vehicle_episodes(
                         policy_started = time.perf_counter()
                         action_tuple = _deterministic_policy_action_tuple(policy, env, obs, cfg, device)
                         eval_policy_seconds += time.perf_counter() - policy_started
+                    _record_deterministic_continuous_actions(action_values, action_tuple)
                     accels = _physical_accels_from_actions(action_tuple, cfg)
                     hard_brake_steps += int(np.sum(accels < float(cfg.hard_brake_accel_threshold)))
                     step_started = time.perf_counter()
@@ -1056,9 +1209,13 @@ def _evaluate_policy_matched_all_vehicle_episodes(
                             episode_offroad_vehicle_ids.add(int(info_vehicle_ids[flag_index]))
                     total_agent_steps += int(max(len(crash_flags), len(offroad_flags), len(live_controlled)))
                     length += 1
-                    last_terminated = bool(terminated)
+                    last_terminated = last_terminated or bool(terminated)
                     last_truncated = bool(truncated)
-                    if terminated or truncated:
+                    if _evaluation_should_stop(
+                        cfg,
+                        terminated=bool(terminated),
+                        truncated=bool(truncated),
+                    ):
                         break
                 if length <= 0:
                     skipped_empty_rollout += 1
@@ -1143,6 +1300,7 @@ def _evaluate_policy_matched_all_vehicle_episodes(
         controlled_vehicle_counts=controlled_vehicle_counts,
         requested_controlled_vehicle_counts=requested_controlled_vehicle_counts,
         vehicle_ids=evaluated_vehicle_ids,
+        action_values=action_values,
         include_raw=include_raw,
     )
     if include_raw:
@@ -1316,6 +1474,11 @@ def _evaluate_policy_matched_trajectories_impl(
     truncated_episodes = 0
     crashed_vehicle_episodes = 0
     offroad_vehicle_episodes = 0
+    action_values: list[list[float]] = (
+        [[] for _ in range(max(0, int(cfg.continuous_action_dim)))]
+        if _is_continuous(cfg)
+        else []
+    )
     eval_policy_seconds = 0.0
     eval_step_seconds = 0.0
     eval_reset_seconds = 0.0
@@ -1351,6 +1514,8 @@ def _evaluate_policy_matched_trajectories_impl(
                 length = 0
                 episode_crashed = False
                 episode_offroad = False
+                encountered_terminated = False
+                last_truncated = False
                 eval_memory = (
                     policy.initial_memory(1, device=device, dtype=torch.float32)
                     if recurrent_policy_enabled(policy)
@@ -1382,6 +1547,7 @@ def _evaluate_policy_matched_trajectories_impl(
                         policy_started = time.perf_counter()
                         action_tuple = _deterministic_policy_action_tuple(policy, env, obs, cfg, device)
                         eval_policy_seconds += time.perf_counter() - policy_started
+                    _record_deterministic_continuous_actions(action_values, action_tuple)
                     accel = _physical_accel_from_action(action_tuple, cfg)
                     if np.isfinite(accel) and accel < float(cfg.hard_brake_accel_threshold):
                         hard_brake_steps += 1
@@ -1396,15 +1562,21 @@ def _evaluate_policy_matched_trajectories_impl(
                     offroad_steps += int(any(bool(flag) for flag in offroad_flags))
                     total_steps += 1
                     length += 1
-                    if terminated or truncated:
+                    encountered_terminated = encountered_terminated or bool(terminated)
+                    last_truncated = bool(truncated)
+                    if _evaluation_should_stop(
+                        cfg,
+                        terminated=bool(terminated),
+                        truncated=bool(truncated),
+                    ):
                         break
                 if length <= 0:
                     skipped_empty_rollout += 1
                     continue
                 evaluated_episodes += 1
                 evaluated_vehicle_ids.add(int(vehicle_id))
-                terminated_episodes += int(bool(terminated))
-                truncated_episodes += int(bool(truncated))
+                terminated_episodes += int(encountered_terminated)
+                truncated_episodes += int(last_truncated)
                 crashed_vehicle_episodes += int(episode_crashed)
                 offroad_vehicle_episodes += int(episode_offroad)
                 episode_lengths.append(length)
@@ -1463,6 +1635,7 @@ def _evaluate_policy_matched_trajectories_impl(
         vehicles=evaluated_episodes,
         vehicle_episodes=evaluated_episodes,
         vehicle_ids=evaluated_vehicle_ids,
+        action_values=action_values,
         include_raw=include_raw,
     )
     if include_raw:
@@ -1487,6 +1660,7 @@ __all__ = [
     '_first_controlled_vehicle',
     '_physical_accel_from_action',
     '_physical_accels_from_actions',
+    '_record_deterministic_continuous_actions',
     '_matched_eval_metrics',
     '_strip_internal_matched_metrics',
     '_combine_matched_eval_metric_dicts',

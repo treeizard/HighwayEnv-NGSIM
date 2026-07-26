@@ -37,6 +37,154 @@ _RUNTIME_CONFIG_FIELDS = {
     "wandb_watch",
 }
 
+POLICY_ARCHITECTURE_FIELDS: tuple[str, ...] = (
+    "policy_model",
+    "hidden_size",
+    "action_mode",
+    "continuous_action_dim",
+    "transformer_layers",
+    "transformer_heads",
+    "transformer_dropout",
+    "transformer_norm_first",
+    "transformer_observation_normalization",
+    "transformer_observation_tokenization",
+    "policy_head_init_std",
+    "transformer_temporal_module",
+    "transformer_temporal_kernel_size",
+    "transformer_temporal_layers",
+    "transformer_memory_tokens",
+    "transformer_memory_context_length",
+    "transformer_use_causal_attention",
+    "centralized_critic",
+    "central_critic_include_local_obs",
+    "central_critic_pooling",
+    "central_critic_max_vehicles",
+    "central_critic_attention_heads",
+)
+
+SHARED_INTERPRETABLE_TRANSFORMER_CONTRACT_ID = (
+    "shared_dense_temporal_recurrent_transformer_v1"
+)
+
+
+def shared_interpretable_transformer_architecture(
+    recipe: dict[str, Any],
+    *,
+    depth: int,
+) -> dict[str, Any]:
+    """Translate the locked BC recipe into the shared BC/GAIL config fields."""
+    if str(recipe.get("status") or "") != "locked":
+        raise RuntimeError("Shared BC/GAIL policy recipe is not locked.")
+    contract_id = str(recipe.get("architecture_contract_id") or "")
+    if contract_id != SHARED_INTERPRETABLE_TRANSFORMER_CONTRACT_ID:
+        raise RuntimeError(
+            "Unexpected BC/GAIL architecture contract: "
+            f"{contract_id!r} != {SHARED_INTERPRETABLE_TRANSFORMER_CONTRACT_ID!r}."
+        )
+    architecture = dict(recipe.get("architecture") or {})
+    supported_depths = {int(value) for value in architecture.get("depths", [])}
+    if int(depth) not in supported_depths:
+        raise RuntimeError(
+            f"Transformer depth {depth} is not in the locked recipe: "
+            f"{sorted(supported_depths)}."
+        )
+    expected = {
+        "policy_model": "recurrent_transformer",
+        "transformer_observation_tokenization": "dense_temporal",
+        "transformer_observation_normalization": True,
+        "memory_tokens": 1,
+    }
+    actual = {name: architecture.get(name) for name in expected}
+    if actual != expected:
+        raise RuntimeError(
+            "Locked shared architecture changed incompatibly: "
+            f"{json.dumps(actual, sort_keys=True)}."
+        )
+    return {
+        "policy_model": "recurrent_transformer",
+        "hidden_size": int(architecture["hidden_size"]),
+        "action_mode": "continuous",
+        "continuous_action_dim": 2,
+        "transformer_layers": int(depth),
+        "transformer_heads": int(architecture["transformer_heads"]),
+        "transformer_dropout": float(architecture["transformer_dropout"]),
+        "transformer_norm_first": bool(
+            architecture["transformer_norm_first"]
+        ),
+        "transformer_observation_normalization": True,
+        "transformer_observation_tokenization": "dense_temporal",
+        "policy_head_init_std": float(architecture["policy_head_init_std"]),
+        "transformer_temporal_module": False,
+        "transformer_temporal_kernel_size": 5,
+        "transformer_temporal_layers": 1,
+        "transformer_memory_tokens": 1,
+        "transformer_memory_context_length": int(
+            architecture["memory_context_length"]
+        ),
+        "transformer_use_causal_attention": True,
+        "centralized_critic": False,
+        "central_critic_include_local_obs": False,
+        "central_critic_pooling": "flat",
+        "central_critic_max_vehicles": 64,
+        "central_critic_attention_heads": 4,
+    }
+
+
+def policy_architecture_contract(
+    source: PSGAILConfig | dict[str, Any],
+) -> dict[str, Any]:
+    """Return the shared BC/GAIL policy architecture identity.
+
+    Checkpoints may store architecture fields in ``policy_architecture``,
+    ``config``, or both. Missing legacy fields resolve to the dataclass defaults
+    so historical semantic-token checkpoints remain loadable, while new dense
+    temporal checkpoints must declare their non-default identity explicitly.
+    """
+    defaults = vars(PSGAILConfig())
+    if isinstance(source, PSGAILConfig):
+        values = vars(source)
+    elif isinstance(source, dict):
+        raw_config = source.get("config", {})
+        if hasattr(raw_config, "__dict__"):
+            raw_config = vars(raw_config)
+        if not isinstance(raw_config, dict):
+            raise TypeError("Checkpoint config must be a mapping.")
+        raw_architecture = source.get("policy_architecture", {})
+        if not isinstance(raw_architecture, dict):
+            raise TypeError("Checkpoint policy_architecture must be a mapping.")
+        values = {**raw_config, **raw_architecture}
+        if not values and any(name in source for name in POLICY_ARCHITECTURE_FIELDS):
+            values = source
+    else:
+        raise TypeError(f"Unsupported architecture source: {type(source)!r}.")
+    return {
+        name: values.get(name, defaults[name])
+        for name in POLICY_ARCHITECTURE_FIELDS
+    }
+
+
+def assert_policy_architecture_matches_checkpoint(
+    cfg: PSGAILConfig,
+    checkpoint: dict[str, Any],
+    *,
+    checkpoint_path: str = "",
+) -> dict[str, Any]:
+    """Fail before state loading when BC and GAIL policy architectures differ."""
+    expected = policy_architecture_contract(cfg)
+    actual = policy_architecture_contract(checkpoint)
+    mismatches = {
+        name: {"gail": expected[name], "checkpoint": actual[name]}
+        for name in POLICY_ARCHITECTURE_FIELDS
+        if expected[name] != actual[name]
+    }
+    if mismatches:
+        location = f" {checkpoint_path}" if checkpoint_path else ""
+        raise RuntimeError(
+            "Policy architecture contract mismatch for checkpoint"
+            f"{location}: {json.dumps(mismatches, sort_keys=True)}"
+        )
+    return actual
+
 
 def sha256_file(path: str | os.PathLike[str]) -> str:
     digest = hashlib.sha256()
@@ -52,6 +200,14 @@ def normalized_config_hash(cfg: PSGAILConfig) -> str:
         key: value
         for key, value in vars(cfg).items()
         if key not in _RUNTIME_CONFIG_FIELDS and not key.startswith("wandb_")
+        and not (
+            key == "transformer_observation_normalization"
+            and value is False
+        )
+        and not (
+            key == "transformer_observation_tokenization"
+            and value == "semantic"
+        )
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -63,6 +219,14 @@ def resume_config_hash(cfg: PSGAILConfig) -> str:
         key: value
         for key, value in vars(cfg).items()
         if key not in _RUNTIME_CONFIG_FIELDS and not key.startswith("wandb_")
+        and not (
+            key == "transformer_observation_normalization"
+            and value is False
+        )
+        and not (
+            key == "transformer_observation_tokenization"
+            and value == "semantic"
+        )
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()

@@ -141,6 +141,19 @@ def _shift_memory(memory: torch.Tensor, new_memory: torch.Tensor) -> torch.Tenso
     return torch.cat([memory[:, 1:], new_memory.unsqueeze(1)], dim=1)
 
 
+def _center_sequence_steps(
+    sequence_steps: list[list[torch.Tensor]],
+) -> torch.Tensor:
+    """Center timesteps within each sequence before pooling them."""
+    centered: list[torch.Tensor] = []
+    for steps in sequence_steps:
+        if not steps:
+            raise ValueError("Every recurrent BC sequence must contain a timestep.")
+        values = torch.stack(steps, dim=0)
+        centered.append(values - values.mean(dim=0))
+    return torch.cat(centered, dim=0)
+
+
 def _batched_sequence_loss(
     policy: torch.nn.Module,
     observations: np.ndarray,
@@ -149,8 +162,22 @@ def _batched_sequence_loss(
     *,
     device: torch.device,
     diagnostics: dict[str, Any] | None = None,
+    action_loss_weights: np.ndarray | None = None,
+    correlation_loss_weight: float = 0.0,
+    variance_loss_weight: float = 0.0,
+    minimum_prediction_std_ratios: np.ndarray | None = None,
+    loss_diagnostics: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Warm up memory, then unroll differentiably across each training window."""
+    """Warm up memory, then unroll differentiably across each training window.
+
+    The optional moment losses are deliberately computed inside each optimizer
+    micro-batch.  MSE alone can select a nearly constant conditional-mean
+    policy on imbalanced driving data.  The correlation term rewards temporal
+    action shape after centering every sequence independently, so unrelated
+    trajectory offsets cannot satisfy it.  The one-sided standard-deviation
+    term prevents a low-variance shortcut without rewarding arbitrarily large
+    action variance.
+    """
     if not windows:
         raise ValueError("At least one sequence window is required.")
     batch_size = len(windows)
@@ -176,6 +203,14 @@ def _batched_sequence_loss(
 
     squared_error_sum = torch.zeros((), dtype=torch.float32, device=device)
     absolute_error_sum = torch.zeros((), dtype=torch.float32, device=device)
+    active_prediction_steps: list[torch.Tensor] = []
+    active_target_steps: list[torch.Tensor] = []
+    sequence_prediction_steps: list[list[torch.Tensor]] = [
+        [] for _window in windows
+    ]
+    sequence_target_steps: list[list[torch.Tensor]] = [
+        [] for _window in windows
+    ]
     valid_count = 0
     max_steps = max(len(window.train_indices) for window in windows)
     for step in range(max_steps):
@@ -190,8 +225,27 @@ def _batched_sequence_loss(
         active = torch.as_tensor(active_np, dtype=torch.bool, device=device)
         active_predictions = predictions[active]
         active_targets = target[active]
+        active_prediction_steps.append(active_predictions)
+        active_target_steps.append(active_targets)
+        for row in np.flatnonzero(active_np):
+            sequence_prediction_steps[int(row)].append(predictions[int(row)])
+            sequence_target_steps[int(row)].append(target[int(row)])
         error = active_predictions - active_targets
-        squared_error_sum = squared_error_sum + error.square().mean(dim=1).sum()
+        if action_loss_weights is None:
+            squared_error = error.square().mean(dim=1)
+        else:
+            weights = torch.as_tensor(
+                action_loss_weights,
+                dtype=error.dtype,
+                device=error.device,
+            )
+            if weights.shape != (error.shape[1],):
+                raise ValueError(
+                    "action_loss_weights must match the action dimension: "
+                    f"{tuple(weights.shape)} != {(error.shape[1],)}."
+                )
+            squared_error = (error.square() * weights).mean(dim=1)
+        squared_error_sum = squared_error_sum + squared_error.sum()
         absolute_error_sum = absolute_error_sum + error.abs().mean(dim=1).sum()
         valid_count += int(active_np.sum())
         if diagnostics is not None:
@@ -210,7 +264,71 @@ def _batched_sequence_loss(
         memory = torch.where(active[:, None, None, None], shifted, memory)
     if valid_count <= 0:
         raise RuntimeError("Recurrent BC batch contained no valid timesteps.")
-    return squared_error_sum / valid_count, absolute_error_sum / valid_count, valid_count
+    base_mse = squared_error_sum / valid_count
+    mae = absolute_error_sum / valid_count
+    objective = base_mse
+    correlation_loss = torch.zeros((), dtype=base_mse.dtype, device=device)
+    variance_loss = torch.zeros((), dtype=base_mse.dtype, device=device)
+    prediction_std_ratio = torch.zeros(
+        actions.shape[1], dtype=base_mse.dtype, device=device
+    )
+    correlation = torch.zeros_like(prediction_std_ratio)
+    if float(correlation_loss_weight) > 0.0 or float(variance_loss_weight) > 0.0:
+        batch_predictions = torch.cat(active_prediction_steps, dim=0)
+        batch_targets = torch.cat(active_target_steps, dim=0)
+        prediction_centered = batch_predictions - batch_predictions.mean(dim=0)
+        target_centered = batch_targets - batch_targets.mean(dim=0)
+        prediction_variance = prediction_centered.square().mean(dim=0)
+        target_variance = target_centered.square().mean(dim=0)
+        temporal_predictions = _center_sequence_steps(sequence_prediction_steps)
+        temporal_targets = _center_sequence_steps(sequence_target_steps)
+        temporal_prediction_variance = temporal_predictions.square().mean(dim=0)
+        temporal_target_variance = temporal_targets.square().mean(dim=0)
+        covariance = (temporal_predictions * temporal_targets).mean(dim=0)
+        epsilon = torch.finfo(batch_predictions.dtype).eps
+        prediction_std = torch.sqrt(prediction_variance + epsilon)
+        target_std = torch.sqrt(target_variance + epsilon)
+        temporal_prediction_std = torch.sqrt(
+            temporal_prediction_variance + epsilon
+        )
+        temporal_target_std = torch.sqrt(temporal_target_variance + epsilon)
+        correlation = covariance / (
+            temporal_prediction_std * temporal_target_std
+        )
+        correlation = correlation.clamp(min=-1.0, max=1.0)
+        prediction_std_ratio = prediction_std / target_std
+        correlation_loss = (1.0 - correlation).mean()
+        if minimum_prediction_std_ratios is None:
+            minimum_ratios = torch.zeros_like(prediction_std_ratio)
+        else:
+            minimum_ratios = torch.as_tensor(
+                minimum_prediction_std_ratios,
+                dtype=prediction_std_ratio.dtype,
+                device=prediction_std_ratio.device,
+            )
+            if minimum_ratios.shape != prediction_std_ratio.shape:
+                raise ValueError(
+                    "minimum_prediction_std_ratios must match the action dimension: "
+                    f"{tuple(minimum_ratios.shape)} != {tuple(prediction_std_ratio.shape)}."
+                )
+        variance_loss = F.relu(minimum_ratios - prediction_std_ratio).square().mean()
+        objective = (
+            base_mse
+            + float(correlation_loss_weight) * correlation_loss
+            + float(variance_loss_weight) * variance_loss
+        )
+    if loss_diagnostics is not None:
+        loss_diagnostics.update(
+            {
+                "objective": float(objective.detach().cpu()),
+                "base_mse": float(base_mse.detach().cpu()),
+                "correlation_loss": float(correlation_loss.detach().cpu()),
+                "variance_loss": float(variance_loss.detach().cpu()),
+                "prediction_std_ratio": prediction_std_ratio.detach().cpu().tolist(),
+                "prediction_target_correlation": correlation.detach().cpu().tolist(),
+            }
+        )
+    return objective, mae, valid_count
 
 
 def evaluate_recurrent_bc(
@@ -397,10 +515,18 @@ def train_recurrent_behavior_clone(
     validation_fraction: float = 0.1,
     max_grad_norm: float = 0.5,
     early_stopping_patience: int = 10,
+    selection_min_validation_skill: float | None = None,
+    action_loss_weights: list[float] | tuple[float, ...] | np.ndarray | None = None,
+    action_loss_weighting: str = "fixed",
+    correlation_loss_weight: float = 0.0,
+    variance_loss_weight: float = 0.0,
+    minimum_prediction_std_ratios: list[float] | tuple[float, ...] | np.ndarray | None = None,
+    selection_min_prediction_std_ratios: list[float] | tuple[float, ...] | np.ndarray | None = None,
+    selection_min_prediction_correlations: list[float] | tuple[float, ...] | np.ndarray | None = None,
     epoch_callback: Callable[[dict[str, Any]], None] | None = None,
     prepared_data: PreparedRecurrentBCData | None = None,
 ) -> RecurrentBCResult:
-    """Train a recurrent policy and select the checkpoint by validation MSE."""
+    """Train a recurrent policy and select a behaviourally non-collapsed checkpoint."""
     if not bool(getattr(policy, "supports_recurrent_memory", False)):
         raise TypeError("Sequence-aware BC requires a recurrent policy.")
     if prepared_data is None:
@@ -421,6 +547,117 @@ def train_recurrent_behavior_clone(
     actions = prepared_data.actions
     split_ids = prepared_data.split_trajectory_ids
     split_windows = prepared_data.split_windows
+    action_loss_weighting = str(action_loss_weighting).lower()
+    if action_loss_weighting not in {"fixed", "inverse_variance"}:
+        raise ValueError(
+            "action_loss_weighting must be 'fixed' or 'inverse_variance'; "
+            f"got {action_loss_weighting!r}."
+        )
+    base_action_loss_weights = np.asarray(
+        (
+            action_loss_weights
+            if action_loss_weights is not None
+            else [1.0] * int(actions.shape[1])
+        ),
+        dtype=np.float64,
+    )
+    if (
+        base_action_loss_weights.shape != (actions.shape[1],)
+        or not np.isfinite(base_action_loss_weights).all()
+        or np.any(base_action_loss_weights <= 0.0)
+    ):
+        raise ValueError(
+            "action_loss_weights must contain one finite positive value per "
+            f"action dimension; got {base_action_loss_weights}."
+        )
+    train_trajectory_ids = set(split_ids["train"])
+    training_mask = np.asarray(
+        [
+            str(trajectory_id) in train_trajectory_ids
+            for trajectory_id in np.asarray(transitions.trajectory_ids)
+        ],
+        dtype=bool,
+    )
+    if not np.any(training_mask):
+        raise RuntimeError("No training actions were available for loss weighting.")
+    training_action_variance = np.var(
+        actions[training_mask],
+        axis=0,
+        dtype=np.float64,
+    )
+    observation_normalization = bool(
+        getattr(policy, "observation_normalization", False)
+    )
+    observation_normalizer_mean: np.ndarray | None = None
+    observation_normalizer_std: np.ndarray | None = None
+    if observation_normalization:
+        training_observations = observations[training_mask]
+        observation_normalizer_mean = training_observations.mean(
+            axis=0, dtype=np.float64
+        ).astype(np.float32)
+        observation_normalizer_std = training_observations.std(
+            axis=0, dtype=np.float64
+        ).astype(np.float32)
+        observation_normalizer_std = np.maximum(
+            observation_normalizer_std,
+            1.0e-6,
+        ).astype(np.float32, copy=False)
+        setter = getattr(policy, "set_observation_normalizer", None)
+        if not callable(setter):
+            raise TypeError(
+                "Policy enables observation normalization without a normalizer setter."
+            )
+        setter(observation_normalizer_mean, observation_normalizer_std)
+    effective_action_loss_weights = base_action_loss_weights.copy()
+    if action_loss_weighting == "inverse_variance":
+        # Equalize standardized per-action error without allowing a near-zero
+        # variance dimension to produce an unbounded optimizer weight.
+        variance_floor = max(
+            1.0e-8,
+            float(np.max(training_action_variance)) * 1.0e-4,
+        )
+        effective_action_loss_weights = (
+            effective_action_loss_weights
+            / np.maximum(training_action_variance, variance_floor)
+        )
+    normalized_action_loss_weights = (
+        effective_action_loss_weights
+        / float(effective_action_loss_weights.mean())
+    ).astype(np.float32, copy=False)
+    if float(correlation_loss_weight) < 0.0 or float(variance_loss_weight) < 0.0:
+        raise ValueError("Anti-collapse loss weights must be non-negative.")
+
+    def _action_vector(
+        values: list[float] | tuple[float, ...] | np.ndarray | None,
+        *,
+        name: str,
+        default: float,
+    ) -> np.ndarray:
+        result = np.asarray(
+            [default] * int(actions.shape[1]) if values is None else values,
+            dtype=np.float64,
+        )
+        if result.shape != (actions.shape[1],) or not np.isfinite(result).all():
+            raise ValueError(
+                f"{name} must contain one finite value per action dimension; got {result}."
+            )
+        return result
+
+    training_minimum_std_ratios = _action_vector(
+        minimum_prediction_std_ratios,
+        name="minimum_prediction_std_ratios",
+        default=0.0,
+    )
+    selection_minimum_std_ratios = _action_vector(
+        selection_min_prediction_std_ratios,
+        name="selection_min_prediction_std_ratios",
+        default=0.0,
+    )
+    selection_minimum_correlations = _action_vector(
+        selection_min_prediction_correlations,
+        name="selection_min_prediction_correlations",
+        default=-1.0,
+    )
     optimizer = torch.optim.AdamW(policy.parameters(), lr=float(learning_rate), weight_decay=float(weight_decay))
     rng = np.random.default_rng(int(seed) + 1701)
     sequences_per_batch = max(1, int(sequences_per_batch))
@@ -436,7 +673,9 @@ def train_recurrent_behavior_clone(
     )
 
     best_epoch = 0
-    best_validation_mse = float("inf")
+    best_validation_selection_mse = float("inf")
+    best_selection_eligible = False
+    best_fallback_gate_margin = float("-inf")
     best_state_dict: dict[str, torch.Tensor] = {}
     history: list[dict[str, Any]] = []
     stale_epochs = 0
@@ -446,6 +685,9 @@ def train_recurrent_behavior_clone(
         ordered = [split_windows["train"][int(index)] for index in order]
         epoch_mse = 0.0
         epoch_mae = 0.0
+        epoch_objective = 0.0
+        epoch_correlation_loss = 0.0
+        epoch_variance_loss = 0.0
         epoch_samples = 0
         epoch_gradient_norm_sum = 0.0
         epoch_gradient_norm_max = 0.0
@@ -458,18 +700,34 @@ def train_recurrent_behavior_clone(
             optimizer.zero_grad(set_to_none=True)
             batch_mse = 0.0
             batch_mae = 0.0
+            batch_objective = 0.0
+            batch_correlation_loss = 0.0
+            batch_variance_loss = 0.0
             for micro_start in range(0, len(batch), micro_batch_sequences):
                 micro = batch[micro_start : micro_start + micro_batch_sequences]
-                mse, mae, count = _batched_sequence_loss(
+                loss_diagnostics: dict[str, Any] = {}
+                objective, mae, count = _batched_sequence_loss(
                     policy,
                     observations,
                     actions,
                     micro,
                     device=device,
+                    action_loss_weights=normalized_action_loss_weights,
+                    correlation_loss_weight=float(correlation_loss_weight),
+                    variance_loss_weight=float(variance_loss_weight),
+                    minimum_prediction_std_ratios=training_minimum_std_ratios,
+                    loss_diagnostics=loss_diagnostics,
                 )
-                (mse * (float(count) / float(batch_samples))).backward()
-                batch_mse += float(mse.detach().cpu()) * count
+                (objective * (float(count) / float(batch_samples))).backward()
+                batch_objective += float(loss_diagnostics["objective"]) * count
+                batch_mse += float(loss_diagnostics["base_mse"]) * count
                 batch_mae += float(mae.detach().cpu()) * count
+                batch_correlation_loss += (
+                    float(loss_diagnostics["correlation_loss"]) * count
+                )
+                batch_variance_loss += (
+                    float(loss_diagnostics["variance_loss"]) * count
+                )
             for group, norm in _gradient_group_norms(policy).items():
                 epoch_group_norm_sums[group] = epoch_group_norm_sums.get(group, 0.0) + norm
             clipping_threshold = float(max_grad_norm)
@@ -484,8 +742,11 @@ def train_recurrent_behavior_clone(
             if clipping_threshold > 0.0 and gradient_norm > clipping_threshold:
                 epoch_clipped_steps += 1
             optimizer.step()
+            epoch_objective += batch_objective
             epoch_mse += batch_mse
             epoch_mae += batch_mae
+            epoch_correlation_loss += batch_correlation_loss
+            epoch_variance_loss += batch_variance_loss
             epoch_samples += batch_samples
 
         validation = evaluate_recurrent_bc(
@@ -496,13 +757,95 @@ def train_recurrent_behavior_clone(
             micro_batch_sequences=micro_batch_sequences,
         )
         validation_mse = float(validation["mse"])
+        validation_selection_mse = float(
+            np.mean(
+                np.asarray(validation["action_mse"], dtype=np.float64)
+                * (
+                    normalized_action_loss_weights
+                    if normalized_action_loss_weights is not None
+                    else np.ones(actions.shape[1], dtype=np.float32)
+                )
+            )
+        )
         validation_skill = 1.0 - validation_mse / max(baseline_validation_mse, 1.0e-12)
-        improved = validation_mse < best_validation_mse
+        validation_std_ratios = np.asarray(
+            validation["prediction_std_ratio"], dtype=np.float64
+        )
+        validation_correlations = np.asarray(
+            validation["prediction_target_correlation"], dtype=np.float64
+        )
+        skill_threshold = (
+            float(selection_min_validation_skill)
+            if selection_min_validation_skill is not None
+            else float("-inf")
+        )
+        selection_eligible = bool(
+            validation_skill >= skill_threshold
+            and np.all(validation_std_ratios >= selection_minimum_std_ratios)
+            and np.all(validation_correlations >= selection_minimum_correlations)
+        )
+        fallback_penalty = float(
+            np.square(
+                np.maximum(
+                    selection_minimum_std_ratios - validation_std_ratios,
+                    0.0,
+                )
+            ).sum()
+            + np.square(
+                np.maximum(
+                    selection_minimum_correlations - validation_correlations,
+                    0.0,
+                )
+            ).sum()
+        )
+        normalized_gate_margins: list[float] = []
+        if np.isfinite(skill_threshold) and skill_threshold > 0.0:
+            normalized_gate_margins.append(validation_skill / skill_threshold)
+        normalized_gate_margins.extend(
+            float(value / threshold)
+            for value, threshold in zip(
+                validation_std_ratios,
+                selection_minimum_std_ratios,
+                strict=True,
+            )
+            if threshold > 0.0
+        )
+        normalized_gate_margins.extend(
+            float(value / threshold)
+            for value, threshold in zip(
+                validation_correlations,
+                selection_minimum_correlations,
+                strict=True,
+            )
+            if threshold > 0.0
+        )
+        fallback_gate_margin = min(normalized_gate_margins, default=0.0)
+        if selection_eligible:
+            improved = bool(
+                not best_selection_eligible
+                or validation_selection_mse < best_validation_selection_mse
+            )
+        else:
+            improved = bool(
+                not best_selection_eligible
+                and (
+                    fallback_gate_margin > best_fallback_gate_margin + 1.0e-12
+                    or (
+                        abs(fallback_gate_margin - best_fallback_gate_margin)
+                        <= 1.0e-12
+                        and validation_selection_mse < best_validation_selection_mse
+                    )
+                )
+            )
         row: dict[str, Any] = {
             "epoch": float(epoch),
+            "train_objective": epoch_objective / max(1, epoch_samples),
             "train_mse": epoch_mse / max(1, epoch_samples),
             "train_mae": epoch_mae / max(1, epoch_samples),
+            "train_correlation_loss": epoch_correlation_loss / max(1, epoch_samples),
+            "train_variance_loss": epoch_variance_loss / max(1, epoch_samples),
             "validation_mse": validation_mse,
+            "validation_selection_mse": validation_selection_mse,
             "validation_mae": float(validation["mae"]),
             "validation_baseline_mse": baseline_validation_mse,
             "validation_skill": validation_skill,
@@ -523,6 +866,24 @@ def train_recurrent_behavior_clone(
             "optimizer_steps": float(epoch_optimizer_steps),
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
             "max_grad_norm": float(max_grad_norm),
+            "action_loss_weights": (
+                normalized_action_loss_weights.tolist()
+            ),
+            "action_loss_weighting": action_loss_weighting,
+            "observation_normalization": observation_normalization,
+            "correlation_loss_weight": float(correlation_loss_weight),
+            "variance_loss_weight": float(variance_loss_weight),
+            "minimum_prediction_std_ratios": training_minimum_std_ratios.tolist(),
+            "selection_min_prediction_std_ratios": selection_minimum_std_ratios.tolist(),
+            "selection_min_prediction_correlations": selection_minimum_correlations.tolist(),
+            "selection_min_validation_skill": (
+                float(selection_min_validation_skill)
+                if selection_min_validation_skill is not None
+                else None
+            ),
+            "selection_eligible": selection_eligible,
+            "selection_fallback_penalty": fallback_penalty,
+            "selection_fallback_gate_margin": fallback_gate_margin,
             "is_best_so_far": improved,
         }
         history.append(row)
@@ -538,13 +899,19 @@ def train_recurrent_behavior_clone(
             f"clipped={row['gradient_clipped_fraction']:.3f} best={row['is_best_so_far']}"
         )
         if improved:
-            best_validation_mse = row["validation_mse"]
+            best_validation_selection_mse = row["validation_selection_mse"]
+            best_selection_eligible = bool(selection_eligible)
+            best_fallback_gate_margin = float(fallback_gate_margin)
             best_epoch = epoch
             best_state_dict = {name: value.detach().cpu().clone() for name, value in policy.state_dict().items()}
             stale_epochs = 0
         else:
             stale_epochs += 1
-        if int(early_stopping_patience) > 0 and stale_epochs >= int(early_stopping_patience):
+        if (
+            int(early_stopping_patience) > 0
+            and best_selection_eligible
+            and stale_epochs >= int(early_stopping_patience)
+        ):
             print(f"Early stopping after {epoch} epochs; best epoch was {best_epoch}.")
             break
 
@@ -573,6 +940,16 @@ def train_recurrent_behavior_clone(
         device=device,
         micro_batch_sequences=micro_batch_sequences,
     )
+    validation_selection_mse = float(
+        np.mean(
+            np.asarray(validation_metrics["action_mse"], dtype=np.float64)
+            * (
+                normalized_action_loss_weights
+                if normalized_action_loss_weights is not None
+                else np.ones(actions.shape[1], dtype=np.float32)
+            )
+        )
+    )
     skill = 1.0 - float(validation_metrics["mse"]) / max(baseline_validation_mse, 1.0e-12)
     initial_validation_mse = float(initial_validation["mse"])
     summary = {
@@ -588,11 +965,40 @@ def train_recurrent_behavior_clone(
         "train_mse": float(train_metrics["mse"]),
         "train_mae": float(train_metrics["mae"]),
         "validation_mse": float(validation_metrics["mse"]),
+        "validation_selection_mse": validation_selection_mse,
         "validation_mae": float(validation_metrics["mae"]),
         "test_mse": float(test_metrics["mse"]),
         "test_mae": float(test_metrics["mae"]),
         "validation_baseline_mse": baseline_validation_mse,
         "validation_skill": float(skill),
+        "action_loss_weights": (
+            normalized_action_loss_weights.tolist()
+        ),
+        "action_loss_weighting": action_loss_weighting,
+        "correlation_loss_weight": float(correlation_loss_weight),
+        "variance_loss_weight": float(variance_loss_weight),
+        "minimum_prediction_std_ratios": training_minimum_std_ratios.tolist(),
+        "selection_min_prediction_std_ratios": selection_minimum_std_ratios.tolist(),
+        "selection_min_prediction_correlations": selection_minimum_correlations.tolist(),
+        "selection_min_validation_skill": (
+            float(selection_min_validation_skill)
+            if selection_min_validation_skill is not None
+            else None
+        ),
+        "best_selection_eligible": bool(best_selection_eligible),
+        "best_fallback_gate_margin": float(best_fallback_gate_margin),
+        "training_action_variance": training_action_variance.tolist(),
+        "observation_normalization": observation_normalization,
+        "observation_normalizer_mean": (
+            observation_normalizer_mean.tolist()
+            if observation_normalizer_mean is not None
+            else None
+        ),
+        "observation_normalizer_std": (
+            observation_normalizer_std.tolist()
+            if observation_normalizer_std is not None
+            else None
+        ),
         "train_action_mse": train_metrics["action_mse"],
         "train_action_mae": train_metrics["action_mae"],
         "train_prediction_std": train_metrics["prediction_std"],

@@ -316,7 +316,9 @@ def _architecture_arguments(checkpoint: Path) -> dict[str, Any]:
     config = dict(payload.get("config") or {})
     names = (
         "policy_model", "hidden_size", "transformer_layers", "transformer_heads",
-        "transformer_dropout", "transformer_norm_first", "transformer_memory_tokens",
+        "transformer_dropout", "transformer_norm_first",
+        "transformer_observation_normalization",
+        "transformer_observation_tokenization", "transformer_memory_tokens",
         "transformer_memory_context_length", "transformer_use_causal_attention",
         "continuous_action_dim",
     )

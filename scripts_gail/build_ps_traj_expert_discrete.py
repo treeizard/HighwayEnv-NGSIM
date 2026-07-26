@@ -51,9 +51,20 @@ from scripts_gail.ps_gail.data import (  # noqa: E402
     ACTION_STEERING_ACCELERATION_KEY,
     scene_snapshot_features,
 )
+from scripts_gail.ps_gail.contracts import (  # noqa: E402
+    policy_observation_contract,
+    runtime_continuous_action_contract,
+)
 
 
 SCHEMA_VERSION = 3
+
+
+def continuous_action_contract() -> dict[str, Any]:
+    """Return the exact normalized-to-physical contract used by this process."""
+    contract = runtime_continuous_action_contract()
+    contract["source"] = "frozen_process_environment_and_shared_constants"
+    return contract
 
 
 def parse_args() -> argparse.Namespace:
@@ -780,6 +791,15 @@ def collect_expert_episode(
         "actions_steering_acceleration_columns": list(ACTION_STEERING_ACCELERATION_COLUMNS)
         if ACTION_STEERING_ACCELERATION_KEY in arrays
         else None,
+        "continuous_action_contract": (
+            continuous_action_contract()
+            if ACTION_CONTINUOUS_ENV_KEY in arrays
+            else None
+        ),
+        "policy_observation_contract": policy_observation_contract(
+            lidar_cells=int(args.cells),
+            maximum_range=float(args.maximum_range),
+        ),
         "controlled_vehicle_ids": sorted({int(v) for v in vehicle_ids}),
         "video_requested": bool(args.save_video),
     }
@@ -1308,6 +1328,11 @@ def main() -> None:
         "prebuilt_split": str(args.prebuilt_split),
         "action_mode": str(args.expert_control_mode),
         "trajectory_state_source": str(args.trajectory_state_source),
+        "observation_config": observation_config_from_args(args),
+        "policy_observation_contract": policy_observation_contract(
+            lidar_cells=int(args.cells),
+            maximum_range=float(args.maximum_range),
+        ),
         "allow_idm": bool(args.allow_idm),
         "control_all_vehicles": bool(args.control_all_vehicles),
         "percentage_controlled_vehicles": float(args.percentage_controlled_vehicles),
@@ -1330,6 +1355,9 @@ def main() -> None:
         "actions_steering_acceleration_columns": list(ACTION_STEERING_ACCELERATION_COLUMNS)
         if has_continuous_actions
         else None,
+        "continuous_action_contract": (
+            continuous_action_contract() if has_continuous_actions else None
+        ),
         "num_episodes": len(manifest_entries),
         "num_samples": int(total_samples),
         "episodes": manifest_entries,

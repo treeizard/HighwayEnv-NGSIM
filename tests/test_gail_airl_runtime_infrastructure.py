@@ -31,6 +31,8 @@ from scripts_gail.ps_gail.study import build_screening_trials, write_study_files
 from scripts_gail.ps_gail.training import rollouts
 from scripts_gail.ps_gail.training import evaluation
 from scripts_gail.ps_gail.validation import best_checkpoint_payload
+from scripts_gail.ps_gail.pilot import load_manifest, trial_argv
+from scripts_gail.monitor_gail_airl_us_pilot_runtime import project_run
 
 
 class _DummyEnv:
@@ -40,6 +42,185 @@ class _DummyEnv:
 
     def close(self) -> None:
         self.closed = True
+
+
+def test_locked_us_pilot_runtime_projection_and_job_shape():
+    rows = [
+        {"step": step, "perf/round_seconds": 100.0}
+        for step in range(2, 20)
+    ]
+    rows.append(
+        {
+            "step": 20,
+            "validation/vehicle_episodes": 4.0,
+            "validation/eval_env_reset_seconds": 4.0,
+            "validation/eval_policy_forward_seconds": 4.0,
+            "validation/eval_env_step_seconds": 32.0,
+        }
+    )
+    projection = project_run(
+        rows,
+        {
+            "safety_factor": 1.10,
+            "conservative_training_rounds": 650,
+            "planned_evaluation_vehicle_trajectories": 7440,
+        },
+        evaluation_parallelism=16,
+    )
+    assert projection["p95_nonvalidation_round_seconds"] == pytest.approx(100.0)
+    assert projection["eval_seconds_per_vehicle_trajectory"] == pytest.approx(10.0)
+    assert projection["evaluation_parallelism"] == pytest.approx(16.0)
+    assert projection["projected_evaluation_wall_seconds"] == pytest.approx(
+        7440 * 10 / 16
+    )
+    assert projection["projected_hours"] == pytest.approx(
+        1.10 * (650 * 100 + 7440 * 10 / 16) / 3600
+    )
+
+    recovery_rows = [
+        {"step": step, "perf/round_seconds": 80.0}
+        for step in range(102, 120)
+    ]
+    recovery_rows.append(
+        {
+            "step": 120,
+            "validation/vehicle_episodes": 4.0,
+            "validation/eval_env_reset_seconds": 4.0,
+            "validation/eval_policy_forward_seconds": 4.0,
+            "validation/eval_env_step_seconds": 32.0,
+        }
+    )
+    recovery_projection = project_run(
+        recovery_rows,
+        {
+            "gate_round": 20,
+            "safety_factor": 1.10,
+            "conservative_training_rounds": 650,
+            "planned_evaluation_vehicle_trajectories": 7440,
+        },
+        evaluation_parallelism=16,
+        measurement_start_round=100,
+    )
+    assert recovery_projection["round_samples"] == pytest.approx(18.0)
+    assert recovery_projection["measurement_start_round"] == pytest.approx(
+        100.0
+    )
+
+    repo = Path(__file__).resolve().parents[1]
+    runner = (repo / "hpc/slurm/script_full_training/run_gail_airl_us_pilot.bash").read_text()
+    submitter = (
+        repo / "hpc/slurm/script_full_training/submit_gail_airl_us_pilot.bash"
+    ).read_text()
+    assert "#SBATCH --gres=gpu:L40S:2" in runner
+    assert "#SBATCH --time=4-12:00:00" in runner
+    assert "#SBATCH --no-requeue" in runner
+    assert "--exclusive --exact --ntasks=1 --cpus-per-task=16 --mem=64G" in runner
+    assert "SLURM_ARRAY_TASK_ID" in runner
+    assert "--dependency" not in submitter
+    assert "--array" not in submitter
+    assert 'BC_JOB_ID="58391443"' in submitter
+
+
+def test_scratch_gail_runner_restores_proven_worker_geometry_and_no_bc(tmp_path):
+    repo = Path(__file__).resolve().parents[1]
+    runner = (
+        repo / "hpc/slurm/script_full_training/run_gail_us_scratch_depth.bash"
+    ).read_text()
+    submitter = (
+        repo / "hpc/slurm/script_full_training/submit_gail_us_scratch.bash"
+    ).read_text()
+    assert "#SBATCH --gres=gpu:L40S:1" in runner
+    assert "#SBATCH --cpus-per-task=32" in runner
+    assert "#SBATCH --mem=64G" in runner
+    assert "--cpus-per-task=32 --mem=64G" in runner
+    assert "(16, 2, 16, 2)" in runner
+    assert '--dependency="${UPSTREAM_DEPENDENCY}"' in submitter
+    assert '--dependency="afterok:${depth2_job}"' not in submitter
+    assert "depth_jobs_are_independent" in submitter
+    assert "--expert-data" in submitter
+    assert "--policy-recipe" in submitter
+    assert "--shared-policy-seed 0" in submitter
+    assert "--require-explicit-data-contracts" in submitter
+    assert "NGSIM_ACCELERATION_LIMIT_MPS2=5.0" in submitter
+    assert "validation_require_exact_horizon" in runner
+    assert "terminal_coverage_gate=0.95" in runner
+    assert "--gail-only --no-bc-initialization --num-rollout-workers 16" in submitter
+    assert "shared_dense_temporal_recurrent_transformer_v1" in submitter
+    assert "--array" not in submitter
+
+    zero_bc = {
+        "bc_pretrain_epochs": 0,
+        "policy_bc_regularization_coef": 0.0,
+        "policy_bc_regularization_final_coef": 0.0,
+        "policy_bc_regularization_decay_rounds": 0,
+    }
+    trials = [
+        {
+            "method": "gail",
+            "depth": depth,
+            "seed": seed,
+            "arguments": dict(zero_bc),
+        }
+        for depth, seed in ((2, 0), (3, 1))
+    ]
+    manifest_path = tmp_path / "scratch.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "scope": {
+                    "methods": ["gail"],
+                    "trial_count": 2,
+                    "uses_bc_initialization": False,
+                },
+                "initializers": [],
+                "trials": trials,
+            }
+        )
+    )
+    assert len(load_manifest(manifest_path)["trials"]) == 2
+
+    trials[0]["arguments"]["initial_policy_checkpoint"] = "/forbidden/bc.pt"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "scope": {
+                    "methods": ["gail"],
+                    "trial_count": 2,
+                    "uses_bc_initialization": False,
+                },
+                "initializers": [],
+                "trials": trials,
+            }
+        )
+    )
+    with pytest.raises(RuntimeError, match="contains a checkpoint"):
+        load_manifest(manifest_path)
+
+
+def test_locked_pilot_trial_argv_preserves_boolean_and_airl_specific_contract():
+    trial = {
+        "method": "airl",
+        "arguments": {
+            "algorithm_variant": "airl_bce",
+            "record_replay_diagnostics": False,
+            "evaluation_terminate_when_all_controlled_crashed": False,
+            "validation_require_exact_horizon": True,
+            "total_rounds": 600,
+        },
+        "trainer_arguments": {
+            "reward_batch_size": 4096,
+            "airl_log_prob_batch_size": 512,
+        },
+    }
+    argv = trial_argv(trial, python="/env/bin/python")
+    assert argv[:3] == ["/env/bin/python", "-m", "scripts_gail.train_simple_airl"]
+    assert "--no-record-replay-diagnostics" in argv
+    assert "--no-evaluation-terminate-when-all-controlled-crashed" in argv
+    assert "--validation-require-exact-horizon" in argv
+    assert argv[argv.index("--reward-batch-size") + 1] == "4096"
+    assert argv[argv.index("--airl-log-prob-batch-size") + 1] == "512"
 
 
 def test_training_env_propagates_explicit_exact_fast_modes(monkeypatch):

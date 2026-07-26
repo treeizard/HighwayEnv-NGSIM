@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -264,6 +265,7 @@ class TransformerActorCritic(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.1,
         norm_first: bool = False,
+        observation_normalization: bool = False,
         temporal_module: bool = False,
         temporal_kernel_size: int = 5,
         temporal_layers: int = 1,
@@ -278,6 +280,17 @@ class TransformerActorCritic(nn.Module):
         self.continuous_action_dim = int(continuous_action_dim)
         obs_dim = int(obs_dim)
         hidden_size = int(hidden_size)
+        self.obs_dim = obs_dim
+        self.observation_normalization = bool(observation_normalization)
+        if self.observation_normalization:
+            self.register_buffer(
+                "observation_normalizer_mean",
+                torch.zeros(self.obs_dim, dtype=torch.float32),
+            )
+            self.register_buffer(
+                "observation_normalizer_std",
+                torch.ones(self.obs_dim, dtype=torch.float32),
+            )
         self.centralized_critic = bool(centralized_critic)
         self.critic_obs_dim = int(critic_obs_dim if critic_obs_dim is not None else obs_dim)
         num_heads = max(1, int(num_heads))
@@ -344,7 +357,34 @@ class TransformerActorCritic(nn.Module):
         )
         self.value_head = nn.Linear(hidden_size, 1)
 
+    def set_observation_normalizer(
+        self,
+        mean: np.ndarray | torch.Tensor,
+        std: np.ndarray | torch.Tensor,
+    ) -> None:
+        if not self.observation_normalization:
+            raise RuntimeError("Observation normalization is disabled for this policy.")
+        mean_tensor = torch.as_tensor(
+            mean,
+            dtype=self.observation_normalizer_mean.dtype,
+            device=self.observation_normalizer_mean.device,
+        )
+        std_tensor = torch.as_tensor(
+            std,
+            dtype=self.observation_normalizer_std.dtype,
+            device=self.observation_normalizer_std.device,
+        )
+        if mean_tensor.shape != (self.obs_dim,) or std_tensor.shape != (self.obs_dim,):
+            raise ValueError("Observation normalizer must match obs_dim.")
+        self.observation_normalizer_mean.copy_(mean_tensor)
+        self.observation_normalizer_std.copy_(std_tensor.clamp_min(1.0e-6))
+
     def _encode_actor(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.observation_normalization:
+            obs = (
+                (obs - self.observation_normalizer_mean)
+                / self.observation_normalizer_std
+            ).clamp(min=-5.0, max=5.0)
         tokens = self.input_proj(obs.unsqueeze(-1))
         if self.temporal_mixer is not None:
             mixed = self.temporal_mixer(tokens.transpose(1, 2)).transpose(1, 2)
@@ -416,6 +456,9 @@ class RecurrentTransformerActorCritic(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.1,
         norm_first: bool = False,
+        observation_normalization: bool = False,
+        observation_tokenization: str = "semantic",
+        policy_head_init_std: float = -1.0,
         memory_tokens: int = 8,
         memory_context_length: int = 32,
         use_causal_attention: bool = True,
@@ -434,8 +477,27 @@ class RecurrentTransformerActorCritic(nn.Module):
         self.memory_context_length = max(1, int(memory_context_length))
         self.use_causal_attention = bool(use_causal_attention)
         self.norm_first = bool(norm_first)
+        self.observation_normalization = bool(observation_normalization)
+        self.observation_tokenization = str(observation_tokenization).lower()
+        if self.observation_tokenization not in {"semantic", "dense_temporal"}:
+            raise ValueError(
+                "observation_tokenization must be 'semantic' or "
+                f"'dense_temporal', got {observation_tokenization!r}."
+            )
+        self.dense_temporal_tokenization = (
+            self.observation_tokenization == "dense_temporal"
+        )
         self.centralized_critic = bool(centralized_critic)
         self.critic_obs_dim = int(critic_obs_dim if critic_obs_dim is not None else obs_dim)
+        if self.observation_normalization:
+            self.register_buffer(
+                "observation_normalizer_mean",
+                torch.zeros(self.obs_dim, dtype=torch.float32),
+            )
+            self.register_buffer(
+                "observation_normalizer_std",
+                torch.ones(self.obs_dim, dtype=torch.float32),
+            )
 
         num_heads = max(1, int(num_heads))
         if self.hidden_size % num_heads != 0:
@@ -449,8 +511,19 @@ class RecurrentTransformerActorCritic(nn.Module):
         lane_flat_dim = self.lane_camera_cells * self.lane_feature_dim
         sensor_dim = self.obs_dim - self.ego_dim
         lidar_flat_dim = sensor_dim - lane_flat_dim
-        self.semantic_tokenization = sensor_dim > lane_flat_dim and lidar_flat_dim > 0 and lidar_flat_dim % 2 == 0
-        if self.semantic_tokenization:
+        self.semantic_tokenization = bool(
+            not self.dense_temporal_tokenization
+            and sensor_dim > lane_flat_dim
+            and lidar_flat_dim > 0
+            and lidar_flat_dim % 2 == 0
+        )
+        if self.dense_temporal_tokenization:
+            self.lidar_feature_dim = 0
+            self.lidar_cells = 0
+            self.lane_flat_dim = 0
+            self.lidar_flat_dim = 0
+            self.max_current_tokens = 1
+        elif self.semantic_tokenization:
             self.lidar_feature_dim = 2
             self.lidar_cells = lidar_flat_dim // self.lidar_feature_dim
             self.lane_flat_dim = lane_flat_dim
@@ -478,6 +551,15 @@ class RecurrentTransformerActorCritic(nn.Module):
         self.ego_proj = nn.Linear(1, self.hidden_size)
         self.lidar_proj = nn.Linear(2, self.hidden_size)
         self.lane_proj = nn.Linear(3, self.hidden_size)
+        self.dense_observation_proj = (
+            nn.Sequential(
+                nn.Linear(self.obs_dim, self.hidden_size),
+                nn.LayerNorm(self.hidden_size),
+                nn.SiLU(),
+            )
+            if self.dense_temporal_tokenization
+            else None
+        )
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.hidden_size,
@@ -510,6 +592,13 @@ class RecurrentTransformerActorCritic(nn.Module):
             self.log_std = None
         else:
             raise ValueError(f"Unsupported action_mode={action_mode!r}.")
+        if float(policy_head_init_std) >= 0.0:
+            nn.init.normal_(
+                self.policy_head.weight,
+                mean=0.0,
+                std=float(policy_head_init_std),
+            )
+            nn.init.zeros_(self.policy_head.bias)
         self.critic_encoder = (
             make_centralized_critic_encoder(
                 self.critic_obs_dim,
@@ -551,11 +640,47 @@ class RecurrentTransformerActorCritic(nn.Module):
         ids = torch.full((int(batch_size), int(count)), int(token_type), dtype=torch.long, device=device)
         return self.type_embedding(ids)
 
+    def set_observation_normalizer(
+        self,
+        mean: np.ndarray | torch.Tensor,
+        std: np.ndarray | torch.Tensor,
+    ) -> None:
+        if not self.observation_normalization:
+            raise RuntimeError("Observation normalization is disabled for this policy.")
+        mean_tensor = torch.as_tensor(
+            mean,
+            dtype=self.observation_normalizer_mean.dtype,
+            device=self.observation_normalizer_mean.device,
+        )
+        std_tensor = torch.as_tensor(
+            std,
+            dtype=self.observation_normalizer_std.dtype,
+            device=self.observation_normalizer_std.device,
+        )
+        if mean_tensor.shape != (self.obs_dim,) or std_tensor.shape != (self.obs_dim,):
+            raise ValueError(
+                "Observation normalizer must match obs_dim: "
+                f"{tuple(mean_tensor.shape)}, {tuple(std_tensor.shape)} != {(self.obs_dim,)}."
+            )
+        if not torch.isfinite(mean_tensor).all() or not torch.isfinite(std_tensor).all():
+            raise ValueError("Observation normalizer contains non-finite values.")
+        self.observation_normalizer_mean.copy_(mean_tensor)
+        self.observation_normalizer_std.copy_(std_tensor.clamp_min(1.0e-6))
+
     def _build_current_tokens(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.observation_normalization:
+            obs = (
+                (obs - self.observation_normalizer_mean)
+                / self.observation_normalizer_std
+            ).clamp(min=-5.0, max=5.0)
         batch_size = int(obs.shape[0])
         policy = self.policy_token.expand(batch_size, -1, -1)
         policy = policy + self._type_tokens(0, batch_size, 1, obs.device)
-        if self.semantic_tokenization:
+        if self.dense_temporal_tokenization:
+            if self.dense_observation_proj is None:
+                raise RuntimeError("Dense temporal tokenization has no observation encoder.")
+            tokens = policy + self.dense_observation_proj(obs).unsqueeze(1)
+        elif self.semantic_tokenization:
             lidar = obs[:, : self.lidar_flat_dim].reshape(batch_size, self.lidar_cells, 2)
             lane_start = self.lidar_flat_dim
             lane_end = lane_start + self.lane_flat_dim
@@ -709,6 +834,138 @@ class RecurrentTransformerActorCritic(nn.Module):
         return policy_out, values
 
 
+class RecurrentGRUActorCritic(nn.Module):
+    """Conventional recurrent regressor with the shared rollout memory API."""
+
+    supports_recurrent_memory = True
+
+    def __init__(
+        self,
+        obs_dim: int,
+        hidden_size: int,
+        *,
+        action_mode: str = "continuous",
+        continuous_action_dim: int = 2,
+        observation_normalization: bool = True,
+        memory_context_length: int = 32,
+    ) -> None:
+        super().__init__()
+        self.action_mode = str(action_mode).lower()
+        if self.action_mode != "continuous":
+            raise ValueError("RecurrentGRUActorCritic supports continuous actions only.")
+        self.obs_dim = int(obs_dim)
+        self.hidden_size = int(hidden_size)
+        self.continuous_action_dim = int(continuous_action_dim)
+        self.observation_normalization = bool(observation_normalization)
+        self.memory_context_length = max(1, int(memory_context_length))
+        self.memory_tokens = 1
+        if self.observation_normalization:
+            self.register_buffer(
+                "observation_normalizer_mean",
+                torch.zeros(self.obs_dim, dtype=torch.float32),
+            )
+            self.register_buffer(
+                "observation_normalizer_std",
+                torch.ones(self.obs_dim, dtype=torch.float32),
+            )
+        self.input_encoder = nn.Sequential(
+            nn.Linear(self.obs_dim, self.hidden_size),
+            nn.LayerNorm(self.hidden_size),
+            nn.SiLU(),
+        )
+        self.memory_gru = nn.GRUCell(self.hidden_size, self.hidden_size)
+        self.policy_head = nn.Linear(self.hidden_size, self.continuous_action_dim)
+        self.log_std = nn.Parameter(
+            torch.full((self.continuous_action_dim,), -0.5)
+        )
+        self.value_head = nn.Linear(self.hidden_size, 1)
+
+    def set_observation_normalizer(
+        self,
+        mean: np.ndarray | torch.Tensor,
+        std: np.ndarray | torch.Tensor,
+    ) -> None:
+        if not self.observation_normalization:
+            raise RuntimeError("Observation normalization is disabled for this policy.")
+        mean_tensor = torch.as_tensor(
+            mean,
+            dtype=self.observation_normalizer_mean.dtype,
+            device=self.observation_normalizer_mean.device,
+        )
+        std_tensor = torch.as_tensor(
+            std,
+            dtype=self.observation_normalizer_std.dtype,
+            device=self.observation_normalizer_std.device,
+        )
+        if mean_tensor.shape != (self.obs_dim,) or std_tensor.shape != (self.obs_dim,):
+            raise ValueError("Observation normalizer must match obs_dim.")
+        self.observation_normalizer_mean.copy_(mean_tensor)
+        self.observation_normalizer_std.copy_(std_tensor.clamp_min(1.0e-6))
+
+    def initial_memory(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        return torch.zeros(
+            (int(batch_size), self.memory_context_length, 1, self.hidden_size),
+            dtype=dtype or self.policy_head.weight.dtype,
+            device=device or self.policy_head.weight.device,
+        )
+
+    def _encode(
+        self,
+        obs: torch.Tensor,
+        memory: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.observation_normalization:
+            obs = (
+                (obs - self.observation_normalizer_mean)
+                / self.observation_normalizer_std
+            ).clamp(min=-5.0, max=5.0)
+        encoded = self.input_encoder(obs)
+        if memory is None:
+            previous = torch.zeros_like(encoded)
+        else:
+            if memory.ndim == 3:
+                memory = memory.unsqueeze(1)
+            if memory.ndim != 4 or memory.shape[-2:] != (1, self.hidden_size):
+                raise ValueError(
+                    "Recurrent GRU memory must have shape "
+                    f"[B, T, 1, {self.hidden_size}], got {tuple(memory.shape)}."
+                )
+            previous = memory[:, -1, 0].to(
+                device=obs.device,
+                dtype=obs.dtype,
+            )
+        return self.memory_gru(encoded, previous)
+
+    def actor(
+        self,
+        obs: torch.Tensor,
+        memory: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return torch.tanh(self.policy_head(self._encode(obs, memory)))
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        critic_obs: torch.Tensor | None = None,
+        *,
+        memory: torch.Tensor | None = None,
+        return_memory: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del critic_obs
+        encoded = self._encode(obs, memory)
+        actions = torch.tanh(self.policy_head(encoded))
+        values = self.value_head(encoded).squeeze(-1)
+        if return_memory:
+            return actions, values, encoded.unsqueeze(1)
+        return actions, values
+
+
 def make_actor_critic(
     policy_model: str,
     obs_dim: int,
@@ -720,6 +977,9 @@ def make_actor_critic(
     transformer_heads: int = 4,
     transformer_dropout: float = 0.1,
     transformer_norm_first: bool = False,
+    transformer_observation_normalization: bool = False,
+    transformer_observation_tokenization: str = "semantic",
+    policy_head_init_std: float = -1.0,
     transformer_temporal_module: bool = False,
     transformer_temporal_kernel_size: int = 5,
     transformer_temporal_layers: int = 1,
@@ -733,6 +993,15 @@ def make_actor_critic(
     central_critic_attention_heads: int = 4,
 ) -> nn.Module:
     model_name = str(policy_model).lower()
+    if model_name == "recurrent_gru":
+        return RecurrentGRUActorCritic(
+            obs_dim,
+            hidden_size,
+            action_mode=action_mode,
+            continuous_action_dim=continuous_action_dim,
+            observation_normalization=transformer_observation_normalization,
+            memory_context_length=transformer_memory_context_length,
+        )
     if model_name == "mlp":
         return SharedActorCritic(
             obs_dim,
@@ -755,6 +1024,7 @@ def make_actor_critic(
             num_heads=transformer_heads,
             dropout=transformer_dropout,
             norm_first=transformer_norm_first,
+            observation_normalization=transformer_observation_normalization,
             temporal_module=transformer_temporal_module,
             temporal_kernel_size=transformer_temporal_kernel_size,
             temporal_layers=transformer_temporal_layers,
@@ -774,6 +1044,9 @@ def make_actor_critic(
             num_heads=transformer_heads,
             dropout=transformer_dropout,
             norm_first=transformer_norm_first,
+            observation_normalization=transformer_observation_normalization,
+            observation_tokenization=transformer_observation_tokenization,
+            policy_head_init_std=policy_head_init_std,
             memory_tokens=transformer_memory_tokens,
             memory_context_length=transformer_memory_context_length,
             use_causal_attention=transformer_use_causal_attention,

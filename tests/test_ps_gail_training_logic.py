@@ -77,11 +77,6 @@ except ModuleNotFoundError:
     sys.modules["gymnasium.utils"] = utils
     sys.modules["gymnasium.wrappers"] = wrappers
 
-fake_envs = types.ModuleType("scripts_gail.ps_gail.envs")
-fake_envs.controlled_vehicle_snapshot = lambda _env: ([], np.zeros((0, 3), dtype=np.float32))
-fake_envs.make_training_env = lambda *args, **kwargs: None
-sys.modules.setdefault("scripts_gail.ps_gail.envs", fake_envs)
-
 from scripts_gail.ps_gail.config import PSGAILConfig
 from scripts_gail.ps_gail.data import (
     ACTION_CONTINUOUS_ENV_COLUMNS,
@@ -2558,6 +2553,51 @@ def test_ps_gail_collision_mode_schedule_keeps_mixed_termination_enabled():
     ]
 
 
+def test_vehicle_increase_soft_collision_gate_is_local_and_non_destructive():
+    cfg = PSGAILConfig(
+        controlled_vehicle_curriculum=True,
+        controlled_vehicle_schedule="1:3:10:10;4:7:20:20;8:12:30:30",
+        collision_mode_schedule="1:12:full",
+        enable_collision=True,
+        terminate_when_all_controlled_crashed=True,
+        collision_proxy_penalty_coef=1.0,
+        vehicle_increase_soft_collision_rounds=2,
+    )
+
+    round_cfgs = [ps_gail_config_for_round(cfg, round_idx) for round_idx in range(1, 11)]
+
+    assert [item.vehicle_increase_soft_collision_active for item in round_cfgs] == [
+        True,
+        True,
+        False,
+        True,
+        True,
+        False,
+        False,
+        True,
+        True,
+        False,
+    ]
+    assert [item.enable_collision for item in round_cfgs] == [
+        False,
+        False,
+        True,
+        False,
+        False,
+        True,
+        True,
+        False,
+        False,
+        True,
+    ]
+    assert all(
+        not item.terminate_when_all_controlled_crashed
+        for item in round_cfgs
+        if item.vehicle_increase_soft_collision_active
+    )
+    assert all(item.collision_proxy_penalty_coef == 1.0 for item in round_cfgs)
+
+
 def test_constant_rollout_target_agent_steps_remains_supported():
     cfg = PSGAILConfig(
         controlled_vehicle_curriculum=True,
@@ -2971,6 +3011,31 @@ def test_weighted_validation_score_prefers_lower_rmse_and_safety_rates():
     assert bad_components["lane_offset_rmse"] == pytest.approx(0.3)
 
 
+def test_matched_evaluation_fixed_horizon_ignores_terminal_but_not_truncation():
+    fixed_horizon_cfg = PSGAILConfig(
+        evaluation_terminate_when_all_controlled_crashed=False,
+    )
+    assert not eval_mod._evaluation_should_stop(
+        fixed_horizon_cfg,
+        terminated=True,
+        truncated=False,
+    )
+    assert eval_mod._evaluation_should_stop(
+        fixed_horizon_cfg,
+        terminated=True,
+        truncated=True,
+    )
+
+    terminating_cfg = PSGAILConfig(
+        evaluation_terminate_when_all_controlled_crashed=True,
+    )
+    assert eval_mod._evaluation_should_stop(
+        terminating_cfg,
+        terminated=True,
+        truncated=False,
+    )
+
+
 def test_matched_validation_reports_crash_agent_fraction_separately_from_incidence():
     squared = {
         20: {"x": [], "y": [], "position": [], "speed": [], "lane_offset": []}
@@ -3002,7 +3067,40 @@ def test_matched_validation_reports_crash_agent_fraction_separately_from_inciden
     assert metrics["validation/collision_rate"] == pytest.approx(1.0)
 
 
-def test_validation_score_uses_crash_agent_fraction_before_vehicle_crash_rate():
+def test_all_vehicle_event_rates_use_vehicle_and_agent_exposure_denominators():
+    squared = {
+        20: {"x": [], "y": [], "position": [], "speed": [], "lane_offset": []}
+    }
+    final_squared = {"x": [], "y": [], "position": [], "speed": [], "lane_offset": []}
+    metrics = eval_mod._matched_eval_metrics(
+        prefix="validation",
+        attempted_episodes=2,
+        evaluated_episodes=2,
+        skipped_missing_expert=0,
+        skipped_bad_reference=0,
+        skipped_empty_rollout=0,
+        total_steps=1_000,
+        collision_steps=120,
+        offroad_steps=30,
+        hard_brake_steps=50,
+        episode_lengths=[200, 200],
+        squared=squared,
+        final_squared=final_squared,
+        horizons=[20],
+        crashed_vehicle_episodes=6,
+        offroad_vehicle_episodes=3,
+        vehicle_episodes=60,
+    )
+
+    assert metrics["validation/controlled_vehicle_rate_denominator"] == 60
+    assert metrics["validation/vehicle_crash_rate"] == pytest.approx(0.1)
+    assert metrics["validation/vehicle_offroad_rate"] == pytest.approx(0.05)
+    assert metrics["validation/controlled_vehicle_agent_steps"] == 1_000
+    assert metrics["validation/collision_agent_step_rate"] == pytest.approx(0.12)
+    assert metrics["validation/hard_brake_agent_step_rate"] == pytest.approx(0.05)
+
+
+def test_validation_score_uses_explicit_duration_crash_metric_by_default():
     cfg = PSGAILConfig()
     cfg.validation_score_position_weight = 0.0
     cfg.validation_score_speed_weight = 0.0
@@ -3024,8 +3122,82 @@ def test_validation_score_uses_crash_agent_fraction_before_vehicle_crash_rate():
 
     assert cost == pytest.approx(1.0)
     assert score == pytest.approx(-1.0)
-    assert scored["validation/score_component_crash_agent_fraction"] == pytest.approx(0.04)
+    assert scored["validation/score_component_crash_rate"] == pytest.approx(0.04)
     assert scored["validation/score_component_vehicle_crash_rate"] == pytest.approx(1.0)
+
+
+def test_strict_validation_requires_exact_horizon_coverage_and_vehicle_crash_rate():
+    cfg = PSGAILConfig(
+        validation_require_exact_horizon=True,
+        validation_min_horizon_coverage=0.95,
+        validation_score_crash_metric="vehicle",
+        validation_score_position_weight=0.0,
+        validation_score_speed_weight=0.0,
+        validation_score_lane_offset_weight=0.0,
+        validation_score_crash_weight=25.0,
+        validation_score_offroad_weight=0.0,
+        validation_score_hard_brake_weight=0.0,
+    )
+    metrics = {
+        "validation/rmse_position_final": 0.0,
+        "validation/rmse_speed_final": 0.0,
+        "validation/rmse_lane_offset_final": 0.0,
+        "validation/collision_duration_rate": 0.0,
+        "validation/vehicle_crash_rate": 1.0,
+        "validation/vehicle_offroad_rate": 0.0,
+        "validation/hard_brake_rate": 0.0,
+        "validation/horizon_coverage_20s": 1.0,
+    }
+    missing_cost, missing_score, _ = validation_cost_and_score(metrics, cfg)
+    assert missing_cost == float("inf")
+    assert missing_score == float("-inf")
+
+    metrics.update(
+        {
+            "validation/rmse_position_20s": 0.0,
+            "validation/rmse_speed_20s": 0.0,
+            "validation/rmse_lane_offset_20s": 0.0,
+            "validation/horizon_coverage_20s": 0.75,
+        }
+    )
+    low_coverage_cost, low_coverage_score, _ = validation_cost_and_score(metrics, cfg)
+    assert low_coverage_cost == float("inf")
+    assert low_coverage_score == float("-inf")
+
+    metrics["validation/horizon_coverage_20s"] = 1.0
+    cost, score, components = validation_cost_and_score(metrics, cfg)
+    assert cost == pytest.approx(25.0)
+    assert score == pytest.approx(-25.0)
+    assert components["crash_rate"] == pytest.approx(1.0)
+
+
+def test_matched_validation_reports_deterministic_action_moments():
+    squared = {
+        20: {"x": [], "y": [], "position": [], "speed": [], "lane_offset": []}
+    }
+    final_squared = {"x": [], "y": [], "position": [], "speed": [], "lane_offset": []}
+    metrics = eval_mod._matched_eval_metrics(
+        prefix="test",
+        attempted_episodes=1,
+        evaluated_episodes=1,
+        skipped_missing_expert=0,
+        skipped_bad_reference=0,
+        skipped_empty_rollout=0,
+        total_steps=2,
+        collision_steps=0,
+        offroad_steps=0,
+        hard_brake_steps=0,
+        episode_lengths=[2],
+        squared=squared,
+        final_squared=final_squared,
+        horizons=[20],
+        vehicle_episodes=1,
+        action_values=[[-1.0, 1.0], [0.25, 0.75]],
+    )
+    assert metrics["test/acceleration_action_mean"] == pytest.approx(0.0)
+    assert metrics["test/acceleration_action_std"] == pytest.approx(1.0)
+    assert metrics["test/steering_action_mean"] == pytest.approx(0.5)
+    assert metrics["test/steering_action_std"] == pytest.approx(0.25)
 
 
 def test_best_checkpoint_payload_carries_validation_metadata_and_model_state_keys():

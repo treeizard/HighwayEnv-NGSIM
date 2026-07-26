@@ -13,7 +13,13 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def make_source(root: Path, *, qualified: bool = True) -> Path:
+def make_source(
+    root: Path,
+    *,
+    qualified: bool = True,
+    policy_qualified: bool | None = None,
+    artifact_complete: bool | None = None,
+) -> Path:
     root.mkdir(parents=True)
     checkpoint = root / "best.pt"
     checkpoint.write_bytes(b"checkpoint")
@@ -26,6 +32,12 @@ def make_source(root: Path, *, qualified: bool = True) -> Path:
                 "transformer_layers": 2,
                 "seed": 2,
                 "metric_capability_passed": qualified,
+                "capability_passed": (
+                    qualified if policy_qualified is None else policy_qualified
+                ),
+                "training_artifact_complete": (
+                    qualified if artifact_complete is None else artifact_complete
+                ),
                 "checkpoint_sha256": checkpoint_digest,
             }
         )
@@ -59,10 +71,48 @@ def test_archive_is_verified_atomic_read_only_and_overwrite_safe(tmp_path):
 
 def test_archive_rejects_unqualified_checkpoint(tmp_path):
     source = make_source(tmp_path / "source", qualified=False)
-    with pytest.raises(ValueError, match="not learning-qualified"):
+    with pytest.raises(
+        ValueError,
+        match="does not satisfy metric_capability_passed",
+    ):
         archive_bc_checkpoints(
             [source],
             destination_root=tmp_path / "archive",
             archive_id="study",
             label="test",
         )
+
+
+def test_policy_archive_rejects_metric_only_checkpoint(tmp_path):
+    source = make_source(
+        tmp_path / "source",
+        qualified=True,
+        policy_qualified=False,
+    )
+    with pytest.raises(ValueError, match="does not satisfy capability_passed"):
+        archive_bc_checkpoints(
+            [source],
+            destination_root=tmp_path / "archive",
+            archive_id="study",
+            label="test",
+            qualification_field="capability_passed",
+        )
+
+
+def test_complete_artifact_archive_keeps_checkpoint_when_rollout_gate_fails(tmp_path):
+    source = make_source(
+        tmp_path / "source",
+        qualified=True,
+        policy_qualified=False,
+        artifact_complete=True,
+    )
+    result = archive_bc_checkpoints(
+        [source],
+        destination_root=tmp_path / "archive",
+        archive_id="study",
+        label="BC interpretability reference",
+        qualification_field="training_artifact_complete",
+    )
+
+    assert result["checkpoint_count"] == 1
+    assert result["qualification"] == "training_artifact_complete"

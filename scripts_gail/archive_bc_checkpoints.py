@@ -35,8 +35,20 @@ def archive_bc_checkpoints(
     destination_root: Path,
     archive_id: str,
     label: str,
+    qualification_field: str = "metric_capability_passed",
 ) -> dict[str, Any]:
     """Copy qualified cells into one checksummed, read-only archive directory."""
+    qualification_field = str(qualification_field)
+    if qualification_field not in {
+        "training_artifact_complete",
+        "metric_capability_passed",
+        "capability_passed",
+    }:
+        raise ValueError(
+            "qualification_field must be training_artifact_complete, "
+            "metric_capability_passed, or capability_passed; "
+            f"got {qualification_field!r}"
+        )
     destination_root = destination_root.resolve()
     final_dir = destination_root / archive_id
     if final_dir.exists():
@@ -50,8 +62,11 @@ def archive_bc_checkpoints(
             summary_path = source / "summary.json"
             checkpoint_path = source / "best.pt"
             summary = _read_json(summary_path)
-            if not bool(summary.get("metric_capability_passed")):
-                raise ValueError(f"Checkpoint is not learning-qualified: {checkpoint_path}")
+            if not bool(summary.get(qualification_field)):
+                raise ValueError(
+                    f"Checkpoint does not satisfy {qualification_field}: "
+                    f"{checkpoint_path}"
+                )
             expected_digest = str(summary.get("checkpoint_sha256") or "")
             actual_digest = sha256_file(checkpoint_path)
             if not expected_digest or expected_digest != actual_digest:
@@ -92,7 +107,7 @@ def archive_bc_checkpoints(
             "schema_version": 1,
             "archive_id": archive_id,
             "label": label,
-            "qualification": "metric_capability_passed",
+            "qualification": qualification_field,
             "checkpoint_count": len(records),
             "checkpoints": records,
         }

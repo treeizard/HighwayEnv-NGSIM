@@ -10,11 +10,16 @@ from scripts_gail import build_gail_airl_study
 from scripts_gail.ps_gail.config import PSGAILConfig
 from scripts_gail.ps_gail.experiment import (
     config_hash,
+    policy_relative_l2_delta,
     resolve_algorithm_variant,
     write_evaluation_summary,
     write_run_manifest,
 )
-from scripts_gail.ps_gail.health import TrainingHealthMonitor
+from scripts_gail.ps_gail.health import (
+    TrainingHealthMonitor,
+    partition_health_reasons,
+)
+from scripts_gail.ps_gail.monitoring import WandbMonitor
 from scripts_gail.ps_gail.study import (
     assess_evaluation_summary,
     build_screening_trials,
@@ -191,6 +196,12 @@ def test_training_health_gate_uses_consecutive_failures():
         "discriminator_saturated",
         "adversarial_reward_collapsed",
     }
+    fatal, warnings = partition_health_reasons(second)
+    assert fatal == [
+        "target_kl_repeatedly_exceeded",
+        "adversarial_reward_collapsed",
+    ]
+    assert warnings == ["discriminator_saturated"]
     assert monitor.observe(
         cfg,
         approx_kl=0.0,
@@ -212,6 +223,73 @@ def test_training_health_gate_uses_consecutive_failures():
         score=-7.0,
         best_score=0.0,
     ) == ["validation_score_repeatedly_regressed"]
+
+
+def test_learning_health_gate_requires_post_initializer_improvement():
+    cfg = PSGAILConfig(
+        health_learning_gate_round=20,
+        health_min_best_round=20,
+        health_min_relative_validation_improvement=0.02,
+    )
+    monitor = TrainingHealthMonitor()
+    assert monitor.observe_learning(
+        cfg,
+        round_idx=19,
+        initial_score=-100.0,
+        best_score=-100.0,
+        best_round=0,
+    ) == []
+    assert monitor.observe_learning(
+        cfg,
+        round_idx=20,
+        initial_score=-100.0,
+        best_score=-99.0,
+        best_round=20,
+    ) == ["validation_did_not_meet_learning_improvement_gate"]
+    assert monitor.observe_learning(
+        cfg,
+        round_idx=20,
+        initial_score=-100.0,
+        best_score=-97.9,
+        best_round=20,
+    ) == []
+
+
+def test_policy_delta_and_durable_compact_metric_reporting(tmp_path):
+    initializer = {"weight": torch.tensor([1.0, 2.0])}
+    selected = {"weight": torch.tensor([2.0, 2.0])}
+    assert policy_relative_l2_delta(selected, initializer) == pytest.approx(1.0 / 5.0**0.5)
+
+    cfg = PSGAILConfig(
+        wandb_mode="disabled",
+        discriminator_loss="bce",
+        wandb_compact_metrics=True,
+    )
+    monitor = WandbMonitor(cfg, str(tmp_path), trainer="gail")
+    monitor.log(
+        {
+            "rollout/mean_reward": 2.0,
+            "rollout/crash_agent_fraction": 0.1,
+            "discriminator/expert_acc": 0.75,
+            "misdefined/noise": 999.0,
+            "nonfinite": float("nan"),
+        },
+        step=1,
+    )
+    monitor.log({"validation/score": -3.0}, step=1)
+    compact = monitor._compact_metrics(monitor._pending_metrics)
+    assert compact["reward/training_mean"] == pytest.approx(2.0)
+    assert compact["rollout/crash_transition_fraction"] == pytest.approx(0.1)
+    assert compact["discriminator/expert_accuracy"] == pytest.approx(0.75)
+    assert "misdefined/noise" not in compact
+    assert "nonfinite" not in compact
+    monitor.finish()
+
+    rows = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["step"] == 1
+    assert rows[0]["validation/score"] == pytest.approx(-3.0)
+    assert rows[0]["nonfinite"] is None
 
 
 def test_study_cli_requires_and_propagates_validated_bc_architecture(tmp_path, monkeypatch):
