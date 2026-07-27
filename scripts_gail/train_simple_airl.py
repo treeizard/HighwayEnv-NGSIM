@@ -4,20 +4,15 @@ from __future__ import annotations
 import argparse
 import os
 import random
-import sys
 import time
 import warnings
-from dataclasses import dataclass
-from dataclasses import fields
-from dataclasses import replace
+from dataclasses import dataclass, fields, replace
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from scripts_gail.ps_gail.config import PSGAILConfig, should_save_checkpoint_video
-from scripts_gail.ps_gail.contracts import validate_training_data_contracts
 from scripts_gail.ps_gail.checkpoints import (
     assert_policy_architecture_matches_checkpoint,
     atomic_torch_save,
@@ -27,6 +22,8 @@ from scripts_gail.ps_gail.checkpoints import (
     resume_config_hash,
     verify_resume_checkpoint,
 )
+from scripts_gail.ps_gail.config import PSGAILConfig, should_save_checkpoint_video
+from scripts_gail.ps_gail.contracts import validate_training_data_contracts
 from scripts_gail.ps_gail.data import load_expert_transition_data
 from scripts_gail.ps_gail.envs import make_training_env
 from scripts_gail.ps_gail.experiment import (
@@ -37,10 +34,13 @@ from scripts_gail.ps_gail.experiment import (
     write_run_manifest,
     write_training_failure,
 )
-from scripts_gail.ps_gail.health import TrainingHealthMonitor, partition_health_reasons
+from scripts_gail.ps_gail.health import (
+    TrainingHealthMonitor,
+    health_warning_metrics,
+    partition_health_reasons,
+)
+from scripts_gail.ps_gail.models import make_actor_critic, make_relu_mlp
 from scripts_gail.ps_gail.monitoring import WandbMonitor
-from scripts_gail.ps_gail.models import make_actor_critic
-from scripts_gail.ps_gail.models import make_relu_mlp
 from scripts_gail.ps_gail.observations import flatten_agent_observations, policy_observations_from_flat
 from scripts_gail.ps_gail.schedule import config_for_round
 from scripts_gail.ps_gail.trainer import (
@@ -2122,9 +2122,7 @@ def main() -> None:
                 "perf/airl_reward_update_seconds": float(reward_stats["reward_update_seconds"]),
                 "perf/airl_refresh_rewards_seconds": float(refresh_seconds),
                 "perf/policy_update_seconds": float(policy_seconds),
-                "health/discriminator_saturation_warning": int(
-                    "discriminator_saturated" in health_warnings
-                ),
+                **health_warning_metrics(health_monitor, health_warnings),
                 "perf/airl_replay_append_seconds": float(replay_append_seconds),
                 "perf/airl_reward_train_samples": float(reward_stats["reward_train_samples"]),
                 "perf/airl_reward_batches_per_update": float(reward_stats["reward_batches_per_update"]),

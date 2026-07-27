@@ -5,7 +5,6 @@ import argparse
 import os
 import random
 import signal
-import sys
 import time
 import warnings
 from dataclasses import fields
@@ -15,8 +14,6 @@ import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical, Independent, Normal
 
-from scripts_gail.ps_gail.config import PSGAILConfig, should_save_checkpoint_video
-from scripts_gail.ps_gail.contracts import validate_training_data_contracts
 from scripts_gail.ps_gail.checkpoints import (
     assert_policy_architecture_matches_checkpoint,
     atomic_torch_save,
@@ -26,6 +23,8 @@ from scripts_gail.ps_gail.checkpoints import (
     resume_config_hash,
     verify_resume_checkpoint,
 )
+from scripts_gail.ps_gail.config import PSGAILConfig, should_save_checkpoint_video
+from scripts_gail.ps_gail.contracts import validate_training_data_contracts
 from scripts_gail.ps_gail.data import (
     fit_feature_standardizer,
     load_expert_policy_and_disc_data,
@@ -43,8 +42,11 @@ from scripts_gail.ps_gail.experiment import (
     write_run_manifest,
     write_training_failure,
 )
-from scripts_gail.ps_gail.health import TrainingHealthMonitor, partition_health_reasons
-from scripts_gail.ps_gail.monitoring import WandbMonitor
+from scripts_gail.ps_gail.health import (
+    TrainingHealthMonitor,
+    health_warning_metrics,
+    partition_health_reasons,
+)
 from scripts_gail.ps_gail.models import (
     SceneDiscriminator,
     SequenceTrajectoryDiscriminator,
@@ -52,6 +54,7 @@ from scripts_gail.ps_gail.models import (
     TrajectoryDiscriminator,
     make_actor_critic,
 )
+from scripts_gail.ps_gail.monitoring import WandbMonitor
 from scripts_gail.ps_gail.observations import flatten_agent_observations, policy_observations_from_flat
 from scripts_gail.ps_gail.schedule import config_for_round
 from scripts_gail.ps_gail.steering_diagnostics import (
@@ -62,13 +65,14 @@ from scripts_gail.ps_gail.steering_diagnostics import (
     steering_vendi_metrics,
 )
 from scripts_gail.ps_gail.trainer import (
+    _shift_recurrent_memory,
     action_conditioned_features,
     collect_round_rollouts,
     configure_policy_action_std,
     discrete_action_masks_from_env,
     discriminator_input_mode,
-    evaluation_thread_context,
     evaluate_policy_matched_trajectories,
+    evaluation_thread_context,
     fit_policy_observation_normalizer,
     infer_continuous_action_dim,
     infer_critic_obs_dim,
@@ -77,7 +81,6 @@ from scripts_gail.ps_gail.trainer import (
     make_rollout_executor,
     policy_action_dim,
     recurrent_policy_enabled,
-    _shift_recurrent_memory,
     refresh_rollout_rewards,
     resolve_device,
     set_optimizer_lr,
@@ -91,7 +94,6 @@ from scripts_gail.ps_gail.validation import (
     scored_validation_metrics,
 )
 from scripts_gail.ps_gail.vendi import safe_sequence_window_mask, vendi_score
-
 
 _GRACEFUL_STOP_REQUESTED = False
 
@@ -2122,12 +2124,15 @@ def main() -> None:
                 "policy/bc_regularization_coef": policy_stats["bc_regularization_coef"],
                 "policy/entropy": policy_stats["entropy"],
                 "policy/approx_kl": policy_stats["approx_kl"],
+                "policy/post_update_approx_kl": policy_stats["post_update_approx_kl"],
                 "policy/ppo_epochs_completed": policy_stats["ppo_epochs_completed"],
                 "policy/ppo_early_stopped_kl": policy_stats["ppo_early_stopped_kl"],
                 "policy/target_kl": policy_stats["target_kl"],
                 "policy/clip_fraction": policy_stats["clip_fraction"],
                 "policy/ratio_mean": policy_stats["ratio_mean"],
                 "policy/ratio_std": policy_stats["ratio_std"],
+                "policy/post_update_ratio_mean": policy_stats["post_update_ratio_mean"],
+                "policy/post_update_ratio_std": policy_stats["post_update_ratio_std"],
                 "policy/ppo_micro_batch_size": policy_stats["ppo_micro_batch_size"],
                 "policy/log_std_mean": policy_stats.get("log_std_mean", float("nan")),
                 "policy/action_std_param_mean": policy_stats.get("action_std_param_mean", float("nan")),
@@ -2242,9 +2247,7 @@ def main() -> None:
                 "perf/discriminator_update_seconds": float(discriminator_seconds),
                 "perf/reward_refresh_seconds": float(reward_refresh_seconds),
                 "perf/policy_update_seconds": float(policy_seconds),
-                "health/discriminator_saturation_warning": int(
-                    "discriminator_saturated" in health_warnings
-                ),
+                **health_warning_metrics(health_monitor, health_warnings),
             }
             if sequence_discriminator is not None:
                 metrics.update(sequence_interaction_metrics(rollout))

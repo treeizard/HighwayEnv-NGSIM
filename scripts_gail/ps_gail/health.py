@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from dataclasses import asdict
 import math
+from dataclasses import asdict, dataclass
 
 from .config import PSGAILConfig
+
+RECOVERABLE_HEALTH_REASONS = frozenset(
+    {
+        "discriminator_saturated",
+        "target_kl_repeatedly_exceeded",
+    }
+)
 
 
 @dataclass
@@ -138,19 +144,43 @@ def partition_health_reasons(reasons: list[str]) -> tuple[list[str], list[str]]:
 
     A highly accurate discriminator is evidence that expert and generator
     distributions remain separable; by itself it is not evidence that
-    optimization is numerically invalid or that the policy has collapsed.
-    Reward variance, action variance, KL and held-out learning gates retain
-    fail-closed behaviour.  Saturation is therefore recorded as a warning and
-    allowed to recover.
+    optimization is numerically invalid or that the policy has collapsed. A
+    finite repeated target-KL excess is likewise an update-size diagnostic:
+    PPO already stops the remaining optimizer epochs for that update. Both
+    conditions are recorded as warnings and allowed to recover. Non-finite
+    values and the remaining policy/learning gates retain fail-closed
+    behaviour.
     """
 
     warnings = [
-        str(reason) for reason in reasons if str(reason) == "discriminator_saturated"
+        str(reason) for reason in reasons if str(reason) in RECOVERABLE_HEALTH_REASONS
     ]
     fatal = [
-        str(reason) for reason in reasons if str(reason) != "discriminator_saturated"
+        str(reason) for reason in reasons if str(reason) not in RECOVERABLE_HEALTH_REASONS
     ]
     return fatal, warnings
 
 
-__all__ = ["TrainingHealthMonitor", "partition_health_reasons"]
+def health_warning_metrics(
+    monitor: TrainingHealthMonitor,
+    warnings: list[str],
+) -> dict[str, int]:
+    """Return durable audit metrics for recoverable health conditions."""
+
+    return {
+        "health/discriminator_saturation_warning": int(
+            "discriminator_saturated" in warnings
+        ),
+        "health/target_kl_warning": int(
+            "target_kl_repeatedly_exceeded" in warnings
+        ),
+        "health/target_kl_consecutive_violations": int(monitor.kl_violations),
+    }
+
+
+__all__ = [
+    "RECOVERABLE_HEALTH_REASONS",
+    "TrainingHealthMonitor",
+    "health_warning_metrics",
+    "partition_health_reasons",
+]

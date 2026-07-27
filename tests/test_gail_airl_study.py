@@ -5,7 +5,6 @@ import sys
 
 import pytest
 import torch
-
 from scripts_gail import build_gail_airl_study
 from scripts_gail.ps_gail.config import PSGAILConfig
 from scripts_gail.ps_gail.experiment import (
@@ -17,6 +16,7 @@ from scripts_gail.ps_gail.experiment import (
 )
 from scripts_gail.ps_gail.health import (
     TrainingHealthMonitor,
+    health_warning_metrics,
     partition_health_reasons,
 )
 from scripts_gail.ps_gail.monitoring import WandbMonitor
@@ -197,11 +197,16 @@ def test_training_health_gate_uses_consecutive_failures():
         "adversarial_reward_collapsed",
     }
     fatal, warnings = partition_health_reasons(second)
-    assert fatal == [
+    assert fatal == ["adversarial_reward_collapsed"]
+    assert warnings == [
         "target_kl_repeatedly_exceeded",
-        "adversarial_reward_collapsed",
+        "discriminator_saturated",
     ]
-    assert warnings == ["discriminator_saturated"]
+    assert health_warning_metrics(monitor, warnings) == {
+        "health/discriminator_saturation_warning": 1,
+        "health/target_kl_warning": 1,
+        "health/target_kl_consecutive_violations": 2,
+    }
     assert monitor.observe(
         cfg,
         approx_kl=0.0,
@@ -211,6 +216,9 @@ def test_training_health_gate_uses_consecutive_failures():
         action_std=0.2,
         extra_metrics={"value_loss": float("nan")},
     ) == ["nonfinite:value_loss"]
+    fatal, warnings = partition_health_reasons(["nonfinite:post_update_approx_kl"])
+    assert fatal == ["nonfinite:post_update_approx_kl"]
+    assert warnings == []
 
     validation_monitor = TrainingHealthMonitor()
     validation_cfg = PSGAILConfig(

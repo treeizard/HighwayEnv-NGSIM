@@ -165,6 +165,8 @@ class WandbMonitor:
             "policy/ppo_epochs_completed",
             "policy/ppo_early_stopped_kl",
             "policy/action_std_param_mean",
+            "health/target_kl_warning",
+            "health/target_kl_consecutive_violations",
             "train/policy_learning_rate",
             "train/disc_learning_rate",
             "train/reward_learning_rate",

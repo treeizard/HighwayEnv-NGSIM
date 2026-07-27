@@ -4,24 +4,24 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import math
-from pathlib import Path
 import shlex
 import subprocess
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import torch
 
+from scripts_gail.ps_gail.checkpoints import policy_architecture_contract
 from scripts_gail.ps_gail.pilot import (
     load_manifest,
     source_fingerprint,
     trial_argv,
     verify_manifest_inputs,
 )
-from scripts_gail.ps_gail.checkpoints import policy_architecture_contract
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,7 +79,6 @@ def _smoke_trial(
             "run_name": str(trial["trial_id"]),
             "total_rounds": rounds,
             "max_expert_samples": 1024,
-            "controlled_vehicle_schedule": f"1:{rounds}:2:2",
             "initial_controlled_vehicles": float(controlled_vehicles),
             "final_controlled_vehicles": float(controlled_vehicles),
             "controlled_vehicle_curriculum_rounds": rounds,
@@ -279,6 +278,8 @@ def main() -> None:
             "rollout/min_episode_length": float(args.episode_steps),
             "rollout/max_episode_length": float(args.episode_steps),
             "rollout/terminated": 0.0,
+            "health/target_kl_warning": 0.0,
+            "health/target_kl_consecutive_violations": 0.0,
         }
         for key, expected in expected_runtime.items():
             value = runtime_metrics.get(key)
@@ -312,6 +313,7 @@ def main() -> None:
             "rollout/normalized_gail_reward_std",
             "rollout/reward_std",
             "policy/approx_kl",
+            "policy/post_update_approx_kl",
             "policy/action_std_param_mean",
         ):
             value = runtime_metrics.get(key)
@@ -348,6 +350,9 @@ def main() -> None:
                         "rollout/raw_gail_reward_std",
                         "rollout/normalized_gail_reward_std",
                         "policy/approx_kl",
+                        "policy/post_update_approx_kl",
+                        "health/target_kl_warning",
+                        "health/target_kl_consecutive_violations",
                         "policy/action_std_param_mean",
                     )
                 },
