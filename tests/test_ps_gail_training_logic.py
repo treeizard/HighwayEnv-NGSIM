@@ -1,5 +1,5 @@
 import ast
-from dataclasses import fields
+from dataclasses import fields, replace
 import json
 import re
 import sys
@@ -91,6 +91,7 @@ from scripts_gail.ps_gail.data import (
     transform_sequence_features,
 )
 from scripts_gail.ps_gail.training import evaluation as eval_mod
+from scripts_gail.ps_gail.training import rollouts as rollout_module
 from scripts_gail.ps_gail.validation import best_checkpoint_payload
 from scripts_gail.ps_gail.validation import scored_validation_metrics
 from scripts_gail.ps_gail.validation import validation_cost_and_score
@@ -115,6 +116,7 @@ from scripts_gail.ps_gail.trainer import (
     central_critic_observation_dim,
     central_critic_observations,
     combine_primary_env_challenge_rewards,
+    configure_policy_action_std,
     discriminator_reward,
     policy_distribution_and_values,
     policy_distribution_values_memory,
@@ -145,6 +147,45 @@ from scripts_gail.train_simple_airl import parse_args as airl_parse_args
 from scripts_gail.train_simple_airl import refresh_airl_rewards
 from scripts_gail.train_simple_airl import update_reward_model
 from scripts_gail.train_simple_iq_learn import convergence_reached, convergence_score
+
+
+def test_action_std_configuration_is_opt_in_action_specific_and_bounded():
+    policy = make_actor_critic(
+        "mlp",
+        obs_dim=4,
+        hidden_size=16,
+        action_mode="continuous",
+        continuous_action_dim=2,
+    )
+    historical = policy.log_std.detach().clone()
+    assert configure_policy_action_std(
+        policy,
+        PSGAILConfig(action_mode="continuous", continuous_action_dim=2),
+        initialize=True,
+    ) == {}
+    assert torch.equal(policy.log_std.detach(), historical)
+
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        continuous_action_dim=2,
+        initial_action_std="0.10,0.05",
+        minimum_action_std="0.02,0.01",
+        maximum_action_std="0.30,0.15",
+    )
+    configured = configure_policy_action_std(policy, cfg, initialize=True)
+    assert configured["action_std"] == pytest.approx([0.10, 0.05])
+
+    with torch.no_grad():
+        policy.log_std.copy_(torch.log(torch.tensor([0.5, 0.001])))
+    clamped = configure_policy_action_std(policy, cfg, initialize=False)
+    assert clamped["action_std"] == pytest.approx([0.30, 0.01])
+
+    with pytest.raises(ValueError, match="one value or 2"):
+        configure_policy_action_std(
+            policy,
+            replace(cfg, initial_action_std="0.1,0.2,0.3"),
+            initialize=True,
+        )
 
 
 def test_ppo_value_clipping_penalizes_large_critic_step():
@@ -2551,6 +2592,60 @@ def test_ps_gail_collision_mode_schedule_keeps_mixed_termination_enabled():
         "full",
         "full",
     ]
+
+
+def test_mixed_collision_variant_respects_explicit_fixed_horizon_contract():
+    fixed_horizon = PSGAILConfig(terminate_when_all_controlled_crashed=False)
+    legacy = PSGAILConfig(terminate_when_all_controlled_crashed=True)
+
+    fixed_collision = rollout_module._collision_variant_cfg(
+        fixed_horizon,
+        collision_on=True,
+    )
+    legacy_collision = rollout_module._collision_variant_cfg(
+        legacy,
+        collision_on=True,
+    )
+    collision_off = rollout_module._collision_variant_cfg(
+        legacy,
+        collision_on=False,
+    )
+
+    assert fixed_collision.enable_collision is True
+    assert fixed_collision.terminate_when_all_controlled_crashed is False
+    assert legacy_collision.terminate_when_all_controlled_crashed is True
+    assert collision_off.enable_collision is False
+    assert collision_off.terminate_when_all_controlled_crashed is False
+
+
+def test_rollout_fixed_horizon_ignores_termination_until_truncation():
+    fixed = PSGAILConfig(rollout_fixed_horizon=True)
+    legacy = PSGAILConfig(rollout_fixed_horizon=False)
+
+    assert rollout_module._rollout_should_reset(
+        fixed,
+        terminated=True,
+        truncated=False,
+        forced_reset=False,
+    ) is False
+    assert rollout_module._rollout_should_reset(
+        legacy,
+        terminated=True,
+        truncated=False,
+        forced_reset=False,
+    ) is True
+    assert rollout_module._rollout_should_reset(
+        fixed,
+        terminated=True,
+        truncated=True,
+        forced_reset=False,
+    ) is True
+    assert rollout_module._rollout_should_reset(
+        fixed,
+        terminated=False,
+        truncated=False,
+        forced_reset=True,
+    ) is True
 
 
 def test_vehicle_increase_soft_collision_gate_is_local_and_non_destructive():

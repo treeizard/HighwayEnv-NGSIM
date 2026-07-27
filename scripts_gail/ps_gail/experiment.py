@@ -138,6 +138,9 @@ def write_run_manifest(run_dir: str, cfg: PSGAILConfig, *, trainer: str) -> str:
         "collision": {
             "enable_collision": bool(cfg.enable_collision),
             "schedule": str(cfg.collision_mode_schedule),
+            "rollout_fixed_horizon": bool(
+                getattr(cfg, "rollout_fixed_horizon", False)
+            ),
             "mixed_on_fraction": float(cfg.collision_mixed_on_fraction),
             "proxy_penalty_coef": float(cfg.collision_proxy_penalty_coef),
             "vehicle_increase_soft_collision_rounds": int(
@@ -173,6 +176,8 @@ def write_evaluation_summary(
     final_policy_test_metrics: dict[str, float] | None = None,
     policy_relative_l2_delta: float | None = None,
     selected_checkpoint: str = "best.pt",
+    best_full_load_score: float | None = None,
+    best_full_load_round: int = 0,
 ) -> str:
     payload = {
         "schema_version": 2,
@@ -192,6 +197,9 @@ def write_evaluation_summary(
         "final_policy_test": _jsonable(final_policy_test_metrics or {}),
         "policy_relative_l2_delta": _jsonable(policy_relative_l2_delta),
     }
+    if best_full_load_score is not None:
+        payload["best_full_load_score"] = _jsonable(best_full_load_score)
+        payload["best_full_load_round"] = int(best_full_load_round)
     path = os.path.join(run_dir, "evaluation_summary.json")
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)

@@ -105,6 +105,9 @@ class PSGAILConfig:
     psro_current_policy_fraction: float = 0.65
     enable_collision: bool = True
     terminate_when_all_controlled_crashed: bool = True
+    # Ignore Gym termination signals during rollout collection and continue to
+    # max_episode_steps. Disabled by default to preserve historical training.
+    rollout_fixed_horizon: bool = False
     collision_mode_schedule: str = ""
     collision_mixed_on_fraction: float = 0.5
     collision_proxy_penalty_coef: float = 1.0
@@ -137,6 +140,11 @@ class PSGAILConfig:
     transformer_observation_normalization: bool = False
     transformer_observation_tokenization: str = "semantic"
     policy_head_init_std: float = -1.0
+    # Optional comma-separated normalized-action standard deviations. Empty
+    # strings preserve the historical initialization and learned variance.
+    initial_action_std: str = ""
+    minimum_action_std: str = ""
+    maximum_action_std: str = ""
     transformer_temporal_module: bool = False
     transformer_temporal_kernel_size: int = 5
     transformer_temporal_layers: int = 1
@@ -284,6 +292,9 @@ class PSGAILConfig:
     validation_stress_episodes: int = 2
     validation_stress_vehicle_mode: str = "all"
     save_best_checkpoint: bool = True
+    # If positive, retain/select a second best checkpoint using validation
+    # rounds at or after this boundary (for example the 100-vehicle phase).
+    full_load_selection_start_round: int = 0
     validation_min_delta: float = 0.0
     validation_max_score_drop: float = 0.0
     validation_regression_patience: int = 0

@@ -17,8 +17,13 @@ set -euo pipefail
 : "${DEPTH:?Set DEPTH to 2 or 3}"
 : "${PILOT_SLURM_LOG_ROOT:?Set PILOT_SLURM_LOG_ROOT explicitly}"
 RECOVERY_RESUME="${RECOVERY_RESUME:-false}"
+GAIL_RUN_PROFILE="${GAIL_RUN_PROFILE:-scratch_bce}"
 
 case "${DEPTH}" in 2|3) ;; *) echo "DEPTH must be 2 or 3" >&2; exit 2 ;; esac
+case "${GAIL_RUN_PROFILE}" in
+    scratch_bce|realistic_wgan_v1) ;;
+    *) echo "Unsupported GAIL_RUN_PROFILE: ${GAIL_RUN_PROFILE}" >&2; exit 2 ;;
+esac
 if [ -n "${SLURM_ARRAY_TASK_ID:-}" ]; then
     echo "Scratch GAIL depth runner refuses Slurm arrays." >&2
     exit 2
@@ -67,24 +72,34 @@ args = dict(trial["arguments"])
 if ACCELERATION_RANGE != (-5.0, 5.0):
     raise SystemExit(f"Expected the aligned ±5 m/s² action contract, got {ACCELERATION_RANGE}")
 if data.get("explicit_contracts_required") is not True:
-    raise SystemExit("Scratch GAIL manifest does not require explicit data contracts")
+    raise SystemExit("GAIL manifest does not require explicit data contracts")
 if args.get("require_explicit_data_contracts") is not True:
-    raise SystemExit("Scratch GAIL trial does not enforce explicit data contracts")
-if args.get("validation_require_exact_horizon") is not False:
-    raise SystemExit("Scratch GAIL must use a finite score for sub-20-second early policies")
-if float(args.get("validation_min_horizon_coverage", -1.0)) != 0.0:
-    raise SystemExit("Scratch GAIL optimization must not gate early policies on 20-second coverage")
+    raise SystemExit("GAIL trial does not enforce explicit data contracts")
 recovery_resume = os.environ.get("RECOVERY_RESUME", "false").lower() == "true"
-expected_initialization = (
-    "random_seeded_exact_resume" if recovery_resume else "random_seeded"
-)
+profile = os.environ.get("GAIL_RUN_PROFILE", "scratch_bce")
+if profile == "scratch_bce":
+    if args.get("validation_require_exact_horizon") is not False:
+        raise SystemExit("Scratch GAIL must use a finite score for sub-20-second early policies")
+    if float(args.get("validation_min_horizon_coverage", -1.0)) != 0.0:
+        raise SystemExit("Scratch GAIL optimization must not gate early policies on 20-second coverage")
+    expected_initialization = (
+        "random_seeded_exact_resume" if recovery_resume else "random_seeded"
+    )
+else:
+    if recovery_resume:
+        raise SystemExit("The realistic WGAN runner does not accept scratch recovery mode")
+    expected_initialization = "verified_matched_bc_checkpoint"
 if scope.get("policy_initialization") != expected_initialization:
     raise SystemExit(
         "Manifest policy initialization mismatch: "
         f"{scope.get('policy_initialization')} != {expected_initialization}"
     )
-if scope.get("uses_bc_initialization") is not False:
-    raise SystemExit("Manifest unexpectedly enables BC initialization")
+if profile == "realistic_wgan_v1" and scope.get(
+    "bc_initializer_qualification"
+) != "matched_training_artifact_v1":
+    raise SystemExit("Realistic WGAN run requires the matched BC artifact contract")
+if bool(scope.get("uses_bc_initialization")) != (profile == "realistic_wgan_v1"):
+    raise SystemExit("Manifest BC initialization does not match the run profile")
 architecture = policy_architecture_contract(args)
 expected_architecture = {
     "policy_model": "recurrent_transformer",
@@ -112,17 +127,46 @@ if recovery_resume:
         raise SystemExit("Recovery must contain only an exact resume checkpoint")
     if int(args.get("expected_resume_round", 0)) <= 0:
         raise SystemExit("Recovery has no positive expected resume round")
-else:
+elif profile == "scratch_bce":
     if args.get("initial_policy_checkpoint") or args.get("resume_checkpoint"):
         raise SystemExit("Scratch job contains an initial or resume checkpoint")
-for name in (
-    "bc_pretrain_epochs",
-    "policy_bc_regularization_coef",
-    "policy_bc_regularization_final_coef",
-    "policy_bc_regularization_decay_rounds",
-):
-    if float(args.get(name, 0)) != 0.0:
-        raise SystemExit(f"Scratch job has nonzero {name}")
+else:
+    if not args.get("initial_policy_checkpoint") or args.get("resume_checkpoint"):
+        raise SystemExit("Realistic WGAN requires one BC initializer and no resume checkpoint")
+    expected_wgan = {
+        "algorithm_variant": "gail_wgan_gp",
+        "discriminator_input": "action",
+        "wgan_gp_lambda": 2.0,
+        "disc_updates_per_round": 2,
+        "discriminator_replay_rounds": 3,
+        "discriminator_replay_max_samples": 120000,
+        "rollout_fixed_horizon": True,
+        "normalize_gail_reward": True,
+        "allow_wgan_reward_normalization": True,
+        "policy_bc_regularization_coef": 0.02,
+        "policy_bc_regularization_final_coef": 0.0,
+        "policy_bc_regularization_decay_rounds": 50,
+        "initial_action_std": "0.10,0.05",
+        "minimum_action_std": "0.02,0.01",
+        "maximum_action_std": "0.30,0.15",
+        "full_load_selection_start_round": 701,
+        "total_rounds": 800,
+        "final_controlled_vehicles": 100.0,
+    }
+    observed_wgan = {name: args.get(name) for name in expected_wgan}
+    if observed_wgan != expected_wgan:
+        raise SystemExit(
+            f"Realistic WGAN configuration mismatch: {observed_wgan}"
+        )
+if profile == "scratch_bce":
+    for name in (
+        "bc_pretrain_epochs",
+        "policy_bc_regularization_coef",
+        "policy_bc_regularization_final_coef",
+        "policy_bc_regularization_decay_rounds",
+    ):
+        if float(args.get(name, 0)) != 0.0:
+            raise SystemExit(f"Scratch job has nonzero {name}")
 workers = int(args["num_rollout_workers"])
 threads = int(args["rollout_worker_threads"])
 eval_workers = int(args["evaluation_num_workers"])
@@ -141,7 +185,7 @@ if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
 if not getattr(wandb.Api(), "api_key", None):
     raise SystemExit("W&B online mode requested but no API key is configured")
 print(
-    f"scratch_initialization=true exact_resume_recovery={str(recovery_resume).lower()} "
+    f"gail_run_profile={profile} exact_resume_recovery={str(recovery_resume).lower()} "
     f"depth={sys.argv[2]}"
 )
 print("continuous_acceleration_range_mps2=[-5.0,5.0] explicit_data_contracts=true")

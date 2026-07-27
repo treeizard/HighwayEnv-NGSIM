@@ -1,20 +1,22 @@
 from __future__ import annotations
 
-from argparse import Namespace
-from dataclasses import replace
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from argparse import Namespace
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
-
-from scripts_gail.prepare_gail_airl_method_manifest import prepare
-from scripts_gail.build_gail_airl_final_manifests import build as build_final_manifests
-from scripts_gail.promote_gail_airl_final_recipe import promote
 from scripts_gail.build_bc_warm_start_audit import build as build_bc_warm_start_audit
+from scripts_gail.build_gail_airl_final_manifests import build as build_final_manifests
+from scripts_gail.monitor_gail_airl_us_pilot_runtime import project_run
+from scripts_gail.prepare_gail_airl_method_manifest import prepare
+from scripts_gail.promote_gail_airl_final_recipe import promote
+from scripts_gail.run_gail_airl_us_local_smoke import _smoke_trial
+from scripts_gail.ps_gail import envs as training_envs
 from scripts_gail.ps_gail.checkpoints import (
     atomic_torch_save,
     checkpoint_metadata,
@@ -25,14 +27,19 @@ from scripts_gail.ps_gail.checkpoints import (
     verify_resume_checkpoint,
 )
 from scripts_gail.ps_gail.config import PSGAILConfig
-from scripts_gail.ps_gail import envs as training_envs
 from scripts_gail.ps_gail.models import make_actor_critic
+from scripts_gail.ps_gail.pilot import (
+    SCRATCH_GAIL_TOTAL_ROUNDS,
+    TOTAL_ROUNDS,
+    _common_arguments,
+    gail_training_profile_overrides,
+    load_manifest,
+    trial_argv,
+)
+from scripts_gail.ps_gail.schedule import config_for_round
 from scripts_gail.ps_gail.study import build_screening_trials, write_study_files
-from scripts_gail.ps_gail.training import rollouts
-from scripts_gail.ps_gail.training import evaluation
+from scripts_gail.ps_gail.training import evaluation, rollouts
 from scripts_gail.ps_gail.validation import best_checkpoint_payload
-from scripts_gail.ps_gail.pilot import load_manifest, trial_argv
-from scripts_gail.monitor_gail_airl_us_pilot_runtime import project_run
 
 
 class _DummyEnv:
@@ -62,7 +69,7 @@ def test_locked_us_pilot_runtime_projection_and_job_shape():
         rows,
         {
             "safety_factor": 1.10,
-            "conservative_training_rounds": 650,
+            "conservative_training_rounds": TOTAL_ROUNDS + 50,
             "planned_evaluation_vehicle_trajectories": 7440,
         },
         evaluation_parallelism=16,
@@ -74,7 +81,9 @@ def test_locked_us_pilot_runtime_projection_and_job_shape():
         7440 * 10 / 16
     )
     assert projection["projected_hours"] == pytest.approx(
-        1.10 * (650 * 100 + 7440 * 10 / 16) / 3600
+        1.10 * (
+            (TOTAL_ROUNDS + 50) * 100 + 7440 * 10 / 16
+        ) / 3600
     )
 
     recovery_rows = [
@@ -95,7 +104,7 @@ def test_locked_us_pilot_runtime_projection_and_job_shape():
         {
             "gate_round": 20,
             "safety_factor": 1.10,
-            "conservative_training_rounds": 650,
+            "conservative_training_rounds": TOTAL_ROUNDS + 50,
             "planned_evaluation_vehicle_trajectories": 7440,
         },
         evaluation_parallelism=16,
@@ -121,6 +130,103 @@ def test_locked_us_pilot_runtime_projection_and_job_shape():
     assert 'BC_JOB_ID="58391443"' in submitter
 
 
+def test_locked_us_pilot_trains_at_100_vehicles_in_the_same_run(tmp_path):
+    base_arguments = _common_arguments(
+        expert_data=tmp_path / "expert",
+        episode_root=tmp_path / "episodes",
+        run_root=tmp_path / "runs",
+        campaign_id="standard_pilot",
+        require_explicit_data_contracts=True,
+    )
+    arguments = _common_arguments(
+        expert_data=tmp_path / "expert",
+        episode_root=tmp_path / "episodes",
+        run_root=tmp_path / "runs",
+        campaign_id="same_run_100_vehicle",
+        require_explicit_data_contracts=True,
+        include_100_vehicle_phase=True,
+    )
+    cfg_names = set(vars(PSGAILConfig()))
+    cfg = PSGAILConfig(
+        **{key: value for key, value in arguments.items() if key in cfg_names}
+    )
+
+    assert TOTAL_ROUNDS == 600
+    assert SCRATCH_GAIL_TOTAL_ROUNDS == 800
+    assert base_arguments["total_rounds"] == TOTAL_ROUNDS
+    assert base_arguments["final_controlled_vehicles"] == pytest.approx(50.0)
+    assert cfg.total_rounds == SCRATCH_GAIL_TOTAL_ROUNDS
+    assert cfg.final_controlled_vehicles == pytest.approx(100.0)
+    assert [
+        config_for_round(cfg, round_idx).percentage_controlled_vehicles
+        for round_idx in (600, 640, 680, 700, 701, 800)
+    ] == pytest.approx([50.0, 70.0, 90.0, 100.0, 100.0, 100.0])
+    assert config_for_round(
+        cfg, 800
+    ).rollout_target_agent_steps == pytest.approx(40_000.0)
+
+
+def test_realistic_wgan_profile_is_additive_and_paper_aligned():
+    legacy = gail_training_profile_overrides("legacy_bce")
+    realistic = gail_training_profile_overrides("realistic_wgan_v1")
+
+    assert legacy == {
+        "algorithm_variant": "gail_bce",
+        "learning_rate": 3.0e-5,
+        "entropy_coef": 0.002,
+    }
+    assert realistic["algorithm_variant"] == "gail_wgan_gp"
+    assert realistic["discriminator_input"] == "action"
+    assert realistic["wgan_gp_lambda"] == pytest.approx(2.0)
+    assert realistic["discriminator_replay_rounds"] == 3
+    assert realistic["terminate_when_all_controlled_crashed"] is False
+    assert realistic["rollout_fixed_horizon"] is True
+    assert realistic["evaluation_terminate_when_all_controlled_crashed"] is False
+    assert realistic["normalize_gail_reward"] is True
+    assert realistic["allow_wgan_reward_normalization"] is True
+    assert realistic["policy_bc_regularization_coef"] == pytest.approx(0.02)
+    assert realistic["initial_action_std"] == "0.10,0.05"
+    assert realistic["full_load_selection_start_round"] == 701
+    with pytest.raises(ValueError, match="Unsupported GAIL training profile"):
+        gail_training_profile_overrides("unknown")
+
+
+def test_local_smoke_can_exercise_an_exact_100_step_fixed_horizon(tmp_path):
+    trial = {
+        "trial_id": "gail_us_d2_s0",
+        "method": "gail",
+        "arguments": {
+            "policy_frequency": 10,
+            "full_load_selection_start_round": 701,
+        },
+        "trainer_arguments": {},
+    }
+
+    smoke = _smoke_trial(
+        trial,
+        output_root=tmp_path / "runs",
+        rounds=1,
+        episode_steps=100,
+        controlled_vehicles=100,
+    )
+    args = smoke["arguments"]
+
+    assert args["rollout_max_episode_steps"] == 100
+    assert args["max_episode_steps"] == 100
+    assert args["rollout_steps"] == 100
+    assert args["initial_controlled_vehicles"] == pytest.approx(100.0)
+    assert args["final_controlled_vehicles"] == pytest.approx(100.0)
+    assert args["controlled_vehicle_schedule"] == "1:1:100:100"
+    assert args["rollout_target_agent_steps"] == 10_000
+    assert args["rollout_target_agent_steps_schedule"] == "1:1:10000:10000"
+    assert args["evaluation_horizons_seconds"] == "1,5,10"
+    assert args["validation_score_horizon_seconds"] == 10
+    assert args["validation_min_horizon_coverage"] == pytest.approx(1.0)
+    assert args["validation_vehicle_mode"] == "single"
+    assert args["test_vehicle_mode"] == "single"
+    assert args["full_load_selection_start_round"] == 1
+
+
 def test_scratch_gail_runner_restores_proven_worker_geometry_and_no_bc(tmp_path):
     repo = Path(__file__).resolve().parents[1]
     runner = (
@@ -128,6 +234,10 @@ def test_scratch_gail_runner_restores_proven_worker_geometry_and_no_bc(tmp_path)
     ).read_text()
     submitter = (
         repo / "hpc/slurm/script_full_training/submit_gail_us_scratch.bash"
+    ).read_text()
+    realistic_submitter = (
+        repo
+        / "hpc/slurm/script_full_training/submit_gail_us_realistic_wgan.bash"
     ).read_text()
     assert "#SBATCH --gres=gpu:L40S:1" in runner
     assert "#SBATCH --cpus-per-task=32" in runner
@@ -147,6 +257,10 @@ def test_scratch_gail_runner_restores_proven_worker_geometry_and_no_bc(tmp_path)
     assert "--gail-only --no-bc-initialization --num-rollout-workers 16" in submitter
     assert "shared_dense_temporal_recurrent_transformer_v1" in submitter
     assert "--array" not in submitter
+    assert "--gail-training-profile realistic_wgan_v1" in realistic_submitter
+    assert "GAIL_RUN_PROFILE=realistic_wgan_v1" in realistic_submitter
+    assert "verified_matched_bc_checkpoint" in realistic_submitter
+    assert "matched_training_artifact_v1" in realistic_submitter
 
     zero_bc = {
         "bc_pretrain_epochs": 0,
@@ -372,6 +486,7 @@ def _deterministic_training_step(model, optimizer):
 
 def test_exact_training_state_interruption_resume_equivalence(tmp_path):
     import random
+
     import numpy as np
 
     cfg = PSGAILConfig(seed=9, total_rounds=3)

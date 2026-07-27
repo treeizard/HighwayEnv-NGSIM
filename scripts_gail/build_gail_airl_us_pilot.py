@@ -6,7 +6,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from scripts_gail.ps_gail.pilot import build_manifest, write_manifest
+from scripts_gail.ps_gail.pilot import (
+    GAIL_TRAINING_PROFILES,
+    build_manifest,
+    write_manifest,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +61,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Start policies from their deterministic random initialization.",
     )
+    parser.add_argument(
+        "--gail-training-profile",
+        choices=GAIL_TRAINING_PROFILES,
+        default="legacy_bce",
+        help=(
+            "Opt-in GAIL recipe. The default preserves the historical BCE "
+            "pilot; realistic_wgan_v1 requires GAIL-only BC initialization."
+        ),
+    )
     parser.add_argument("--num-rollout-workers", type=int, default=8)
     return parser.parse_args()
 
@@ -78,6 +91,7 @@ def main() -> None:
         require_explicit_data_contracts=bool(
             args.require_explicit_data_contracts
         ),
+        gail_training_profile=args.gail_training_profile,
     )
     write_manifest(args.output, payload)
     print(args.output.resolve())

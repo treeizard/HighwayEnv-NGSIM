@@ -13,6 +13,7 @@ from .policy import (
     _is_continuous,
     _recurrent_memory_cache_from_prior_steps,
     _shift_recurrent_memory,
+    configure_policy_action_std,
     policy_distribution_and_values,
     policy_distribution_values_memory,
     recurrent_memory_stats,
@@ -337,6 +338,7 @@ def _update_recurrent_policy(
                             bc_losses.append(float(bc_loss.detach().cpu().item()))
                 nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
                 optimizer.step()
+                configure_policy_action_std(policy, cfg, initialize=False)
                 policy_losses.append(weighted_policy_loss)
                 value_losses.append(weighted_value_loss)
                 entropies.append(weighted_entropy)
@@ -596,6 +598,7 @@ def update_policy(
                             bc_losses.append(float(bc_loss.detach().cpu().item()))
                 nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
                 optimizer.step()
+                configure_policy_action_std(policy, cfg, initialize=False)
                 policy_losses.append(weighted_policy_loss)
                 value_losses.append(weighted_value_loss)
                 entropies.append(weighted_entropy)

@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
-from datetime import datetime, timezone
 import hashlib
 import json
-from pathlib import Path
 import re
 import subprocess
 import sys
+from dataclasses import fields
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -23,12 +23,62 @@ from .checkpoints import (
 from .config import PSGAILConfig
 from .validation import paper_driver_model_validation_overrides
 
-
 PILOT_SCHEMA_VERSION = 1
 BC_JOB_ID = "58391443"
 TOTAL_ROUNDS = 600
+SCRATCH_GAIL_TOTAL_ROUNDS = 800
+GAIL_TRAINING_PROFILES = ("legacy_bce", "realistic_wgan_v1")
+BC_INITIALIZER_QUALIFICATIONS = (
+    "legacy_zero_event_v1",
+    "matched_training_artifact_v1",
+)
 PLANNED_EVALUATION_VEHICLE_TRAJECTORIES = 7_440
 MAX_PROJECTED_HOURS = 108.0
+
+
+def gail_training_profile_overrides(profile: str) -> dict[str, Any]:
+    """Return an additive GAIL recipe while retaining the historical default."""
+    profile = str(profile).strip().lower()
+    if profile not in GAIL_TRAINING_PROFILES:
+        raise ValueError(
+            f"Unsupported GAIL training profile {profile!r}; expected one of "
+            f"{list(GAIL_TRAINING_PROFILES)}."
+        )
+    if profile == "legacy_bce":
+        return {
+            "algorithm_variant": "gail_bce",
+            "learning_rate": 3.0e-5,
+            "entropy_coef": 0.002,
+        }
+    return {
+        "algorithm_variant": "gail_wgan_gp",
+        "discriminator_input": "action",
+        "wgan_gp_lambda": 2.0,
+        "normalize_discriminator_features": True,
+        "discriminator_feature_clip": 10.0,
+        "disc_updates_per_round": 2,
+        "discriminator_replay_rounds": 3,
+        "discriminator_replay_max_samples": 120_000,
+        "terminate_when_all_controlled_crashed": False,
+        "rollout_fixed_horizon": True,
+        "evaluation_terminate_when_all_controlled_crashed": False,
+        "normalize_gail_reward": True,
+        "allow_wgan_reward_normalization": True,
+        "wgan_reward_center": False,
+        "wgan_reward_clip": 0.0,
+        "wgan_reward_scale": 1.0,
+        "wgan_reward_norm_min_std": 1.0e-3,
+        "wgan_reward_norm_clip": 5.0,
+        "learning_rate": 1.0e-5,
+        "entropy_coef": 5.0e-4,
+        "policy_bc_regularization_coef": 0.02,
+        "policy_bc_regularization_final_coef": 0.0,
+        "policy_bc_regularization_decay_rounds": 50,
+        "initial_action_std": "0.10,0.05",
+        "minimum_action_std": "0.02,0.01",
+        "maximum_action_std": "0.30,0.15",
+        "full_load_selection_start_round": 701,
+    }
 
 
 def _json_load(path: Path) -> dict[str, Any]:
@@ -63,6 +113,7 @@ def _source_paths(repo: Path) -> list[Path]:
         "hpc/slurm/script_full_training/submit_gail_airl_us_pilot.bash",
         "hpc/slurm/script_full_training/run_gail_us_scratch_depth.bash",
         "hpc/slurm/script_full_training/submit_gail_us_scratch.bash",
+        "hpc/slurm/script_full_training/submit_gail_us_realistic_wgan.bash",
         "hpc/slurm/script_full_training/submit_failed_policy_recovery.bash",
     ):
         path = repo / relative
@@ -115,7 +166,19 @@ def verify_source_lock(manifest: dict[str, Any], repo: Path) -> None:
             raise RuntimeError(f"Pilot source hash mismatch: {relative}")
 
 
-def _validate_bc_candidate(checkpoint: Path, *, depth: int, seed: int) -> dict[str, Any]:
+def _validate_bc_candidate(
+    checkpoint: Path,
+    *,
+    depth: int,
+    seed: int,
+    qualification: str = "legacy_zero_event_v1",
+) -> dict[str, Any]:
+    qualification = str(qualification).strip().lower()
+    if qualification not in BC_INITIALIZER_QUALIFICATIONS:
+        raise ValueError(
+            f"Unsupported BC initializer qualification {qualification!r}; "
+            f"expected one of {list(BC_INITIALIZER_QUALIFICATIONS)}."
+        )
     checkpoint = checkpoint.resolve()
     summary_path = checkpoint.with_name("summary.json")
     summary = _json_load(summary_path)
@@ -158,11 +221,89 @@ def _validate_bc_candidate(checkpoint: Path, *, depth: int, seed: int) -> dict[s
         failures.append("summary checkpoint SHA does not match checkpoint")
     held = dict(summary.get("held_out_evaluation") or {})
     held_metrics = dict(held.get("metrics") or {})
-    for key in ("bc_eval/crash_episode_fraction", "bc_eval/offroad_episode_fraction"):
-        if float(held_metrics.get(key, 1.0)) != 0.0:
-            failures.append(f"held-out {key} is nonzero")
-    if float(held_metrics.get("bc_eval/mean_episode_length", 0.0)) < 200.0:
-        failures.append("held-out BC policy did not cover the full 20-second horizon")
+    qualification_metrics: dict[str, float]
+    if qualification == "legacy_zero_event_v1":
+        for key in ("bc_eval/crash_episode_fraction", "bc_eval/offroad_episode_fraction"):
+            if float(held_metrics.get(key, 1.0)) != 0.0:
+                failures.append(f"held-out {key} is nonzero")
+        if float(held_metrics.get("bc_eval/mean_episode_length", 0.0)) < 200.0:
+            failures.append("held-out BC policy did not cover the full 20-second horizon")
+        qualification_metrics = {
+            "held_out_crash_episode_fraction": float(
+                held_metrics.get("bc_eval/crash_episode_fraction", float("nan"))
+            ),
+            "held_out_offroad_episode_fraction": float(
+                held_metrics.get("bc_eval/offroad_episode_fraction", float("nan"))
+            ),
+            "held_out_mean_episode_length": float(
+                held_metrics.get("bc_eval/mean_episode_length", float("nan"))
+            ),
+        }
+    else:
+        for key in (
+            "training_artifact_complete",
+            "interpretability_baseline_eligible",
+            "matched_evaluation_passed",
+            "closed_loop_evaluation_complete",
+        ):
+            if summary.get(key) is not True:
+                failures.append(f"{key} did not pass")
+        expected_held_values = {
+            "prebuilt_split": "test",
+            "collision_physics_enabled": True,
+            "collision_termination_enabled": False,
+            "vehicle_mode": "all",
+        }
+        for key, expected in expected_held_values.items():
+            if held.get(key) != expected:
+                failures.append(
+                    f"held-out {key}={held.get(key)!r}, expected {expected!r}"
+                )
+        metric_keys = (
+            "test/mean_episode_length",
+            "test/horizon_coverage_20s",
+            "test/vehicle_crash_rate",
+            "test/vehicle_offroad_rate",
+            "test/acceleration_action_std",
+            "test/steering_action_std",
+        )
+        parsed_metrics: dict[str, float] = {}
+        for key in metric_keys:
+            try:
+                value = float(held_metrics[key])
+            except (KeyError, TypeError, ValueError):
+                failures.append(f"held-out {key} is missing or invalid")
+                continue
+            if not torch.isfinite(torch.tensor(value)).item():
+                failures.append(f"held-out {key} is non-finite")
+            parsed_metrics[key] = value
+        if parsed_metrics.get("test/mean_episode_length", 0.0) < 200.0:
+            failures.append("held-out BC evaluation did not run for 200 timesteps")
+        if parsed_metrics.get("test/horizon_coverage_20s", 0.0) <= 0.0:
+            failures.append("held-out BC evaluation has no 20-second coverage")
+        for key in ("test/acceleration_action_std", "test/steering_action_std"):
+            if parsed_metrics.get(key, 0.0) <= 1.0e-3:
+                failures.append(f"held-out {key} shows collapsed actions")
+        qualification_metrics = {
+            "held_out_vehicle_crash_rate": parsed_metrics.get(
+                "test/vehicle_crash_rate", float("nan")
+            ),
+            "held_out_vehicle_offroad_rate": parsed_metrics.get(
+                "test/vehicle_offroad_rate", float("nan")
+            ),
+            "held_out_horizon_coverage_20s": parsed_metrics.get(
+                "test/horizon_coverage_20s", float("nan")
+            ),
+            "held_out_mean_episode_length": parsed_metrics.get(
+                "test/mean_episode_length", float("nan")
+            ),
+            "held_out_acceleration_action_std": parsed_metrics.get(
+                "test/acceleration_action_std", float("nan")
+            ),
+            "held_out_steering_action_std": parsed_metrics.get(
+                "test/steering_action_std", float("nan")
+            ),
+        }
     if failures:
         raise RuntimeError(f"Unqualified BC initializer {checkpoint}: {'; '.join(failures)}")
     expert = dict(summary.get("expert_data") or {})
@@ -173,18 +314,11 @@ def _validate_bc_candidate(checkpoint: Path, *, depth: int, seed: int) -> dict[s
         "sidecar": _file_record(checkpoint.with_name(f"{checkpoint.name}.sha256")),
         "summary": _file_record(summary_path),
         "qualification": {
+            "contract": qualification,
             "checkpoint_eligibility": summary["checkpoint_eligibility"],
             "capability_passed": True,
             "learning_signal_passed": True,
-            "held_out_crash_episode_fraction": float(
-                held_metrics["bc_eval/crash_episode_fraction"]
-            ),
-            "held_out_offroad_episode_fraction": float(
-                held_metrics["bc_eval/offroad_episode_fraction"]
-            ),
-            "held_out_mean_episode_length": float(
-                held_metrics["bc_eval/mean_episode_length"]
-            ),
+            **qualification_metrics,
         },
         "policy_architecture": architecture,
         "expert_manifest_sha256": str(expert.get("manifest_sha256") or ""),
@@ -198,7 +332,36 @@ def _common_arguments(
     run_root: Path,
     campaign_id: str,
     require_explicit_data_contracts: bool,
+    include_100_vehicle_phase: bool = False,
 ) -> dict[str, Any]:
+    total_rounds = (
+        SCRATCH_GAIL_TOTAL_ROUNDS
+        if include_100_vehicle_phase
+        else TOTAL_ROUNDS
+    )
+    final_controlled_vehicles = 100.0 if include_100_vehicle_phase else 50.0
+    controlled_vehicle_schedule = (
+        (
+            "1:120:10:10;121:240:20:20;241:360:30:30;"
+            "361:480:40:40;481:600:50:50;"
+            "601:640:50:70;641:680:70:90;681:700:90:100;"
+            "701:800:100:100"
+        )
+        if include_100_vehicle_phase
+        else (
+            "1:120:10:10;121:240:20:20;241:360:30:30;"
+            "361:480:40:40;481:600:50:50"
+        )
+    )
+    rollout_target_agent_steps_schedule = (
+        (
+            "1:500:10000:10000;501:600:10000:20000;"
+            "601:640:20000:25000;641:680:25000:32000;"
+            "681:700:32000:40000;701:800:40000:40000"
+        )
+        if include_100_vehicle_phase
+        else "1:500:10000:10000;501:600:10000:20000"
+    )
     return {
         "expert_data": str(expert_data.resolve()),
         "episode_root": str(episode_root.resolve()),
@@ -223,19 +386,16 @@ def _common_arguments(
         "policy_bc_regularization_coef": 0.0,
         "policy_bc_regularization_final_coef": 0.0,
         "policy_bc_regularization_decay_rounds": 0,
-        "total_rounds": TOTAL_ROUNDS,
+        "total_rounds": total_rounds,
         "max_expert_samples": 100_000,
         "controlled_vehicle_curriculum": True,
         "initial_controlled_vehicles": 10.0,
-        "final_controlled_vehicles": 50.0,
-        "controlled_vehicle_curriculum_rounds": TOTAL_ROUNDS,
-        "controlled_vehicle_schedule": (
-            "1:120:10:10;121:240:20:20;241:360:30:30;"
-            "361:480:40:40;481:600:50:50"
-        ),
+        "final_controlled_vehicles": final_controlled_vehicles,
+        "controlled_vehicle_curriculum_rounds": total_rounds,
+        "controlled_vehicle_schedule": controlled_vehicle_schedule,
         "rollout_target_agent_steps": 10_000,
         "rollout_target_agent_steps_schedule": (
-            "1:500:10000:10000;501:600:10000:20000"
+            rollout_target_agent_steps_schedule
         ),
         "rollout_min_episodes": 1,
         "rollout_full_episodes": True,
@@ -270,7 +430,9 @@ def _common_arguments(
         "disc_updates_per_round": 1,
         "discriminator_replay_rounds": 0,
         "discriminator_replay_max_samples": 0,
-        "collision_mode_schedule": "1:200:soft;201:400:mixed;401:600:full",
+        "collision_mode_schedule": (
+            f"1:200:soft;201:400:mixed;401:{total_rounds}:full"
+        ),
         "enable_collision": True,
         "collision_mixed_on_fraction": 0.5,
         "collision_proxy_penalty_coef": 1.0,
@@ -325,6 +487,7 @@ def build_manifest(
     policy_recipe: Path | None = None,
     shared_policy_seed: int | None = None,
     require_explicit_data_contracts: bool = False,
+    gail_training_profile: str = "legacy_bce",
 ) -> dict[str, Any]:
     if not re.fullmatch(r"[A-Za-z0-9._-]+", campaign_id):
         raise ValueError(f"Unsafe campaign id: {campaign_id!r}")
@@ -344,6 +507,19 @@ def build_manifest(
         raise ValueError(f"Duplicate method in method set: {methods!r}")
     if int(num_rollout_workers) < 1:
         raise ValueError("num_rollout_workers must be positive")
+    gail_training_profile = str(gail_training_profile).strip().lower()
+    gail_profile_overrides = gail_training_profile_overrides(
+        gail_training_profile
+    )
+    if gail_training_profile != "legacy_bce":
+        if tuple(methods) != ("gail",):
+            raise ValueError(
+                "The realistic WGAN profile is scoped to a GAIL-only manifest."
+            )
+        if not use_bc_initialization:
+            raise ValueError(
+                "The realistic WGAN profile requires a verified matched BC artifact."
+            )
     expert_data = (
         expert_data.resolve()
         if expert_data is not None
@@ -373,9 +549,19 @@ def build_manifest(
         )
         for depth, seed in depth_seed_pairs
     )
+    initializer_qualification = (
+        "matched_training_artifact_v1"
+        if gail_training_profile == "realistic_wgan_v1"
+        else "legacy_zero_event_v1"
+    )
     initializers = (
         [
-            _validate_bc_candidate(path, depth=depth, seed=seed)
+            _validate_bc_candidate(
+                path,
+                depth=depth,
+                seed=seed,
+                qualification=initializer_qualification,
+            )
             for depth, seed, path in bc_specs
         ]
         if use_bc_initialization
@@ -405,6 +591,13 @@ def build_manifest(
         require_explicit_data_contracts=bool(
             require_explicit_data_contracts
         ),
+        include_100_vehicle_phase=(
+            tuple(methods) == ("gail",)
+            and (
+                not use_bc_initialization
+                or gail_training_profile == "realistic_wgan_v1"
+            )
+        ),
     )
     common.update(
         {
@@ -424,6 +617,11 @@ def build_manifest(
         # 20-second coverage acceptance gate.
         common["validation_require_exact_horizon"] = False
         common["validation_min_horizon_coverage"] = 0.0
+    elif gail_training_profile == "realistic_wgan_v1":
+        common["wandb_tags"] = (
+            "us,gail,ps-gail,wgan-gp,bc-initialized,recurrent-transformer,"
+            "realistic-driving,full-load-100,locked"
+        )
     initializer_by_depth = {int(item["depth"]): item for item in initializers}
     trials: list[dict[str, Any]] = []
     for method in methods:
@@ -447,6 +645,8 @@ def build_manifest(
                     "entropy_coef": 0.002 if method == "gail" else 0.003,
                 }
             )
+            if method == "gail":
+                arguments.update(gail_profile_overrides)
             if use_bc_initialization:
                 initializer = initializer_by_depth[depth]
                 arguments.update(initializer["policy_architecture"])
@@ -472,6 +672,10 @@ def build_manifest(
                     ),
                 }
             )
+    required_completed_round = max(
+        int(dict(trial["arguments"])["total_rounds"]) for trial in trials
+    )
+    conservative_training_rounds = required_completed_round + 50
     return {
         "schema_version": PILOT_SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -484,15 +688,33 @@ def build_manifest(
             ],
             "trial_count": len(trials),
             "policy_initialization": (
-                "qualified_bc_checkpoint" if use_bc_initialization else "random_seeded"
+                (
+                    "verified_matched_bc_checkpoint"
+                    if initializer_qualification == "matched_training_artifact_v1"
+                    else "qualified_bc_checkpoint"
+                )
+                if use_bc_initialization
+                else "random_seeded"
+            ),
+            "bc_initializer_qualification": (
+                initializer_qualification if use_bc_initialization else None
             ),
             "uses_bc_initialization": bool(use_bc_initialization),
+            "gail_training_profile": gail_training_profile,
             "depth_comparison_is_exploratory": True,
             "reason": (
                 (
-                    "depths use one paired qualified BC policy seed"
-                    if shared_policy_seed is not None
-                    else "depths use different qualified BC policy seeds"
+                    (
+                        "depths use one paired verified matched BC artifact"
+                        if shared_policy_seed is not None
+                        else "depths use different verified matched BC artifacts"
+                    )
+                    if initializer_qualification == "matched_training_artifact_v1"
+                    else (
+                        "depths use one paired qualified BC policy seed"
+                        if shared_policy_seed is not None
+                        else "depths use different qualified BC policy seeds"
+                    )
                 )
                 if use_bc_initialization
                 else (
@@ -519,13 +741,30 @@ def build_manifest(
         "initializers": initializers,
         "trials": trials,
         "resources": {
-            "jobs": len(trials) if not use_bc_initialization else 2,
-            "job_shape": (
-                "one method per job; two depths concurrent"
-                if use_bc_initialization
-                else "one independent depth per job; depths may run concurrently"
+            "jobs": (
+                len(trials)
+                if (
+                    not use_bc_initialization
+                    or gail_training_profile == "realistic_wgan_v1"
+                )
+                else 2
             ),
-            "gpus_per_job": 2 if use_bc_initialization else 1,
+            "job_shape": (
+                "one independent depth per job; depths may run concurrently"
+                if (
+                    not use_bc_initialization
+                    or gail_training_profile == "realistic_wgan_v1"
+                )
+                else "one method per job; two depths concurrent"
+            ),
+            "gpus_per_job": (
+                1
+                if (
+                    not use_bc_initialization
+                    or gail_training_profile == "realistic_wgan_v1"
+                )
+                else 2
+            ),
             "gpu_type": "L40S",
             "cpus_per_job": 32,
             "memory_per_job_gb": 64,
@@ -539,6 +778,15 @@ def build_manifest(
         },
         "blocking_gate": (
             {
+                "bc_job_id": None,
+                "required_terminal_state": None,
+                "reason": (
+                    "Matched BC artifacts are verified directly by checksum, "
+                    "metadata, and held-out evaluation."
+                ),
+            }
+            if gail_training_profile == "realistic_wgan_v1"
+            else {
                 "bc_job_id": BC_JOB_ID,
                 "required_terminal_state": "COMPLETED",
             }
@@ -552,19 +800,20 @@ def build_manifest(
         "runtime_projection": {
             "gate_round": 20,
             "safety_factor": 1.10,
-            "conservative_training_rounds": 650,
+            "conservative_training_rounds": conservative_training_rounds,
             "planned_evaluation_vehicle_trajectories": (
                 PLANNED_EVALUATION_VEHICLE_TRAJECTORIES
             ),
             "maximum_projected_hours": MAX_PROJECTED_HOURS,
             "formula": (
-                "1.10 * (650 * p95(round_seconds for rounds 2..19) + "
+                f"1.10 * ({conservative_training_rounds} * "
+                "p95(round_seconds for rounds 2..19) + "
                 "eval_seconds_per_vehicle_trajectory * 7440 / "
                 "evaluation_num_workers)"
             ),
         },
         "acceptance": {
-            "required_completed_round": TOTAL_ROUNDS,
+            "required_completed_round": required_completed_round,
             "minimum_best_round": 20,
             "minimum_relative_validation_cost_improvement": 0.02,
             "minimum_20s_horizon_coverage": 0.95,
@@ -769,10 +1018,13 @@ def source_fingerprint(manifest: dict[str, Any]) -> str:
 
 __all__ = [
     "BC_JOB_ID",
+    "GAIL_TRAINING_PROFILES",
     "MAX_PROJECTED_HOURS",
     "PLANNED_EVALUATION_VEHICLE_TRAJECTORIES",
+    "SCRATCH_GAIL_TOTAL_ROUNDS",
     "TOTAL_ROUNDS",
     "build_manifest",
+    "gail_training_profile_overrides",
     "load_manifest",
     "select_trial",
     "source_fingerprint",

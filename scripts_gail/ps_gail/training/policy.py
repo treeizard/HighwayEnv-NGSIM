@@ -23,6 +23,118 @@ CENTRAL_CRITIC_CONTEXT_DIM = 4
 CONTINUOUS_UNSQUASH_EPS = 1.0e-6
 
 
+def _action_std_vector(
+    raw: str,
+    *,
+    name: str,
+    action_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        values = [float(item.strip()) for item in text.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must contain comma-separated positive numbers."
+        ) from exc
+    if len(values) == 1:
+        values *= int(action_dim)
+    if len(values) != int(action_dim):
+        raise ValueError(
+            f"{name} must contain one value or {action_dim} action-specific "
+            f"values, got {len(values)}."
+        )
+    array = np.asarray(values, dtype=np.float64)
+    if not np.isfinite(array).all() or bool((array <= 0.0).any()):
+        raise ValueError(f"{name} values must be finite and strictly positive.")
+    return torch.as_tensor(array, dtype=dtype, device=device)
+
+
+def configure_policy_action_std(
+    policy: nn.Module,
+    cfg: PSGAILConfig,
+    *,
+    initialize: bool,
+) -> dict[str, list[float]]:
+    """Apply opt-in action-noise initialization and bounds.
+
+    Historical configurations leave all three strings empty, producing no
+    mutation. Exact-resume callers use ``initialize=False`` so checkpoint
+    values are retained and only the configured bounds remain active.
+    """
+    raw_specs = {
+        "initial_action_std": str(
+            getattr(cfg, "initial_action_std", "") or ""
+        ),
+        "minimum_action_std": str(
+            getattr(cfg, "minimum_action_std", "") or ""
+        ),
+        "maximum_action_std": str(
+            getattr(cfg, "maximum_action_std", "") or ""
+        ),
+    }
+    enabled = any(value.strip() for value in raw_specs.values())
+    if not enabled:
+        return {}
+    log_std = getattr(policy, "log_std", None)
+    if log_std is None:
+        if enabled:
+            raise ValueError(
+                "Action-standard-deviation controls require a continuous policy."
+            )
+        return {}
+    action_dim = int(log_std.numel())
+    initial = _action_std_vector(
+        raw_specs["initial_action_std"],
+        name="initial_action_std",
+        action_dim=action_dim,
+        device=log_std.device,
+        dtype=log_std.dtype,
+    )
+    minimum = _action_std_vector(
+        raw_specs["minimum_action_std"],
+        name="minimum_action_std",
+        action_dim=action_dim,
+        device=log_std.device,
+        dtype=log_std.dtype,
+    )
+    maximum = _action_std_vector(
+        raw_specs["maximum_action_std"],
+        name="maximum_action_std",
+        action_dim=action_dim,
+        device=log_std.device,
+        dtype=log_std.dtype,
+    )
+    if (
+        minimum is not None
+        and maximum is not None
+        and bool((minimum > maximum).any())
+    ):
+        raise ValueError("minimum_action_std cannot exceed maximum_action_std.")
+    with torch.no_grad():
+        if initialize and initial is not None:
+            log_std.copy_(torch.log(initial))
+        action_std = torch.exp(log_std)
+        if minimum is not None:
+            action_std = torch.maximum(action_std, minimum)
+        if maximum is not None:
+            action_std = torch.minimum(action_std, maximum)
+        log_std.copy_(torch.log(action_std))
+    return {
+        "action_std": [
+            float(value)
+            for value in torch.exp(log_std.detach()).cpu().tolist()
+        ],
+        "log_std": [
+            float(value)
+            for value in log_std.detach().cpu().tolist()
+        ],
+    }
+
+
 def fit_policy_observation_normalizer(
     policy: nn.Module,
     observations: np.ndarray,

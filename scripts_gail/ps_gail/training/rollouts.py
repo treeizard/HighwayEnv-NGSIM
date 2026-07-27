@@ -85,8 +85,23 @@ def _collision_variant_cfg(cfg: PSGAILConfig, *, collision_on: bool) -> PSGAILCo
     return replace(
         cfg,
         enable_collision=bool(collision_on),
-        terminate_when_all_controlled_crashed=bool(collision_on),
+        terminate_when_all_controlled_crashed=bool(
+            collision_on and cfg.terminate_when_all_controlled_crashed
+        ),
         collision_mode_schedule="mixed_on" if collision_on else "mixed_off",
+    )
+
+
+def _rollout_should_reset(
+    cfg: PSGAILConfig,
+    *,
+    terminated: bool,
+    truncated: bool,
+    forced_reset: bool,
+) -> bool:
+    """Apply the opt-in fixed-horizon contract to training rollouts."""
+    return bool(truncated or forced_reset) or bool(
+        terminated and not bool(getattr(cfg, "rollout_fixed_horizon", False))
     )
 
 
@@ -784,7 +799,12 @@ def collect_rollout(
                 next_critic_obs_agents = critic_obs_agents.copy()
         episode_steps += 1
         force_rollout_reset = forced_reset_cap > 0 and episode_steps >= forced_reset_cap
-        done = bool(terminated or truncated or force_rollout_reset)
+        done = _rollout_should_reset(
+            cfg,
+            terminated=bool(terminated),
+            truncated=bool(truncated),
+            forced_reset=bool(force_rollout_reset),
+        )
         crash_flags = info.get("controlled_vehicle_crashes", [])
         offroad_flags = info.get("controlled_vehicle_offroad", [])
         interaction_metrics = (
@@ -877,7 +897,10 @@ def collect_rollout(
         env_steps += 1
         if done:
             episode_lengths.append(int(episode_steps))
-            terminated_count += int(bool(terminated))
+            terminated_count += int(
+                bool(terminated)
+                and not bool(getattr(cfg, "rollout_fixed_horizon", False))
+            )
             truncated_count += int(bool(truncated or force_rollout_reset))
             crash_event_count += int(episode_had_crash)
             offroad_event_count += int(episode_had_offroad)

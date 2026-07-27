@@ -64,6 +64,7 @@ from scripts_gail.ps_gail.steering_diagnostics import (
 from scripts_gail.ps_gail.trainer import (
     action_conditioned_features,
     collect_round_rollouts,
+    configure_policy_action_std,
     discrete_action_masks_from_env,
     discriminator_input_mode,
     evaluation_thread_context,
@@ -148,6 +149,7 @@ def materialize_resume_best_checkpoint(
     save_best_checkpoint: bool,
     cfg: PSGAILConfig,
     method: str,
+    source_name: str = "best.pt",
 ) -> bool:
     """Verify and re-emit the prior lean best with stage-2 official identity."""
     if not save_best_checkpoint or not np.isfinite(float(best_validation_score)):
@@ -155,9 +157,11 @@ def materialize_resume_best_checkpoint(
     if os.path.isfile(target_best_path):
         return False
     resume_dir = os.path.dirname(os.path.abspath(resume_checkpoint))
-    candidates = [os.path.join(resume_dir, "best.pt")]
+    candidates = [os.path.join(resume_dir, source_name)]
     if os.path.basename(resume_dir) == "checkpoints":
-        candidates.append(os.path.join(os.path.dirname(resume_dir), "best.pt"))
+        candidates.append(
+            os.path.join(os.path.dirname(resume_dir), source_name)
+        )
     for candidate in candidates:
         if os.path.abspath(candidate) == os.path.abspath(target_best_path):
             return False
@@ -449,10 +453,12 @@ def gail_checkpoint_payload(
 
 def training_risk_warnings(cfg: PSGAILConfig) -> list[str]:
     messages: list[str] = []
-    if bool(cfg.enable_collision) and bool(cfg.terminate_when_all_controlled_crashed):
+    if bool(cfg.enable_collision) and not bool(
+        getattr(cfg, "rollout_fixed_horizon", False)
+    ):
         messages.append(
             "Collision termination is enabled. This can create variable-horizon leakage in "
-            "adversarial imitation; compare against a fixed-horizon run if imitation quality is unstable."
+            "adversarial imitation; set --rollout-fixed-horizon for fixed-length training."
         )
     if bool(cfg.enable_sequence_discriminator) and str(cfg.sequence_reward_assignment).lower() in {
         "last",
@@ -1447,6 +1453,19 @@ def main() -> None:
                 bc_path,
             )
             monitor.save(bc_path)
+        action_std_configuration = configure_policy_action_std(
+            policy,
+            cfg,
+            initialize=resume_payload is None,
+        )
+        if action_std_configuration:
+            print(
+                "policy_action_std_configuration="
+                f"std={action_std_configuration['action_std']} "
+                f"log_std={action_std_configuration['log_std']} "
+                f"minimum={cfg.minimum_action_std or 'unbounded'} "
+                f"maximum={cfg.maximum_action_std or 'unbounded'}"
+            )
         initializer_policy_state = (
             policy_archive_snapshot(policy) if resume_payload is None else None
         )
@@ -1459,6 +1478,8 @@ def main() -> None:
         psro_policy_archive: list[dict[str, torch.Tensor]] = []
         best_validation_score = float("-inf")
         best_validation_round = 0
+        best_full_load_score = float("-inf")
+        best_full_load_round = 0
         initial_validation_metrics: dict[str, float] = {}
         last_validation_metrics: dict[str, float] = {}
         final_stress_metrics: dict[str, float] = {}
@@ -1468,6 +1489,7 @@ def main() -> None:
         final_policy_test_metrics: dict[str, float] = {}
         selected_policy_relative_l2_delta: float | None = None
         best_path = os.path.join(run_dir, "best.pt")
+        best_full_load_path = os.path.join(run_dir, "best_full_load.pt")
         last_validation_stress_round = 0
         previous_controlled_vehicles = None
         last_vehicle_jump_round = None
@@ -1485,6 +1507,8 @@ def main() -> None:
                 trainer_state={
                     "best_validation_score": float(best_validation_score),
                     "best_validation_round": int(best_validation_round),
+                    "best_full_load_score": float(best_full_load_score),
+                    "best_full_load_round": int(best_full_load_round),
                     "initial_validation_metrics": dict(initial_validation_metrics),
                     "last_validation_metrics": dict(last_validation_metrics),
                     "final_stress_metrics": dict(final_stress_metrics),
@@ -1541,6 +1565,12 @@ def main() -> None:
                     )
                 best_validation_score = float(runtime["best_validation_score"])
                 best_validation_round = int(runtime["best_validation_round"])
+                best_full_load_score = float(
+                    runtime.get("best_full_load_score", float("-inf"))
+                )
+                best_full_load_round = int(
+                    runtime.get("best_full_load_round", 0)
+                )
                 initial_validation_metrics = dict(runtime["initial_validation_metrics"])
                 last_validation_metrics = dict(runtime["last_validation_metrics"])
                 final_stress_metrics = dict(runtime["final_stress_metrics"])
@@ -1574,6 +1604,21 @@ def main() -> None:
                     method="gail",
                 ):
                     monitor.save(best_path)
+                if (
+                    np.isfinite(best_full_load_score)
+                    and materialize_resume_best_checkpoint(
+                        resume_checkpoint,
+                        best_full_load_path,
+                        best_validation_score=best_full_load_score,
+                        save_best_checkpoint=bool(
+                            getattr(cfg, "save_best_checkpoint", True)
+                        ),
+                        cfg=cfg,
+                        method="gail",
+                        source_name="best_full_load.pt",
+                    )
+                ):
+                    monitor.save(best_full_load_path)
 
         if resume_payload is None and bool(getattr(cfg, "psro_lite", False)):
             append_policy_archive(psro_policy_archive, policy, cfg)
@@ -2125,6 +2170,9 @@ def main() -> None:
                 "train/collision_termination_enabled": int(
                     bool(getattr(round_cfg, "terminate_when_all_controlled_crashed", True))
                 ),
+                "train/rollout_fixed_horizon": int(
+                    bool(getattr(round_cfg, "rollout_fixed_horizon", False))
+                ),
                 "train/collision_mode_soft": int(str(getattr(round_cfg, "collision_mode_schedule", "")) == "soft"),
                 "train/collision_mode_mixed": int(str(getattr(round_cfg, "collision_mode_schedule", "")) == "mixed"),
                 "train/collision_mode_full": int(str(getattr(round_cfg, "collision_mode_schedule", "")) in {"full", ""}),
@@ -2343,6 +2391,9 @@ def main() -> None:
                 step=round_idx,
             )
             pending_best: tuple[dict[str, float], float, float] | None = None
+            pending_full_load_best: (
+                tuple[dict[str, float], float, float] | None
+            ) = None
             if int(getattr(cfg, "validation_every", 0)) > 0 and round_idx % int(cfg.validation_every) == 0:
                 val_metrics = evaluate_policy_matched_trajectories(
                     policy,
@@ -2390,6 +2441,33 @@ def main() -> None:
                         best_validation_score = float(val_score)
                         best_validation_round = int(round_idx)
                         pending_best = (dict(val_metrics), float(val_score), float(val_cost))
+                    full_load_selection_start = max(
+                        0,
+                        int(
+                            getattr(
+                                cfg,
+                                "full_load_selection_start_round",
+                                0,
+                            )
+                        ),
+                    )
+                    full_load_improved = (
+                        full_load_selection_start > 0
+                        and round_idx >= full_load_selection_start
+                        and bool(getattr(cfg, "save_best_checkpoint", True))
+                        and np.isfinite(val_score)
+                        and val_score
+                        > best_full_load_score
+                        + float(getattr(cfg, "validation_min_delta", 0.0))
+                    )
+                    if full_load_improved:
+                        best_full_load_score = float(val_score)
+                        best_full_load_round = int(round_idx)
+                        pending_full_load_best = (
+                            dict(val_metrics),
+                            float(val_score),
+                            float(val_cost),
+                        )
                     learning_health_reasons = health_monitor.observe_learning(
                         round_cfg,
                         round_idx=round_idx,
@@ -2417,6 +2495,12 @@ def main() -> None:
                     print(
                         matched_validation_summary("validation", f"{round_idx:04d}", val_metrics)
                         + f" best={best_validation_score:.4f}@{best_validation_round}"
+                        + (
+                            " full_load_best="
+                            f"{best_full_load_score:.4f}@{best_full_load_round}"
+                            if full_load_selection_start > 0
+                            else ""
+                        )
                     )
 
             stress_every = int(getattr(cfg, "validation_stress_every", 0))
@@ -2495,6 +2579,33 @@ def main() -> None:
                     best_path,
                 )
                 monitor.save(best_path)
+            if pending_full_load_best is not None:
+                saved_metrics, saved_score, saved_cost = (
+                    pending_full_load_best
+                )
+                atomic_torch_save(
+                    best_checkpoint_payload(
+                        gail_checkpoint_payload(
+                            round_idx=round_idx,
+                            policy=policy,
+                            discriminator=discriminator,
+                            scene_discriminator=scene_discriminator,
+                            sequence_only_discriminator=sequence_only_discriminator,
+                            primary_discriminator_normalizer=primary_discriminator_normalizer,
+                            scene_discriminator_normalizer=scene_discriminator_normalizer,
+                            discriminator_name=discriminator_name,
+                            expert_metadata=expert_metadata,
+                            cfg=cfg,
+                            round_cfg=round_cfg,
+                        ),
+                        round_idx=round_idx,
+                        validation_metrics=saved_metrics,
+                        validation_score=saved_score,
+                        validation_cost=saved_cost,
+                    ),
+                    best_full_load_path,
+                )
+                monitor.save(best_full_load_path)
             if cfg.checkpoint_every > 0 and round_idx % int(cfg.checkpoint_every) == 0:
                 checkpoint_path = os.path.join(ckpt_dir, f"round_{round_idx:04d}.pt")
                 atomic_torch_save(
@@ -2670,7 +2781,15 @@ def main() -> None:
                 print(matched_validation_summary("validation_stress", "final", stress_metrics))
         selected_checkpoint_name = "final.pt"
         selected_policy_state = policy_archive_snapshot(policy)
-        if os.path.isfile(best_path):
+        if (
+            int(getattr(cfg, "full_load_selection_start_round", 0)) > 0
+            and os.path.isfile(best_full_load_path)
+        ):
+            selected_policy_state = load_verified_policy_state(
+                best_full_load_path
+            )
+            selected_checkpoint_name = "best_full_load.pt"
+        elif os.path.isfile(best_path):
             selected_policy_state = load_verified_policy_state(best_path)
             selected_checkpoint_name = "best.pt"
         policy.load_state_dict(selected_policy_state)
@@ -2772,6 +2891,15 @@ def main() -> None:
             final_policy_test_metrics=final_policy_test_metrics,
             policy_relative_l2_delta=selected_policy_relative_l2_delta,
             selected_checkpoint=selected_checkpoint_name,
+            best_full_load_score=(
+                best_full_load_score
+                if int(
+                    getattr(cfg, "full_load_selection_start_round", 0)
+                )
+                > 0
+                else None
+            ),
+            best_full_load_round=best_full_load_round,
         )
         monitor.save(summary_path)
     finally:

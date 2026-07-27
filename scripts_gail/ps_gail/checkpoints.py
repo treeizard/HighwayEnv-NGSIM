@@ -37,6 +37,14 @@ _RUNTIME_CONFIG_FIELDS = {
     "wandb_watch",
 }
 
+_BACKWARD_COMPATIBLE_CONFIG_DEFAULTS = {
+    "initial_action_std": "",
+    "minimum_action_std": "",
+    "maximum_action_std": "",
+    "full_load_selection_start_round": 0,
+    "rollout_fixed_horizon": False,
+}
+
 POLICY_ARCHITECTURE_FIELDS: tuple[str, ...] = (
     "policy_model",
     "hidden_size",
@@ -208,6 +216,7 @@ def normalized_config_hash(cfg: PSGAILConfig) -> str:
             key == "transformer_observation_tokenization"
             and value == "semantic"
         )
+        and _BACKWARD_COMPATIBLE_CONFIG_DEFAULTS.get(key, object()) != value
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -227,6 +236,7 @@ def resume_config_hash(cfg: PSGAILConfig) -> str:
             key == "transformer_observation_tokenization"
             and value == "semantic"
         )
+        and _BACKWARD_COMPATIBLE_CONFIG_DEFAULTS.get(key, object()) != value
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
