@@ -147,7 +147,9 @@ def _update_recurrent_policy(
     post_update_ratio_std = float("nan")
     target_kl = max(0.0, float(getattr(cfg, "target_kl", 0.0)))
     epochs_completed = 0
+    optimizer_steps = 0
     early_stopped_kl = False
+    minibatch_early_stopped_kl = False
 
     def cpu_to_device(tensor: torch.Tensor) -> torch.Tensor:
         if device.type == "cuda":
@@ -336,9 +338,6 @@ def _update_recurrent_policy(
                         )
                         if bc_loss is not None:
                             bc_losses.append(float(bc_loss.detach().cpu().item()))
-                nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
-                optimizer.step()
-                configure_policy_action_std(policy, cfg, initialize=False)
                 policy_losses.append(weighted_policy_loss)
                 value_losses.append(weighted_value_loss)
                 entropies.append(weighted_entropy)
@@ -346,7 +345,21 @@ def _update_recurrent_policy(
                 clip_fractions.append(weighted_clip_fraction)
                 ratio_means.append(weighted_ratio_mean)
                 ratio_stds.append(weighted_ratio_std)
+                # Waiting until the end of a recurrent epoch permits many
+                # sequence-minibatch steps after the trust-region target has
+                # already been crossed. Reject that next step immediately.
+                if target_kl > 0.0 and weighted_approx_kl > target_kl:
+                    optimizer.zero_grad(set_to_none=True)
+                    early_stopped_kl = True
+                    minibatch_early_stopped_kl = True
+                    break
+                nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+                optimizer.step()
+                optimizer_steps += 1
+                configure_policy_action_std(policy, cfg, initialize=False)
             epochs_completed += 1
+            if minibatch_early_stopped_kl:
+                break
             epoch_kls = approx_kls[epoch_kl_start:]
             if target_kl > 0.0 and epoch_kls and float(np.mean(epoch_kls)) > target_kl:
                 early_stopped_kl = True
@@ -402,7 +415,9 @@ def _update_recurrent_policy(
             int(getattr(cfg, "transformer_recurrent_sequence_length", 32))
         ),
         "ppo_epochs_completed": float(epochs_completed),
+        "ppo_optimizer_steps": float(optimizer_steps),
         "ppo_early_stopped_kl": float(int(early_stopped_kl)),
+        "ppo_minibatch_early_stopped_kl": float(int(minibatch_early_stopped_kl)),
         "target_kl": float(target_kl),
     }
     stats.update(recurrent_memory_stats(rollout))
@@ -496,7 +511,9 @@ def update_policy(
     post_update_ratio_std = float("nan")
     target_kl = max(0.0, float(getattr(cfg, "target_kl", 0.0)))
     epochs_completed = 0
+    optimizer_steps = 0
     early_stopped_kl = False
+    minibatch_early_stopped_kl = False
     batch_size = max(1, int(cfg.batch_size))
     num_samples = int(obs_tensor.shape[0])
     # Micro Batch and Mini Batch
@@ -596,9 +613,6 @@ def update_policy(
                         )
                         if bc_loss is not None:
                             bc_losses.append(float(bc_loss.detach().cpu().item()))
-                nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
-                optimizer.step()
-                configure_policy_action_std(policy, cfg, initialize=False)
                 policy_losses.append(weighted_policy_loss)
                 value_losses.append(weighted_value_loss)
                 entropies.append(weighted_entropy)
@@ -606,7 +620,18 @@ def update_policy(
                 clip_fractions.append(weighted_clip_fraction)
                 ratio_means.append(weighted_ratio_mean)
                 ratio_stds.append(weighted_ratio_std)
+                if target_kl > 0.0 and weighted_approx_kl > target_kl:
+                    optimizer.zero_grad(set_to_none=True)
+                    early_stopped_kl = True
+                    minibatch_early_stopped_kl = True
+                    break
+                nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+                optimizer.step()
+                optimizer_steps += 1
+                configure_policy_action_std(policy, cfg, initialize=False)
             epochs_completed += 1
+            if minibatch_early_stopped_kl:
+                break
             epoch_kls = approx_kls[epoch_kl_start:]
             if target_kl > 0.0 and epoch_kls and float(np.mean(epoch_kls)) > target_kl:
                 early_stopped_kl = True
@@ -674,7 +699,9 @@ def update_policy(
         "log_std_delta": final_log_std_mean - initial_log_std_mean,
         "action_std_param_delta": final_action_std_mean - initial_action_std_mean,
         "ppo_epochs_completed": float(epochs_completed),
+        "ppo_optimizer_steps": float(optimizer_steps),
         "ppo_early_stopped_kl": float(int(early_stopped_kl)),
+        "ppo_minibatch_early_stopped_kl": float(int(minibatch_early_stopped_kl)),
         "target_kl": float(target_kl),
     }
 

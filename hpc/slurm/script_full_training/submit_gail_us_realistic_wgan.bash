@@ -16,6 +16,7 @@ EXPERT_DATA="${EXPERT_DATA:-${VFI_PROJECT_ROOT}/data/expert/${COLLECTION_ID}/us/
 BC_ROOT="${BC_ROOT:-${VFI_PROJECT_ROOT}/results/runs/policies/bc/gail_aligned_accel5_58539772/us}"
 POLICY_RECIPE="${POLICY_RECIPE:-${REPODIR}/configs/bc_gail_aligned_accel5_v4.json}"
 UPSTREAM_DEPENDENCY="${UPSTREAM_DEPENDENCY:-}"
+GAIL_DEPTHS="${GAIL_DEPTHS:-2 3}"
 
 case "${CAMPAIGN_ID}" in
     *[!A-Za-z0-9._-]*|'') echo "Unsafe CAMPAIGN_ID: ${CAMPAIGN_ID}" >&2; exit 2 ;;
@@ -54,6 +55,35 @@ if [ -n "${UPSTREAM_DEPENDENCY}" ]; then
         *) echo "UPSTREAM_DEPENDENCY must be empty or afterok:<job_id>." >&2; exit 2 ;;
     esac
 fi
+read -r -a requested_depths <<< "${GAIL_DEPTHS}"
+if [ "${#requested_depths[@]}" -eq 0 ]; then
+    echo "GAIL_DEPTHS must select depth 2, depth 3, or both." >&2
+    exit 2
+fi
+seen_depth2=false
+seen_depth3=false
+for depth in "${requested_depths[@]}"; do
+    case "${depth}" in
+        2)
+            if [ "${seen_depth2}" = true ]; then
+                echo "GAIL_DEPTHS contains duplicate depth 2." >&2
+                exit 2
+            fi
+            seen_depth2=true
+            ;;
+        3)
+            if [ "${seen_depth3}" = true ]; then
+                echo "GAIL_DEPTHS contains duplicate depth 3." >&2
+                exit 2
+            fi
+            seen_depth3=true
+            ;;
+        *)
+            echo "GAIL_DEPTHS contains unsupported depth: ${depth}" >&2
+            exit 2
+            ;;
+    esac
+done
 
 submission_dir="${VFI_PROJECT_ROOT}/results/runs/submissions/${CAMPAIGN_ID}"
 run_root="${VFI_PROJECT_ROOT}/results/runs/policies/gail_airl/${CAMPAIGN_ID}"
@@ -162,7 +192,7 @@ if [ -n "${UPSTREAM_DEPENDENCY}" ]; then
 fi
 
 if [ "${DRY_RUN}" = true ]; then
-    for depth in 2 3; do
+    for depth in "${requested_depths[@]}"; do
         command=(sbatch --parsable --chdir="${REPODIR}" \
             --job-name="gail_us_wgan_d${depth}" "${dependency_args[@]}" \
             --export="${common_export},DEPTH=${depth}" \
@@ -189,13 +219,13 @@ common_export="ALL,REPODIR=${REPODIR},PILOT_MANIFEST=${manifest},PILOT_SLURM_LOG
 common_export="${common_export},VFI_PROJECT_ROOT=${VFI_PROJECT_ROOT},VFI_CONDA_ENV=ngsim_env,PYTHON_BIN=${PYTHON_BIN}"
 common_export="${common_export},NGSIM_ACCELERATION_LIMIT_MPS2=5.0,GAIL_RUN_PROFILE=realistic_wgan_v1"
 
-for depth in 2 3; do
+for depth in "${requested_depths[@]}"; do
     sbatch --test-only --chdir="${REPODIR}" --job-name="gail_us_wgan_d${depth}" \
         --export="${common_export},DEPTH=${depth}" "${runner}"
 done
 
 submitted_jobs=()
-for depth in 2 3; do
+for depth in "${requested_depths[@]}"; do
     set +e
     output="$(sbatch --parsable --chdir="${REPODIR}" \
         --job-name="gail_us_wgan_d${depth}" "${dependency_args[@]}" \
@@ -214,9 +244,12 @@ for depth in 2 3; do
     submitted_jobs+=("${output%%;*}")
 done
 
-depth2_job="${submitted_jobs[0]}"
-depth3_job="${submitted_jobs[1]}"
-export CAMPAIGN_ID manifest run_root slurm_log_root depth2_job depth3_job
+submitted_depth_pairs=""
+for index in "${!requested_depths[@]}"; do
+    submitted_depth_pairs+="${requested_depths[$index]}:${submitted_jobs[$index]} "
+done
+submitted_depth_pairs="${submitted_depth_pairs% }"
+export CAMPAIGN_ID manifest run_root slurm_log_root submitted_depth_pairs
 export EXPERT_DATA BC_ROOT POLICY_RECIPE UPSTREAM_DEPENDENCY
 "${PYTHON_BIN}" - "${submission_dir}/submission_metadata.json" <<'PY'
 from datetime import datetime, timezone
@@ -224,6 +257,11 @@ import json
 import os
 import sys
 
+jobs = {
+    f"gail_depth{depth}": job_id
+    for item in os.environ["submitted_depth_pairs"].split()
+    for depth, job_id in [item.split(":", 1)]
+}
 payload = {
     "schema_version": 1,
     "submitted_utc": datetime.now(timezone.utc).isoformat(),
@@ -239,13 +277,10 @@ payload = {
     "policy_initialization": "verified_matched_bc_checkpoint",
     "bc_initializer_qualification": "matched_training_artifact_v1",
     "full_load_selection_start_round": 701,
-    "jobs": {
-        "gail_depth2": os.environ["depth2_job"],
-        "gail_depth3": os.environ["depth3_job"],
-    },
+    "jobs": jobs,
     "upstream_dependency": os.environ.get("UPSTREAM_DEPENDENCY") or None,
     "gpus_per_job": 1,
-    "concurrent_depths": True,
+    "concurrent_depths": len(jobs) > 1,
     "arrays": False,
     "requeue": False,
     "automatic_retry": False,
@@ -254,6 +289,7 @@ with open(sys.argv[1], "x", encoding="utf-8") as handle:
     json.dump(payload, handle, indent=2, sort_keys=True)
     handle.write("\n")
 PY
-echo "submitted_depth2_job=${depth2_job}"
-echo "submitted_depth3_job=${depth3_job}"
+for index in "${!requested_depths[@]}"; do
+    echo "submitted_depth${requested_depths[$index]}_job=${submitted_jobs[$index]}"
+done
 echo "manifest=${manifest}"

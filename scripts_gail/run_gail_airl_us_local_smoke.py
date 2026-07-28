@@ -291,6 +291,13 @@ def main() -> None:
                 failures.append(
                     f"runtime_contract_mismatch:{key}={value!r}!={expected!r}"
                 )
+        for key in (
+            "policy/ppo_optimizer_steps",
+            "policy/ppo_minibatch_early_stopped_kl",
+        ):
+            value = runtime_metrics.get(key)
+            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                failures.append(f"nonfinite_or_missing:{key}")
         achieved_controlled_vehicles = runtime_metrics.get(
             "rollout/mean_controlled_vehicles"
         )

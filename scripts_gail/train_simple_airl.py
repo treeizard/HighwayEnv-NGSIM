@@ -2080,7 +2080,11 @@ def main() -> None:
                 "policy/entropy": policy_stats["entropy"],
                 "policy/approx_kl": policy_stats["approx_kl"],
                 "policy/ppo_epochs_completed": policy_stats["ppo_epochs_completed"],
+                "policy/ppo_optimizer_steps": policy_stats["ppo_optimizer_steps"],
                 "policy/ppo_early_stopped_kl": policy_stats["ppo_early_stopped_kl"],
+                "policy/ppo_minibatch_early_stopped_kl": policy_stats[
+                    "ppo_minibatch_early_stopped_kl"
+                ],
                 "policy/target_kl": policy_stats["target_kl"],
                 "policy/post_update_approx_kl": policy_stats["post_update_approx_kl"],
                 "policy/clip_fraction": policy_stats["clip_fraction"],

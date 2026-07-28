@@ -602,7 +602,7 @@ def test_centralized_critic_uses_separate_observation_path():
     assert not torch.allclose(values_a, values_b)
 
 
-def test_ppo_target_kl_stops_remaining_epochs():
+def test_ppo_target_kl_stops_before_remaining_minibatch_updates():
     torch.manual_seed(5)
     np.random.seed(5)
     cfg = PSGAILConfig(
@@ -634,6 +634,86 @@ def test_ppo_target_kl_stops_remaining_epochs():
 
     assert stats["ppo_early_stopped_kl"] == 1.0
     assert 1.0 <= stats["ppo_epochs_completed"] < float(cfg.ppo_epochs)
+    assert stats["ppo_minibatch_early_stopped_kl"] == 1.0
+    assert 1.0 <= stats["ppo_optimizer_steps"] < 4.0
+    assert stats["target_kl"] == cfg.target_kl
+
+
+def test_recurrent_ppo_target_kl_stops_before_remaining_sequence_minibatches():
+    torch.manual_seed(7)
+    np.random.seed(7)
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        policy_model="recurrent_transformer",
+        continuous_action_dim=2,
+        hidden_size=16,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+        transformer_memory_storage_dtype="float32",
+        transformer_recurrent_sequence_length=2,
+        transformer_recurrent_sequences_per_batch=2,
+        transformer_recurrent_micro_batch_sequences=2,
+        ppo_epochs=4,
+        learning_rate=0.1,
+        entropy_coef=0.0,
+        value_coef=0.0,
+        target_kl=1.0e-6,
+    )
+    policy = make_actor_critic(
+        "recurrent_transformer",
+        obs_dim=6,
+        hidden_size=16,
+        action_mode="continuous",
+        continuous_action_dim=2,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+    ).eval()
+    observations = np.random.randn(16, 6).astype(np.float32)
+    actions = []
+    old_log_probs = []
+    old_values = []
+    step_memories = []
+    memory = policy.initial_memory(1, dtype=torch.float32)
+    with torch.no_grad():
+        for observation in observations:
+            dist, values, step_memory = policy_distribution_values_memory(
+                policy,
+                torch.as_tensor(observation[None, :], dtype=torch.float32),
+                cfg,
+                None,
+                memory=memory,
+                return_memory=True,
+            )
+            action = dist.sample()
+            actions.append(action.squeeze(0).cpu().numpy())
+            old_log_probs.append(float(dist.log_prob(action).cpu().item()))
+            old_values.append(float(values.cpu().item()))
+            step_memories.append(step_memory.squeeze(0).cpu().numpy())
+            memory = torch.cat([memory[:, 1:], step_memory.unsqueeze(1)], dim=1)
+    rollout = _minimal_rollout(
+        observations=observations,
+        actions=np.asarray(actions, dtype=np.float32),
+        old_log_probs=np.asarray(old_log_probs, dtype=np.float32),
+        old_values=np.asarray(old_values, dtype=np.float32),
+        returns=np.asarray(old_values, dtype=np.float32),
+        advantages=np.ones(16, dtype=np.float32),
+        trajectory_ids=np.zeros(16, dtype=np.int64),
+        dones=np.asarray([False] * 15 + [True]),
+    )
+    rollout.policy_step_memories = np.asarray(step_memories, dtype=np.float32)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.learning_rate)
+
+    stats = update_policy(policy, optimizer, rollout, cfg, torch.device("cpu"))
+
+    assert stats["ppo_early_stopped_kl"] == 1.0
+    assert stats["ppo_minibatch_early_stopped_kl"] == 1.0
+    assert 1.0 <= stats["ppo_optimizer_steps"] < 4.0
     assert stats["target_kl"] == cfg.target_kl
 
 
