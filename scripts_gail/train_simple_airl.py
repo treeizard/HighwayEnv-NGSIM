@@ -2085,6 +2085,18 @@ def main() -> None:
                 "policy/ppo_minibatch_early_stopped_kl": policy_stats[
                     "ppo_minibatch_early_stopped_kl"
                 ],
+                "policy/ppo_kl_backtrack_attempts": policy_stats[
+                    "ppo_kl_backtrack_attempts"
+                ],
+                "policy/ppo_kl_step_scale_min": policy_stats[
+                    "ppo_kl_step_scale_min"
+                ],
+                "policy/ppo_accepted_step_kl_max": policy_stats[
+                    "ppo_accepted_step_kl_max"
+                ],
+                "policy/ppo_kl_step_rejected": policy_stats[
+                    "ppo_kl_step_rejected"
+                ],
                 "policy/target_kl": policy_stats["target_kl"],
                 "policy/post_update_approx_kl": policy_stats["post_update_approx_kl"],
                 "policy/clip_fraction": policy_stats["clip_fraction"],

@@ -294,6 +294,10 @@ def main() -> None:
         for key in (
             "policy/ppo_optimizer_steps",
             "policy/ppo_minibatch_early_stopped_kl",
+            "policy/ppo_kl_backtrack_attempts",
+            "policy/ppo_kl_step_scale_min",
+            "policy/ppo_accepted_step_kl_max",
+            "policy/ppo_kl_step_rejected",
         ):
             value = runtime_metrics.get(key)
             if not isinstance(value, (int, float)) or not math.isfinite(float(value)):

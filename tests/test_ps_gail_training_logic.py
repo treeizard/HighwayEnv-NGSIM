@@ -131,7 +131,11 @@ from scripts_gail.ps_gail.trainer import (
     update_discriminator,
     update_policy,
 )
-from scripts_gail.ps_gail.training.ppo import _clipped_value_loss
+from scripts_gail.ps_gail.training.ppo import (
+    PPO_KL_MAX_BACKTRACKS,
+    _clipped_value_loss,
+    _optimizer_step_with_kl_backtracking,
+)
 from scripts_gail.train_simple_ps_gail import behavior_clone_pretrain
 from scripts_gail.train_simple_ps_gail import config_for_round as ps_gail_config_for_round
 from scripts_gail.train_simple_ps_gail import parse_args as ps_gail_parse_args
@@ -629,14 +633,56 @@ def test_ppo_target_kl_stops_before_remaining_minibatch_updates():
         advantages=np.ones(32, dtype=np.float32),
     )
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.learning_rate)
+    policy_before = {
+        name: value.detach().clone()
+        for name, value in policy.state_dict().items()
+    }
 
     stats = update_policy(policy, optimizer, rollout, cfg, torch.device("cpu"))
 
     assert stats["ppo_early_stopped_kl"] == 1.0
     assert 1.0 <= stats["ppo_epochs_completed"] < float(cfg.ppo_epochs)
     assert stats["ppo_minibatch_early_stopped_kl"] == 1.0
-    assert 1.0 <= stats["ppo_optimizer_steps"] < 4.0
+    assert stats["ppo_optimizer_steps"] == 0.0
+    assert stats["ppo_kl_backtrack_attempts"] == float(
+        PPO_KL_MAX_BACKTRACKS + 1
+    )
+    assert stats["ppo_kl_step_rejected"] == 1.0
+    assert stats["post_update_approx_kl"] <= cfg.target_kl
+    for name, value in policy.state_dict().items():
+        torch.testing.assert_close(value, policy_before[name], rtol=0.0, atol=0.0)
     assert stats["target_kl"] == cfg.target_kl
+
+
+def test_optimizer_step_backtracks_to_an_accepted_kl_and_restores_adam_state():
+    cfg = PSGAILConfig()
+    policy = torch.nn.Linear(1, 1, bias=False)
+    torch.nn.init.zeros_(policy.weight)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1.0)
+    (-policy.weight.sum()).backward()
+
+    accepted, backtracks, step_scale, observed_kl = (
+        _optimizer_step_with_kl_backtracking(
+            policy,
+            optimizer,
+            cfg,
+            target_kl=0.1,
+            kl_evaluator=lambda: float(policy.weight.detach().square().item()),
+        )
+    )
+
+    assert accepted is True
+    assert backtracks == 2
+    assert step_scale == 0.25
+    assert observed_kl <= 0.1
+    torch.testing.assert_close(
+        policy.weight.detach(),
+        torch.tensor([[0.25]]),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    assert float(optimizer.state[policy.weight]["step"].item()) == 1.0
+    assert optimizer.param_groups[0]["lr"] == 1.0
 
 
 def test_recurrent_ppo_target_kl_stops_before_remaining_sequence_minibatches():
@@ -708,12 +754,23 @@ def test_recurrent_ppo_target_kl_stops_before_remaining_sequence_minibatches():
     )
     rollout.policy_step_memories = np.asarray(step_memories, dtype=np.float32)
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.learning_rate)
+    policy_before = {
+        name: value.detach().clone()
+        for name, value in policy.state_dict().items()
+    }
 
     stats = update_policy(policy, optimizer, rollout, cfg, torch.device("cpu"))
 
     assert stats["ppo_early_stopped_kl"] == 1.0
     assert stats["ppo_minibatch_early_stopped_kl"] == 1.0
-    assert 1.0 <= stats["ppo_optimizer_steps"] < 4.0
+    assert stats["ppo_optimizer_steps"] == 0.0
+    assert stats["ppo_kl_backtrack_attempts"] == float(
+        PPO_KL_MAX_BACKTRACKS + 1
+    )
+    assert stats["ppo_kl_step_rejected"] == 1.0
+    assert stats["post_update_approx_kl"] <= cfg.target_kl
+    for name, value in policy.state_dict().items():
+        torch.testing.assert_close(value, policy_before[name], rtol=0.0, atol=0.0)
     assert stats["target_kl"] == cfg.target_kl
 
 

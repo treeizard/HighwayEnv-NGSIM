@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import copy
+import math
+from collections.abc import Callable
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -20,6 +24,9 @@ from .policy import (
     recurrent_policy_enabled,
 )
 from .types import RolloutBatch
+
+PPO_KL_BACKTRACK_FACTOR = 0.5
+PPO_KL_MAX_BACKTRACKS = 8
 
 
 def _clipped_value_loss(
@@ -40,6 +47,67 @@ def _clipped_value_loss(
         torch.square(values - returns),
         torch.square(clipped_values - returns),
     ).mean()
+
+
+def _optimizer_step_with_kl_backtracking(
+    policy: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    cfg: PSGAILConfig,
+    *,
+    target_kl: float,
+    kl_evaluator: Callable[[], float],
+) -> tuple[bool, int, float, float]:
+    """Apply one optimizer step without accepting an over-target KL update."""
+    if target_kl <= 0.0:
+        optimizer.step()
+        configure_policy_action_std(policy, cfg, initialize=False)
+        return True, 0, 1.0, float("nan")
+
+    policy_state = {
+        name: value.detach().clone()
+        for name, value in policy.state_dict().items()
+    }
+    optimizer_state = copy.deepcopy(optimizer.state_dict())
+    base_learning_rates = [
+        float(parameter_group["lr"])
+        for parameter_group in optimizer.param_groups
+    ]
+    observed_kl = float("nan")
+
+    for backtracks in range(PPO_KL_MAX_BACKTRACKS + 1):
+        if backtracks:
+            policy.load_state_dict(policy_state)
+            optimizer.load_state_dict(copy.deepcopy(optimizer_state))
+        step_scale = PPO_KL_BACKTRACK_FACTOR**backtracks
+        for parameter_group, base_learning_rate in zip(
+            optimizer.param_groups,
+            base_learning_rates,
+            strict=True,
+        ):
+            parameter_group["lr"] = base_learning_rate * step_scale
+        optimizer.step()
+        configure_policy_action_std(policy, cfg, initialize=False)
+        with torch.no_grad():
+            observed_kl = float(kl_evaluator())
+        if math.isfinite(observed_kl) and observed_kl <= target_kl:
+            for parameter_group, base_learning_rate in zip(
+                optimizer.param_groups,
+                base_learning_rates,
+                strict=True,
+            ):
+                parameter_group["lr"] = base_learning_rate
+            return True, backtracks, step_scale, observed_kl
+
+    policy.load_state_dict(policy_state)
+    optimizer.load_state_dict(copy.deepcopy(optimizer_state))
+    for parameter_group, base_learning_rate in zip(
+        optimizer.param_groups,
+        base_learning_rates,
+        strict=True,
+    ):
+        parameter_group["lr"] = base_learning_rate
+    optimizer.zero_grad(set_to_none=True)
+    return False, PPO_KL_MAX_BACKTRACKS + 1, 0.0, observed_kl
 
 
 def _recurrent_rollout_chunks(
@@ -150,6 +218,10 @@ def _update_recurrent_policy(
     optimizer_steps = 0
     early_stopped_kl = False
     minibatch_early_stopped_kl = False
+    kl_backtrack_attempts = 0
+    kl_step_scale_min = 1.0
+    kl_step_rejected = False
+    accepted_step_kls: list[float] = []
 
     def cpu_to_device(tensor: torch.Tensor) -> torch.Tensor:
         if device.type == "cuda":
@@ -271,6 +343,40 @@ def _update_recurrent_policy(
             valid_count,
         )
 
+    diagnostic_chunks = chunks[: min(len(chunks), max(1, seqs_per_batch))]
+
+    def recurrent_diagnostics(
+        selected_chunks: list[tuple[np.ndarray, int, int]],
+    ) -> tuple[float, float, float]:
+        diagnostic_transition_count = sum(
+            end - start
+            for _indices, start, end in selected_chunks
+        )
+        weighted_kl = 0.0
+        weighted_ratio_mean = 0.0
+        weighted_ratio_std = 0.0
+        with torch.no_grad():
+            for micro_start in range(0, len(selected_chunks), micro_sequences):
+                micro_chunks = selected_chunks[
+                    micro_start : micro_start + micro_sequences
+                ]
+                _pl, _vl, _ent, approx_kl, ratio, valid_count = (
+                    recurrent_micro_forward(micro_chunks)
+                )
+                micro_weight = float(valid_count) / float(
+                    max(1, diagnostic_transition_count)
+                )
+                weighted_kl += micro_weight * float(
+                    approx_kl.detach().cpu().item()
+                )
+                weighted_ratio_mean += micro_weight * float(
+                    ratio.mean().detach().cpu().item()
+                )
+                weighted_ratio_std += micro_weight * float(
+                    ratio.std(unbiased=False).detach().cpu().item()
+                )
+        return weighted_kl, weighted_ratio_mean, weighted_ratio_std
+
     try:
         for _epoch in range(int(cfg.ppo_epochs)):
             epoch_kl_start = len(approx_kls)
@@ -354,9 +460,30 @@ def _update_recurrent_policy(
                     minibatch_early_stopped_kl = True
                     break
                 nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
-                optimizer.step()
+                (
+                    step_accepted,
+                    step_backtracks,
+                    step_scale,
+                    accepted_step_kl,
+                ) = _optimizer_step_with_kl_backtracking(
+                    policy,
+                    optimizer,
+                    cfg,
+                    target_kl=target_kl,
+                    kl_evaluator=lambda: recurrent_diagnostics(
+                        diagnostic_chunks
+                    )[0],
+                )
+                kl_backtrack_attempts += step_backtracks
+                if not step_accepted:
+                    early_stopped_kl = True
+                    minibatch_early_stopped_kl = True
+                    kl_step_rejected = True
+                    break
                 optimizer_steps += 1
-                configure_policy_action_std(policy, cfg, initialize=False)
+                kl_step_scale_min = min(kl_step_scale_min, step_scale)
+                if math.isfinite(accepted_step_kl):
+                    accepted_step_kls.append(accepted_step_kl)
             epochs_completed += 1
             if minibatch_early_stopped_kl:
                 break
@@ -365,25 +492,12 @@ def _update_recurrent_policy(
                 early_stopped_kl = True
                 break
 
-        diagnostic_chunks = chunks[: min(len(chunks), max(1, seqs_per_batch))]
         if diagnostic_chunks:
-            diagnostic_transition_count = sum(end - start for _indices, start, end in diagnostic_chunks)
-            weighted_post_kl = 0.0
-            weighted_post_ratio_mean = 0.0
-            weighted_post_ratio_std = 0.0
-            with torch.no_grad():
-                for micro_start in range(0, len(diagnostic_chunks), micro_sequences):
-                    micro_chunks = diagnostic_chunks[micro_start : micro_start + micro_sequences]
-                    _pl, _vl, _ent, approx_kl, ratio, valid_count = recurrent_micro_forward(micro_chunks)
-                    micro_weight = float(valid_count) / float(max(1, diagnostic_transition_count))
-                    weighted_post_kl += micro_weight * float(approx_kl.detach().cpu().item())
-                    weighted_post_ratio_mean += micro_weight * float(ratio.mean().detach().cpu().item())
-                    weighted_post_ratio_std += micro_weight * float(
-                        ratio.std(unbiased=False).detach().cpu().item()
-                    )
-            post_update_approx_kl = weighted_post_kl
-            post_update_ratio_mean = weighted_post_ratio_mean
-            post_update_ratio_std = weighted_post_ratio_std
+            (
+                post_update_approx_kl,
+                post_update_ratio_mean,
+                post_update_ratio_std,
+            ) = recurrent_diagnostics(diagnostic_chunks)
     finally:
         if was_training:
             policy.train()
@@ -418,6 +532,14 @@ def _update_recurrent_policy(
         "ppo_optimizer_steps": float(optimizer_steps),
         "ppo_early_stopped_kl": float(int(early_stopped_kl)),
         "ppo_minibatch_early_stopped_kl": float(int(minibatch_early_stopped_kl)),
+        "ppo_kl_backtrack_attempts": float(kl_backtrack_attempts),
+        "ppo_kl_step_scale_min": float(
+            kl_step_scale_min if optimizer_steps else 0.0
+        ),
+        "ppo_accepted_step_kl_max": float(
+            max(accepted_step_kls) if accepted_step_kls else 0.0
+        ),
+        "ppo_kl_step_rejected": float(int(kl_step_rejected)),
         "target_kl": float(target_kl),
     }
     stats.update(recurrent_memory_stats(rollout))
@@ -514,6 +636,10 @@ def update_policy(
     optimizer_steps = 0
     early_stopped_kl = False
     minibatch_early_stopped_kl = False
+    kl_backtrack_attempts = 0
+    kl_step_scale_min = 1.0
+    kl_step_rejected = False
+    accepted_step_kls: list[float] = []
     batch_size = max(1, int(cfg.batch_size))
     num_samples = int(obs_tensor.shape[0])
     # Micro Batch and Mini Batch
@@ -532,6 +658,53 @@ def update_policy(
         else:
             batch = batch.to(device=device)
         return batch
+
+    diagnostic_count = min(num_samples, max(batch_size, 4096))
+    diagnostic_idx = torch.arange(diagnostic_count)
+
+    def feedforward_diagnostics(
+        selected_indices: torch.Tensor,
+    ) -> tuple[float, float, float]:
+        weighted_kl = 0.0
+        weighted_ratio_mean = 0.0
+        weighted_ratio_std = 0.0
+        total_count = int(selected_indices.numel())
+        with torch.no_grad():
+            for micro_start in range(0, total_count, micro_batch_size):
+                micro_idx = selected_indices[
+                    micro_start : micro_start + micro_batch_size
+                ]
+                micro_count = int(micro_idx.numel())
+                micro_weight = float(micro_count) / float(max(1, total_count))
+                obs = device_batch(obs_tensor, micro_idx)
+                actions = device_batch(action_tensor, micro_idx)
+                old_log_probs = device_batch(old_log_probs_tensor, micro_idx)
+                critic_obs = device_batch(critic_obs_tensor, micro_idx)
+                masks = (
+                    device_batch(action_mask_tensor, micro_idx)
+                    if action_mask_tensor is not None
+                    else None
+                )
+                dist, _values = policy_distribution_and_values(
+                    policy,
+                    obs,
+                    cfg,
+                    masks,
+                    critic_obs_tensor=critic_obs,
+                )
+                log_ratio = dist.log_prob(actions) - old_log_probs
+                ratio = torch.exp(log_ratio)
+                approx_kl = ((ratio - 1.0) - log_ratio).mean()
+                weighted_kl += micro_weight * float(
+                    approx_kl.detach().cpu().item()
+                )
+                weighted_ratio_mean += micro_weight * float(
+                    ratio.mean().detach().cpu().item()
+                )
+                weighted_ratio_std += micro_weight * float(
+                    ratio.std(unbiased=False).detach().cpu().item()
+                )
+        return weighted_kl, weighted_ratio_mean, weighted_ratio_std
 
     try:
         for _ in range(int(cfg.ppo_epochs)):
@@ -626,9 +799,30 @@ def update_policy(
                     minibatch_early_stopped_kl = True
                     break
                 nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
-                optimizer.step()
+                (
+                    step_accepted,
+                    step_backtracks,
+                    step_scale,
+                    accepted_step_kl,
+                ) = _optimizer_step_with_kl_backtracking(
+                    policy,
+                    optimizer,
+                    cfg,
+                    target_kl=target_kl,
+                    kl_evaluator=lambda: feedforward_diagnostics(
+                        diagnostic_idx
+                    )[0],
+                )
+                kl_backtrack_attempts += step_backtracks
+                if not step_accepted:
+                    early_stopped_kl = True
+                    minibatch_early_stopped_kl = True
+                    kl_step_rejected = True
+                    break
                 optimizer_steps += 1
-                configure_policy_action_std(policy, cfg, initialize=False)
+                kl_step_scale_min = min(kl_step_scale_min, step_scale)
+                if math.isfinite(accepted_step_kl):
+                    accepted_step_kls.append(accepted_step_kl)
             epochs_completed += 1
             if minibatch_early_stopped_kl:
                 break
@@ -637,41 +831,12 @@ def update_policy(
                 early_stopped_kl = True
                 break
 
-        diagnostic_count = min(num_samples, max(batch_size, 4096))
         if diagnostic_count > 0:
-            diagnostic_idx = torch.randperm(num_samples)[:diagnostic_count]
-            weighted_post_kl = 0.0
-            weighted_post_ratio_mean = 0.0
-            weighted_post_ratio_std = 0.0
-            total_count = int(diagnostic_idx.numel())
-            with torch.no_grad():
-                for micro_start in range(0, total_count, micro_batch_size):
-                    micro_idx = diagnostic_idx[micro_start : micro_start + micro_batch_size]
-                    micro_count = int(micro_idx.numel())
-                    micro_weight = float(micro_count) / float(total_count)
-                    obs = device_batch(obs_tensor, micro_idx)
-                    actions = device_batch(action_tensor, micro_idx)
-                    old_log_probs = device_batch(old_log_probs_tensor, micro_idx)
-                    critic_obs = device_batch(critic_obs_tensor, micro_idx)
-                    masks = device_batch(action_mask_tensor, micro_idx) if action_mask_tensor is not None else None
-                    dist, _values = policy_distribution_and_values(
-                        policy,
-                        obs,
-                        cfg,
-                        masks,
-                        critic_obs_tensor=critic_obs,
-                    )
-                    log_ratio = dist.log_prob(actions) - old_log_probs
-                    ratio = torch.exp(log_ratio)
-                    approx_kl = ((ratio - 1.0) - log_ratio).mean()
-                    weighted_post_kl += micro_weight * float(approx_kl.detach().cpu().item())
-                    weighted_post_ratio_mean += micro_weight * float(ratio.mean().detach().cpu().item())
-                    weighted_post_ratio_std += micro_weight * float(
-                        ratio.std(unbiased=False).detach().cpu().item()
-                    )
-            post_update_approx_kl = weighted_post_kl
-            post_update_ratio_mean = weighted_post_ratio_mean
-            post_update_ratio_std = weighted_post_ratio_std
+            (
+                post_update_approx_kl,
+                post_update_ratio_mean,
+                post_update_ratio_std,
+            ) = feedforward_diagnostics(diagnostic_idx)
     finally:
         if was_training:
             policy.train()
@@ -702,6 +867,14 @@ def update_policy(
         "ppo_optimizer_steps": float(optimizer_steps),
         "ppo_early_stopped_kl": float(int(early_stopped_kl)),
         "ppo_minibatch_early_stopped_kl": float(int(minibatch_early_stopped_kl)),
+        "ppo_kl_backtrack_attempts": float(kl_backtrack_attempts),
+        "ppo_kl_step_scale_min": float(
+            kl_step_scale_min if optimizer_steps else 0.0
+        ),
+        "ppo_accepted_step_kl_max": float(
+            max(accepted_step_kls) if accepted_step_kls else 0.0
+        ),
+        "ppo_kl_step_rejected": float(int(kl_step_rejected)),
         "target_kl": float(target_kl),
     }
 

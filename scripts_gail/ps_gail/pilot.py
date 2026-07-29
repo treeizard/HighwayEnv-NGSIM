@@ -114,6 +114,7 @@ def _source_paths(repo: Path) -> list[Path]:
         "hpc/slurm/script_full_training/run_gail_us_scratch_depth.bash",
         "hpc/slurm/script_full_training/submit_gail_us_scratch.bash",
         "hpc/slurm/script_full_training/submit_gail_us_realistic_wgan.bash",
+        "hpc/slurm/script_full_training/submit_gail_us_realistic_wgan_accepted_step_kl_repair.bash",
         "hpc/slurm/script_full_training/submit_gail_us_realistic_wgan_kl_control_repair.bash",
         "hpc/slurm/script_full_training/submit_failed_policy_recovery.bash",
     ):
