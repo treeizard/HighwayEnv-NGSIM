@@ -1305,6 +1305,13 @@ def main() -> None:
             transformer_observation_normalization=bool(
                 getattr(cfg, "transformer_observation_normalization", False)
             ),
+            policy_observation_standardization_clip=float(
+                getattr(
+                    cfg,
+                    "policy_observation_standardization_clip",
+                    0.0,
+                )
+            ),
             transformer_observation_tokenization=str(
                 getattr(cfg, "transformer_observation_tokenization", "semantic")
             ),
@@ -1854,6 +1861,8 @@ def main() -> None:
                 device,
                 expert_policy_observations=expert.policy_observations,
                 expert_actions=expert.actions_continuous_env,
+                expert_trajectory_ids=expert.trajectory_ids,
+                expert_timesteps=expert.timesteps,
             )
             health_warnings: list[str] = []
             if bool(getattr(round_cfg, "abort_on_health_failure", False)):
@@ -2450,6 +2459,11 @@ def main() -> None:
         if os.path.isfile(best_path):
             selected_policy_state = load_verified_policy_state(best_path)
             selected_checkpoint_name = "best.pt"
+        if initializer_policy_state is not None:
+            selected_policy_relative_l2_delta = policy_relative_l2_delta(
+                selected_policy_state,
+                initializer_policy_state,
+            )
         policy.load_state_dict(selected_policy_state)
         if int(getattr(cfg, "validation_episodes", 0)) > 0:
             raw_selected_validation = evaluate_policy_matched_trajectories(
@@ -2506,10 +2520,6 @@ def main() -> None:
                     f"hard_brake={selected_test_metrics.get('test/hard_brake_rate', 0.0):.4f}"
                 )
             if initializer_policy_state is not None:
-                selected_policy_relative_l2_delta = policy_relative_l2_delta(
-                    selected_policy_state,
-                    initializer_policy_state,
-                )
                 policy.load_state_dict(initializer_policy_state)
                 raw_initializer_test = evaluate_policy_matched_trajectories(
                     policy,

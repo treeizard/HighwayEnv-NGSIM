@@ -60,6 +60,38 @@ def test_front_gap_logic_ignores_plain_replay_front_vehicle():
     assert desired_gap == pytest.approx(50.0)
 
 
+def test_last_active_replay_row_does_not_differentiate_into_padding():
+    road = Road(RoadNetwork.straight_road_network(lanes=1))
+    trajectory = np.asarray(
+        [
+            [790.0, 0.0, 20.0, 1.0],
+            [792.0, 0.0, 20.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    vehicle = NGSIMVehicle.create(
+        road=road,
+        vehicle_ID=7,
+        position=trajectory[0, :2],
+        v_length=5.0,
+        v_width=2.0,
+        ngsim_traj=trajectory,
+        scene="unit-test",
+        heading=0.0,
+        speed=20.0,
+        allow_idm=False,
+    )
+    road.vehicles.append(vehicle)
+    vehicle.sim_steps = 1
+
+    vehicle._update_from_trajectory()
+
+    np.testing.assert_allclose(vehicle.position, [792.0, 0.0])
+    assert vehicle.speed == pytest.approx(20.0)
+    assert vehicle.appear is True
+
+
 def test_front_gap_logic_respects_overtaken_front_vehicle():
     road = Road(RoadNetwork.straight_road_network(lanes=1))
     rear = _make_vehicle(road, vehicle_id=1, x=0.0, speed=10.0)

@@ -29,6 +29,24 @@ PPO_KL_BACKTRACK_FACTOR = 0.5
 PPO_KL_MAX_BACKTRACKS = 8
 
 
+def _validated_expert_actions(expert_actions: object) -> np.ndarray:
+    """Return expert normalized actions without changing invalid labels."""
+    actions = np.asarray(expert_actions, dtype=np.float32)
+    if not np.isfinite(actions).all():
+        raise ValueError(
+            "PPO BC-regularization expert actions contain non-finite values."
+        )
+    outside = np.argwhere((actions < -1.0) | (actions > 1.0))
+    if outside.size:
+        index = tuple(int(value) for value in outside[0])
+        raise ValueError(
+            "PPO BC-regularization expert actions violate the normalized "
+            f"[-1, 1] contract at index {index}: {float(actions[index])}. "
+            "Expert labels are never clipped."
+        )
+    return actions
+
+
 def _clipped_value_loss(
     values: torch.Tensor,
     returns: torch.Tensor,
@@ -137,6 +155,8 @@ def _update_recurrent_policy(
     *,
     expert_policy_observations: np.ndarray | None = None,
     expert_actions: np.ndarray | None = None,
+    expert_trajectory_ids: np.ndarray | None = None,
+    expert_timesteps: np.ndarray | None = None,
 ) -> dict[str, float]:
     was_training = policy.training
     policy.eval()
@@ -174,7 +194,7 @@ def _update_recurrent_policy(
             device=cpu_device,
         )
         expert_action_tensor = torch.as_tensor(
-            np.clip(np.asarray(expert_actions, dtype=np.float32), -1.0, 1.0),
+            _validated_expert_actions(expert_actions),
             dtype=torch.float32,
             device=cpu_device,
         )
@@ -185,9 +205,54 @@ def _update_recurrent_policy(
             )
         if len(expert_obs_tensor) == 0:
             raise ValueError("Expert BC regularization received no expert samples.")
+        if expert_trajectory_ids is None or expert_timesteps is None:
+            raise ValueError(
+                "Recurrent policy_bc_regularization_coef requires expert "
+                "trajectory IDs and timesteps for sequence-faithful context."
+            )
+        expert_trajectory_ids_array = np.asarray(expert_trajectory_ids)
+        expert_timesteps_array = np.asarray(expert_timesteps)
+        if (
+            len(expert_trajectory_ids_array) != len(expert_obs_tensor)
+            or len(expert_timesteps_array) != len(expert_obs_tensor)
+        ):
+            raise ValueError(
+                "Expert BC regularization trajectory/timestep count mismatch."
+            )
+        expert_trajectory_rows: dict[str, np.ndarray] = {}
+        expert_row_positions: dict[int, tuple[np.ndarray, int]] = {}
+        for trajectory_id in np.unique(expert_trajectory_ids_array):
+            rows = np.flatnonzero(
+                expert_trajectory_ids_array == trajectory_id
+            ).astype(np.int64)
+            rows = rows[
+                np.argsort(
+                    expert_timesteps_array[rows],
+                    kind="stable",
+                )
+            ]
+            expert_trajectory_rows[str(trajectory_id)] = rows
+            for position, row in enumerate(rows):
+                expert_row_positions[int(row)] = (rows, int(position))
+        context_eligible_expert_rows = np.asarray(
+            [
+                row
+                for row, (_rows, position) in expert_row_positions.items()
+                if position > 0
+            ],
+            dtype=np.int64,
+        )
+        if context_eligible_expert_rows.size == 0:
+            raise ValueError(
+                "Recurrent BC regularization has no expert target with causal "
+                "trajectory context."
+            )
     else:
         expert_obs_tensor = None
         expert_action_tensor = None
+        expert_trajectory_rows = {}
+        expert_row_positions = {}
+        context_eligible_expert_rows = np.asarray([], dtype=np.int64)
 
     chunks = _recurrent_rollout_chunks(
         rollout,
@@ -210,6 +275,7 @@ def _update_recurrent_policy(
     ratio_means: list[float] = []
     ratio_stds: list[float] = []
     bc_losses: list[float] = []
+    bc_context_steps: list[float] = []
     post_update_approx_kl = float("nan")
     post_update_ratio_mean = float("nan")
     post_update_ratio_std = float("nan")
@@ -227,6 +293,71 @@ def _update_recurrent_policy(
         if device.type == "cuda":
             return tensor.pin_memory().to(device=device, non_blocking=True)
         return tensor.to(device=device)
+
+    def sequence_faithful_expert_bc_loss(
+        requested_targets: int,
+    ) -> tuple[torch.Tensor, float]:
+        if (
+            expert_obs_tensor is None
+            or expert_action_tensor is None
+            or context_eligible_expert_rows.size == 0
+        ):
+            raise RuntimeError("Sequence-faithful BC context was not prepared.")
+        target_count = max(
+            1,
+            min(
+                int(requested_targets),
+                int(context_eligible_expert_rows.size),
+                max(1, int(micro_sequences)),
+            ),
+        )
+        target_rows = rng.choice(
+            context_eligible_expert_rows,
+            size=target_count,
+            replace=context_eligible_expert_rows.size < target_count,
+        )
+        context_length = max(
+            1,
+            int(getattr(cfg, "transformer_memory_context_length", 32)),
+        )
+        losses: list[torch.Tensor] = []
+        prefix_lengths: list[int] = []
+        for target_row_value in np.asarray(target_rows).reshape(-1):
+            target_row = int(target_row_value)
+            trajectory_rows, position = expert_row_positions[target_row]
+            start = max(0, int(position) - context_length)
+            context_rows = trajectory_rows[start : int(position) + 1]
+            memory = policy.initial_memory(
+                1,
+                device=device,
+                dtype=torch.float32,
+            )
+            prediction: torch.Tensor | None = None
+            for context_position, row_value in enumerate(context_rows):
+                row = int(row_value)
+                obs = cpu_to_device(expert_obs_tensor[row : row + 1])
+                prediction, _values, step_memory = policy(
+                    obs,
+                    memory=memory,
+                    return_memory=True,
+                )
+                if step_memory is None:
+                    raise RuntimeError(
+                        "Recurrent expert BC context did not return memory."
+                    )
+                if context_position + 1 < len(context_rows):
+                    memory = _shift_recurrent_memory(memory, step_memory)
+            if prediction is None:
+                raise RuntimeError("Empty recurrent expert BC context.")
+            target = cpu_to_device(
+                expert_action_tensor[target_row : target_row + 1]
+            )
+            losses.append(F.mse_loss(prediction, target))
+            prefix_lengths.append(max(0, len(context_rows) - 1))
+        return (
+            torch.stack(losses).mean(),
+            float(np.mean(prefix_lengths)),
+        )
 
     def make_micro_indices(micro_chunks: list[tuple[np.ndarray, int, int]]) -> tuple[np.ndarray, np.ndarray]:
         max_len = max(end - start for _indices, start, end in micro_chunks)
@@ -408,25 +539,10 @@ def _update_recurrent_policy(
                     loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
                     bc_loss = None
                     if bc_coef > 0.0 and expert_obs_tensor is not None and expert_action_tensor is not None:
-                        expert_idx = torch.randint(
-                            0,
-                            int(expert_obs_tensor.shape[0]),
-                            (valid_count,),
-                            device=cpu_device,
+                        bc_loss, context_steps = (
+                            sequence_faithful_expert_bc_loss(valid_count)
                         )
-                        expert_obs = cpu_to_device(expert_obs_tensor[expert_idx])
-                        expert_actions_for_bc = cpu_to_device(expert_action_tensor[expert_idx])
-                        expert_memory = policy.initial_memory(
-                            int(expert_obs.shape[0]),
-                            device=device,
-                            dtype=expert_obs.dtype,
-                        )
-                        pred_expert_actions, _values, _memory = policy(
-                            expert_obs,
-                            memory=expert_memory,
-                            return_memory=True,
-                        )
-                        bc_loss = F.mse_loss(pred_expert_actions, expert_actions_for_bc)
+                        bc_context_steps.append(context_steps)
                         loss = loss + bc_coef * bc_loss
                     (loss * micro_weight).backward()
                     with torch.no_grad():
@@ -519,6 +635,9 @@ def _update_recurrent_policy(
         "advantage_std": float(np.std(rollout.advantages)) if rollout.advantages.size else 0.0,
         "bc_regularization_loss": float(np.mean(bc_losses)) if bc_losses else 0.0,
         "bc_regularization_coef": float(bc_coef),
+        "bc_regularization_context_mean_steps": (
+            float(np.mean(bc_context_steps)) if bc_context_steps else 0.0
+        ),
         "ppo_micro_batch_size": float(micro_sequences),
         "log_std_mean": final_log_std_mean,
         "action_std_param_mean": final_action_std_mean,
@@ -556,6 +675,8 @@ def update_policy(
     *,
     expert_policy_observations: np.ndarray | None = None,
     expert_actions: np.ndarray | None = None,
+    expert_trajectory_ids: np.ndarray | None = None,
+    expert_timesteps: np.ndarray | None = None,
 ) -> dict[str, float]:
     if recurrent_policy_enabled(policy):
         return _update_recurrent_policy(
@@ -566,6 +687,8 @@ def update_policy(
             device,
             expert_policy_observations=expert_policy_observations,
             expert_actions=expert_actions,
+            expert_trajectory_ids=expert_trajectory_ids,
+            expert_timesteps=expert_timesteps,
         )
     was_training = policy.training
     # Rollout log-probabilities are collected with policy.eval(). Keeping PPO
@@ -606,7 +729,7 @@ def update_policy(
             device=cpu_device,
         )
         expert_action_tensor = torch.as_tensor(
-            np.clip(np.asarray(expert_actions, dtype=np.float32), -1.0, 1.0),
+            _validated_expert_actions(expert_actions),
             dtype=torch.float32,
             device=cpu_device,
         )
@@ -879,6 +1002,7 @@ def update_policy(
     }
 
 __all__ = [
+    '_validated_expert_actions',
     '_clipped_value_loss',
     '_recurrent_rollout_chunks',
     '_update_recurrent_policy',

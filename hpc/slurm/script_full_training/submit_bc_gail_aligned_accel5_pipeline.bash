@@ -34,6 +34,10 @@ mkdir -p \
 COLLECTOR_SHA256="$(sha256sum "${REPODIR}/scripts_gail/build_ps_traj_expert_discrete.py" | awk '{print $1}')"
 CONSTANTS_SHA256="$(sha256sum "${REPODIR}/highway_env/ngsim_utils/core/constants.py" | awk '{print $1}')"
 CONTRACTS_SHA256="$(sha256sum "${REPODIR}/scripts_gail/ps_gail/contracts.py" | awk '{print $1}')"
+REPLAY_SHA256="$(sha256sum "${REPODIR}/highway_env/ngsim_utils/vehicles/replay.py" | awk '{print $1}')"
+TRAJECTORY_GEN_SHA256="$(sha256sum "${REPODIR}/highway_env/ngsim_utils/data/trajectory_gen.py" | awk '{print $1}')"
+NGSIM_ENV_SHA256="$(sha256sum "${REPODIR}/highway_env/envs/ngsim_env.py" | awk '{print $1}')"
+LIDAR_SHA256="$(sha256sum "${REPODIR}/highway_env/envs/common/observations/lidar.py" | awk '{print $1}')"
 AUDIT_SCRIPT_SHA256="$(sha256sum "${REPODIR}/scripts_gail/audit_domain_matched_expert.py" | awk '{print $1}')"
 RECIPE_SHA256="$(sha256sum "${LOCKED_RECIPE}" | awk '{print $1}')"
 BC_RUNNER_SHA256="$(sha256sum "${BC_RUNNER}" | awk '{print $1}')"
@@ -44,8 +48,9 @@ DATA_SHA256="$(sha256sum "${REPODIR}/scripts_gail/ps_gail/data.py" | awk '{print
 
 COLLECTION_JOB_ID="$(
     sbatch --parsable \
+        --array=0,1,3,4 \
         --chdir="${VFI_PROJECT_ROOT}" \
-        --export="ALL,REPODIR=${REPODIR},COLLECTION_ID=${COLLECTION_ID},EXPERT_ACCELERATION_LIMIT_MPS2=5.0,COLLECTION_EXPECTED_COLLECTOR_SHA256=${COLLECTOR_SHA256},COLLECTION_EXPECTED_CONSTANTS_SHA256=${CONSTANTS_SHA256},COLLECTION_EXPECTED_CONTRACTS_SHA256=${CONTRACTS_SHA256}" \
+        --export="ALL,REPODIR=${REPODIR},COLLECTION_ID=${COLLECTION_ID},EXPERT_ACCELERATION_LIMIT_MPS2=5.0,COLLECTION_EXPECTED_COLLECTOR_SHA256=${COLLECTOR_SHA256},COLLECTION_EXPECTED_CONSTANTS_SHA256=${CONSTANTS_SHA256},COLLECTION_EXPECTED_CONTRACTS_SHA256=${CONTRACTS_SHA256},COLLECTION_EXPECTED_REPLAY_SHA256=${REPLAY_SHA256},COLLECTION_EXPECTED_TRAJECTORY_GEN_SHA256=${TRAJECTORY_GEN_SHA256},COLLECTION_EXPECTED_NGSIM_ENV_SHA256=${NGSIM_ENV_SHA256},COLLECTION_EXPECTED_LIDAR_SHA256=${LIDAR_SHA256}" \
         "${COLLECTION_RUNNER}"
 )"
 COLLECTION_JOB_ID="${COLLECTION_JOB_ID%%;*}"
@@ -54,7 +59,7 @@ AUDIT_JOB_ID="$(
     sbatch --parsable \
         --dependency="afterok:${COLLECTION_JOB_ID}" \
         --chdir="${VFI_PROJECT_ROOT}" \
-        --export="ALL,REPODIR=${REPODIR},COLLECTION_ID=${COLLECTION_ID},EXPERT_ACCELERATION_LIMIT_MPS2=5.0,AUDIT_EXPECTED_SCRIPT_SHA256=${AUDIT_SCRIPT_SHA256}" \
+        --export="ALL,REPODIR=${REPODIR},COLLECTION_ID=${COLLECTION_ID},EXPERT_ACCELERATION_LIMIT_MPS2=5.0,AUDIT_SPLITS=train:val,AUDIT_EXPECTED_SCRIPT_SHA256=${AUDIT_SCRIPT_SHA256}" \
         "${AUDIT_RUNNER}"
 )"
 AUDIT_JOB_ID="${AUDIT_JOB_ID%%;*}"

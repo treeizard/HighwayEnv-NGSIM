@@ -104,10 +104,18 @@ class LidarObservation(ObservationType):
 
     def space(self) -> spaces.Space:
         high = 1.0 if self.normalize else self.maximum_range
+        low = np.tile(
+            np.array([0.0, -high], dtype=np.float32),
+            (self.cells, 1),
+        )
+        high_arr = np.tile(
+            np.array([high, high], dtype=np.float32),
+            (self.cells, 1),
+        )
         return spaces.Box(
             shape=(self.cells, 2),
-            low=-high,
-            high=high,
+            low=low,
+            high=high_arr,
             dtype=np.float32,
         )
 

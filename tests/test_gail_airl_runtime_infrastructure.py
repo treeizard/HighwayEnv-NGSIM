@@ -34,6 +34,8 @@ from scripts_gail.ps_gail.pilot import (
     _common_arguments,
     gail_training_profile_overrides,
     load_manifest,
+    realistic_shared_physics_overrides,
+    required_prebuilt_splits,
     trial_argv,
 )
 from scripts_gail.ps_gail.schedule import config_for_round
@@ -184,11 +186,52 @@ def test_realistic_wgan_profile_is_additive_and_paper_aligned():
     assert realistic["evaluation_terminate_when_all_controlled_crashed"] is False
     assert realistic["normalize_gail_reward"] is True
     assert realistic["allow_wgan_reward_normalization"] is True
-    assert realistic["policy_bc_regularization_coef"] == pytest.approx(0.02)
+    assert realistic["policy_bc_regularization_coef"] == 0.0
+    assert realistic["policy_bc_regularization_final_coef"] == 0.0
+    assert realistic["policy_bc_regularization_decay_rounds"] == 0
+    assert realistic["enable_collision"] is True
+    assert realistic["collision_mode_schedule"] == ""
+    assert realistic["vehicle_increase_soft_collision_rounds"] == 0
+    assert realistic["test_episodes"] == 0
+    assert realistic["health_learning_gate_round"] == 0
     assert realistic["initial_action_std"] == "0.10,0.05"
     assert realistic["full_load_selection_start_round"] == 701
     with pytest.raises(ValueError, match="Unsupported GAIL training profile"):
         gail_training_profile_overrides("unknown")
+
+
+def test_realistic_shared_physics_is_method_neutral_and_seals_unused_test():
+    shared = realistic_shared_physics_overrides()
+    assert shared["enable_collision"] is True
+    assert shared["collision_mode_schedule"] == ""
+    assert shared["rollout_fixed_horizon"] is True
+    assert shared["test_episodes"] == 0
+    assert "algorithm_variant" not in shared
+    assert "wgan_gp_lambda" not in shared
+    trials = [
+        {"method": "gail", "arguments": dict(shared)},
+        {"method": "airl", "arguments": dict(shared)},
+    ]
+    assert required_prebuilt_splits(trials) == ("train", "val")
+    trials[1]["arguments"]["test_episodes"] = 1
+    assert required_prebuilt_splits(trials) == ("train", "val", "test")
+
+
+def test_realistic_wgan_profile_keeps_native_collision_physics_at_every_load():
+    cfg = PSGAILConfig(
+        **gail_training_profile_overrides("realistic_wgan_v1"),
+        controlled_vehicle_curriculum=True,
+        initial_controlled_vehicles=10.0,
+        final_controlled_vehicles=100.0,
+        controlled_vehicle_curriculum_rounds=800,
+    )
+
+    for round_idx in (1, 200, 201, 400, 401, 600, 701, 800):
+        scheduled = config_for_round(cfg, round_idx)
+        assert scheduled.enable_collision is True
+        assert scheduled.collision_mode_schedule == "full"
+        assert scheduled.terminate_when_all_controlled_crashed is False
+        assert scheduled.policy_bc_regularization_coef == 0.0
 
 
 def test_local_smoke_can_exercise_an_exact_100_step_fixed_horizon(tmp_path):
@@ -223,6 +266,7 @@ def test_local_smoke_can_exercise_an_exact_100_step_fixed_horizon(tmp_path):
     assert args["validation_score_horizon_seconds"] == 10
     assert args["validation_min_horizon_coverage"] == pytest.approx(1.0)
     assert args["validation_vehicle_mode"] == "single"
+    assert args["test_episodes"] == 0
     assert args["test_vehicle_mode"] == "single"
     assert args["full_load_selection_start_round"] == 1
 
@@ -355,13 +399,16 @@ def test_training_env_propagates_explicit_exact_fast_modes(monkeypatch):
             record_replay_diagnostics=False,
             sensor_road_edge_mode="batched",
             reuse_pre_reset_spaces=True,
-        )
+        ),
+        crash_controlled_vehicles_offroad=False,
     )
     assert captured["road_query_mode"] == "spatial"
     assert captured["collision_check_mode"] == "broadphase"
     assert captured["record_replay_diagnostics"] is False
     assert captured["sensor_road_edge_mode"] == "batched"
     assert captured["reuse_pre_reset_spaces"] is True
+    assert captured["crash_controlled_vehicles_offroad"] is False
+    assert captured["action"]["clip"] is False
 
 
 def test_rollout_worker_reuses_policy_and_refreshes_weights():
@@ -749,6 +796,7 @@ def test_all_matched_evaluation_constructors_propagate_simulator_modes(monkeypat
         assert env_cfg["record_replay_diagnostics"] is False
         assert env_cfg["sensor_road_edge_mode"] == "batched"
         assert env_cfg["reuse_pre_reset_spaces"] is True
+        assert env_cfg["action"]["clip"] is False
 
 
 def _build_final_manifest_fixture(tmp_path):

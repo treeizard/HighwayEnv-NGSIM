@@ -1,8 +1,10 @@
+import numpy as np
 import pytest
 
 from highway_env.road.road import Road, RoadNetwork
 from highway_env.vehicle.kinematics import Vehicle
 from highway_env.vehicle.objects import Landmark, Obstacle
+from highway_env.vehicle.objects import RoadObject
 
 
 FPS = 15
@@ -71,3 +73,26 @@ def test_collision():
 
     assert v4.crashed is False
     assert l.hit
+
+
+def test_swept_collision_records_partner_before_deferred_impact():
+    first = RoadObject(road=None, position=[0, 0])
+    second = RoadObject(road=None, position=[10, 0])
+    first.vehicle_ID = 7
+    second.vehicle_ID = 19
+    first._is_colliding = lambda _other, _dt: (
+        False,
+        True,
+        np.asarray([1.0, 0.0]),
+    )
+
+    first.handle_collisions(second, dt=0.1)
+
+    assert not first.crashed
+    assert not second.crashed
+    assert first.first_collision_partner_vehicle_id == 19
+    assert second.first_collision_partner_vehicle_id == 7
+    assert (
+        first.first_collision_partner_provenance
+        == "physics_swept_intersection"
+    )

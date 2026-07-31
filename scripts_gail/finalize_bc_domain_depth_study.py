@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Verify and index a complete 12-model domain/depth BC study.
+"""Verify and index a recipe-defined domain/depth/seed BC study.
 
 Every full-training model must have a summary, loadable checkpoint, hash
-sidecar, test-split collision-free evaluation record, and activation smoke
+sidecar, collision-enabled locked-test record, and activation smoke
 manifests. Reported metrics do not reject trained study models.
 """
 
@@ -55,16 +55,19 @@ def finalize_study(policy_root: Path, smoke_root: Path, out: Path) -> dict[str, 
     metric_capability_passed_count = 0
     capability_passed_count = 0
 
-    for domain in ("us", "japanese"):
-        for layers in (2, 3):
-            for seed in (0, 1, 2):
-                relative = Path(domain) / f"recurrent_transformer_{layers}layer" / f"policy_seed_{seed}"
-                run_dir = policy_root / relative
+    summary_paths = sorted(policy_root.glob("*/*/*/summary.json"))
+    require(summary_paths, f"No BC study summaries found under {policy_root}.")
+    for summary_path in summary_paths:
+                run_dir = summary_path.parent
+                relative = run_dir.relative_to(policy_root)
                 checkpoint = run_dir / "best.pt"
-                summary_path = run_dir / "summary.json"
                 hash_path = run_dir / "best.pt.sha256"
                 require(summary_path.is_file(), f"Missing required study summary: {summary_path}")
                 summary = read_json(summary_path)
+                domain = str(summary.get("domain"))
+                layers = int(summary.get("transformer_layers", -1))
+                seed = int(summary.get("seed", -1))
+                require(domain in {"us", "japanese"}, f"Unknown domain in {summary_path}")
                 require(summary.get("domain") == domain, f"Domain mismatch in {summary_path}")
                 require(int(summary.get("transformer_layers", -1)) == layers, f"Depth mismatch in {summary_path}")
                 require(int(summary.get("seed", -1)) == seed, f"Seed mismatch in {summary_path}")
@@ -80,8 +83,12 @@ def finalize_study(policy_root: Path, smoke_root: Path, out: Path) -> dict[str, 
                     f"BC evaluation did not use the test split: {summary_path}",
                 )
                 require(
-                    evaluation.get("collision_physics_enabled") is False,
-                    f"BC evaluation did not disable collision physics: {summary_path}",
+                    evaluation.get("collision_physics_enabled") is True,
+                    f"BC locked test did not enable collision physics: {summary_path}",
+                )
+                require(
+                    summary.get("final_test_qualification_passed") is True,
+                    f"BC locked test qualification did not pass: {summary_path}",
                 )
                 evaluation_metrics = evaluation.get("metrics") or {}
                 require(
@@ -145,8 +152,10 @@ def finalize_study(policy_root: Path, smoke_root: Path, out: Path) -> dict[str, 
                     }
                 )
 
-    require(len(models) == 12, f"Expected 12 verified models, got {len(models)}.")
-    require(checkpoint_count == 12, f"Expected 12 verified checkpoints, got {checkpoint_count}.")
+    require(
+        checkpoint_count == len(models),
+        f"Expected {len(models)} verified checkpoints, got {checkpoint_count}.",
+    )
     result = {
         "schema_version": 1,
         "study": "bc_domain_depth_v1",

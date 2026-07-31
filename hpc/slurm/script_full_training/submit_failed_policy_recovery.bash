@@ -16,7 +16,6 @@ DATA_PROJECT_ROOT="${DATA_PROJECT_ROOT:-/fs04/bt60/ytao0016/validation_first_int
 RUN_TESTS="${RUN_TESTS:-true}"
 DRY_RUN="${DRY_RUN:-false}"
 SUBMIT_BC="${SUBMIT_BC:-true}"
-BC_QUALIFICATION="${BC_QUALIFICATION:-${VFI_PROJECT_ROOT}/results/test_runs/bc_recovery_v3_simple_gru_us_20260725T065000Z/diagnosis.json}"
 DEPTH2_CHECKPOINT="${DEPTH2_CHECKPOINT:-${VFI_PROJECT_ROOT}/results/runs/policies/gail_airl/gail_us_aligned_a5_20260724T054734Z/gail/recurrent_transformer_2layer_seed_0/resume_latest.pt}"
 DEPTH3_CHECKPOINT="${DEPTH3_CHECKPOINT:-${VFI_PROJECT_ROOT}/results/runs/policies/gail_airl/gail_us_aligned_a5_20260724T054734Z/gail/recurrent_transformer_3layer_seed_1/resume_latest.pt}"
 FAILED_GAIL_MANIFEST="${FAILED_GAIL_MANIFEST:-${VFI_PROJECT_ROOT}/results/runs/submissions/gail_us_aligned_a5_20260724T054734Z/pilot_manifest.json}"
@@ -30,36 +29,6 @@ for required in "${PYTHON_BIN}" \
     "${DEPTH3_CHECKPOINT}" "${DEPTH3_CHECKPOINT}.sha256"; do
     test -s "${required}"
 done
-if [ "${SUBMIT_BC}" = true ]; then
-    test -s "${BC_QUALIFICATION}"
-fi
-
-if [ "${SUBMIT_BC}" = true ]; then
-"${PYTHON_BIN}" - "${BC_QUALIFICATION}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-selected = payload.get("selected_candidate")
-if not isinstance(selected, dict) or selected.get("promotion_passed") is not True:
-    raise SystemExit("Local BC recovery did not pass its promotion gate.")
-required = {
-    "acceleration_std_ratio": 0.25,
-    "acceleration_correlation": 0.50,
-    "steering_std_ratio": 0.10,
-    "steering_correlation": 0.20,
-}
-failures = {
-    key: (selected.get(key), threshold)
-    for key, threshold in required.items()
-    if float(selected.get(key, float("-inf"))) < threshold
-}
-if failures:
-    raise SystemExit(f"BC qualification is below production gates: {failures}")
-PY
-fi
-
 deployment_root="${VFI_PROJECT_ROOT}/deployments/${CAMPAIGN_ID}"
 repodir="${deployment_root}/HighwayEnv-NGSIM"
 submission_dir="${VFI_PROJECT_ROOT}/results/runs/submissions/${CAMPAIGN_ID}"
@@ -85,6 +54,7 @@ if [ "${RUN_TESTS}" = true ]; then
         PYTHONPATH="${repodir}" "${PYTHON_BIN}" -m pytest -q \
             tests/test_recurrent_bc.py \
             tests/test_bc_load_once_matrix.py \
+            tests/test_expert_observation_validation.py \
             tests/test_gail_airl_runtime_infrastructure.py \
             tests/test_gail_airl_study.py \
             tests/test_ps_gail_training_logic.py
@@ -123,16 +93,17 @@ manifest="${submission_dir}/pilot_manifest.json"
         --verify-only --include-large-data
 )
 
-recipe="${repodir}/configs/bc_gail_aligned_accel5_v3.json"
+recipe="${repodir}/configs/bc_gail_aligned_accel5_v5.json"
 audit_runner="${repodir}/hpc/slurm/script_data_collection/audit_domain_matched_expert_accel5.bash"
 bc_runner="${repodir}/hpc/slurm/script_full_training/run_bc_gail_aligned_accel5.bash"
 gail_runner="${repodir}/hpc/slurm/script_full_training/run_gail_us_scratch_depth.bash"
-audit_out="${audit_root}/collection_contract_audit.json"
+audit_out="${audit_root}/collection_contract_audit_train_val.json"
 audit_script="${repodir}/scripts_gail/audit_domain_matched_expert.py"
 
 audit_export="ALL,REPODIR=${repodir},VFI_PROJECT_ROOT=${VFI_PROJECT_ROOT}"
 audit_export="${audit_export},VFI_CONDA_ENV=ngsim_env,COLLECTION_ID=domain_matched_accel5_v2"
 audit_export="${audit_export},AUDIT_OUT=${audit_out}"
+audit_export="${audit_export},AUDIT_SPLITS=train:val"
 audit_export="${audit_export},AUDIT_EXPECTED_SCRIPT_SHA256=$(sha256sum "${audit_script}" | awk '{print $1}')"
 audit_export="${audit_export},AUDIT_EXPECTED_RUNNER_SHA256=$(sha256sum "${audit_runner}" | awk '{print $1}')"
 
@@ -208,7 +179,7 @@ depth3_job="$(sbatch --parsable --chdir="${repodir}" \
 depth3_job="${depth3_job%%;*}"
 
 export CAMPAIGN_ID repodir manifest base_manifest run_root slurm_log_root audit_out
-export audit_job bc_job depth2_job depth3_job BC_QUALIFICATION
+export audit_job bc_job depth2_job depth3_job
 "${PYTHON_BIN}" - "${submission_dir}/submission_metadata.json" <<'PY'
 from datetime import datetime, timezone
 import json
@@ -225,7 +196,8 @@ payload = {
     "run_root": os.environ["run_root"],
     "slurm_log_root": os.environ["slurm_log_root"],
     "audit_output": os.environ["audit_out"],
-    "local_bc_qualification": os.environ["BC_QUALIFICATION"],
+    "historical_bc_promotion_precondition": "removed_circular_precondition",
+    "bc_scientific_qualification": "pending_prospective_validation",
     "continuous_acceleration_range_mps2": [-5.0, 5.0],
     "replaces_failed_jobs": [
         "58507057",

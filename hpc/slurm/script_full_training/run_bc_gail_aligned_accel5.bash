@@ -64,17 +64,21 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 COLLECTION_ID="${COLLECTION_ID:-domain_matched_accel5_v2}"
 COLLECTION_ROOT="${VFI_DATA_ROOT}/expert/${COLLECTION_ID}"
-AUDIT_PATH="${BC_AUDIT_PATH:-${COLLECTION_ROOT}/collection_contract_audit.json}"
-US_EXPERT="${COLLECTION_ROOT}/us/train"
-JAPANESE_EXPERT="${COLLECTION_ROOT}/japanese/train"
+AUDIT_PATH="${BC_AUDIT_PATH:-${COLLECTION_ROOT}/collection_contract_audit_train_val.json}"
+US_TRAIN_EXPERT="${COLLECTION_ROOT}/us/train"
+US_VALIDATION_EXPERT="${COLLECTION_ROOT}/us/val"
+JAPANESE_TRAIN_EXPERT="${COLLECTION_ROOT}/japanese/train"
+JAPANESE_VALIDATION_EXPERT="${COLLECTION_ROOT}/japanese/val"
 STUDY_RUN_ID="${SLURM_JOB_ID:?BC comparison requires a Slurm job id}"
 POLICY_ROOT="${VFI_RESULTS_ROOT}/runs/policies/bc/gail_aligned_accel5_${STUDY_RUN_ID}"
 CHECKPOINT_ARCHIVE_ROOT="${VFI_CHECKPOINT_ROOT}/bc/validated_comparisons"
 
 for required in \
     "${AUDIT_PATH}" \
-    "${US_EXPERT}/manifest.json" \
-    "${JAPANESE_EXPERT}/manifest.json" \
+    "${US_TRAIN_EXPERT}/manifest.json" \
+    "${US_VALIDATION_EXPERT}/manifest.json" \
+    "${JAPANESE_TRAIN_EXPERT}/manifest.json" \
+    "${JAPANESE_VALIDATION_EXPERT}/manifest.json" \
     "${BC_LOCKED_RECIPE}"; do
     test -s "${required}"
 done
@@ -84,8 +88,16 @@ import os
 from pathlib import Path
 
 payload = json.loads(Path(os.environ["AUDIT_PATH"]).read_text(encoding="utf-8"))
-if payload.get("status") != "passed" or int(payload.get("domain_split_count", 0)) != 6:
-    raise SystemExit(f"Expert collection did not pass its six-cell audit: {payload}")
+if (
+    payload.get("status") != "passed"
+    or payload.get("audited_splits") != ["train", "val"]
+    or payload.get("test_data_status") != "not_opened"
+    or int(payload.get("domain_split_count", 0)) != 4
+):
+    raise SystemExit(
+        "Expert collection did not pass the explicit train/validation-only "
+        f"four-cell audit: {payload}"
+    )
 scales = payload.get("continuous_action_contract", {}).get("scales")
 if scales is None or abs(float(scales[0]) - 5.0) > 1e-8:
     raise SystemExit(f"Expert collection has the wrong acceleration scale: {scales}")
@@ -119,15 +131,18 @@ import sys
 from pathlib import Path
 
 recipe = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-depths = recipe["architecture"].get("depths", [2, 3])
-print(2 * 3 * len(depths))
+depths = recipe["architecture"]["depths"]
+seeds = recipe["architecture"]["policy_seeds"]
+print(2 * len(depths) * len(seeds))
 PY
 )"
 export MODEL_COUNT
 python -m scripts_gail.run_bc_domain_depth_matrix \
     --recipe "${BC_LOCKED_RECIPE}" \
-    --us-expert "${US_EXPERT}" \
-    --japanese-expert "${JAPANESE_EXPERT}" \
+    --us-train-expert "${US_TRAIN_EXPERT}" \
+    --us-validation-expert "${US_VALIDATION_EXPERT}" \
+    --japanese-train-expert "${JAPANESE_TRAIN_EXPERT}" \
+    --japanese-validation-expert "${JAPANESE_VALIDATION_EXPERT}" \
     --episode-root "${VFI_HIGHWAY_DATA_ROOT}/processed_20s" \
     --policy-root "${POLICY_ROOT}" \
     --checkpoint-archive-root "${CHECKPOINT_ARCHIVE_ROOT}" \
@@ -143,8 +158,14 @@ import os
 from pathlib import Path
 
 payload = json.loads(Path(os.environ["MATRIX_MANIFEST"]).read_text(encoding="utf-8"))
-if payload.get("loader_calls") != {"us": 1, "japanese": 1}:
+expected_loader_calls = {
+    "us": {"train": 1, "validation": 1, "test": 0},
+    "japanese": {"train": 1, "validation": 1, "test": 0},
+}
+if payload.get("loader_calls") != expected_loader_calls:
     raise SystemExit(f"Unexpected expert loader calls: {payload.get('loader_calls')}")
+if payload.get("test_source_status") != "pending_deferred_not_accepted":
+    raise SystemExit(f"Test source was not sealed: {payload.get('test_source_status')}")
 expected = int(os.environ["MODEL_COUNT"])
 if int(payload.get("model_count", -1)) != expected:
     raise SystemExit(f"The aligned BC job did not train all {expected} requested cells")
@@ -160,15 +181,10 @@ if int(archive.get("checkpoint_count", -1)) != expected:
         f"Only {archive.get('checkpoint_count')}/{expected} complete BC "
         "checkpoints were archived"
     )
-expected_selections = expected // 3
-if int(payload.get("paper_benchmark_selected_count", -1)) != expected_selections:
-    raise SystemExit(
-        f"Expected {expected_selections} domain/depth representatives selected "
-        "with shared validation metrics, got "
-        f"{payload.get('paper_benchmark_selected_count')}"
-    )
 print(json.dumps({
-    "status": "passed",
+    "status": "artifact_matrix_completed",
+    "scientific_qualification_status": "pending_locked_test_and_expert_replay",
+    "interpretability_qualification_passed": False,
     "policy_root": str(Path(os.environ["MATRIX_MANIFEST"]).parent),
     "training_artifact_complete_count": expected,
     "interpretability_baseline_eligible_count": payload[
@@ -178,9 +194,16 @@ print(json.dumps({
     "closed_loop_quality_passed_count": payload[
         "closed_loop_quality_passed_count"
     ],
-    "paper_benchmark_selected_count": expected_selections,
-    "paper_benchmark_selections": payload["paper_benchmark_selections"],
-    "closed_loop_metrics_role": "descriptive_non_terminal",
+    "validation_candidate_selected_count": payload[
+        "validation_candidate_selected_count"
+    ],
+    "validation_candidate_selections": payload[
+        "validation_candidate_selections"
+    ],
+    "development_fallback_selected_count": payload[
+        "development_fallback_selected_count"
+    ],
+    "closed_loop_metrics_role": "qualification_non_terminal_for_matrix_execution",
     "checkpoint_archive": archive.get("archive"),
     "matrix_manifest": os.environ["MATRIX_MANIFEST"],
 }, indent=2))

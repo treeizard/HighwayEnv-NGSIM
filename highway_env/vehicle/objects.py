@@ -65,6 +65,31 @@ class RoadObject(ABC):
         self.crashed = False
         self.hit = False
         self.impact = np.zeros(self.position.shape)
+        # First-impact provenance is diagnostic state only.  It does not
+        # participate in collision detection or vehicle dynamics.  Recording
+        # the first counterpart here avoids trying to infer a collision actor
+        # later from proximity after the physics engine has separated the
+        # polygons.
+        self.first_collision_partner_vehicle_id = None
+        self.first_collision_partner_type = None
+        self.first_collision_partner_provenance = None
+
+    def _record_first_collision_partner(
+        self,
+        other: RoadObject,
+        *,
+        provenance: str,
+    ) -> None:
+        """Record the counterpart for the first physics collision signal."""
+
+        if self.first_collision_partner_type is not None:
+            return
+        partner_id = getattr(other, "vehicle_ID", None)
+        self.first_collision_partner_vehicle_id = (
+            None if partner_id is None else int(partner_id)
+        )
+        self.first_collision_partner_type = type(other).__name__
+        self.first_collision_partner_provenance = str(provenance)
 
     @classmethod
     def make_on_lane(
@@ -102,6 +127,28 @@ class RoadObject(ABC):
         if not (self.collidable and other.collidable):
             return
         intersecting, will_intersect, transition = self._is_colliding(other, dt)
+        if self.solid and other.solid:
+            if intersecting:
+                self._record_first_collision_partner(
+                    other,
+                    provenance="physics_current_intersection",
+                )
+                other._record_first_collision_partner(
+                    self,
+                    provenance="physics_current_intersection",
+                )
+            elif will_intersect:
+                # ``impact`` is consumed by Vehicle.step and marks the vehicle
+                # crashed.  Record the counterpart here, before that deferred
+                # crash flag would otherwise erase its provenance.
+                self._record_first_collision_partner(
+                    other,
+                    provenance="physics_swept_intersection",
+                )
+                other._record_first_collision_partner(
+                    self,
+                    provenance="physics_swept_intersection",
+                )
         if will_intersect:
             if self.solid and other.solid:
                 if isinstance(other, Obstacle):

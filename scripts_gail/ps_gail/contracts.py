@@ -21,6 +21,7 @@ LIDAR_FEATURE_DIM = 2
 LANE_CAMERA_FEATURE_DIM = 3
 RAW_EGO_COLUMNS = ("speed_mps", "heading_rad", "width_m", "length_m")
 POLICY_EGO_COLUMNS = ("length_m", "speed_mps", "heading_rad")
+NORMALIZED_OBSERVATION_BOUND_TOLERANCE = 1.0e-6
 
 
 @dataclass(frozen=True)
@@ -239,6 +240,7 @@ def policy_observation_contract(
     lidar_cells: int,
     maximum_range: float,
     lane_camera_cells: int = LANE_CAMERA_CELLS,
+    route_intent: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     """Describe the raw sensor tuple and the exact actor input projection."""
     lidar_cells = int(lidar_cells)
@@ -247,20 +249,71 @@ def policy_observation_contract(
     lane_flat_dim = lane_camera_cells * LANE_CAMERA_FEATURE_DIM
     raw_dim = lidar_flat_dim + lane_flat_dim + len(RAW_EGO_COLUMNS)
     policy_dim = lidar_flat_dim + lane_flat_dim + len(POLICY_EGO_COLUMNS)
+    policy_order = [
+        "lidar_flat",
+        "lane_camera_flat",
+        *POLICY_EGO_COLUMNS,
+    ]
+    route_intent_payload = None
+    if route_intent is not None:
+        route_intent_payload = dict(route_intent)
+        if int(route_intent_payload.get("schema_version", -1)) != 1:
+            raise ValueError("Route-intent contract schema_version must be 1.")
+        projection = dict(route_intent_payload.get("policy_projection") or {})
+        fields = list(projection.get("feature_names") or [])
+        feature_dim = int(projection.get("feature_dim", -1))
+        low = list(projection.get("low") or [])
+        high = list(projection.get("high") or [])
+        if (
+            not route_intent_payload.get("provider_id")
+            or feature_dim < 1
+            or len(fields) != feature_dim
+            or len(set(fields)) != feature_dim
+            or len(low) != feature_dim
+            or len(high) != feature_dim
+        ):
+            raise ValueError("Route-intent policy projection is incomplete.")
+        if projection.get("includes_previous_action") is not False:
+            raise ValueError("Route-intent policy projection cannot include actions.")
+        if projection.get("includes_topology_identity") is not False:
+            raise ValueError(
+                "Route-intent topology identity must remain analysis-only."
+            )
+        if (
+            dict(route_intent_payload.get("topology_sidecar") or {}).get(
+                "policy_visible"
+            )
+            is not False
+        ):
+            raise ValueError("Route-intent topology sidecar cannot be policy-visible.")
+        if any(
+            token in field.lower()
+            for field in fields
+            for token in ("action", "steer", "accel", "domain", "topology", "graph_hash")
+        ):
+            raise ValueError(
+                "Route-intent policy fields contain a forbidden shortcut field."
+            )
+        policy_dim += feature_dim
+        policy_order.append("route_intent_policy_projection")
     return {
-        "schema_version": 1,
+        "schema_version": 3 if route_intent_payload is not None else 2,
         "raw_observation_components": [
             {
                 "name": "lidar",
                 "shape": [lidar_cells, LIDAR_FEATURE_DIM],
                 "columns": ["distance_norm", "relative_speed_norm"],
                 "normalized": True,
+                "low": [0.0, -1.0],
+                "high": [1.0, 1.0],
             },
             {
                 "name": "lane_camera",
                 "shape": [lane_camera_cells, LANE_CAMERA_FEATURE_DIM],
                 "columns": ["presence", "relative_x_norm", "relative_y_norm"],
                 "normalized": True,
+                "low": [0.0, -1.0, -1.0],
+                "high": [1.0, 1.0, 1.0],
             },
             {
                 "name": "ego_state",
@@ -270,17 +323,203 @@ def policy_observation_contract(
             },
         ],
         "raw_observation_dim": raw_dim,
-        "policy_observation_order": [
-            "lidar_flat",
-            "lane_camera_flat",
-            *POLICY_EGO_COLUMNS,
-        ],
+        "policy_observation_order": policy_order,
         "policy_observation_dim": policy_dim,
         "omitted_raw_fields": ["width_m"],
         "maximum_range_m": float(maximum_range),
         "lidar_cells": lidar_cells,
         "lane_camera_cells": lane_camera_cells,
-        "source": "shared_lidar_camera_policy_projection_v1",
+        "source": "shared_lidar_camera_policy_projection_v2_bounded_sensors",
+        "route_intent_contract": route_intent_payload,
+    }
+
+
+def validate_declared_raw_observation_space(
+    observations: np.ndarray,
+    contract: dict[str, Any],
+    *,
+    context: str = "raw observations",
+    bound_tolerance: float = NORMALIZED_OBSERVATION_BOUND_TOLERANCE,
+) -> dict[str, Any]:
+    """Validate stored raw sensors against their declared observation space.
+
+    This deliberately checks only fields whose bounds are part of the sensor
+    contract. In particular, it does not invent dataset-specific limits for
+    ego speed or vehicle dimensions.
+    """
+    values = np.asarray(observations)
+    if values.ndim != 2 or not len(values):
+        raise ValueError(
+            f"{context} must be a non-empty rank-2 raw observation array; "
+            f"got {values.shape}."
+        )
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"{context} contains non-finite raw observations.")
+
+    raw_dim = int(contract.get("raw_observation_dim", -1))
+    if values.shape[1] != raw_dim:
+        raise ValueError(
+            f"{context} raw observation dimension {values.shape[1]} does not "
+            f"match the declared dimension {raw_dim}."
+        )
+
+    components = contract.get("raw_observation_components")
+    if not isinstance(components, list):
+        raise ValueError(
+            f"{context} has no declared raw_observation_components."
+        )
+    expected_layout = {
+        "lidar": {
+            "columns": ("distance_norm", "relative_speed_norm"),
+        },
+        "lane_camera": {
+            "columns": ("presence", "relative_x_norm", "relative_y_norm"),
+        },
+        "ego_state": {
+            "columns": RAW_EGO_COLUMNS,
+        },
+    }
+    component_names = [str(item.get("name", "")) for item in components]
+    if component_names != list(expected_layout):
+        raise ValueError(
+            f"{context} declares unsupported raw component order "
+            f"{component_names}; expected {list(expected_layout)}."
+        )
+
+    tolerance = float(bound_tolerance)
+    if not np.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError(
+            f"bound_tolerance must be finite and non-negative, got {tolerance}."
+        )
+
+    offset = 0
+    field_receipts: dict[str, dict[str, float]] = {}
+    component_receipts: dict[str, dict[str, Any]] = {}
+    for component in components:
+        name = str(component["name"])
+        specification = expected_layout[name]
+        shape = component.get("shape")
+        if (
+            not isinstance(shape, list)
+            or not shape
+            or any(int(size) <= 0 for size in shape)
+        ):
+            raise ValueError(
+                f"{context} component {name!r} has invalid shape {shape!r}."
+            )
+        shape_tuple = tuple(int(size) for size in shape)
+        columns = tuple(str(value) for value in component.get("columns", []))
+        if columns != specification["columns"]:
+            raise ValueError(
+                f"{context} component {name!r} columns {columns!r} do not "
+                f"match the supported declaration {specification['columns']!r}."
+            )
+        if shape_tuple[-1] != len(columns):
+            raise ValueError(
+                f"{context} component {name!r} shape {shape_tuple} does not "
+                f"match its {len(columns)} columns."
+            )
+        width = int(np.prod(shape_tuple, dtype=np.int64))
+        stop = offset + width
+        if stop > values.shape[1]:
+            raise ValueError(
+                f"{context} component {name!r} exceeds the raw observation "
+                f"dimension at columns [{offset}, {stop})."
+            )
+        component_values = values[:, offset:stop].reshape(
+            len(values),
+            -1,
+            len(columns),
+        )
+        bounds: tuple[tuple[float, float], ...] | None = None
+        if name in {"lidar", "lane_camera"}:
+            low = component.get("low")
+            high = component.get("high")
+            if (
+                not isinstance(low, list)
+                or not isinstance(high, list)
+                or len(low) != len(columns)
+                or len(high) != len(columns)
+            ):
+                raise ValueError(
+                    f"{context} component {name!r} must declare one low/high "
+                    f"bound per column; got low={low!r}, high={high!r}."
+                )
+            bounds = tuple(
+                (float(lower), float(upper))
+                for lower, upper in zip(low, high)
+            )
+            if any(
+                not np.isfinite(lower)
+                or not np.isfinite(upper)
+                or lower > upper
+                for lower, upper in bounds
+            ):
+                raise ValueError(
+                    f"{context} component {name!r} declares invalid bounds "
+                    f"low={low!r}, high={high!r}."
+                )
+        if bounds is not None and component.get("normalized") is not True:
+            raise ValueError(
+                f"{context} component {name!r} must declare normalized=true "
+                "for the supported normalized sensor fields."
+            )
+        component_fields: dict[str, Any] = {}
+        for field_index, field_name in enumerate(columns):
+            field_values = component_values[:, :, field_index]
+            minimum = float(np.min(field_values))
+            maximum = float(np.max(field_values))
+            field_receipt: dict[str, Any] = {
+                "minimum": minimum,
+                "maximum": maximum,
+            }
+            if bounds is not None:
+                lower, upper = bounds[field_index]
+                violation_mask = (field_values < lower - tolerance) | (
+                    field_values > upper + tolerance
+                )
+                violation_count = int(np.count_nonzero(violation_mask))
+                field_receipt.update(
+                    {
+                        "declared_lower": float(lower),
+                        "declared_upper": float(upper),
+                        "violation_count": violation_count,
+                    }
+                )
+                if violation_count:
+                    first_row, first_cell = np.argwhere(violation_mask)[0]
+                    first_value = float(field_values[first_row, first_cell])
+                    raise ValueError(
+                        f"{context} violates declared {name}.{field_name} "
+                        f"bounds [{lower}, {upper}]: count={violation_count}, "
+                        f"minimum={minimum:.9g}, maximum={maximum:.9g}, "
+                        f"first_row={int(first_row)}, "
+                        f"first_cell={int(first_cell)}, "
+                        f"first_value={first_value:.9g}."
+                    )
+            component_fields[field_name] = field_receipt
+            field_receipts[f"{name}.{field_name}"] = field_receipt
+        component_receipts[name] = {
+            "shape": list(shape_tuple),
+            "columns": list(columns),
+            "fields": component_fields,
+        }
+        offset = stop
+
+    if offset != values.shape[1]:
+        raise ValueError(
+            f"{context} declared components cover {offset} columns, but the "
+            f"raw observations have {values.shape[1]}."
+        )
+    return {
+        "schema_version": 1,
+        "status": "passed",
+        "context": str(context),
+        "row_count": int(len(values)),
+        "raw_observation_dim": int(values.shape[1]),
+        "bound_tolerance": tolerance,
+        "components": component_receipts,
+        "fields": field_receipts,
     }
 
 
@@ -290,6 +529,8 @@ def assert_compatible_observation_contracts(
 ) -> None:
     """Reject sensor contracts that change the actor input semantics."""
     keys: Iterable[str] = (
+        "schema_version",
+        "raw_observation_components",
         "raw_observation_dim",
         "policy_observation_dim",
         "policy_observation_order",
@@ -297,6 +538,7 @@ def assert_compatible_observation_contracts(
         "maximum_range_m",
         "lidar_cells",
         "lane_camera_cells",
+        "route_intent_contract",
     )
     for key in keys:
         reference_value = reference.get(key)

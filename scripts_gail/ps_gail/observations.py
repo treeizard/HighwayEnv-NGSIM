@@ -54,7 +54,11 @@ def flatten_agent_observations(obs: Any) -> np.ndarray:
     return arr.reshape(1, -1)
 
 
-def policy_observations_from_flat(flat_observations: np.ndarray) -> np.ndarray:
+def policy_observations_from_flat(
+    flat_observations: np.ndarray,
+    *,
+    route_intent_features: np.ndarray | None = None,
+) -> np.ndarray:
     """Return lidar + lane + [length, velocity, heading].
 
     The repo's LidarCameraObservations appends ego state as
@@ -70,4 +74,25 @@ def policy_observations_from_flat(flat_observations: np.ndarray) -> np.ndarray:
     speed = obs[:, -4:-3]
     heading = obs[:, -3:-2]
     length = obs[:, -1:]
-    return np.concatenate([sensor, length, speed, heading], axis=1).astype(np.float32, copy=False)
+    policy = np.concatenate([sensor, length, speed, heading], axis=1).astype(
+        np.float32,
+        copy=False,
+    )
+    if route_intent_features is None:
+        return policy
+    route = np.asarray(route_intent_features, dtype=np.float32)
+    if route.ndim == 1:
+        route = route.reshape(1, -1)
+    if route.ndim != 2 or route.shape[0] != policy.shape[0] or route.shape[1] < 1:
+        raise ValueError(
+            "Route-intent features must be rank-2 with the same row count as "
+            f"policy observations; got policy={policy.shape}, route={route.shape}."
+        )
+    if not np.all(np.isfinite(route)):
+        raise ValueError("Route-intent features contain non-finite values.")
+    if np.any(route < -1.000001) or np.any(route > 1.000001):
+        raise ValueError(
+            "Policy route-intent features must satisfy their normalized [-1, 1] "
+            "contract."
+        )
+    return np.concatenate([policy, route], axis=1).astype(np.float32, copy=False)

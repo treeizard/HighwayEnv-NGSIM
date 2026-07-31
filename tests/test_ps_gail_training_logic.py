@@ -92,7 +92,10 @@ from scripts_gail.ps_gail.data import (
 )
 from scripts_gail.ps_gail.training import evaluation as eval_mod
 from scripts_gail.ps_gail.training import rollouts as rollout_module
-from scripts_gail.ps_gail.validation import best_checkpoint_payload
+from scripts_gail.ps_gail.validation import (
+    best_checkpoint_payload,
+    closed_loop_policy_quality,
+)
 from scripts_gail.ps_gail.validation import scored_validation_metrics
 from scripts_gail.ps_gail.validation import validation_cost_and_score
 import scripts_gail.ps_gail.steering_diagnostics as steering_diag_mod
@@ -135,7 +138,9 @@ from scripts_gail.ps_gail.training.ppo import (
     PPO_KL_MAX_BACKTRACKS,
     _clipped_value_loss,
     _optimizer_step_with_kl_backtracking,
+    _validated_expert_actions,
 )
+from scripts_gail.ps_gail.training.policy import _actions_to_env_tuple
 from scripts_gail.train_simple_ps_gail import behavior_clone_pretrain
 from scripts_gail.train_simple_ps_gail import config_for_round as ps_gail_config_for_round
 from scripts_gail.train_simple_ps_gail import parse_args as ps_gail_parse_args
@@ -189,6 +194,30 @@ def test_action_std_configuration_is_opt_in_action_specific_and_bounded():
             policy,
             replace(cfg, initial_action_std="0.1,0.2,0.3"),
             initialize=True,
+        )
+
+
+def test_matched_evaluation_preserves_native_actions_and_rejects_bad_range():
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        continuous_action_dim=2,
+    )
+    native = torch.tensor([[0.125, -0.875]], dtype=torch.float32)
+    action_tuple = eval_mod._validated_deterministic_continuous_actions(
+        native,
+        cfg,
+    )
+    np.testing.assert_array_equal(action_tuple[0], native[0].numpy())
+
+    with pytest.raises(RuntimeError, match="Actions are never clamped"):
+        eval_mod._validated_deterministic_continuous_actions(
+            torch.tensor([[0.0, -1.01]], dtype=torch.float32),
+            cfg,
+        )
+    with pytest.raises(RuntimeError, match="non-finite"):
+        eval_mod._validated_deterministic_continuous_actions(
+            torch.tensor([[float("nan"), 0.0]], dtype=torch.float32),
+            cfg,
         )
 
 
@@ -473,7 +502,15 @@ def test_action_conditioned_loader_returns_valid_continuous_transition_data(tmp_
     assert data.actions_steering_acceleration.shape == (3, 2)
     assert np.all(np.isfinite(data.actions_continuous_env))
     assert data.trajectory_ids.shape == (3,)
-    assert data.metadata["trajectory_id_schema"] == "file_index:vehicle_id"
+    assert data.metadata["trajectory_id_schema"] == (
+        "source_stable/scene/episode_name:vehicle_id_with_labelled_fallback"
+    )
+    assert data.metadata["trajectory_id_identity_quality"] == (
+        "contains_basename_only_nonqualifying"
+    )
+    assert set(data.trajectory_ids.tolist()) == {
+        "fallback_basename/expert_unified.npz:7"
+    }
     assert data.metadata["continuous_action_dim"] == 2
     assert data.metadata["actions_continuous_env_columns"] == list(ACTION_CONTINUOUS_ENV_COLUMNS)
     assert data.metadata["sampling"] == "trajectory_preserving_without_replacement"
@@ -899,6 +936,78 @@ def test_recurrent_update_policy_validates_bc_expert_lengths():
         )
 
 
+def test_recurrent_bc_anchor_requires_and_uses_causal_expert_context():
+    torch.manual_seed(0)
+    np.random.seed(0)
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        policy_model="recurrent_transformer",
+        continuous_action_dim=2,
+        hidden_size=16,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+        transformer_recurrent_sequence_length=2,
+        transformer_recurrent_sequences_per_batch=2,
+        transformer_recurrent_micro_batch_sequences=2,
+        policy_bc_regularization_coef=0.1,
+        batch_size=4,
+        ppo_epochs=1,
+        target_kl=0.0,
+    )
+    policy = make_actor_critic(
+        "recurrent_transformer",
+        obs_dim=6,
+        hidden_size=16,
+        action_mode="continuous",
+        continuous_action_dim=2,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=2,
+        transformer_memory_context_length=3,
+    )
+    observations = np.random.randn(4, 6).astype(np.float32)
+    rollout = _minimal_rollout(
+        observations=observations,
+        actions=np.zeros((4, 2), dtype=np.float32),
+        old_log_probs=np.zeros(4, dtype=np.float32),
+        old_values=np.zeros(4, dtype=np.float32),
+        returns=np.zeros(4, dtype=np.float32),
+        advantages=np.ones(4, dtype=np.float32),
+        trajectory_ids=np.asarray([0, 0, 1, 1], dtype=np.int64),
+        dones=np.asarray([False, True, False, True]),
+    )
+    expert_actions = np.zeros((4, 2), dtype=np.float32)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1.0e-4)
+    with pytest.raises(ValueError, match="trajectory IDs and timesteps"):
+        update_policy(
+            policy,
+            optimizer,
+            rollout,
+            cfg,
+            torch.device("cpu"),
+            expert_policy_observations=observations,
+            expert_actions=expert_actions,
+        )
+
+    stats = update_policy(
+        policy,
+        optimizer,
+        rollout,
+        cfg,
+        torch.device("cpu"),
+        expert_policy_observations=observations,
+        expert_actions=expert_actions,
+        expert_trajectory_ids=np.asarray([10, 10, 20, 20]),
+        expert_timesteps=np.asarray([0, 1, 0, 1]),
+    )
+    assert np.isfinite(stats["bc_regularization_loss"])
+    assert stats["bc_regularization_context_mean_steps"] >= 1.0
+
+
 def test_central_critic_observations_encode_per_agent_scene_context():
     class Vehicle:
         def __init__(self, x, y, vx, vy, speed, heading, vehicle_id):
@@ -999,6 +1108,379 @@ def test_behavior_clone_pretrain_matches_continuous_actions():
 
     assert before["bc/train_mse"] < 0.05
     assert before["bc/train_mae"] < 0.2
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), 1.01, -1.01])
+def test_behavior_clone_pretrain_rejects_invalid_targets(invalid):
+    transitions = types.SimpleNamespace(
+        policy_observations=np.zeros((2, 4), dtype=np.float32),
+        actions_continuous_env=np.asarray(
+            [[0.0, 0.0], [invalid, 0.0]],
+            dtype=np.float32,
+        ),
+    )
+    policy = make_actor_critic(
+        "mlp",
+        obs_dim=4,
+        hidden_size=8,
+        action_mode="continuous",
+        continuous_action_dim=2,
+    )
+
+    with pytest.raises(ValueError, match="non-finite|normalized"):
+        behavior_clone_pretrain(
+            policy,
+            transitions,
+            PSGAILConfig(action_mode="continuous", bc_pretrain_epochs=1),
+            torch.device("cpu"),
+        )
+
+
+def test_rollout_action_conversion_preserves_values_and_rejects_invalid():
+    cfg = PSGAILConfig(action_mode="continuous", continuous_action_dim=2)
+    native = torch.tensor([[0.25, -0.75]], dtype=torch.float32)
+
+    converted = _actions_to_env_tuple(native, cfg)
+
+    np.testing.assert_array_equal(converted[0], native.numpy()[0])
+    with pytest.raises(RuntimeError, match="never clipped"):
+        _actions_to_env_tuple(torch.tensor([[1.01, 0.0]]), cfg)
+    with pytest.raises(RuntimeError, match="non-finite"):
+        _actions_to_env_tuple(torch.tensor([[float("nan"), 0.0]]), cfg)
+
+
+def test_ppo_expert_actions_are_validated_without_clipping():
+    valid = np.asarray([[0.25, -0.75]], dtype=np.float32)
+    np.testing.assert_array_equal(_validated_expert_actions(valid), valid)
+    with pytest.raises(ValueError, match="never clipped"):
+        _validated_expert_actions(np.asarray([[1.01, 0.0]], dtype=np.float32))
+    with pytest.raises(ValueError, match="non-finite"):
+        _validated_expert_actions(
+            np.asarray([[float("nan"), 0.0]], dtype=np.float32)
+        )
+
+
+def test_physical_acceleration_decoding_never_clips():
+    cfg = PSGAILConfig(action_mode="continuous", continuous_action_dim=2)
+    action_tuple = (
+        np.asarray([0.25, 0.0], dtype=np.float32),
+        np.asarray([-0.5, 0.0], dtype=np.float32),
+    )
+
+    assert eval_mod._physical_accel_from_action(action_tuple, cfg) == pytest.approx(
+        1.25
+    )
+    np.testing.assert_allclose(
+        eval_mod._physical_accels_from_actions(action_tuple, cfg),
+        [1.25, -2.5],
+    )
+    with pytest.raises(RuntimeError, match="never clipped"):
+        eval_mod._physical_accel_from_action(
+            (np.asarray([1.01, 0.0], dtype=np.float32),),
+            cfg,
+        )
+    with pytest.raises(RuntimeError, match="non-finite"):
+        eval_mod._physical_accels_from_actions(
+            (np.asarray([float("nan"), 0.0], dtype=np.float32),),
+            cfg,
+        )
+
+
+def test_all_matched_eval_builders_separate_offroad_from_collision(monkeypatch):
+    captured: list[dict[str, object]] = []
+    monkeypatch.setattr(eval_mod, "register_ngsim_env", lambda: None)
+    monkeypatch.setattr(
+        eval_mod,
+        "build_env_config",
+        lambda **kwargs: dict(kwargs),
+    )
+    monkeypatch.setattr(
+        eval_mod,
+        "_apply_simulator_runtime_options",
+        lambda _env_cfg, _cfg: None,
+    )
+
+    def make(_env_id, **kwargs):
+        captured.append(kwargs["config"])
+        return object()
+
+    monkeypatch.setattr(eval_mod.gym, "make", make)
+    cfg = PSGAILConfig(action_mode="continuous", continuous_action_dim=2)
+
+    eval_mod._make_matched_eval_env(
+        cfg,
+        split="val",
+        episode_name="episode",
+        vehicle_id=1,
+    )
+    eval_mod._make_matched_eval_all_vehicle_env(
+        cfg,
+        split="val",
+        episode_name="episode",
+    )
+    eval_mod._make_matched_eval_selected_vehicle_env(
+        cfg,
+        split="val",
+        episode_name="episode",
+        vehicle_ids=(1, 2),
+    )
+
+    assert len(captured) == 3
+    assert all(
+        config["disable_controlled_vehicle_collisions"] is False
+        for config in captured
+    )
+    assert all(
+        config["crash_controlled_vehicles_offroad"] is False
+        for config in captured
+    )
+    assert all(
+        config["action"]["clip"] is False
+        for config in captured
+    )
+
+
+def test_matched_evaluation_steps_native_policy_action_after_disabling_expert_mode(
+    monkeypatch,
+):
+    requested_action = np.asarray([0.37, -0.22], dtype=np.float32)
+
+    class FakeVehicle:
+        vehicle_ID = 7
+        position = np.zeros(2, dtype=np.float32)
+        speed = 0.0
+        lane = None
+        crashed = False
+
+        def __init__(self):
+            self.action = {
+                "acceleration": 0.0,
+                "steering": 0.0,
+            }
+
+    class FakeEnv:
+        def __init__(self):
+            self.unwrapped = self
+            self.config = {"expert_test_mode": True}
+            self.controlled_vehicles = [FakeVehicle()]
+            self._expert_state_by_vehicle_id = {
+                7: {
+                    "ref_xy": np.zeros((2, 2), dtype=np.float32),
+                    "ref_v": np.zeros(2, dtype=np.float32),
+                }
+            }
+            self.step_actions: list[tuple[object, ...]] = []
+            self.expert_modes_at_step: list[bool] = []
+
+        def reset(self, *, seed):
+            del seed
+            # Reset populates the expert reference while entering replay mode.
+            self.config["expert_test_mode"] = True
+            return np.zeros(1, dtype=np.float32), {}
+
+        def step(self, action):
+            self.expert_modes_at_step.append(
+                bool(self.config["expert_test_mode"])
+            )
+            self.step_actions.append(action)
+            normalized = np.asarray(action[0], dtype=np.float32)
+            self.controlled_vehicles[0].action = {
+                "acceleration": eval_mod._physical_accel_from_action(
+                    action,
+                    cfg,
+                ),
+                "steering": float(normalized[1]) * eval_mod.MAX_STEER,
+            }
+            return (
+                np.zeros(1, dtype=np.float32),
+                0.0,
+                False,
+                True,
+                {
+                    "applied_actions": tuple(
+                        np.asarray(value).copy() for value in action
+                    ),
+                    "controlled_vehicle_crashes": [False],
+                    "controlled_vehicle_offroad": [False],
+                    "controlled_vehicle_ids": [7],
+                },
+            )
+
+        def close(self):
+            return None
+
+    fake_env = FakeEnv()
+    monkeypatch.setattr(
+        eval_mod,
+        "_get_matched_eval_env",
+        lambda *_args, **_kwargs: (fake_env, False),
+    )
+    monkeypatch.setattr(
+        eval_mod,
+        "_deterministic_policy_action_tuple",
+        lambda *_args, **_kwargs: (requested_action.copy(),),
+    )
+    policy = torch.nn.Linear(1, 1)
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        continuous_action_dim=2,
+        test_vehicle_mode="single",
+        evaluation_horizons_seconds="1",
+        policy_frequency=1,
+        max_episode_steps=1,
+    )
+
+    metrics = eval_mod._evaluate_policy_matched_trajectories_impl(
+        policy,
+        cfg,
+        torch.device("cpu"),
+        split="test",
+        episodes=1,
+        prefix="test",
+        scenarios=[(0, "episode", 7)],
+    )
+
+    assert metrics["test/episodes"] == pytest.approx(1.0)
+    assert fake_env.expert_modes_at_step == [False]
+    assert len(fake_env.step_actions) == 1
+    np.testing.assert_array_equal(
+        np.asarray(fake_env.step_actions[0][0]),
+        requested_action,
+    )
+
+
+def test_matched_single_ego_expert_floor_reuses_policy_pairing_and_records_events(
+    monkeypatch,
+):
+    expert_action = np.asarray([0.25, -0.1], dtype=np.float32)
+
+    class FakeVehicle:
+        vehicle_ID = 7
+
+    class FakeEnv:
+        def __init__(self):
+            self.unwrapped = self
+            self.config = {"expert_test_mode": True}
+            self.controlled_vehicles = [FakeVehicle()]
+            self.reset_seeds = []
+            self.step_count = 0
+            self.closed = False
+
+        def reset(self, *, seed):
+            self.reset_seeds.append(int(seed))
+            self.config["expert_test_mode"] = True
+            return np.zeros(1, dtype=np.float32), {}
+
+        def step(self, _dummy_action):
+            self.step_count += 1
+            crashed = self.step_count == 2
+            return (
+                np.zeros(1, dtype=np.float32),
+                0.0,
+                crashed,
+                crashed,
+                {
+                    "expert_action_continuous": expert_action.copy(),
+                    "applied_actions": (expert_action.copy(),),
+                    "controlled_vehicle_crashes": [crashed],
+                    "controlled_vehicle_offroad": [crashed],
+                    "controlled_vehicle_collision_partners": [
+                        {
+                            "vehicle_id": 7,
+                            "partner_vehicle_id": 19,
+                            "partner_type": "NGSIMVehicle",
+                            "provenance": "physics_current_intersection",
+                        }
+                    ],
+                    "background_idm_handovers": [
+                        {
+                            "vehicle_id": 19,
+                            "handover_step": 3,
+                            "reason": "trajectory_exhausted",
+                        }
+                    ],
+                },
+            )
+
+        def close(self):
+            self.closed = True
+
+    fake_env = FakeEnv()
+    requested = []
+
+    def get_env(_cfg, **kwargs):
+        requested.append(dict(kwargs))
+        return fake_env, False
+
+    monkeypatch.setattr(eval_mod, "_get_matched_eval_env", get_env)
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        continuous_action_dim=2,
+        evaluation_horizons_seconds="2",
+        policy_frequency=1,
+        max_episode_steps=2,
+        evaluation_terminate_when_all_controlled_crashed=False,
+        enable_collision=True,
+    )
+
+    result = eval_mod.evaluate_expert_replay_matched_single_vehicle_floor(
+        cfg,
+        split="val",
+        episodes=1,
+        scenarios=[("episode", 7)],
+    )
+
+    assert requested == [
+        {
+            "split": "val",
+            "episode_name": "episode",
+            "vehicle_id": 7,
+            "all_vehicle": False,
+        }
+    ]
+    assert fake_env.reset_seeds == [20260716 + 100_000]
+    assert fake_env.closed is True
+    assert result["framework"] == "matched_single_ego_expert_floor_v3"
+    assert result["vehicle_mode"] == "single_requested_ego"
+    assert result["expert_floor/vehicle_crash_rate"] == pytest.approx(1.0)
+    assert result["collision_partner_complete_episodes"] == 1
+    assert result["collision_partner_completeness_rate"] == pytest.approx(1.0)
+    assert result["collision_after_or_at_background_handover_episodes"] == 1
+    assert result["action_execution_receipt"]["exact_echo"] is True
+    record = result["episodes"][0]
+    assert record["first_collision_step"] == 1
+    assert record["first_offroad_step"] == 1
+    assert record["first_collision_partner"]["partner_vehicle_id"] == 19
+    assert record["first_background_handover_policy_step"] == 0
+    assert record["background_handover_precedes_collision"] is True
+
+    fake_env.closed = False
+    fake_env.step_count = 0
+    fake_env.reset_seeds.clear()
+    result = eval_mod.evaluate_expert_replay_matched_single_vehicle_floor(
+        cfg,
+        split="val",
+        episodes=1,
+        scenarios=[(5, "episode", 7)],
+    )
+    assert fake_env.reset_seeds == [20260716 + 100_000 + 5]
+    assert result["episodes"][0]["scenario_index"] == 5
+
+
+def test_collision_object_records_exact_first_counterpart():
+    from highway_env.vehicle.objects import RoadObject
+
+    first = RoadObject(None, np.zeros(2), 0.0, 0.0)
+    second = RoadObject(None, np.zeros(2), 0.0, 0.0)
+    first.vehicle_ID = 7
+    second.vehicle_ID = 19
+
+    first.handle_collisions(second, dt=0.0)
+
+    assert first.crashed and second.crashed
+    assert first.first_collision_partner_vehicle_id == 19
+    assert second.first_collision_partner_vehicle_id == 7
+    assert first.first_collision_partner_type == "RoadObject"
 
 
 def test_iq_learn_convergence_score_rewards_survival_and_penalizes_crashes():
@@ -2863,14 +3345,33 @@ def test_training_count_validation_selects_scheduled_vehicle_count_and_clips(mon
         return "", valid_ids_by_episode, {}, ["ep_a", "ep_b"]
 
     monkeypatch.setattr(eval_mod, "load_prebuilt_data", fake_load_prebuilt_data)
-    cfg = PSGAILConfig(percentage_controlled_vehicles=2, seed=123)
+    cfg = PSGAILConfig(
+        percentage_controlled_vehicles=2,
+        seed=123,
+        evaluation_scenario_seed=44,
+    )
     specs = eval_mod._evaluation_training_count_episode_specs(cfg, split="val", episodes=2)
     assert len(specs) == 2
     assert [len(vehicle_ids) for _idx, _episode, vehicle_ids in specs] == [2, 2]
     for _idx, episode, vehicle_ids in specs:
         assert set(vehicle_ids).issubset(set(map(int, valid_ids_by_episode[episode])))
 
-    clipped_cfg = PSGAILConfig(percentage_controlled_vehicles=5, seed=123)
+    paired_cfg = PSGAILConfig(
+        percentage_controlled_vehicles=2,
+        seed=999,
+        evaluation_scenario_seed=44,
+    )
+    assert eval_mod._evaluation_training_count_episode_specs(
+        paired_cfg,
+        split="val",
+        episodes=2,
+    ) == specs
+
+    clipped_cfg = PSGAILConfig(
+        percentage_controlled_vehicles=5,
+        seed=123,
+        evaluation_scenario_seed=44,
+    )
     clipped_specs = eval_mod._evaluation_training_count_episode_specs(
         clipped_cfg,
         split="val",
@@ -3268,6 +3769,135 @@ def test_matched_evaluation_fixed_horizon_ignores_terminal_but_not_truncation():
     )
 
 
+def test_matched_evaluation_audits_native_action_echo_and_physical_state():
+    cfg = PSGAILConfig(action_mode="continuous", continuous_action_dim=2)
+    requested = (np.asarray([0.4, -0.2], dtype=np.float32),)
+    vehicle = types.SimpleNamespace(
+        action={
+            "acceleration": 2.0,
+            "steering": -0.2 * np.pi / 4.0,
+        },
+        MIN_SPEED=-40.0,
+        MAX_SPEED=40.0,
+    )
+
+    receipt = eval_mod._audit_native_action_execution(
+        types.SimpleNamespace(),
+        {"applied_actions": tuple(value.copy() for value in requested)},
+        requested,
+        [(vehicle, False, 15.0)],
+        cfg,
+    )
+
+    assert receipt["normalized_echo_exact_count"] == 1.0
+    assert receipt["post_step_action_exact_count"] == 1.0
+    assert receipt["unexpected_override_count"] == 0.0
+
+
+def test_matched_evaluation_accepts_only_documented_native_action_override():
+    cfg = PSGAILConfig(action_mode="continuous", continuous_action_dim=2)
+    requested = (np.asarray([0.4, -0.2], dtype=np.float32),)
+    vehicle = types.SimpleNamespace(
+        action={"acceleration": -12.0, "steering": 0.0},
+        MIN_SPEED=-40.0,
+        MAX_SPEED=40.0,
+    )
+    receipt = eval_mod._audit_native_action_execution(
+        types.SimpleNamespace(),
+        {"applied_actions": tuple(value.copy() for value in requested)},
+        requested,
+        [(vehicle, True, 12.0)],
+        cfg,
+    )
+    assert receipt["crash_physics_override_count"] == 1.0
+    assert receipt["unexpected_override_count"] == 0.0
+
+    with pytest.raises(RuntimeError, match="without a documented native"):
+        eval_mod._audit_native_action_execution(
+            types.SimpleNamespace(),
+            {"applied_actions": tuple(value.copy() for value in requested)},
+            requested,
+            [(vehicle, False, 12.0)],
+            cfg,
+        )
+
+
+def test_parallel_matched_action_receipts_use_global_counts_and_maximum():
+    prefix = "validation"
+
+    def part(
+        *,
+        echo_count,
+        echo_exact,
+        state_count,
+        state_exact,
+        crash_overrides,
+        speed_overrides,
+        unexpected_overrides,
+        maximum_difference,
+    ):
+        values = {
+            f"{prefix}/evaluated_steps": float(state_count),
+            f"{prefix}/episodes": 1.0,
+            f"{prefix}/vehicle_episodes": 1.0,
+        }
+        receipt = {
+            "normalized_echo_count": echo_count,
+            "normalized_echo_exact_count": echo_exact,
+            "post_step_action_count": state_count,
+            "post_step_action_exact_count": state_exact,
+            "crash_physics_override_count": crash_overrides,
+            "speed_bound_override_count": speed_overrides,
+            "unexpected_override_count": unexpected_overrides,
+            "maximum_post_step_action_abs_difference": maximum_difference,
+        }
+        values.update(
+            {
+                f"__raw/{prefix}/action_execution_{name}": float(value)
+                for name, value in receipt.items()
+            }
+        )
+        return values
+
+    metrics = eval_mod._combine_matched_eval_metric_dicts(
+        [
+            part(
+                echo_count=2,
+                echo_exact=1,
+                state_count=2,
+                state_exact=1,
+                crash_overrides=1,
+                speed_overrides=0,
+                unexpected_overrides=0,
+                maximum_difference=4.0,
+            ),
+            part(
+                echo_count=8,
+                echo_exact=8,
+                state_count=8,
+                state_exact=6,
+                crash_overrides=0,
+                speed_overrides=1,
+                unexpected_overrides=1,
+                maximum_difference=0.5,
+            ),
+        ],
+        prefix=prefix,
+        horizons=[],
+    )
+
+    assert metrics[f"{prefix}/normalized_action_echo_exact_rate"] == (
+        pytest.approx(0.9)
+    )
+    assert metrics[f"{prefix}/post_step_action_state_exact_rate"] == (
+        pytest.approx(0.7)
+    )
+    assert metrics[f"{prefix}/crash_physics_action_override_count"] == 1.0
+    assert metrics[f"{prefix}/speed_bound_action_override_count"] == 1.0
+    assert metrics[f"{prefix}/unexpected_action_override_count"] == 1.0
+    assert metrics[f"{prefix}/maximum_post_step_action_abs_difference"] == 4.0
+
+
 def test_matched_validation_reports_crash_agent_fraction_separately_from_incidence():
     squared = {
         20: {"x": [], "y": [], "position": [], "speed": [], "lane_offset": []}
@@ -3291,12 +3921,72 @@ def test_matched_validation_reports_crash_agent_fraction_separately_from_inciden
         horizons=[20],
         crashed_vehicle_episodes=1,
         vehicle_episodes=1,
+        background_idm_handover_vehicle_episodes=2,
     )
 
     assert metrics["validation/crash_agent_fraction"] == pytest.approx(0.3)
     assert metrics["validation/collision_duration_rate"] == pytest.approx(0.3)
     assert metrics["validation/vehicle_crash_rate"] == pytest.approx(1.0)
     assert metrics["validation/collision_rate"] == pytest.approx(1.0)
+    assert metrics[
+        "validation/background_idm_handover_count"
+    ] == pytest.approx(2.0)
+    assert metrics[
+        "validation/mean_background_idm_handovers_per_episode"
+    ] == pytest.approx(2.0)
+
+
+def test_matched_validation_separates_rollout_from_reference_horizon_coverage():
+    squared = {
+        20: {"x": [], "y": [], "position": [], "speed": [], "lane_offset": []}
+    }
+    final_squared = {
+        "x": [1.0],
+        "y": [0.0],
+        "position": [1.0],
+        "speed": [0.0],
+        "lane_offset": [0.0],
+    }
+    metrics = eval_mod._matched_eval_metrics(
+        prefix="validation",
+        attempted_episodes=1,
+        evaluated_episodes=1,
+        skipped_missing_expert=0,
+        skipped_bad_reference=0,
+        skipped_empty_rollout=0,
+        total_steps=200,
+        collision_steps=0,
+        offroad_steps=0,
+        hard_brake_steps=0,
+        episode_lengths=[200],
+        squared=squared,
+        final_squared=final_squared,
+        horizons=[20],
+        vehicle_episodes=1,
+        rollout_covered_vehicle_counts={20: 1},
+    )
+
+    assert metrics["validation/horizon_coverage_20s"] == pytest.approx(0.0)
+    assert metrics[
+        "validation/reference_horizon_coverage_20s"
+    ] == pytest.approx(0.0)
+    assert metrics[
+        "validation/rollout_horizon_coverage_20s"
+    ] == pytest.approx(1.0)
+
+    gate = closed_loop_policy_quality(
+        metrics,
+        prefix="validation",
+        max_vehicle_crash_rate=1.0,
+        max_vehicle_offroad_rate=1.0,
+        score_horizon_seconds=20,
+        min_horizon_coverage=1.0,
+    )
+    assert gate["observed"]["horizon_coverage"] == pytest.approx(1.0)
+    assert gate["observed"]["reference_horizon_coverage"] == pytest.approx(
+        0.0
+    )
+    assert gate["passed"] is True
 
 
 def test_all_vehicle_event_rates_use_vehicle_and_agent_exposure_denominators():

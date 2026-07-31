@@ -128,6 +128,9 @@ class PSGAILConfig:
     policy_frequency: int = 10
     max_episode_steps: int = 200
     max_episode_steps_schedule: str = ""
+    # Evaluation cases and reset RNG are paired across independently trained
+    # policy seeds. They must not inherit the optimizer/training seed.
+    evaluation_scenario_seed: int = 20260716
 
     # Policy/Discriminator architecture and optimization parameters. These values define the model architecture and optimization hyperparameters;
     # changing them can significantly affect learning dynamics and performance. (Currently support transformer and MLP policy architectures, and MLP discriminators.)
@@ -138,6 +141,9 @@ class PSGAILConfig:
     transformer_dropout: float = 0.1
     transformer_norm_first: bool = False
     transformer_observation_normalization: bool = False
+    # Zero preserves standardized values. A positive value enables an explicit
+    # symmetric legacy/ablation clip and is part of checkpoint provenance.
+    policy_observation_standardization_clip: float = 0.0
     transformer_observation_tokenization: str = "semantic"
     policy_head_init_std: float = -1.0
     # Optional comma-separated normalized-action standard deviations. Empty
@@ -151,6 +157,10 @@ class PSGAILConfig:
     transformer_memory_tokens: int = 8
     transformer_memory_context_length: int = 32
     transformer_recurrent_sequence_length: int = 32
+    # Qualifying recurrent BC reconstructs the live memory by replaying the
+    # complete causal prefix. Bounded raw-history replay is legacy diagnostic
+    # only because hidden summaries recursively depend on earlier states.
+    recurrent_bc_warmup_mode: str = "full_prefix"
     transformer_recurrent_sequences_per_batch: int = 32
     transformer_recurrent_micro_batch_sequences: int = 8
     transformer_memory_storage_dtype: str = "float16"

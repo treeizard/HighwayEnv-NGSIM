@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "status": "engineering_candidate_not_policy_selected",
+  "provider_id": "topology_aware_route_intent_v1",
+  "provider_module": "highway_env.road.route_intent",
+  "provider_class": "TopologyAwareRouteIntentProvider",
+  "controller_horizons_m": [
+    5.0,
+    10.0,
+    20.0,
+    40.0,
+    80.0
+  ],
+  "policy_horizons_m": [
+    20.0,
+    40.0,
+    80.0
+  ],
+  "policy_projection": {
+    "frame": "current_route_lane_anchor",
+    "feature_dim": 16,
+    "include_previous_action": false,
+    "include_actuator_state": false,
+    "include_current_tracking_error": false,
+    "include_domain_or_topology_identity": false
+  },
+  "controller_projection": {
+    "frame": "ego",
+    "feature_dim": 35,
+    "role": "planner_controller_interoperability_not_default_policy_input"
+  },
+  "planner_contract": {
+    "explicit_route_required": true,
+    "missing_route_behavior": "fail_closed",
+    "permitted_source_kinds": [
+      "external_online_planner",
+      "planner_graph_route",
+      "scenario_route_command"
+    ],
+    "forbidden_source_kinds": [
+      "expert_action_history",
+      "realized_future_path",
+      "realized_future_trajectory",
+      "teacher_tracker",
+      "teacher_tracker_state"
+    ]
+  },
+  "topology_sidecar": {
+    "policy_visible": false,
+    "required_uses": [
+      "us_japanese_test_stratification",
+      "merge_split_controls",
+      "topology_decoding_and_suppression",
+      "provenance"
+    ]
+  },
+  "scientific_status": {
+    "policy_training_unlocked": false,
+    "oracle_gap_gate_evaluated": false,
+    "closed_loop_gate_evaluated": false,
+    "interpretability_qualified": false
+  }
+}

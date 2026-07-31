@@ -4,7 +4,11 @@ import json
 from pathlib import Path
 
 from scripts_gail.select_bc_3layer_tuning import select_tuning_candidate
-from scripts_gail.diagnose_bc_3layer import CANDIDATES, infer_diagnosis
+from scripts_gail.diagnose_bc_3layer import (
+    CANDIDATES,
+    infer_diagnosis,
+    promotion_record,
+)
 
 
 def test_recovery_candidate_matches_production_action_weighting():
@@ -95,3 +99,37 @@ def test_diagnosis_attributes_minimal_passing_change():
     selected = {"candidate_id": "baseline_no_early_stop"}
     assert "premature early stopping" in infer_diagnosis([], selected)
     assert "do not launch" in infer_diagnosis([], None)
+
+
+def test_local_diagnosis_selects_on_validation_and_defers_locked_test():
+    candidate = next(
+        row
+        for row in CANDIDATES
+        if row["candidate_id"] == "recovery_v3_simple_gru"
+    )
+    summary = {
+        "validation_skill": 0.5,
+        "validation_mse": 0.02,
+        "validation_mae": 0.07,
+        "validation_prediction_std_ratio": [0.8, 0.3],
+        "validation_prediction_target_correlation": [0.8, 0.5],
+        "validation_prediction_saturation_fraction": [0.0, 0.0],
+        "initial_validation_mse": 0.1,
+        "best_epoch": 4,
+        "completed_epochs": 5,
+        "history": [
+            {
+                "gradient_clipped_fraction": 0.0,
+                "gradient_group_norm_mean": {},
+            }
+        ],
+        "action_loss_weights": [0.1, 1.9],
+        "training_action_variance": [0.05, 0.002],
+    }
+
+    record = promotion_record(candidate, summary)
+
+    assert record["promotion_passed"] is False
+    assert record["validation_screen_passed"] is True
+    assert record["promotion_status"] == "pending_locked_test"
+    assert record["test_prediction_target_correlation"] is None

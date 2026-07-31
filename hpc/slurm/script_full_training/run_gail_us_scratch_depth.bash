@@ -143,9 +143,15 @@ else:
         "rollout_fixed_horizon": True,
         "normalize_gail_reward": True,
         "allow_wgan_reward_normalization": True,
-        "policy_bc_regularization_coef": 0.02,
+        "policy_bc_regularization_coef": 0.0,
         "policy_bc_regularization_final_coef": 0.0,
-        "policy_bc_regularization_decay_rounds": 50,
+        "policy_bc_regularization_decay_rounds": 0,
+        "enable_collision": True,
+        "collision_mode_schedule": "",
+        "vehicle_increase_soft_collision_rounds": 0,
+        "test_episodes": 0,
+        "health_learning_gate_round": 0,
+        "health_min_relative_validation_improvement": 0.0,
         "initial_action_std": "0.10,0.05",
         "minimum_action_std": "0.02,0.01",
         "maximum_action_std": "0.30,0.15",
@@ -176,10 +182,18 @@ if (workers, threads, eval_workers, eval_threads) != (16, 2, 16, 2):
         "Expected proven 16x2 rollout/evaluation geometry, got "
         f"{workers}x{threads} and {eval_workers}x{eval_threads}"
     )
-if int(args.get("vehicle_increase_soft_collision_rounds", 0)) != 5:
-    raise SystemExit("Expected five soft-collision rounds after each vehicle-count increase")
-if float(args.get("collision_proxy_penalty_coef", 0.0)) <= 0.0:
-    raise SystemExit("Soft-collision gate requires a positive collision-proxy penalty")
+if profile == "realistic_wgan_v1":
+    if args.get("enable_collision") is not True:
+        raise SystemExit("Realistic WGAN must keep native collision physics enabled")
+    if str(args.get("collision_mode_schedule", "")) != "":
+        raise SystemExit("Realistic WGAN must use full collision mode at every round")
+    if int(args.get("vehicle_increase_soft_collision_rounds", 0)) != 0:
+        raise SystemExit("Realistic WGAN cannot disable collisions after load changes")
+else:
+    if int(args.get("vehicle_increase_soft_collision_rounds", 0)) != 5:
+        raise SystemExit("Expected five soft-collision rounds after each vehicle-count increase")
+    if float(args.get("collision_proxy_penalty_coef", 0.0)) <= 0.0:
+        raise SystemExit("Soft-collision gate requires a positive collision-proxy penalty")
 if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
     raise SystemExit(f"Expected exactly one allocated GPU, found {torch.cuda.device_count()}")
 if not getattr(wandb.Api(), "api_key", None):
@@ -191,7 +205,10 @@ print(
 print("continuous_acceleration_range_mps2=[-5.0,5.0] explicit_data_contracts=true")
 print("optimization_validation_horizon=finite_fallback terminal_coverage_gate=0.95")
 print(f"worker_geometry=rollout:{workers}x{threads},evaluation:{eval_workers}x{eval_threads}")
-print("vehicle_increase_soft_collision_rounds=5 collision_proxy_penalty_enabled=true")
+if profile == "realistic_wgan_v1":
+    print("collision_mode=full vehicle_increase_soft_collision_rounds=0")
+else:
+    print("vehicle_increase_soft_collision_rounds=5 collision_proxy_penalty_enabled=true")
 print(f"allocated_gpu={torch.cuda.get_device_name(0)}")
 PY
 

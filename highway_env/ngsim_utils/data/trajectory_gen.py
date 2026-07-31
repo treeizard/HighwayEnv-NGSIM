@@ -401,6 +401,40 @@ def trajectory_row_is_active(row):
     return not (invalid_sentinel or inactive_padding)
 
 
+def trajectory_step_speed_mps(
+    row,
+    next_row,
+    *,
+    sample_frequency_hz: float,
+):
+    """Return a finite replay speed without differentiating into padding.
+
+    Processed trajectories use zero/sentinel rows outside a vehicle's active
+    interval.  Spatially differencing the last active row against the first
+    padding row creates a one-frame speed of thousands of metres per second,
+    which then contaminates lidar relative-speed observations.  Use the
+    recorded current-row speed at active-interval boundaries and spatial
+    differencing only between two active rows.
+    """
+
+    row_arr = np.asarray(row, dtype=float)
+    recorded_speed = float(row_arr[2])
+    if not np.isfinite(recorded_speed):
+        raise ValueError("Trajectory row contains a non-finite recorded speed.")
+    recorded_speed = max(recorded_speed, 0.0)
+    frequency = float(sample_frequency_hz)
+    if not np.isfinite(frequency) or frequency <= 0.0:
+        raise ValueError("sample_frequency_hz must be finite and positive.")
+    if next_row is None or not trajectory_row_is_active(next_row):
+        return recorded_speed
+    next_arr = np.asarray(next_row, dtype=float)
+    displacement = float(np.linalg.norm(next_arr[:2] - row_arr[:2]))
+    speed_from_delta = displacement * frequency
+    if not np.isfinite(speed_from_delta):
+        raise ValueError("Trajectory row delta produces a non-finite speed.")
+    return speed_from_delta if speed_from_delta > 1e-3 else recorded_speed
+
+
 def trajectory_rows_are_continuous(
     prev_row,
     next_row,

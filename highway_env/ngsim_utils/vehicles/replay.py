@@ -35,6 +35,7 @@ from highway_env.ngsim_utils.data.trajectory_gen import (
     first_valid_index as first_active_index,
     process_raw_trajectory,
     trajectory_row_is_active,
+    trajectory_step_speed_mps,
 )
 
 
@@ -419,14 +420,14 @@ class NGSIMVehicle(IDMVehicle):
             trajectory_row_is_active(self.ngsim_traj[self.sim_steps])
         )
 
-        # Speed from spatial difference (fallback to recorded v)
-        dx = nxt_x - cur_x
-        dy = nxt_y - cur_y
-        dist = math.hypot(dx, dy)
-        data_dt = self.DATA_DT
-
-        speed_est = dist / utils.not_zero(data_dt)
-        self.speed = speed_est if speed_est > 1e-3 else float(cur_v)
+        # Never differentiate the last active pose into an inactive padding
+        # row: that creates a one-frame kilometre-scale displacement and
+        # corrupts relative-speed lidar.
+        self.speed = trajectory_step_speed_mps(
+            self.ngsim_traj[self.sim_steps],
+            self.ngsim_traj[self.sim_steps + 1],
+            sample_frequency_hz=1.0 / self.DATA_DT,
+        )
         self.target_speed = self.speed
 
         # Prefer the recorded lane id during replay; fall back to closest geometry.

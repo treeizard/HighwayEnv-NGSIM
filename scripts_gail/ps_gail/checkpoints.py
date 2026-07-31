@@ -55,6 +55,7 @@ POLICY_ARCHITECTURE_FIELDS: tuple[str, ...] = (
     "transformer_dropout",
     "transformer_norm_first",
     "transformer_observation_normalization",
+    "policy_observation_standardization_clip",
     "transformer_observation_tokenization",
     "policy_head_init_std",
     "transformer_temporal_module",
@@ -120,6 +121,12 @@ def shared_interpretable_transformer_architecture(
             architecture["transformer_norm_first"]
         ),
         "transformer_observation_normalization": True,
+        "policy_observation_standardization_clip": float(
+            architecture.get(
+                "policy_observation_standardization_clip",
+                5.0,
+            )
+        ),
         "transformer_observation_tokenization": "dense_temporal",
         "policy_head_init_std": float(architecture["policy_head_init_std"]),
         "transformer_temporal_module": False,
@@ -165,10 +172,19 @@ def policy_architecture_contract(
             values = source
     else:
         raise TypeError(f"Unsupported architecture source: {type(source)!r}.")
-    return {
+    contract = {
         name: values.get(name, defaults[name])
         for name in POLICY_ARCHITECTURE_FIELDS
     }
+    if (
+        isinstance(source, dict)
+        and "policy_observation_standardization_clip" not in values
+    ):
+        # Historical normalized policies were trained with an implicit ±5
+        # clip. Preserve exact replay while requiring prospective runs to
+        # declare their (default-disabled) setting.
+        contract["policy_observation_standardization_clip"] = 5.0
+    return contract
 
 
 def assert_policy_architecture_matches_checkpoint(

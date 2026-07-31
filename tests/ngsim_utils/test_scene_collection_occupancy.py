@@ -92,3 +92,74 @@ def test_available_collection_scenarios_filters_without_probe_env(monkeypatch):
     scenarios = collector.available_collection_scenarios(_collection_args())
 
     assert scenarios == [{"episode_name": "episode-a", "ego_ids": [1]}]
+
+
+def test_poststep_activation_refreshes_the_observation_before_return():
+    env = NGSimEnv.__new__(NGSimEnv)
+    env.config = {"scene_dataset_collection_mode": True}
+    env.control_mode = "continuous"
+    env.steps = 7
+    state = {"active": False, "observed_after_sync": False}
+
+    def sync(*, step_index: int) -> None:
+        assert step_index == 7
+        state["active"] = True
+
+    class Observation:
+        @staticmethod
+        def observe() -> np.ndarray:
+            state["observed_after_sync"] = bool(state["active"])
+            return np.asarray([1.0 if state["active"] else -1.0])
+
+    def info(obs, _action):
+        return {"observation_echo": np.asarray(obs).copy()}
+
+    env._sync_scene_collection_controlled_vehicles = sync
+    env.observation_type = Observation()
+    env._info = info
+
+    refreshed, refreshed_info = (
+        env._refresh_scene_collection_observation_after_sync(
+            np.asarray([-1.0]),
+            np.zeros(2, dtype=np.float32),
+        )
+    )
+
+    assert state["observed_after_sync"]
+    np.testing.assert_array_equal(refreshed, [1.0])
+    np.testing.assert_array_equal(
+        refreshed_info["observation_echo"],
+        refreshed,
+    )
+
+
+def test_delayed_scene_activation_resets_tracker_to_source_relative_offset():
+    env = NGSimEnv.__new__(NGSimEnv)
+    env.config = {"disable_scene_collection_spawn_safety": True}
+    env.control_mode = "continuous"
+    reset_offsets: list[int] = []
+    tracker = SimpleNamespace(
+        reset=lambda *, k0=0: reset_offsets.append(int(k0))
+    )
+    env._expert_state_by_vehicle_id = {7: {"tracker": tracker}}
+    ego = SimpleNamespace(
+        vehicle_ID=7,
+        scene_collection_is_active=False,
+        scene_collection_start_index=3,
+        scene_collection_full_traj=_active_traj(12, start=3),
+    )
+
+    def activate_from_row(_ego, _row, *, next_row=None):
+        assert next_row is not None
+        _ego.scene_collection_is_active = True
+
+    env._set_scene_collection_vehicle_from_row = activate_from_row
+
+    env._activate_scene_collection_vehicle(ego, step_index=5)
+    assert reset_offsets == [2]
+    assert env._expert_state_by_vehicle_id[7][
+        "activation_tracker_offset"
+    ] == 2
+
+    env._activate_scene_collection_vehicle(ego, step_index=6)
+    assert reset_offsets == [2]

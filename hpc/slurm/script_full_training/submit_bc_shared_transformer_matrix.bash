@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Submit only the matched 12-cell BC matrix. The existing expert collection is
+# Submit only the recipe-locked BC confirmation matrix. The existing expert collection is
 # re-audited, and the BC job runs from an immutable copy of the exact dirty
 # source state validated locally.
 
@@ -17,8 +17,6 @@ COLLECTION_ID="${COLLECTION_ID:-domain_matched_accel5_v2}"
 RUN_TESTS="${RUN_TESTS:-true}"
 DRY_RUN="${DRY_RUN:-false}"
 BC_TIME_LIMIT="${BC_TIME_LIMIT:-2-00:00:00}"
-US_QUALIFICATION="${US_QUALIFICATION:-${VFI_PROJECT_ROOT}/results/runs/diagnostics/bc_transformer_scope_20260726/us_dense_temporal_depth2_depth3_qualification/diagnosis.json}"
-JAPANESE_QUALIFICATION="${JAPANESE_QUALIFICATION:-${VFI_PROJECT_ROOT}/results/runs/diagnostics/bc_transformer_scope_20260726/japanese_dense_temporal_depth2_depth3_qualification/diagnosis.json}"
 
 case "${CAMPAIGN_ID}" in
     *[!A-Za-z0-9._-]*|'')
@@ -35,16 +33,12 @@ esac
 
 for required in \
     "${PYTHON_BIN}" \
-    "${SOURCE_REPODIR}/configs/bc_gail_aligned_accel5_v4.json" \
-    "${US_QUALIFICATION}" \
-    "${JAPANESE_QUALIFICATION}"; do
+    "${SOURCE_REPODIR}/configs/bc_gail_aligned_accel5_v5.json"; do
     test -s "${required}"
 done
 
 "${PYTHON_BIN}" - \
-    "${SOURCE_REPODIR}/configs/bc_gail_aligned_accel5_v4.json" \
-    "${US_QUALIFICATION}" \
-    "${JAPANESE_QUALIFICATION}" <<'PY'
+    "${SOURCE_REPODIR}/configs/bc_gail_aligned_accel5_v5.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -56,7 +50,8 @@ evaluation = recipe.get("evaluation", {})
 expected = {
     "status": "locked",
     "policy_model": "recurrent_transformer",
-    "depths": [2, 3],
+    "depths": [2],
+    "policy_seeds": [0, 1, 2, 3, 4],
     "transformer_observation_tokenization": "dense_temporal",
     "transformer_observation_normalization": True,
     "memory_tokens": 1,
@@ -65,6 +60,7 @@ actual = {
     "status": recipe.get("status"),
     "policy_model": architecture.get("policy_model"),
     "depths": architecture.get("depths"),
+    "policy_seeds": architecture.get("policy_seeds"),
     "transformer_observation_tokenization": architecture.get(
         "transformer_observation_tokenization"
     ),
@@ -76,10 +72,10 @@ actual = {
 if actual != expected:
     raise SystemExit(f"Shared recurrent-transformer recipe is not locked: {actual}")
 expected_benchmark = {
-    "objective": "behavior_cloning_interpretability_reference",
+    "objective": "behavior_cloning_policy_realism_reference",
     "matrix_completion_gate": "all_training_artifacts_complete",
-    "interpretability_eligibility_gate": "offline_imitation_learning",
-    "closed_loop_metrics_role": "descriptive_non_terminal",
+    "interpretability_eligibility_gate": "policy_realism_qualified",
+    "closed_loop_metrics_role": "qualification_non_terminal_for_matrix_execution",
 }
 actual_benchmark = {
     key: benchmark.get(key)
@@ -89,31 +85,19 @@ if actual_benchmark != expected_benchmark:
     raise SystemExit(
         f"BC interpretability benchmark is not locked: {actual_benchmark}"
     )
-if (
-    evaluation.get("vehicle_mode") != "all"
-    or evaluation.get("terminate_on_collision") is not False
-):
+if evaluation.get("vehicle_mode") != "single" or evaluation.get(
+    "terminate_on_collision"
+) is not False:
     raise SystemExit(
-        "BC paper-metric evaluation must control all vehicles without "
+        "BC primary validation must use the selected single vehicle without "
         f"collision termination: {evaluation}"
     )
-
-for path in map(Path, sys.argv[2:]):
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    records = {
-        int(row.get("transformer_layers", -1)): row
-        for row in payload.get("candidates", [])
-        if row.get("policy_model") == "recurrent_transformer"
-    }
-    if set(records) != {2, 3}:
-        raise SystemExit(f"Qualification lacks both transformer depths: {path}")
-    for depth, row in records.items():
-        if row.get("promotion_passed") is not True:
-            raise SystemExit(
-                f"Qualification rejected depth {depth} in {path}: {row}"
-            )
-        if row.get("transformer_observation_tokenization") != "dense_temporal":
-            raise SystemExit(f"Wrong tokenization in {path}: {row}")
+if evaluation.get("test_evaluation_mode") != "deferred":
+    raise SystemExit("Locked test data must remain sealed during matrix selection.")
+if evaluation.get("absolute_outcome_gate_role") != (
+    "engineering_alert_non_publication_gate"
+):
+    raise SystemExit("Absolute collision/offroad thresholds are mislabelled.")
 PY
 
 deployment_root="${VFI_PROJECT_ROOT}/deployments/${CAMPAIGN_ID}"
@@ -146,11 +130,11 @@ rsync -a \
     --exclude='logs/' \
     "${SOURCE_REPODIR}/" "${repodir}/"
 
-recipe="${repodir}/configs/bc_gail_aligned_accel5_v4.json"
+recipe="${repodir}/configs/bc_gail_aligned_accel5_v5.json"
 audit_runner="${repodir}/hpc/slurm/script_data_collection/audit_domain_matched_expert_accel5.bash"
 bc_runner="${repodir}/hpc/slurm/script_full_training/run_bc_gail_aligned_accel5.bash"
 audit_script="${repodir}/scripts_gail/audit_domain_matched_expert.py"
-audit_out="${audit_root}/collection_contract_audit.json"
+audit_out="${audit_root}/collection_contract_audit_train_val.json"
 for required in "${recipe}" "${audit_runner}" "${bc_runner}" "${audit_script}"; do
     test -s "${required}"
 done
@@ -162,7 +146,10 @@ if [ "${RUN_TESTS}" = true ]; then
             "${PYTHON_BIN}" -m pytest -q \
             tests/test_recurrent_bc.py \
             tests/test_bc_load_once_matrix.py \
-            tests/test_gail_airl_runtime_infrastructure.py
+            tests/test_expert_observation_validation.py \
+            tests/test_gail_airl_runtime_infrastructure.py \
+            tests/test_bc_domain_depth_workflow.py \
+            tests/test_ps_gail_training_logic.py
     )
 fi
 
@@ -174,6 +161,7 @@ chmod -R a-w "${repodir}"
 audit_export="ALL,REPODIR=${repodir},VFI_PROJECT_ROOT=${VFI_PROJECT_ROOT}"
 audit_export="${audit_export},VFI_CONDA_ENV=ngsim_env,COLLECTION_ID=${COLLECTION_ID}"
 audit_export="${audit_export},EXPERT_ACCELERATION_LIMIT_MPS2=5.0,AUDIT_OUT=${audit_out}"
+audit_export="${audit_export},AUDIT_SPLITS=train:val"
 audit_export="${audit_export},AUDIT_EXPECTED_SCRIPT_SHA256=$(sha256sum "${audit_script}" | awk '{print $1}')"
 audit_export="${audit_export},AUDIT_EXPECTED_RUNNER_SHA256=$(sha256sum "${audit_runner}" | awk '{print $1}')"
 
@@ -234,7 +222,7 @@ bc_job="$(
 bc_job="${bc_job%%;*}"
 
 export CAMPAIGN_ID repodir recipe audit_out audit_job bc_job
-export slurm_log_root US_QUALIFICATION JAPANESE_QUALIFICATION BC_TIME_LIMIT
+export slurm_log_root BC_TIME_LIMIT
 "${PYTHON_BIN}" - "${submission_dir}/submission.json" <<'PY'
 from datetime import datetime, timezone
 import hashlib
@@ -256,19 +244,29 @@ locked_sources = (
     "hpc/slurm/script_full_training/run_bc_gail_aligned_accel5.bash",
     "scripts_gail/run_bc_domain_depth_matrix.py",
     "scripts_gail/train_recurrent_bc_policy.py",
+    "scripts_gail/pretrain_continuous_bc_policy.py",
+    "scripts_gail/train_simple_ps_gail.py",
     "scripts_gail/archive_bc_checkpoints.py",
     "scripts_gail/ps_gail/recurrent_bc.py",
+    "scripts_gail/ps_gail/envs.py",
+    "scripts_gail/ps_gail/training/evaluation.py",
+    "scripts_gail/ps_gail/training/policy.py",
+    "scripts_gail/ps_gail/training/ppo.py",
     "scripts_gail/ps_gail/models.py",
     "scripts_gail/ps_gail/contracts.py",
     "scripts_gail/ps_gail/data.py",
     "scripts_gail/ps_gail/checkpoints.py",
 )
+recipe_payload = json.loads(Path(os.environ["recipe"]).read_text(encoding="utf-8"))
+depths = list(recipe_payload["architecture"]["depths"])
+seeds = list(recipe_payload["architecture"]["policy_seeds"])
 payload = {
     "schema_version": 1,
     "submitted_utc": datetime.now(timezone.utc).isoformat(),
     "campaign_id": os.environ["CAMPAIGN_ID"],
     "study": "matched_bc_shared_dense_temporal_recurrent_transformer",
-    "status": "submitted",
+    "status": "validation_matrix_submitted",
+    "scientific_qualification_status": "pending_locked_test_and_expert_replay",
     "deployment": os.environ["repodir"],
     "source_lock": {
         "git_revision": subprocess.check_output(
@@ -285,21 +283,20 @@ payload = {
     "recipe_sha256": sha256(os.environ["recipe"]),
     "architecture_contract_id": "shared_dense_temporal_recurrent_transformer_v1",
     "benchmark_contract": {
-        "objective": "behavior_cloning_interpretability_reference",
+        "objective": "behavior_cloning_policy_realism_reference",
         "matrix_completion_gate": "all_training_artifacts_complete",
-        "interpretability_eligibility_gate": "offline_imitation_learning",
-        "closed_loop_metrics_role": "descriptive_non_terminal",
+        "interpretability_eligibility_gate": "policy_realism_qualified",
+        "closed_loop_metrics_role": "qualification_non_terminal_for_matrix_execution",
         "shared_validation_framework": "shared_bc_gail_paper_metrics_v1",
-        "validation_vehicle_mode": "all",
+        "validation_vehicle_mode": "single",
         "collision_termination_enabled": False,
+        "test_evaluation_mode": "deferred",
     },
-    "transformer_depths": [2, 3],
-    "policy_model_count": 12,
+    "transformer_depths": depths,
+    "policy_seeds": seeds,
+    "policy_model_count": 2 * len(depths) * len(seeds),
     "bc_time_limit": os.environ["BC_TIME_LIMIT"],
-    "local_qualification": {
-        "us": os.environ["US_QUALIFICATION"],
-        "japanese": os.environ["JAPANESE_QUALIFICATION"],
-    },
+    "historical_promotion_precondition": "removed",
     "jobs": {
         "expert_contract_audit": os.environ["audit_job"],
         "bc_matrix": os.environ["bc_job"],

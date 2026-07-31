@@ -7,12 +7,12 @@ import random
 import signal
 import time
 import warnings
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.distributions import Categorical, Independent, Normal
+from torch.distributions import Categorical
 
 from scripts_gail.ps_gail.checkpoints import (
     assert_policy_architecture_matches_checkpoint,
@@ -84,9 +84,13 @@ from scripts_gail.ps_gail.trainer import (
     refresh_rollout_rewards,
     resolve_device,
     set_optimizer_lr,
+    SquashedNormal,
     subsample_rollout_for_training,
     update_discriminator,
     update_policy,
+)
+from scripts_gail.ps_gail.training.policy import (
+    _continuous_distribution_location,
 )
 from scripts_gail.ps_gail.validation import (
     best_checkpoint_payload,
@@ -495,6 +499,28 @@ def training_risk_warnings(cfg: PSGAILConfig) -> list[str]:
     return messages
 
 
+def _validated_continuous_policy_actions(
+    actions: torch.Tensor,
+    *,
+    context: str,
+) -> np.ndarray:
+    """Return native bounded policy actions without silently modifying them."""
+    detached = actions.detach()
+    if not bool(torch.isfinite(detached).all()):
+        raise RuntimeError(f"{context} produced non-finite continuous actions.")
+    outside = (detached < -1.0) | (detached > 1.0)
+    if bool(outside.any()):
+        first = tuple(
+            int(value)
+            for value in torch.nonzero(outside, as_tuple=False)[0].tolist()
+        )
+        raise RuntimeError(
+            f"{context} violated the normalized [-1, 1] action contract at "
+            f"index {first}: {float(detached[first])}. Actions are never clamped."
+        )
+    return detached.cpu().numpy().astype(np.float32, copy=False)
+
+
 def _policy_action_tuple(
     policy: SharedActorCritic,
     obs,
@@ -529,8 +555,16 @@ def _policy_action_tuple(
                 if policy.log_std is None:
                     raise RuntimeError("Continuous action mode requires policy.log_std.")
                 std = torch.exp(policy.log_std).expand_as(policy_out)
-                actions = Independent(Normal(policy_out, std), 1).sample()
-            actions_np = torch.clamp(actions, -1.0, 1.0).detach().cpu().numpy().astype(np.float32)
+                location = _continuous_distribution_location(policy_out)
+                actions = SquashedNormal(location, std).sample()
+            actions_np = _validated_continuous_policy_actions(
+                actions,
+                context=(
+                    "Deterministic policy evaluation"
+                    if deterministic
+                    else "Stochastic policy evaluation"
+                ),
+            )
             action_tuple = tuple(action.copy() for action in actions_np)
             return (action_tuple, new_memory) if return_memory else action_tuple
         if bool(getattr(cfg, "enable_action_masking", True)):
@@ -639,19 +673,26 @@ def behavior_clone_pretrain(
     cfg: PSGAILConfig,
     device: torch.device,
 ) -> dict[str, float]:
+    """Pretrain from already-normalized labels, failing on contract violations."""
     if str(cfg.action_mode).lower() != "continuous":
         raise ValueError("BC pretraining currently requires --action-mode continuous.")
 
     observations = np.asarray(transitions.policy_observations, dtype=np.float32)
-    actions = np.clip(
-        np.asarray(transitions.actions_continuous_env, dtype=np.float32),
-        -1.0,
-        1.0,
-    )
+    actions = np.asarray(transitions.actions_continuous_env, dtype=np.float32)
     if observations.ndim != 2 or actions.ndim != 2:
         raise ValueError(f"BC data must be rank-2 obs/actions, got {observations.shape} and {actions.shape}.")
     if len(observations) != len(actions):
         raise ValueError(f"BC observation/action length mismatch: {len(observations)} != {len(actions)}.")
+    if not np.isfinite(actions).all():
+        raise ValueError("BC action targets contain non-finite normalized actions.")
+    outside = np.argwhere((actions < -1.0) | (actions > 1.0))
+    if outside.size:
+        row, column = (int(value) for value in outside[0])
+        raise ValueError(
+            "BC action targets violate the normalized [-1, 1] contract at "
+            f"index ({row}, {column}): {float(actions[row, column])}. "
+            "Targets are never clipped."
+        )
 
     rng = np.random.default_rng(int(cfg.seed) + 17)
     indices = rng.permutation(len(observations))
@@ -771,17 +812,15 @@ def _collision_only_flags(
     crash_flags: list[object] | tuple[object, ...],
     offroad_flags: list[object] | tuple[object, ...],
 ) -> list[bool]:
-    """Separate vehicle-collision flags from off-road crashes.
+    """Return physical collision flags independently from off-road flags.
 
-    NGSimEnv deliberately marks an off-road controlled vehicle as ``crashed``.
-    A raw crash flag is therefore not a collision-only measurement.
+    Unmatched policy evaluation constructs NGSimEnv with
+    ``crash_controlled_vehicles_offroad=False``. Under that explicit contract,
+    ``controlled_vehicle_crashes`` is the physical collision signal and must
+    remain true when a vehicle is simultaneously off road.
     """
-    count = max(len(crash_flags), len(offroad_flags))
-    return [
-        bool(crash_flags[idx]) and not bool(offroad_flags[idx] if idx < len(offroad_flags) else False)
-        for idx in range(count)
-        if idx < len(crash_flags)
-    ]
+    del offroad_flags
+    return [bool(flag) for flag in crash_flags]
 
 
 def _collision_proxy_flags(interaction_metrics: list[object] | tuple[object, ...]) -> list[bool]:
@@ -795,6 +834,41 @@ def _collision_proxy_flags(interaction_metrics: list[object] | tuple[object, ...
             min_gap = float("inf")
         flags.append(bool(np.isfinite(min_gap) and min_gap <= 0.0))
     return flags
+
+
+def _unmatched_survival_env_overrides() -> dict[str, bool]:
+    """Return keyword arguments accepted by ``make_training_env``."""
+    return {
+        "crash_controlled_vehicles_offroad": False,
+    }
+
+
+def _unmatched_survival_config(cfg: PSGAILConfig) -> PSGAILConfig:
+    """Return the fixed-horizon evaluation config without mutating training."""
+
+    return replace(
+        cfg,
+        terminate_when_all_controlled_crashed=False,
+    )
+
+
+def _unmatched_survival_should_stop(
+    *,
+    terminated: bool,
+    truncated: bool,
+) -> bool:
+    """Ignore terminal policy outcomes and stop only at the time limit.
+
+    ``terminate_when_all_controlled_crashed=False`` prevents collision from
+    removing the requested scoring horizon, but NGSimEnv can emit other
+    terminal signals as well.  A receipt labelled fixed-horizon must therefore
+    treat every terminal signal as an outcome and continue until the explicit
+    truncation/time limit.  The loop's ``max_episode_steps`` bound remains the
+    final safety bound.
+    """
+
+    del terminated
+    return bool(truncated)
 
 
 def evaluate_policy_survival(
@@ -820,7 +894,11 @@ def evaluate_policy_survival(
     policy.eval()
     try:
         with evaluation_thread_context(cfg):
-            env = make_training_env(cfg)
+            evaluation_cfg = _unmatched_survival_config(cfg)
+            env = make_training_env(
+                evaluation_cfg,
+                **_unmatched_survival_env_overrides(),
+            )
             for episode_idx in range(eval_episodes):
                 obs, _info = env.reset(seed=int(cfg.seed) + int(seed_offset) + episode_idx)
                 eval_memory = (
@@ -877,7 +955,10 @@ def evaluate_policy_survival(
                         episode_had_collision_proxy or any(collision_proxy_flags)
                     )
                     episode_had_offroad = bool(episode_had_offroad or any(bool(flag) for flag in offroad_flags))
-                    if terminated or truncated:
+                    if _unmatched_survival_should_stop(
+                        terminated=bool(terminated),
+                        truncated=bool(truncated),
+                    ):
                         break
                 lengths.append(length)
                 crash_episodes += int(episode_had_crash)
@@ -1071,6 +1152,13 @@ def main() -> None:
             ),
             transformer_observation_normalization=bool(
                 getattr(cfg, "transformer_observation_normalization", False)
+            ),
+            policy_observation_standardization_clip=float(
+                getattr(
+                    cfg,
+                    "policy_observation_standardization_clip",
+                    0.0,
+                )
             ),
             transformer_observation_tokenization=str(
                 getattr(cfg, "transformer_observation_tokenization", "semantic")
@@ -1829,6 +1917,16 @@ def main() -> None:
                 ),
                 expert_actions=(
                     expert_transitions.actions_continuous_env
+                    if expert_transitions is not None
+                    else None
+                ),
+                expert_trajectory_ids=(
+                    expert_transitions.trajectory_ids
+                    if expert_transitions is not None
+                    else None
+                ),
+                expert_timesteps=(
+                    expert_transitions.timesteps
                     if expert_transitions is not None
                     else None
                 ),
@@ -2811,6 +2909,11 @@ def main() -> None:
         elif os.path.isfile(best_path):
             selected_policy_state = load_verified_policy_state(best_path)
             selected_checkpoint_name = "best.pt"
+        if initializer_policy_state is not None:
+            selected_policy_relative_l2_delta = policy_relative_l2_delta(
+                selected_policy_state,
+                initializer_policy_state,
+            )
         policy.load_state_dict(selected_policy_state)
         if int(getattr(cfg, "validation_episodes", 0)) > 0:
             raw_selected_validation = evaluate_policy_matched_trajectories(
@@ -2867,10 +2970,6 @@ def main() -> None:
                     f"hard_brake={selected_test_metrics.get('test/hard_brake_rate', 0.0):.4f}"
                 )
             if initializer_policy_state is not None:
-                selected_policy_relative_l2_delta = policy_relative_l2_delta(
-                    selected_policy_state,
-                    initializer_policy_state,
-                )
                 policy.load_state_dict(initializer_policy_state)
                 raw_initializer_test = evaluate_policy_matched_trajectories(
                     policy,

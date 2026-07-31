@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "status": "locked",
+  "study_id": "bc_policy_repair_v3_factorial_seed0_validation_only",
+  "purpose": "Prospective engineering discovery on the padding-fixed v3 train/validation collection. Compare recurrent GRU and recurrent Transformer policies under fixed and inverse-variance action losses without opening test data or modifying policy actions.",
+  "evidence_level": "engineering_discovery_validation_only",
+  "scientific_claim_allowed": false,
+  "collection": {
+    "id": "domain_matched_accel5_v3_paddingfix",
+    "audited_splits": [
+      "train",
+      "val"
+    ],
+    "not_opened_splits": [
+      "test"
+    ],
+    "test_data_status": "not_opened",
+    "domains": [
+      {
+        "id": "us",
+        "scene": "us-101"
+      },
+      {
+        "id": "japanese",
+        "scene": "japanese"
+      }
+    ]
+  },
+  "factorial_design": {
+    "policy_seeds": [
+      0
+    ],
+    "phase": "seed0_discovery",
+    "all_cells_mandatory": true,
+    "stop_on_poor_metric": false,
+    "selection_split": "val",
+    "winner_selection_allowed": false,
+    "arms": [
+      {
+        "id": "gru_d1_fixed",
+        "architecture": "gru",
+        "policy_model": "recurrent_gru",
+        "depth": 1,
+        "action_loss_weighting": "fixed"
+      },
+      {
+        "id": "gru_d1_inverse_variance",
+        "architecture": "gru",
+        "policy_model": "recurrent_gru",
+        "depth": 1,
+        "action_loss_weighting": "inverse_variance"
+      },
+      {
+        "id": "transformer_d2_fixed",
+        "architecture": "transformer",
+        "policy_model": "recurrent_transformer",
+        "depth": 2,
+        "action_loss_weighting": "fixed"
+      },
+      {
+        "id": "transformer_d2_inverse_variance",
+        "architecture": "transformer",
+        "policy_model": "recurrent_transformer",
+        "depth": 2,
+        "action_loss_weighting": "inverse_variance"
+      }
+    ],
+    "comparison_rule": "Report every cell and paired same-domain continuous outcomes. Seed 0 may diagnose implementation and learnability only; it cannot select a publication policy or establish G0."
+  },
+  "runtime_invariants": {
+    "policy_action_execution": "network_output_passed_unchanged_to_env_step",
+    "policy_action_clamping": false,
+    "policy_action_substitution": false,
+    "collision_physics_enabled": true,
+    "collision_termination_enabled": false,
+    "test_evaluation_mode": "deferred",
+    "evaluation_split": "val",
+    "recurrent_warmup_mode": "full_prefix",
+    "evaluation_scenario_seed": 20260716,
+    "scenario_pairing": "same_domain_bank_and_protocol_seed_across_all_arms",
+    "observation_standardization_clip": 0.0
+  },
+  "data": {
+    "continuous_action_columns": [
+      "acceleration_norm",
+      "steering_norm"
+    ],
+    "continuous_action_scales": [
+      5.0,
+      0.7853981633974483
+    ],
+    "policy_observation_dim": 322,
+    "require_explicit_data_contracts": true,
+    "max_expert_samples": 300000,
+    "max_validation_samples": 100000,
+    "max_test_samples": 0,
+    "row_budget_semantics": "trajectory_preserving_targets_may_overshoot",
+    "trajectory_identity_requirement": "scene_and_episode_name_plus_vehicle_id",
+    "data_seed": 20260716,
+    "split_seed": 20260716,
+    "train_fraction": 0.8,
+    "validation_fraction": 0.1
+  },
+  "architecture": {
+    "hidden_size": 256,
+    "transformer_heads": 4,
+    "transformer_dropout": 0.0,
+    "transformer_norm_first": true,
+    "observation_normalization": true,
+    "observation_tokenization": "dense_temporal",
+    "policy_head_init_std": 0.01,
+    "memory_tokens": 1,
+    "memory_context_length": 32
+  },
+  "optimization": {
+    "epochs": 50,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.00001,
+    "max_grad_norm": 5.0,
+    "early_stopping_patience": 10,
+    "early_stopping_min_epochs": 40,
+    "early_stopping_min_delta_relative": 0.001,
+    "checkpoint_selection_rule": "validation_loss",
+    "mirror_augmentation_probability": 0.0,
+    "sequence_length": 32,
+    "sequences_per_batch": 16,
+    "micro_batch_sequences": 16,
+    "action_loss_weights": [
+      1.0,
+      1.0
+    ],
+    "correlation_loss_weight": 0.0,
+    "variance_loss_weight": 0.0,
+    "training_min_prediction_std_ratios": [
+      0.0,
+      0.0
+    ]
+  },
+  "gates": {
+    "role": "report_only_during_seed0_discovery",
+    "min_validation_skill": 0.1,
+    "max_validation_mae": 0.35,
+    "learning_action_index": 0,
+    "min_learning_action_std_ratio": 0.25,
+    "min_learning_action_correlation": 0.5,
+    "learning_action_indices": [
+      0,
+      1
+    ],
+    "min_learning_action_std_ratios": [
+      0.25,
+      0.1
+    ],
+    "min_learning_action_correlations": [
+      0.5,
+      0.2
+    ]
+  },
+  "evaluation": {
+    "validation_episodes": 12,
+    "episodes": 12,
+    "vehicle_mode": "single",
+    "matched_evaluation": true,
+    "min_rollout_steps": 100,
+    "max_crash_fraction": 1.0,
+    "max_offroad_fraction": 1.0,
+    "absolute_outcome_gate_role": "engineering_report_only",
+    "expert_replay_qualification": {
+      "required_for_policy_realism": true,
+      "status": "pending_frozen_reference",
+      "maximum_vehicle_crash_rate_gap": 0.05,
+      "maximum_vehicle_offroad_rate_gap": 0.05
+    }
+  },
+  "reporting": {
+    "primary_continuous_metrics": [
+      "validation_mse",
+      "validation_mae",
+      "validation_skill",
+      "validation_prediction_target_correlation",
+      "validation_prediction_std_ratio",
+      "paper_validation_score",
+      "validation_vehicle_crash_rate",
+      "validation_vehicle_offroad_rate"
+    ],
+    "report_all_cells": true,
+    "retain_failed_cells": true,
+    "locked_test_required_after_method_freeze": true,
+    "publication_qualification_in_this_phase": false
+  }
+}

@@ -14,6 +14,35 @@ CENTRAL_CRITIC_VEHICLE_FEATURE_DIM = 5
 CENTRAL_CRITIC_CONTEXT_DIM = 4
 
 
+def _validated_observation_standardization_clip(value: float) -> float:
+    """Return an explicit symmetric clip bound, where zero disables clipping."""
+    clip = float(value)
+    if not np.isfinite(clip) or clip < 0.0:
+        raise ValueError(
+            "policy_observation_standardization_clip must be finite and "
+            f"non-negative, got {value!r}."
+        )
+    return clip
+
+
+def _standardize_policy_observations(
+    observations: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    *,
+    clip: float,
+) -> torch.Tensor:
+    """Standardize observations without silently truncating their values."""
+    standardized = (observations - mean) / std
+    if not bool(torch.isfinite(standardized).all()):
+        raise ValueError(
+            "Standardized policy observations contain non-finite values."
+        )
+    if clip > 0.0:
+        standardized = standardized.clamp(min=-clip, max=clip)
+    return standardized
+
+
 def parse_hidden_sizes(hidden_sizes: str | int | tuple[int, ...] | list[int] | None) -> tuple[int, ...]:
     if hidden_sizes is None:
         return DEFAULT_CRITIC_HIDDEN_SIZES
@@ -266,6 +295,7 @@ class TransformerActorCritic(nn.Module):
         dropout: float = 0.1,
         norm_first: bool = False,
         observation_normalization: bool = False,
+        observation_standardization_clip: float = 0.0,
         temporal_module: bool = False,
         temporal_kernel_size: int = 5,
         temporal_layers: int = 1,
@@ -282,6 +312,11 @@ class TransformerActorCritic(nn.Module):
         hidden_size = int(hidden_size)
         self.obs_dim = obs_dim
         self.observation_normalization = bool(observation_normalization)
+        self.policy_observation_standardization_clip = (
+            _validated_observation_standardization_clip(
+                observation_standardization_clip
+            )
+        )
         if self.observation_normalization:
             self.register_buffer(
                 "observation_normalizer_mean",
@@ -381,10 +416,12 @@ class TransformerActorCritic(nn.Module):
 
     def _encode_actor(self, obs: torch.Tensor) -> torch.Tensor:
         if self.observation_normalization:
-            obs = (
-                (obs - self.observation_normalizer_mean)
-                / self.observation_normalizer_std
-            ).clamp(min=-5.0, max=5.0)
+            obs = _standardize_policy_observations(
+                obs,
+                self.observation_normalizer_mean,
+                self.observation_normalizer_std,
+                clip=self.policy_observation_standardization_clip,
+            )
         tokens = self.input_proj(obs.unsqueeze(-1))
         if self.temporal_mixer is not None:
             mixed = self.temporal_mixer(tokens.transpose(1, 2)).transpose(1, 2)
@@ -457,6 +494,7 @@ class RecurrentTransformerActorCritic(nn.Module):
         dropout: float = 0.1,
         norm_first: bool = False,
         observation_normalization: bool = False,
+        observation_standardization_clip: float = 0.0,
         observation_tokenization: str = "semantic",
         policy_head_init_std: float = -1.0,
         memory_tokens: int = 8,
@@ -478,6 +516,11 @@ class RecurrentTransformerActorCritic(nn.Module):
         self.use_causal_attention = bool(use_causal_attention)
         self.norm_first = bool(norm_first)
         self.observation_normalization = bool(observation_normalization)
+        self.policy_observation_standardization_clip = (
+            _validated_observation_standardization_clip(
+                observation_standardization_clip
+            )
+        )
         self.observation_tokenization = str(observation_tokenization).lower()
         if self.observation_tokenization not in {"semantic", "dense_temporal"}:
             raise ValueError(
@@ -669,10 +712,12 @@ class RecurrentTransformerActorCritic(nn.Module):
 
     def _build_current_tokens(self, obs: torch.Tensor) -> torch.Tensor:
         if self.observation_normalization:
-            obs = (
-                (obs - self.observation_normalizer_mean)
-                / self.observation_normalizer_std
-            ).clamp(min=-5.0, max=5.0)
+            obs = _standardize_policy_observations(
+                obs,
+                self.observation_normalizer_mean,
+                self.observation_normalizer_std,
+                clip=self.policy_observation_standardization_clip,
+            )
         batch_size = int(obs.shape[0])
         policy = self.policy_token.expand(batch_size, -1, -1)
         policy = policy + self._type_tokens(0, batch_size, 1, obs.device)
@@ -847,6 +892,7 @@ class RecurrentGRUActorCritic(nn.Module):
         action_mode: str = "continuous",
         continuous_action_dim: int = 2,
         observation_normalization: bool = True,
+        observation_standardization_clip: float = 0.0,
         memory_context_length: int = 32,
     ) -> None:
         super().__init__()
@@ -857,6 +903,11 @@ class RecurrentGRUActorCritic(nn.Module):
         self.hidden_size = int(hidden_size)
         self.continuous_action_dim = int(continuous_action_dim)
         self.observation_normalization = bool(observation_normalization)
+        self.policy_observation_standardization_clip = (
+            _validated_observation_standardization_clip(
+                observation_standardization_clip
+            )
+        )
         self.memory_context_length = max(1, int(memory_context_length))
         self.memory_tokens = 1
         if self.observation_normalization:
@@ -921,10 +972,12 @@ class RecurrentGRUActorCritic(nn.Module):
         memory: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.observation_normalization:
-            obs = (
-                (obs - self.observation_normalizer_mean)
-                / self.observation_normalizer_std
-            ).clamp(min=-5.0, max=5.0)
+            obs = _standardize_policy_observations(
+                obs,
+                self.observation_normalizer_mean,
+                self.observation_normalizer_std,
+                clip=self.policy_observation_standardization_clip,
+            )
         encoded = self.input_encoder(obs)
         if memory is None:
             previous = torch.zeros_like(encoded)
@@ -978,6 +1031,7 @@ def make_actor_critic(
     transformer_dropout: float = 0.1,
     transformer_norm_first: bool = False,
     transformer_observation_normalization: bool = False,
+    policy_observation_standardization_clip: float = 0.0,
     transformer_observation_tokenization: str = "semantic",
     policy_head_init_std: float = -1.0,
     transformer_temporal_module: bool = False,
@@ -1000,6 +1054,9 @@ def make_actor_critic(
             action_mode=action_mode,
             continuous_action_dim=continuous_action_dim,
             observation_normalization=transformer_observation_normalization,
+            observation_standardization_clip=(
+                policy_observation_standardization_clip
+            ),
             memory_context_length=transformer_memory_context_length,
         )
     if model_name == "mlp":
@@ -1025,6 +1082,9 @@ def make_actor_critic(
             dropout=transformer_dropout,
             norm_first=transformer_norm_first,
             observation_normalization=transformer_observation_normalization,
+            observation_standardization_clip=(
+                policy_observation_standardization_clip
+            ),
             temporal_module=transformer_temporal_module,
             temporal_kernel_size=transformer_temporal_kernel_size,
             temporal_layers=transformer_temporal_layers,
@@ -1045,6 +1105,9 @@ def make_actor_critic(
             dropout=transformer_dropout,
             norm_first=transformer_norm_first,
             observation_normalization=transformer_observation_normalization,
+            observation_standardization_clip=(
+                policy_observation_standardization_clip
+            ),
             observation_tokenization=transformer_observation_tokenization,
             policy_head_init_std=policy_head_init_std,
             memory_tokens=transformer_memory_tokens,

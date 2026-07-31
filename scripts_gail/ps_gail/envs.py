@@ -29,7 +29,37 @@ def observation_config(cfg: PSGAILConfig) -> dict[str, Any]:
     }
 
 
-def make_training_env(cfg: PSGAILConfig, *, render_mode: str | None = None) -> gym.Env:
+def configure_native_continuous_action_passthrough(
+    env_cfg: dict[str, Any],
+    *,
+    action_mode: str,
+) -> None:
+    """Disable redundant simulator clamping for validated policy actions.
+
+    Continuous policy paths already reject non-finite or out-of-range
+    normalized commands before ``env.step``.  Leaving HighwayEnv's default
+    clamp enabled would silently conceal a future contract regression.  This
+    mutates only the environment configuration; it does not alter an action.
+    """
+
+    if str(action_mode).lower() != "continuous":
+        return
+    action_cfg = env_cfg.setdefault("action", {})
+    nested_action_cfg = (
+        action_cfg.setdefault("action_config", {})
+        if action_cfg.get("type") == "MultiAgentAction"
+        else action_cfg
+    )
+    nested_action_cfg["clip"] = False
+
+
+def make_training_env(
+    cfg: PSGAILConfig,
+    *,
+    render_mode: str | None = None,
+    crash_controlled_vehicles_offroad: bool = True,
+) -> gym.Env:
+    """Build an env, with explicit control over off-road/crash conflation."""
     register_ngsim_env()
     env_cfg = build_env_config(
         scene=cfg.scene,
@@ -64,7 +94,13 @@ def make_training_env(cfg: PSGAILConfig, *, render_mode: str | None = None) -> g
     env_cfg["reuse_pre_reset_spaces"] = bool(
         getattr(cfg, "reuse_pre_reset_spaces", False)
     )
-    env_cfg["crash_controlled_vehicles_offroad"] = True
+    env_cfg["crash_controlled_vehicles_offroad"] = bool(
+        crash_controlled_vehicles_offroad
+    )
+    configure_native_continuous_action_passthrough(
+        env_cfg,
+        action_mode=str(cfg.action_mode),
+    )
     needs_collision_proxy_metrics = (
         not bool(getattr(cfg, "enable_collision", True))
         and float(getattr(cfg, "collision_proxy_penalty_coef", 0.0)) > 0.0

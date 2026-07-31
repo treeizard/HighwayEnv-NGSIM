@@ -36,6 +36,40 @@ PLANNED_EVALUATION_VEHICLE_TRAJECTORIES = 7_440
 MAX_PROJECTED_HOURS = 108.0
 
 
+def realistic_shared_physics_overrides() -> dict[str, Any]:
+    """Physics/evaluation settings shared by realistic GAIL and AIRL arms."""
+
+    return {
+        "terminate_when_all_controlled_crashed": False,
+        "rollout_fixed_horizon": True,
+        "evaluation_terminate_when_all_controlled_crashed": False,
+        "enable_collision": True,
+        "collision_mode_schedule": "",
+        "vehicle_increase_soft_collision_rounds": 0,
+        "test_episodes": 0,
+        "health_learning_gate_round": 0,
+        "health_min_relative_validation_improvement": 0.0,
+        "initial_action_std": "0.10,0.05",
+        "minimum_action_std": "0.02,0.01",
+        "maximum_action_std": "0.30,0.15",
+        "full_load_selection_start_round": 701,
+    }
+
+
+def required_prebuilt_splits(
+    trials: list[dict[str, Any]],
+) -> tuple[str, ...]:
+    """Return only prebuilt splits that at least one trial may open."""
+
+    splits = ["train", "val"]
+    if any(
+        int(dict(trial.get("arguments") or {}).get("test_episodes", 0)) > 0
+        for trial in trials
+    ):
+        splits.append("test")
+    return tuple(splits)
+
+
 def gail_training_profile_overrides(profile: str) -> dict[str, Any]:
     """Return an additive GAIL recipe while retaining the historical default."""
     profile = str(profile).strip().lower()
@@ -51,6 +85,7 @@ def gail_training_profile_overrides(profile: str) -> dict[str, Any]:
             "entropy_coef": 0.002,
         }
     return {
+        **realistic_shared_physics_overrides(),
         "algorithm_variant": "gail_wgan_gp",
         "discriminator_input": "action",
         "wgan_gp_lambda": 2.0,
@@ -59,9 +94,6 @@ def gail_training_profile_overrides(profile: str) -> dict[str, Any]:
         "disc_updates_per_round": 2,
         "discriminator_replay_rounds": 3,
         "discriminator_replay_max_samples": 120_000,
-        "terminate_when_all_controlled_crashed": False,
-        "rollout_fixed_horizon": True,
-        "evaluation_terminate_when_all_controlled_crashed": False,
         "normalize_gail_reward": True,
         "allow_wgan_reward_normalization": True,
         "wgan_reward_center": False,
@@ -71,13 +103,12 @@ def gail_training_profile_overrides(profile: str) -> dict[str, Any]:
         "wgan_reward_norm_clip": 5.0,
         "learning_rate": 1.0e-5,
         "entropy_coef": 5.0e-4,
-        "policy_bc_regularization_coef": 0.02,
+        # The policy is initialized from a full-prefix recurrent BC
+        # checkpoint.  The former PPO-side BC term sampled independent expert
+        # rows from zero memory, which is not the same recurrent estimand.
+        "policy_bc_regularization_coef": 0.0,
         "policy_bc_regularization_final_coef": 0.0,
-        "policy_bc_regularization_decay_rounds": 50,
-        "initial_action_std": "0.10,0.05",
-        "minimum_action_std": "0.02,0.01",
-        "maximum_action_std": "0.30,0.15",
-        "full_load_selection_start_round": 701,
+        "policy_bc_regularization_decay_rounds": 0,
     }
 
 
@@ -513,14 +544,15 @@ def build_manifest(
     gail_profile_overrides = gail_training_profile_overrides(
         gail_training_profile
     )
+    realistic_shared_overrides = (
+        realistic_shared_physics_overrides()
+        if gail_training_profile == "realistic_wgan_v1"
+        else {}
+    )
     if gail_training_profile != "legacy_bce":
-        if tuple(methods) != ("gail",):
-            raise ValueError(
-                "The realistic WGAN profile is scoped to a GAIL-only manifest."
-            )
         if not use_bc_initialization:
             raise ValueError(
-                "The realistic WGAN profile requires a verified matched BC artifact."
+                "The realistic shared profile requires a verified matched BC artifact."
             )
     expert_data = (
         expert_data.resolve()
@@ -576,15 +608,6 @@ def build_manifest(
             raise RuntimeError(
                 "BC initializers and requested expert dataset do not share one manifest."
             )
-    prebuilt = episode_root / "us-101/prebuilt"
-    data_files = {
-        path.name: _file_record(path)
-        for split in ("train", "val", "test")
-        for path in (
-            prebuilt / f"trajectory_{split}.npy",
-            prebuilt / f"veh_ids_{split}.npy",
-        )
-    }
     common = _common_arguments(
         expert_data=expert_data,
         episode_root=episode_root,
@@ -647,6 +670,7 @@ def build_manifest(
                     "entropy_coef": 0.002 if method == "gail" else 0.003,
                 }
             )
+            arguments.update(realistic_shared_overrides)
             if method == "gail":
                 arguments.update(gail_profile_overrides)
             if use_bc_initialization:
@@ -674,6 +698,16 @@ def build_manifest(
                     ),
                 }
             )
+    prebuilt_splits = required_prebuilt_splits(trials)
+    prebuilt = episode_root / "us-101/prebuilt"
+    data_files = {
+        path.name: _file_record(path)
+        for split in prebuilt_splits
+        for path in (
+            prebuilt / f"trajectory_{split}.npy",
+            prebuilt / f"veh_ids_{split}.npy",
+        )
+    }
     required_completed_round = max(
         int(dict(trial["arguments"])["total_rounds"]) for trial in trials
     )
@@ -1027,6 +1061,8 @@ __all__ = [
     "TOTAL_ROUNDS",
     "build_manifest",
     "gail_training_profile_overrides",
+    "realistic_shared_physics_overrides",
+    "required_prebuilt_splits",
     "load_manifest",
     "select_trial",
     "source_fingerprint",

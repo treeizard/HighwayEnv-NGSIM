@@ -175,6 +175,9 @@ def load_policy_bundle(
         transformer_observation_normalization=bool(
             _cfg(config, "transformer_observation_normalization", False)
         ),
+        policy_observation_standardization_clip=float(
+            _cfg(config, "policy_observation_standardization_clip", 5.0)
+        ),
         transformer_observation_tokenization=str(
             _cfg(config, "transformer_observation_tokenization", "semantic")
         ),

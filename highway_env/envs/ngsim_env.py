@@ -71,6 +71,7 @@ from highway_env.ngsim_utils.data.trajectory_gen import (
     common_first_valid_index,
     longest_continuous_active_span_bounds,
     trajectory_row_is_active,
+    trajectory_step_speed_mps,
 )
 from highway_env.ngsim_utils.vehicles.ego import EgoVehicle
 
@@ -688,14 +689,11 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         next_row: np.ndarray | None = None,
     ) -> None:
         x, y, speed, lane_id = np.asarray(row, dtype=float)[:4]
-        if next_row is not None:
-            nx, ny = np.asarray(next_row, dtype=float)[:2]
-            speed_from_delta = float(
-                np.hypot(float(nx - x), float(ny - y))
-                * float(self.config["simulation_frequency"])
-            )
-            if speed_from_delta > 1e-3:
-                speed = speed_from_delta
+        speed = trajectory_step_speed_mps(
+            row,
+            next_row,
+            sample_frequency_hz=float(self.config["simulation_frequency"]),
+        )
         ego.position = np.array([x, y], dtype=float)
         ego.speed = float(max(speed, 0.0))
         ego.target_speed = float(max(speed, 0.0))
@@ -879,6 +877,31 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         ):
             self._deactivate_scene_collection_vehicle(ego)
             return
+        if not force_replay:
+            vehicle_id = int(getattr(ego, "vehicle_ID"))
+            expert_state = self._expert_state_by_vehicle_id.get(vehicle_id)
+            if not isinstance(expert_state, dict):
+                raise RuntimeError(
+                    "Scene-collection activation has no expert tracker for "
+                    f"vehicle {vehicle_id}."
+                )
+            tracker = expert_state.get("tracker")
+            if tracker is None or not callable(getattr(tracker, "reset", None)):
+                raise RuntimeError(
+                    "Scene-collection activation has an invalid expert tracker "
+                    f"for vehicle {vehicle_id}."
+                )
+            start_index = int(
+                getattr(ego, "scene_collection_start_index", 0)
+            )
+            tracker_offset = int(step_index) - start_index
+            if tracker_offset < 0:
+                raise RuntimeError(
+                    "Scene-collection tracker activation precedes its source "
+                    f"start: step={step_index}, start={start_index}."
+                )
+            tracker.reset(k0=tracker_offset)
+            expert_state["activation_tracker_offset"] = tracker_offset
         self._set_scene_collection_vehicle_from_row(ego, row, next_row=next_row)
 
     def _deactivate_scene_collection_vehicle(self, ego: EgoVehicle) -> None:
@@ -910,6 +933,33 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 )
             else:
                 self._deactivate_scene_collection_vehicle(ego)
+
+    def _refresh_scene_collection_observation_after_sync(
+        self,
+        obs: Any,
+        action: Action,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Align the returned next observation with post-step activation state.
+
+        In scene collection, a vehicle may become active at the policy step
+        reached by ``super().step``.  The superclass observation was computed
+        before that activation sync.  Returning it would pair the next
+        transition's expert action with an inactive/stale observation (most
+        visibly a stale ego heading for late-start Japanese trajectories).
+        Re-observe only after the state sync and rebuild info against the same
+        observation.  Teleport collection follows its separate in-step path.
+        """
+
+        if (
+            not self.scene_dataset_collection_mode
+            or self.control_mode == "teleport"
+        ):
+            return obs, {}
+        self._sync_scene_collection_controlled_vehicles(
+            step_index=int(self.steps)
+        )
+        refreshed = self.observation_type.observe()
+        return refreshed, self._info(refreshed, action)
 
     def _processed_trajectory_cache_key(
         self, episode_name: str, vehicle_id: int
@@ -1235,6 +1285,48 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             and (not bool(getattr(vehicle, "on_road", True)))
             for vehicle in self.controlled_vehicles
         ]
+        info["controlled_vehicle_collision_partners"] = [
+            {
+                "vehicle_id": int(getattr(vehicle, "vehicle_ID", -1)),
+                "partner_vehicle_id": (
+                    None
+                    if getattr(
+                        vehicle,
+                        "first_collision_partner_vehicle_id",
+                        None,
+                    )
+                    is None
+                    else int(vehicle.first_collision_partner_vehicle_id)
+                ),
+                "partner_type": getattr(
+                    vehicle,
+                    "first_collision_partner_type",
+                    None,
+                ),
+                "provenance": getattr(
+                    vehicle,
+                    "first_collision_partner_provenance",
+                    None,
+                ),
+            }
+            for vehicle in self.controlled_vehicles
+        ]
+        controlled_identities = {
+            id(vehicle) for vehicle in self.controlled_vehicles
+        }
+        info["background_idm_handovers"] = [
+            {
+                "vehicle_id": int(getattr(vehicle, "vehicle_ID", -1)),
+                "handover_step": int(vehicle.idm_handover_step),
+                "reason": str(
+                    getattr(vehicle, "idm_handover_reason", None)
+                    or "unspecified"
+                ),
+            }
+            for vehicle in list(getattr(self.road, "vehicles", ()) or ())
+            if id(vehicle) not in controlled_identities
+            and getattr(vehicle, "idm_handover_step", None) is not None
+        ]
         if bool(self.config.get("enable_interaction_metrics", False)):
             info["controlled_vehicle_interaction_metrics"] = self.controlled_vehicle_interaction_metrics()
         info["scene_dataset_collection_mode"] = self.scene_dataset_collection_mode
@@ -1391,7 +1483,12 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                     self._replay_xy_pol = list(expert_state["replay_xy"])
 
         if self.scene_dataset_collection_mode and self.control_mode != "teleport":
-            self._sync_scene_collection_controlled_vehicles(step_index=int(self.steps))
-            info.update(self._info(obs, action))
+            obs, refreshed_info = (
+                self._refresh_scene_collection_observation_after_sync(
+                    obs,
+                    action,
+                )
+            )
+            info.update(refreshed_info)
 
         return obs, reward, terminated, truncated, info

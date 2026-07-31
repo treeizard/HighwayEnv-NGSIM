@@ -50,10 +50,18 @@ module load miniforge3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${VFI_CONDA_ENV:-ngsim_env}"
 
-US_EXPERT="${VFI_DATA_ROOT}/expert/ngsim_ps_unified_expert_continuous_55145982"
-JAPANESE_EXPERT="${VFI_DATA_ROOT}/expert/japanese/continuous_v1/train"
-LOCKED_RECIPE="${BC_LOCKED_RECIPE:-${VFI_PROJECT_ROOT}/configs/bc_recovery_recipe.json}"
-for required in "${US_EXPERT}/manifest.json" "${JAPANESE_EXPERT}/manifest.json" "${LOCKED_RECIPE}"; do
+COLLECTION_ROOT="${VFI_DATA_ROOT}/expert/${COLLECTION_ID:-domain_matched_accel5_v2}"
+US_TRAIN_EXPERT="${COLLECTION_ROOT}/us/train"
+US_VALIDATION_EXPERT="${COLLECTION_ROOT}/us/val"
+JAPANESE_TRAIN_EXPERT="${COLLECTION_ROOT}/japanese/train"
+JAPANESE_VALIDATION_EXPERT="${COLLECTION_ROOT}/japanese/val"
+LOCKED_RECIPE="${BC_LOCKED_RECIPE:-${VFI_PROJECT_ROOT}/configs/bc_gail_aligned_accel5_v5.json}"
+for required in \
+    "${US_TRAIN_EXPERT}/manifest.json" \
+    "${US_VALIDATION_EXPERT}/manifest.json" \
+    "${JAPANESE_TRAIN_EXPERT}/manifest.json" \
+    "${JAPANESE_VALIDATION_EXPERT}/manifest.json" \
+    "${LOCKED_RECIPE}"; do
     test -s "${required}"
 done
 assert_sha256 "${BC_EXPECTED_RECIPE_SHA256:-}" "${LOCKED_RECIPE}"
@@ -71,27 +79,28 @@ if [ "${BC_PRODUCTION_SUBMISSION:-0}" = "1" ]; then
     ACTIVATION_ROOT="${VFI_RESULTS_ROOT}/test_runs/bc_interpretability_smoke/domain_depth_recovered_${STUDY_RUN_ID}"
     CHECKPOINT_ARCHIVE_ROOT="${VFI_CHECKPOINT_ROOT}/bc/autoregressive_policy_comparison"
     REGISTRY_ROOT="${VFI_RESULTS_ROOT}/runs/policy_registry/bc_domain_depth_recovered_${STUDY_RUN_ID}"
-    MODEL_LIMIT=12
+    MODEL_LIMIT=0
 else
     STUDY_RUN_ID="${BC_STUDY_RUN_ID:-${SLURM_JOB_ID:-local_$(date -u +%Y%m%dT%H%M%SZ)}}"
     POLICY_ROOT="${BC_STUDY_POLICY_ROOT:-${VFI_RESULTS_ROOT}/runs/policies/bc/domain_depth_recovered_${STUDY_RUN_ID}}"
     ACTIVATION_ROOT="${BC_STUDY_ACTIVATION_ROOT:-${VFI_RESULTS_ROOT}/test_runs/bc_interpretability_smoke/domain_depth_recovered_${STUDY_RUN_ID}}"
     CHECKPOINT_ARCHIVE_ROOT="${BC_CHECKPOINT_ARCHIVE_ROOT:-${VFI_CHECKPOINT_ROOT}/bc/autoregressive_policy_comparison}"
     REGISTRY_ROOT="${BC_STUDY_REGISTRY_ROOT:-${VFI_RESULTS_ROOT}/runs/policy_registry/bc_domain_depth_recovered_${STUDY_RUN_ID}}"
-    MODEL_LIMIT="${BC_STUDY_MODEL_LIMIT:-12}"
+    MODEL_LIMIT="${BC_STUDY_MODEL_LIMIT:-0}"
 fi
 
 cd "${REPODIR}"
 python -m scripts_gail.run_bc_domain_depth_matrix \
     --recipe "${LOCKED_RECIPE}" \
-    --us-expert "${US_EXPERT}" \
-    --japanese-expert "${JAPANESE_EXPERT}" \
+    --us-train-expert "${US_TRAIN_EXPERT}" \
+    --us-validation-expert "${US_VALIDATION_EXPERT}" \
+    --japanese-train-expert "${JAPANESE_TRAIN_EXPERT}" \
+    --japanese-validation-expert "${JAPANESE_VALIDATION_EXPERT}" \
     --episode-root "${VFI_HIGHWAY_DATA_ROOT}/processed_20s" \
     --policy-root "${POLICY_ROOT}" \
     --checkpoint-archive-root "${CHECKPOINT_ARCHIVE_ROOT}" \
     --study-id "recovered_${STUDY_RUN_ID}" \
     --model-limit "${MODEL_LIMIT}" \
-    --require-confirmation \
     --device cuda
 
 MATRIX_MANIFEST="${POLICY_ROOT}/matrix_manifest.json"
@@ -101,85 +110,27 @@ import os
 from pathlib import Path
 
 manifest = json.loads(Path(os.environ["MATRIX_MANIFEST"]).read_text(encoding="utf-8"))
-if manifest.get("loader_calls") != {"us": 1, "japanese": 1}:
-    raise SystemExit(f"Expert data was not loaded exactly once per domain: {manifest.get('loader_calls')}")
-if int(manifest.get("model_count", -1)) != int(os.environ["MODEL_LIMIT"]):
+expected_loads = {
+    "us": {"train": 1, "validation": 1, "test": 0},
+    "japanese": {"train": 1, "validation": 1, "test": 0},
+}
+if manifest.get("loader_calls") != expected_loads:
+    raise SystemExit(f"Explicit sources were not loaded exactly once: {manifest.get('loader_calls')}")
+requested_limit = int(os.environ["MODEL_LIMIT"])
+expected_models = (
+    requested_limit
+    if requested_limit > 0
+    else 2
+    * len(manifest.get("recipe_depths", []))
+    * len(manifest.get("recipe_policy_seeds", []))
+)
+if int(manifest.get("model_count", -1)) != expected_models:
     raise SystemExit("Matrix model count does not match the requested limit")
-passed = int(manifest.get("metric_capability_passed_count", -1))
-if passed != int(os.environ["MODEL_LIMIT"]):
+if int(manifest.get("training_artifact_complete_count", -1)) != expected_models:
     raise SystemExit(
-        f"Only {passed}/{os.environ['MODEL_LIMIT']} BC cells passed the locked learning gate; "
-        "preserving diagnostics but refusing activation collection and study promotion."
+        "The validation matrix did not produce every requested artifact."
     )
 PY
 
-if [ "${MODEL_LIMIT}" -lt 12 ]; then
-    echo "Completed requested load-once BC pilot cells: ${MODEL_LIMIT}"
-    exit 0
-fi
-
-run_activation_check() {
-    local checkpoint="$1"
-    local expert_data="$2"
-    local output_dir="$3"
-    local layers="$4"
-
-    cd "${VFI_PROJECT_ROOT}"
-    python -m interpretability.sae.cli.inspect_checkpoint \
-        --checkpoint "${checkpoint}" \
-        --device cpu
-    python -m interpretability.sae.cli.collect_activations \
-        --checkpoint "${checkpoint}" \
-        --expert-data "${expert_data}" \
-        --out "${output_dir}" \
-        --signal-target residual_policy_tokens \
-        --layers "${layers}" \
-        --split all \
-        --max-transitions 64 \
-        --max-files 2 \
-        --max-vehicles-per-file 1 \
-        --shard-size 64 \
-        --device cuda
-    for layer in ${layers//,/ }; do
-        test -s "${output_dir}/residual_layer_${layer}_policy_token/manifest.json"
-    done
-}
-
-for domain in us japanese; do
-    if [ "${domain}" = us ]; then
-        expert_data="${US_EXPERT}"
-    else
-        expert_data="${JAPANESE_EXPERT}"
-    fi
-    for depth in 2 3; do
-        if [ "${depth}" -eq 2 ]; then
-            capture_layers="0,1"
-        else
-            capture_layers="0,1,2"
-        fi
-        for seed in 0 1 2; do
-            relative="${domain}/recurrent_transformer_${depth}layer/policy_seed_${seed}"
-            run_activation_check \
-                "${POLICY_ROOT}/${relative}/best.pt" \
-                "${expert_data}" \
-                "${ACTIVATION_ROOT}/${relative}" \
-                "${capture_layers}"
-        done
-    done
-done
-
-STUDY_MANIFEST="${POLICY_ROOT}/study_manifest.json"
-cd "${REPODIR}"
-python -m scripts_gail.finalize_bc_domain_depth_study \
-    --policy-root "${POLICY_ROOT}" \
-    --smoke-root "${ACTIVATION_ROOT}" \
-    --out "${STUDY_MANIFEST}"
-
-cd "${VFI_PROJECT_ROOT}"
-python -m workflows.analysis.build_policy_checkpoint_registry \
-    --policy-root "${POLICY_ROOT}" \
-    --sae-root "${VFI_RESULTS_ROOT}/runs/sae" \
-    --out "${REGISTRY_ROOT}"
-
-echo "Completed load-once serial BC study: ${STUDY_MANIFEST}"
-echo "Qualified checkpoint archive: ${CHECKPOINT_ARCHIVE_ROOT}/recovered_${STUDY_RUN_ID}"
+echo "Completed validation-only BC matrix: ${MATRIX_MANIFEST}"
+echo "Locked test, expert-relative qualification, activation collection, and finalization remain pending."

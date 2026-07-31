@@ -357,13 +357,23 @@ def _sample_policy_actions(
     return actions, dist.log_prob(actions)
 
 def _actions_to_env_tuple(actions: torch.Tensor, cfg: PSGAILConfig) -> tuple[object, ...]:
-    actions_np = actions.detach().cpu().numpy()
+    detached = actions.detach()
+    if not bool(torch.isfinite(detached).all()):
+        raise RuntimeError("Policy rollout produced non-finite actions.")
+    actions_np = detached.cpu().numpy()
     if _is_continuous(cfg):
         actions_np = np.asarray(actions_np, dtype=np.float32).reshape(
             -1,
             int(cfg.continuous_action_dim),
         )
-        actions_np = np.clip(actions_np, -1.0, 1.0)
+        outside = np.argwhere((actions_np < -1.0) | (actions_np > 1.0))
+        if outside.size:
+            index = tuple(int(value) for value in outside[0])
+            raise RuntimeError(
+                "Policy rollout violated the normalized [-1, 1] action "
+                f"contract at index {index}: {float(actions_np[index])}. "
+                "Actions are never clipped before env.step()."
+            )
         return tuple(action.copy() for action in actions_np)
     return tuple(int(action) for action in actions_np.tolist())
 
@@ -561,6 +571,9 @@ def _make_policy_from_state_dict(
         ),
         transformer_observation_normalization=bool(
             getattr(cfg, "transformer_observation_normalization", False)
+        ),
+        policy_observation_standardization_clip=float(
+            getattr(cfg, "policy_observation_standardization_clip", 0.0)
         ),
         transformer_observation_tokenization=str(
             getattr(cfg, "transformer_observation_tokenization", "semantic")

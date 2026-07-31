@@ -12,6 +12,7 @@ import numpy as np
 from .contracts import (
     assert_compatible_action_contracts,
     assert_compatible_observation_contracts,
+    validate_declared_raw_observation_space,
     validate_expert_action_contract,
 )
 from .observations import policy_observations_from_flat
@@ -325,6 +326,62 @@ def _metadata_values(metadata_items: list[dict[str, Any]], key: str) -> list[Any
         if value is not None and value not in values:
             values.append(value)
     return values
+
+
+def _summarize_raw_observation_space_receipts(
+    receipts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    field_extrema: dict[str, dict[str, float]] = {}
+    source_rows_checked = 0
+    for file_receipt in receipts:
+        observations = file_receipt["observations"]
+        source_rows_checked += int(observations["row_count"])
+        for array_name in ("observations", "next_observations"):
+            for field_name, field in file_receipt[array_name]["fields"].items():
+                extrema = field_extrema.setdefault(
+                    field_name,
+                    {
+                        "minimum": float(field["minimum"]),
+                        "maximum": float(field["maximum"]),
+                    },
+                )
+                extrema["minimum"] = min(
+                    extrema["minimum"],
+                    float(field["minimum"]),
+                )
+                extrema["maximum"] = max(
+                    extrema["maximum"],
+                    float(field["maximum"]),
+                )
+    return {
+        "status": "passed" if receipts else "not_checked_missing_declared_contract",
+        "full_source_files_checked": len(receipts),
+        "source_rows_checked_per_array": source_rows_checked,
+        "arrays_checked": (
+            ["observations", "next_observations"] if receipts else []
+        ),
+        "checked_before_row_sampling": True,
+        "field_extrema_across_both_arrays": field_extrema,
+    }
+
+
+def _source_stable_trajectory_namespace(
+    file_path: str,
+    metadata: dict[str, Any],
+) -> tuple[str, str]:
+    """Identify an episode independently of its index within a source root."""
+    scene = str(metadata.get("scene") or "").strip()
+    episode_name = str(
+        metadata.get("episode_name")
+        or metadata.get("collection_episode_name")
+        or ""
+    ).strip()
+    if scene and episode_name:
+        return f"source_stable/{scene}/{episode_name}", "scene_and_episode_name"
+    return (
+        f"fallback_basename/{os.path.basename(file_path)}",
+        "basename_only_nonqualifying",
+    )
 
 
 def _validate_action_conditioned_arrays(
@@ -825,9 +882,11 @@ def load_expert_transition_data(
     metadata_items: list[dict[str, Any]] = []
     action_contracts: list[dict[str, object]] = []
     observation_contracts: list[dict[str, Any]] = []
+    raw_observation_space_receipts: list[dict[str, Any]] = []
+    trajectory_identity_qualities: list[str] = []
     samples_by_file: list[dict[str, Any]] = []
 
-    for file_idx, file_path in enumerate(files):
+    for file_path in files:
         idx = sample_plan.get(file_path)
         if file_path not in sample_plan:
             continue
@@ -856,14 +915,27 @@ def load_expert_transition_data(
             rewards = np.asarray(data["rewards"], dtype=np.float32)
             vehicle_ids = np.asarray(data["vehicle_ids"], dtype=np.int64)
             timesteps = np.asarray(data["timesteps"], dtype=np.int64)
-            trajectory_ids = np.asarray(
-                [f"{file_idx}:{int(vehicle_id)}" for vehicle_id in vehicle_ids],
-                dtype=object,
-            )
             metadata_item = (
                 json.loads(str(data["metadata_json"].item()))
                 if "metadata_json" in data.files
                 else {}
+            )
+            (
+                trajectory_namespace,
+                trajectory_identity_quality,
+            ) = _source_stable_trajectory_namespace(
+                file_path,
+                metadata_item,
+            )
+            trajectory_identity_qualities.append(
+                trajectory_identity_quality
+            )
+            trajectory_ids = np.asarray(
+                [
+                    f"{trajectory_namespace}:{int(vehicle_id)}"
+                    for vehicle_id in vehicle_ids
+                ],
+                dtype=object,
             )
             inferred_action_contract = _validate_action_conditioned_arrays(
                 file_path,
@@ -902,6 +974,27 @@ def load_expert_transition_data(
                         observation_contract,
                     )
                 observation_contracts.append(observation_contract)
+                raw_observation_receipt = (
+                    validate_declared_raw_observation_space(
+                        obs,
+                        observation_contract,
+                        context=f"{file_path} observations",
+                    )
+                )
+                next_raw_observation_receipt = (
+                    validate_declared_raw_observation_space(
+                        next_obs,
+                        observation_contract,
+                        context=f"{file_path} next_observations",
+                    )
+                )
+                raw_observation_space_receipts.append(
+                    {
+                        "file": os.path.basename(file_path),
+                        "observations": raw_observation_receipt,
+                        "next_observations": next_raw_observation_receipt,
+                    }
+                )
             if metadata_item:
                 metadata_items.append(metadata_item)
 
@@ -998,8 +1091,22 @@ def load_expert_transition_data(
             observation_contracts
             and len(observation_contracts) == len(samples_by_file)
         ),
+        "raw_observation_space_validation": (
+            _summarize_raw_observation_space_receipts(
+                raw_observation_space_receipts
+            )
+        ),
         "trajectory_frame": str(trajectory_frame).lower(),
-        "trajectory_id_schema": "file_index:vehicle_id",
+        "trajectory_id_schema": (
+            "source_stable/scene/episode_name:vehicle_id_with_labelled_fallback"
+        ),
+        "trajectory_id_identity_quality": (
+            "scene_and_episode_name"
+            if trajectory_identity_qualities
+            and set(trajectory_identity_qualities)
+            == {"scene_and_episode_name"}
+            else "contains_basename_only_nonqualifying"
+        ),
         "sampling": sampling_mode,
         "lane_change_sampling": lane_change_metadata,
         "max_samples": int(max_samples),

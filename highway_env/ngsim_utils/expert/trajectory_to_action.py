@@ -421,6 +421,10 @@ class PurePursuitTracker:
         proj_back: int = 20,
         proj_fwd: int = 80,
         max_time_slip: int = 30,
+        # A sub-millimetric target direction is not numerically identifiable
+        # once collection states are stored as float32.  Treat it as zero
+        # lateral error so collection and exact replay share one contract.
+        minimum_target_displacement_m: float = 1.0e-3,
 
         # Optional lane references preserve compatibility with older callers.
         ref_lanes: np.ndarray | None = None,
@@ -447,6 +451,16 @@ class PurePursuitTracker:
         self.proj_back = int(proj_back)
         self.proj_fwd = int(proj_fwd)
         self.max_time_slip = int(max_time_slip)
+        self.minimum_target_displacement_m = float(
+            minimum_target_displacement_m
+        )
+        if (
+            not np.isfinite(self.minimum_target_displacement_m)
+            or self.minimum_target_displacement_m < 0.0
+        ):
+            raise ValueError(
+                "minimum_target_displacement_m must be finite and nonnegative."
+            )
 
         # internal state
         self._k = 0
@@ -546,11 +560,20 @@ class PurePursuitTracker:
 
         dx = float(tgt[0] - pos_xy[0])
         dy = float(tgt[1] - pos_xy[1])
-        
-        # Uses standard polar angle difference. 
-        # This works regardless of whether North is X or Y, 
-        # as long as 'heading' and 'arctan2' share the same zero-reference.
-        alpha = wrap_to_pi_scalar(np.arctan2(dy, dx) - float(heading))
+
+        target_displacement = float(np.hypot(dx, dy))
+        if target_displacement < self.minimum_target_displacement_m:
+            # The direction of a near-zero vector is undefined.  In
+            # particular, float64 simulator positions and their float32
+            # archived copies can yield unrelated atan2 angles here.
+            alpha = 0.0
+        else:
+            # Uses standard polar angle difference.
+            # This works regardless of whether North is X or Y, as long as
+            # heading and arctan2 share the same zero-reference.
+            alpha = wrap_to_pi_scalar(
+                np.arctan2(dy, dx) - float(heading)
+            )
         
         # curvature for pure pursuit: kappa = 2*sin(alpha)/Ld
         # Note: Using max(Ld, 1e-6) prevents div/0

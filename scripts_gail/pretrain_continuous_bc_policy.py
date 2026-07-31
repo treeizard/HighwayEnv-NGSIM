@@ -19,6 +19,8 @@ from scripts_gail.ps_gail.data import load_expert_transition_data
 from scripts_gail.ps_gail.envs import observation_config
 from scripts_gail.ps_gail.models import make_actor_critic
 from scripts_gail.ps_gail.observations import flatten_agent_observations, policy_observations_from_flat
+from scripts_gail.ps_gail.training.policy import _continuous_distribution_location
+from scripts_gail.ps_gail.training.torch_utils import SquashedNormal
 from scripts_gail.ps_gail.trainer import infer_continuous_action_dim, infer_policy_obs_dim, resolve_device
 from scripts_gail.train_simple_ps_gail import behavior_clone_pretrain
 
@@ -76,6 +78,15 @@ def parse_args() -> argparse.Namespace:
         default=False,
     )
     parser.add_argument(
+        "--policy-observation-standardization-clip",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional symmetric clip after observation standardization. "
+            "Zero disables clipping; positive values are legacy/ablation only."
+        ),
+    )
+    parser.add_argument(
         "--transformer-observation-tokenization",
         choices=["semantic", "dense_temporal"],
         default="semantic",
@@ -123,6 +134,9 @@ def cfg_from_args(args: argparse.Namespace) -> PSGAILConfig:
         transformer_norm_first=bool(args.transformer_norm_first),
         transformer_observation_normalization=bool(
             args.transformer_observation_normalization
+        ),
+        policy_observation_standardization_clip=float(
+            args.policy_observation_standardization_clip
         ),
         transformer_observation_tokenization=str(
             args.transformer_observation_tokenization
@@ -215,6 +229,9 @@ def build_policy_for_env(cfg: PSGAILConfig, env: gym.Env, device: torch.device) 
         transformer_observation_normalization=bool(
             getattr(cfg, "transformer_observation_normalization", False)
         ),
+        policy_observation_standardization_clip=float(
+            getattr(cfg, "policy_observation_standardization_clip", 0.0)
+        ),
         transformer_observation_tokenization=str(
             getattr(cfg, "transformer_observation_tokenization", "semantic")
         ),
@@ -250,8 +267,25 @@ def policy_action_tuple(
             if log_std is None:
                 raise RuntimeError("Continuous policy checkpoint does not expose log_std.")
             std = torch.exp(log_std).expand_as(mean_actions)
-            actions = torch.normal(mean_actions, std)
-    actions_np = torch.clamp(actions, -1.0, 1.0).detach().cpu().numpy().astype(np.float32)
+            actions = SquashedNormal(
+                _continuous_distribution_location(mean_actions),
+                std,
+            ).sample()
+    detached = actions.detach()
+    if not bool(torch.isfinite(detached).all()):
+        raise RuntimeError("BC replay policy produced non-finite actions.")
+    outside = (detached < -1.0) | (detached > 1.0)
+    if bool(outside.any()):
+        first = tuple(
+            int(value)
+            for value in torch.nonzero(outside, as_tuple=False)[0].tolist()
+        )
+        raise RuntimeError(
+            "BC replay policy violated the normalized [-1, 1] action "
+            f"contract at index {first}: {float(detached[first])}. "
+            "Actions are never clipped."
+        )
+    actions_np = detached.cpu().numpy().astype(np.float32, copy=False)
     return tuple(action.copy() for action in actions_np)
 
 

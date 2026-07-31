@@ -325,13 +325,25 @@ def make_policy(candidate: dict[str, Any], *, obs_dim: int, action_dim: int, dev
 
 
 def promotion_record(candidate: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
+    """Build a validation-only screen record; locked test remains unopened."""
     std_ratio = float(summary["validation_prediction_std_ratio"][0])
     correlation = float(summary["validation_prediction_target_correlation"][0])
     steering_std_ratio = float(summary["validation_prediction_std_ratio"][1])
     steering_correlation = float(summary["validation_prediction_target_correlation"][1])
     skill = float(summary["validation_skill"])
     saturation = float(summary["validation_prediction_saturation_fraction"][0])
-    metrics_finite = bool(np.isfinite([skill, std_ratio, correlation, saturation]).all())
+    metrics_finite = bool(
+        np.isfinite(
+            [
+                skill,
+                std_ratio,
+                correlation,
+                steering_std_ratio,
+                steering_correlation,
+                saturation,
+            ]
+        ).all()
+    )
     passed = bool(
         metrics_finite
         and skill >= 0.10
@@ -362,6 +374,14 @@ def promotion_record(candidate: dict[str, Any], summary: dict[str, Any]) -> dict
         "steering_std_ratio": steering_std_ratio,
         "steering_correlation": steering_correlation,
         "acceleration_saturation_fraction": saturation,
+        "test_evaluation_status": "pending_deferred",
+        "test_mse": None,
+        "test_mae": None,
+        "test_action_mse": None,
+        "test_action_mae": None,
+        "test_prediction_std_ratio": None,
+        "test_prediction_target_correlation": None,
+        "test_prediction_saturation_fraction": None,
         "metrics_finite": metrics_finite,
         "minimum_normalized_gate_margin": gate_margin,
         "initial_validation_mse": float(summary["initial_validation_mse"]),
@@ -371,7 +391,9 @@ def promotion_record(candidate: dict[str, Any], summary: dict[str, Any]) -> dict
         "last_gradient_group_norm_mean": summary["history"][-1]["gradient_group_norm_mean"],
         "effective_action_loss_weights": summary["action_loss_weights"],
         "training_action_variance": summary["training_action_variance"],
-        "promotion_passed": passed,
+        "validation_screen_passed": passed,
+        "promotion_passed": False,
+        "promotion_status": "pending_locked_test",
     }
 
 
@@ -542,7 +564,9 @@ def main() -> None:
         )
 
     ranked = sorted(records, key=rank_key, reverse=True)
-    passing = [record for record in ranked if record["promotion_passed"]]
+    passing = [
+        record for record in ranked if record["validation_screen_passed"]
+    ]
     passing.sort(
         key=lambda row: (
             float(row["validation_skill"]),
@@ -566,6 +590,9 @@ def main() -> None:
         "candidate_count": len(records),
         "overfit_mode": bool(args.overfit),
         "passing_count": len(passing),
+        "selection_evidence": "validation_only",
+        "locked_test_status": "pending_deferred",
+        "promotion_status": "pending_locked_test",
         "ranked_candidate_ids": [str(record["candidate_id"]) for record in ranked],
         "selected_candidate": selected,
         "diagnosis": infer_diagnosis(records, selected),

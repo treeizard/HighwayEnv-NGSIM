@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "status": "locked",
+  "recipe_id": "bc_gail_aligned_accel5_v5_fail_closed_policy_realism",
+  "purpose": "Matched US/Japanese recurrent-Transformer BC with held-out two-action and explicit closed-loop quality qualification. Training artifacts remain recoverable when a policy fails.",
+  "benchmark": {
+    "objective": "behavior_cloning_policy_realism_reference",
+    "matrix_completion_gate": "all_training_artifacts_complete",
+    "interpretability_eligibility_gate": "policy_realism_qualified",
+    "shared_validation_framework": "shared_bc_gail_paper_metrics_v1",
+    "policy_realism_framework": "closed_loop_policy_quality_v1",
+    "checkpoint_ranking_split": "val",
+    "checkpoint_ranking_score": "weighted_paper_metric_cost",
+    "offline_primary_metrics": [
+      "held_out_mse",
+      "held_out_mae",
+      "skill_vs_train_mean",
+      "per_action_prediction_std_ratio",
+      "per_action_prediction_target_correlation"
+    ],
+    "closed_loop_metrics_role": "qualification_non_terminal_for_matrix_execution",
+    "closed_loop_metrics": [
+      "position_rmse_by_horizon",
+      "speed_rmse_by_horizon",
+      "lane_offset_rmse_by_horizon",
+      "vehicle_crash_rate",
+      "vehicle_offroad_rate",
+      "hard_brake_agent_step_rate"
+    ],
+    "fatal_conditions": [
+      "non_finite_training",
+      "missing_or_corrupt_checkpoint",
+      "data_or_action_contract_mismatch",
+      "architecture_contract_mismatch",
+      "runtime_failure"
+    ]
+  },
+  "architecture_contract_id": "shared_dense_temporal_recurrent_transformer_v1",
+  "architecture": {
+    "policy_model": "recurrent_transformer",
+    "depths": [
+      2
+    ],
+    "policy_seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "hidden_size": 256,
+    "transformer_heads": 4,
+    "transformer_dropout": 0.0,
+    "transformer_norm_first": true,
+    "transformer_observation_normalization": true,
+    "transformer_observation_tokenization": "dense_temporal",
+    "policy_head_init_std": 0.01,
+    "memory_tokens": 1,
+    "memory_context_length": 32
+  },
+  "optimization": {
+    "epochs": 50,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.00001,
+    "max_grad_norm": 5.0,
+    "early_stopping_patience": 10,
+    "early_stopping_min_epochs": 40,
+    "early_stopping_min_delta_relative": 0.001,
+    "checkpoint_selection_rule": "validation_loss",
+    "mirror_augmentation_probability": 0.0,
+    "sequence_length": 32,
+    "sequences_per_batch": 16,
+    "micro_batch_sequences": 16,
+    "action_loss_weights": [
+      1.0,
+      1.0
+    ],
+    "action_loss_weighting": "inverse_variance",
+    "correlation_loss_weight": 0.0,
+    "variance_loss_weight": 0.0,
+    "training_min_prediction_std_ratios": [
+      0.0,
+      0.0
+    ]
+  },
+  "data": {
+    "collection_id": "domain_matched_accel5_v2",
+    "continuous_action_columns": [
+      "acceleration_norm",
+      "steering_norm"
+    ],
+    "continuous_action_scales": [
+      5.0,
+      0.7853981633974483
+    ],
+    "policy_observation_dim": 322,
+    "require_explicit_data_contracts": true,
+    "max_expert_samples": 300000,
+    "max_validation_samples": 100000,
+    "data_seed": 20260716,
+    "split_seed": 20260716,
+    "train_fraction": 0.8,
+    "validation_fraction": 0.1
+  },
+  "gates": {
+    "min_validation_skill": 0.1,
+    "max_validation_mae": 0.35,
+    "learning_action_index": 0,
+    "min_learning_action_std_ratio": 0.25,
+    "min_learning_action_correlation": 0.5,
+    "learning_action_indices": [
+      0,
+      1
+    ],
+    "min_learning_action_std_ratios": [
+      0.25,
+      0.1
+    ],
+    "min_learning_action_correlations": [
+      0.5,
+      0.2
+    ]
+  },
+  "evaluation": {
+    "test_evaluation_mode": "deferred",
+    "validation_episodes": 12,
+    "episodes": 12,
+    "split": "val",
+    "vehicle_mode": "single",
+    "enable_collision": true,
+    "terminate_on_collision": false,
+    "gail_aligned_matched_trajectories": true,
+    "horizons_seconds": [
+      1,
+      5,
+      10,
+      20
+    ],
+    "horizon_coverage_role": "reported_non_terminal",
+    "minimum_20s_horizon_coverage": 0.0,
+    "min_rollout_steps": 100,
+    "max_crash_fraction": 1.0,
+    "max_offroad_fraction": 1.0,
+    "engineering_alert_crash_fraction": 0.05,
+    "engineering_alert_offroad_fraction": 0.05,
+    "absolute_outcome_gate_role": "engineering_alert_non_publication_gate",
+    "expert_replay_qualification": {
+      "required_for_policy_realism": true,
+      "status": "pending_full_validation_and_test_baseline",
+      "maximum_vehicle_crash_rate_gap": 0.05,
+      "maximum_vehicle_offroad_rate_gap": 0.05,
+      "note": "Absolute 0.05 rates are engineering alerts only. Publication qualification remains pending a prospectively frozen same-scenario expert-relative comparison."
+    }
+  },
+  "repair_provenance": {
+    "replaces_recipe": "bc_gail_aligned_accel5_v4_shared_dense_temporal_transformer",
+    "verified_failure": "Historical job 58539772 labelled finite matched evaluations as closed-loop passes even when selected test vehicle crash rates were 0.7595 and 0.8206.",
+    "changes": [
+      "require validation and held-out per-action offline gates",
+      "apply explicit crash and off-road thresholds",
+      "separate evaluation completion from policy quality",
+      "retain rejected checkpoints without promoting them"
+    ],
+    "expert_replay_baseline_status": "pending",
+    "topology_validation_status": {
+      "us": "pending_no_independent_surveyed_geometry",
+      "japanese": "not_independent_due_to_shared_recenter_clip_topology"
+    }
+  }
+}

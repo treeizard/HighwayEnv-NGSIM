@@ -107,7 +107,10 @@ def _smoke_trial(
             "validation_vehicle_mode": "single",
             "validation_stress_every": 0,
             "validation_stress_episodes": 0,
-            "test_episodes": 1,
+            # Integration smokes exercise the validation/evaluator path only.
+            # Final-test access is reserved for a prospectively locked study
+            # and must not be consumed by a mutable engineering run.
+            "test_episodes": 0,
             "test_vehicle_mode": "single",
             "evaluation_horizons_seconds": ",".join(
                 str(value) for value in sorted(evaluation_horizons)
@@ -248,6 +251,8 @@ def main() -> None:
                 failures.append(f"invalid_training_metrics:{exc}")
         selected = dict(summary.get("selected_validation") or {})
         test = dict(summary.get("test") or {})
+        if test:
+            failures.append("unexpected_test_metrics_in_validation_only_smoke")
         policy_delta = summary.get("policy_relative_l2_delta")
         if (
             not isinstance(policy_delta, (int, float))
@@ -265,10 +270,6 @@ def main() -> None:
             f"selected_validation/horizon_coverage_{score_horizon_seconds}s",
         ):
             value = selected.get(key)
-            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-                failures.append(f"nonfinite_or_missing:{key}")
-        for key in ("test/cost", "test/acceleration_action_std", "test/steering_action_std"):
-            value = test.get(key)
             if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
                 failures.append(f"nonfinite_or_missing:{key}")
         expected_runtime = {

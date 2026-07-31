@@ -71,3 +71,29 @@ def test_pure_pursuit_tracker_uses_shared_acceleration_limits_by_default():
     assert tracker.a_min == pytest.approx(MIN_ACCEL)
     assert tracker.a_max == pytest.approx(MAX_ACCEL)
     assert accel == pytest.approx(MAX_ACCEL)
+
+
+def test_pure_pursuit_tracker_has_deterministic_near_zero_target_direction():
+    reference = np.zeros((64, 2), dtype=float)
+    speeds = np.zeros(64, dtype=float)
+
+    def steering_for_position(position):
+        tracker = PurePursuitTracker(
+            reference,
+            speeds,
+            dt=0.1,
+            L_forward=4.5,
+        )
+        steering, _accel, _near, target_idx, _lane = tracker.step(
+            np.asarray(position, dtype=float),
+            heading=1.0,
+            speed=0.0,
+        )
+        assert target_idx == 30
+        return steering
+
+    positive_rounding = steering_for_position([5.0e-5, -5.0e-5])
+    negative_rounding = steering_for_position([-5.0e-5, 5.0e-5])
+
+    assert positive_rounding == pytest.approx(0.0)
+    assert negative_rounding == pytest.approx(0.0)

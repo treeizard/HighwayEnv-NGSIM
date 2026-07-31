@@ -10,6 +10,7 @@ from .config import PSGAILConfig
 
 
 PAPER_DRIVER_MODEL_VALIDATION_FRAMEWORK = "shared_bc_gail_paper_metrics_v1"
+POLICY_REALISM_QUALIFICATION_FRAMEWORK = "closed_loop_policy_quality_v1"
 
 
 def paper_driver_model_validation_overrides() -> dict[str, Any]:
@@ -46,6 +47,179 @@ def _finite_metric(
         if np.isfinite(value):
             return value
     return float("nan")
+
+
+def closed_loop_policy_quality(
+    metrics: dict[str, float],
+    *,
+    prefix: str,
+    max_vehicle_crash_rate: float,
+    max_vehicle_offroad_rate: float,
+    score_horizon_seconds: int = 20,
+    min_horizon_coverage: float = 0.0,
+) -> dict[str, Any]:
+    """Apply explicit safety/coverage gates to one matched rollout split.
+
+    A completed finite rollout is evidence that the evaluator ran, not that the
+    policy drove acceptably.  Keep that distinction machine-readable so a
+    catastrophic policy cannot be labelled as passing merely because its
+    metrics are finite.
+    """
+
+    thresholds = {
+        "max_vehicle_crash_rate": float(max_vehicle_crash_rate),
+        "max_vehicle_offroad_rate": float(max_vehicle_offroad_rate),
+        "min_horizon_coverage": float(min_horizon_coverage),
+    }
+    if not 0.0 <= thresholds["max_vehicle_crash_rate"] <= 1.0:
+        raise ValueError("max_vehicle_crash_rate must be in [0, 1].")
+    if not 0.0 <= thresholds["max_vehicle_offroad_rate"] <= 1.0:
+        raise ValueError("max_vehicle_offroad_rate must be in [0, 1].")
+    if not 0.0 <= thresholds["min_horizon_coverage"] <= 1.0:
+        raise ValueError("min_horizon_coverage must be in [0, 1].")
+
+    horizon = int(score_horizon_seconds)
+    observed = {
+        "vehicle_crash_rate": _finite_metric(
+            metrics,
+            (
+                f"{prefix}/vehicle_crash_rate",
+                f"{prefix}/collision_rate",
+            ),
+        ),
+        "vehicle_offroad_rate": _finite_metric(
+            metrics,
+            (
+                f"{prefix}/vehicle_offroad_rate",
+                f"{prefix}/offroad_duration_rate",
+            ),
+        ),
+        "horizon_coverage": _finite_metric(
+            metrics,
+            (
+                f"{prefix}/rollout_horizon_coverage_{horizon}s",
+                f"{prefix}/horizon_coverage_{horizon}s",
+            ),
+        ),
+        "reference_horizon_coverage": _finite_metric(
+            metrics,
+            (
+                f"{prefix}/reference_horizon_coverage_{horizon}s",
+                f"{prefix}/horizon_coverage_{horizon}s",
+            ),
+        ),
+    }
+    checks = {
+        "finite_vehicle_crash_rate": bool(
+            np.isfinite(observed["vehicle_crash_rate"])
+        ),
+        "finite_vehicle_offroad_rate": bool(
+            np.isfinite(observed["vehicle_offroad_rate"])
+        ),
+        "finite_horizon_coverage": bool(
+            np.isfinite(observed["horizon_coverage"])
+        ),
+        "vehicle_crash_rate": bool(
+            np.isfinite(observed["vehicle_crash_rate"])
+            and observed["vehicle_crash_rate"]
+            <= thresholds["max_vehicle_crash_rate"]
+        ),
+        "vehicle_offroad_rate": bool(
+            np.isfinite(observed["vehicle_offroad_rate"])
+            and observed["vehicle_offroad_rate"]
+            <= thresholds["max_vehicle_offroad_rate"]
+        ),
+        "horizon_coverage": bool(
+            np.isfinite(observed["horizon_coverage"])
+            and observed["horizon_coverage"]
+            >= thresholds["min_horizon_coverage"]
+        ),
+    }
+    failed_checks = sorted(name for name, passed in checks.items() if not passed)
+    return {
+        "framework": POLICY_REALISM_QUALIFICATION_FRAMEWORK,
+        "split": str(prefix),
+        "score_horizon_seconds": horizon,
+        "thresholds": thresholds,
+        "observed": observed,
+        "checks": checks,
+        "failed_checks": failed_checks,
+        "passed": not failed_checks,
+    }
+
+
+def action_learning_gate(
+    *,
+    split: str,
+    prediction_std_ratios: list[float] | tuple[float, ...],
+    prediction_target_correlations: list[float] | tuple[float, ...],
+    action_indices: list[int],
+    minimum_std_ratios: list[float],
+    minimum_correlations: list[float],
+) -> dict[str, Any]:
+    """Return a fail-closed per-action imitation gate for one offline split."""
+
+    if not (
+        len(action_indices)
+        == len(minimum_std_ratios)
+        == len(minimum_correlations)
+    ):
+        raise ValueError(
+            "Learning action indices and per-action gate thresholds must have "
+            "the same length."
+        )
+    action_names = ("acceleration_norm", "steering_norm")
+    gates: list[dict[str, object]] = []
+    for action_index, minimum_std_ratio, minimum_correlation in zip(
+        action_indices,
+        minimum_std_ratios,
+        minimum_correlations,
+    ):
+        if not 0 <= int(action_index) < len(prediction_std_ratios):
+            raise ValueError(
+                f"learning_action_index={action_index} is outside the action "
+                f"dimension [0, {len(prediction_std_ratios)})."
+            )
+        std_ratio = float(prediction_std_ratios[int(action_index)])
+        correlation = float(prediction_target_correlations[int(action_index)])
+        passed = bool(
+            np.isfinite(std_ratio)
+            and np.isfinite(correlation)
+            and std_ratio >= float(minimum_std_ratio)
+            and correlation >= float(minimum_correlation)
+        )
+        gates.append(
+            {
+                "action_index": int(action_index),
+                "action_name": action_names[int(action_index)],
+                "prediction_std_ratio": std_ratio,
+                "minimum_prediction_std_ratio": float(minimum_std_ratio),
+                "prediction_target_correlation": correlation,
+                "minimum_prediction_target_correlation": float(
+                    minimum_correlation
+                ),
+                "passed": passed,
+            }
+        )
+    return {
+        "split": str(split),
+        "aggregation": "all_required_actions",
+        "actions": gates,
+        "passed": all(bool(gate["passed"]) for gate in gates),
+        # Compatibility fields for older report readers. The actions list is
+        # authoritative and all listed dimensions must pass.
+        "action_index": int(gates[0]["action_index"]),
+        "prediction_std_ratio": float(gates[0]["prediction_std_ratio"]),
+        "minimum_prediction_std_ratio": float(
+            gates[0]["minimum_prediction_std_ratio"]
+        ),
+        "prediction_target_correlation": float(
+            gates[0]["prediction_target_correlation"]
+        ),
+        "minimum_prediction_target_correlation": float(
+            gates[0]["minimum_prediction_target_correlation"]
+        ),
+    }
 
 
 def validation_cost_and_score(
@@ -99,11 +273,23 @@ def validation_cost_and_score(
         "hard_brake_rate": _finite_metric(metrics, (f"{prefix}/hard_brake_rate",)),
         "horizon_coverage": _finite_metric(
             metrics,
-            (f"{prefix}/horizon_coverage_{horizon}s",),
+            (
+                f"{prefix}/reference_horizon_coverage_{horizon}s",
+                f"{prefix}/horizon_coverage_{horizon}s",
+            ),
+        ),
+        "rollout_horizon_coverage": _finite_metric(
+            metrics,
+            (
+                f"{prefix}/rollout_horizon_coverage_{horizon}s",
+                f"{prefix}/horizon_coverage_{horizon}s",
+            ),
         ),
     }
     required_components = {
-        key: value for key, value in components.items() if key != "horizon_coverage"
+        key: value
+        for key, value in components.items()
+        if key not in {"horizon_coverage", "rollout_horizon_coverage"}
     }
     if not all(np.isfinite(value) for value in required_components.values()):
         return float("inf"), float("-inf"), components

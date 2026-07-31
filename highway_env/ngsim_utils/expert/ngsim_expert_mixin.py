@@ -646,9 +646,24 @@ class NGSimExpertMixin:
         ):
             return self._inactive_scene_collection_action(expert_state)
 
-        pos = vehicle.position
-        hdg = float(vehicle.heading)
-        spd = float(vehicle.speed)
+        if self.scene_dataset_collection_mode:
+            # The collection contract archives simulated x/y/speed and the
+            # policy observation (including heading) as float32.  Compute the
+            # native expert label from that same representable pre-action
+            # state so a source-locked tracker replay is exact.  Without this
+            # canonicalization, millimetric float64-to-float32 position
+            # rounding can be amplified by atan2 near a route target and make
+            # the stored action depend on state that was not preserved.
+            pos = np.asarray(vehicle.position, dtype=np.float32).astype(
+                float,
+                copy=False,
+            )
+            hdg = float(np.float32(vehicle.heading))
+            spd = float(np.float32(vehicle.speed))
+        else:
+            pos = vehicle.position
+            hdg = float(vehicle.heading)
+            spd = float(vehicle.speed)
 
         steer_cmd, accel_cmd, i_near, i_tgt, _expert_target_lane_id = expert_state["tracker"].step(
             pos, hdg, spd

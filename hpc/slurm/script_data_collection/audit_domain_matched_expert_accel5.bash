@@ -19,7 +19,13 @@ export NGSIM_ACCELERATION_LIMIT_MPS2="${EXPERT_ACCELERATION_LIMIT_MPS2:-5.0}"
 export PYTHONUNBUFFERED=1
 COLLECTION_ID="${COLLECTION_ID:-domain_matched_accel5_v2}"
 COLLECTION_ROOT="${VFI_DATA_ROOT}/expert/${COLLECTION_ID}"
-AUDIT_OUT="${AUDIT_OUT:-${COLLECTION_ROOT}/collection_contract_audit.json}"
+AUDIT_OUT="${AUDIT_OUT:-${COLLECTION_ROOT}/collection_contract_audit_train_val.json}"
+AUDIT_SPLITS="${AUDIT_SPLITS:-train val}"
+
+: "${AUDIT_EXPECTED_SCRIPT_SHA256:?Missing audit script source lock}"
+: "${AUDIT_EXPECTED_RUNNER_SHA256:?Missing audit runner source lock}"
+: "${AUDIT_EXPECTED_CONTRACTS_SHA256:?Missing contracts source lock}"
+: "${AUDIT_EXPECTED_CONSTANTS_SHA256:?Missing constants source lock}"
 
 if [ "${NGSIM_ACCELERATION_LIMIT_MPS2}" != "5.0" ]; then
     echo "Corrected comparison collection must use 5.0 m/s^2." >&2
@@ -33,6 +39,14 @@ if [ -n "${AUDIT_EXPECTED_RUNNER_SHA256:-}" ]; then
     actual="$(sha256sum "${REPODIR}/hpc/slurm/script_data_collection/audit_domain_matched_expert_accel5.bash" | awk '{print $1}')"
     test "${actual}" = "${AUDIT_EXPECTED_RUNNER_SHA256}"
 fi
+if [ -n "${AUDIT_EXPECTED_CONTRACTS_SHA256:-}" ]; then
+    actual="$(sha256sum "${REPODIR}/scripts_gail/ps_gail/contracts.py" | awk '{print $1}')"
+    test "${actual}" = "${AUDIT_EXPECTED_CONTRACTS_SHA256}"
+fi
+if [ -n "${AUDIT_EXPECTED_CONSTANTS_SHA256:-}" ]; then
+    actual="$(sha256sum "${REPODIR}/highway_env/ngsim_utils/core/constants.py" | awk '{print $1}')"
+    test "${actual}" = "${AUDIT_EXPECTED_CONSTANTS_SHA256}"
+fi
 
 mkdir -p "${VFI_LOG_ROOT}/slurm" "${PYTHONPYCACHEPREFIX}"
 module load miniforge3
@@ -40,8 +54,12 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${VFI_CONDA_ENV:-ngsim_env}"
 
 cd "${REPODIR}"
+AUDIT_SPLIT_SPEC="${AUDIT_SPLITS//,/ }"
+AUDIT_SPLIT_SPEC="${AUDIT_SPLIT_SPEC//:/ }"
+read -r -a AUDIT_SPLIT_ARGS <<< "${AUDIT_SPLIT_SPEC}"
 python -m scripts_gail.audit_domain_matched_expert \
     --collection-root "${COLLECTION_ROOT}" \
-    --out "${AUDIT_OUT}"
+    --out "${AUDIT_OUT}" \
+    --splits "${AUDIT_SPLIT_ARGS[@]}"
 
-echo "Passed six-cell expert contract audit: ${AUDIT_OUT}"
+echo "Passed expert contract audit for splits [${AUDIT_SPLITS}]: ${AUDIT_OUT}"

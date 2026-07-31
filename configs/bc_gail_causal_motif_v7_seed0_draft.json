@@ -1,0 +1,201 @@
+{
+  "schema_version": 2,
+  "status": "blocked_pending_shared_input_target_contract",
+  "recipe_id": "bc_gail_causal_motif_v7_seed0_draft",
+  "purpose": "Prospective seed-0 US/Japanese depth-2/depth-3 recurrent-Transformer BC canary. This draft is intentionally rejected until a deployment-observable shared input/target contract and its exact audited training collection receive one decision receipt.",
+  "benchmark": {
+    "objective": "noncollapsed_bc_intervention_support",
+    "matrix_completion_gate": "all_training_artifacts_complete",
+    "interpretability_eligibility_gate": "intervention_support_eligible",
+    "shared_validation_framework": "shared_bc_gail_paper_metrics_v1",
+    "policy_realism_framework": "paired_single_ego_matched_expert_v1",
+    "checkpoint_ranking_split": "val",
+    "checkpoint_ranking_score": "validation_loss",
+    "offline_primary_metrics": [
+      "validation_mse",
+      "validation_mae",
+      "skill_vs_train_mean",
+      "per_action_prediction_std_ratio",
+      "per_action_prediction_target_correlation"
+    ],
+    "closed_loop_metrics_role": "validation_diagnostic_and_event_support",
+    "fatal_conditions": [
+      "non_finite_training",
+      "missing_or_corrupt_checkpoint",
+      "data_or_action_contract_mismatch",
+      "architecture_contract_mismatch",
+      "non_source_stable_split_identity",
+      "evaluator_action_alteration",
+      "runtime_failure"
+    ]
+  },
+  "architecture_contract_id": "shared_dense_temporal_recurrent_transformer_depth_only_v2",
+  "architecture": {
+    "policy_model": "recurrent_transformer",
+    "depths": [
+      2,
+      3
+    ],
+    "policy_seeds": [
+      0
+    ],
+    "hidden_size": 256,
+    "transformer_heads": 4,
+    "transformer_dropout": 0.0,
+    "transformer_norm_first": true,
+    "transformer_observation_normalization": true,
+    "policy_observation_standardization_clip": 0.0,
+    "transformer_observation_tokenization": "dense_temporal",
+    "policy_head_init_std": 0.01,
+    "memory_tokens": 1,
+    "memory_context_length": 32,
+    "only_permitted_architecture_axis": "depth"
+  },
+  "route_intent_candidate": {
+    "status": "engineering_implemented_scientific_candidate_blocked",
+    "provider_id": "topology_aware_route_intent_v1",
+    "provider_config": "configs/route_intent_provider_v1.json",
+    "policy_projection_dim": 16,
+    "controller_projection_dim": 35,
+    "topology_sidecar_policy_visible": false,
+    "previous_action_included": false,
+    "causal_online_planner_source_for_demonstrations": null,
+    "collection_rollout_equivalence_receipt": null,
+    "oracle_gap_receipt": null,
+    "policy_training_unlocked": false
+  },
+  "optimization": {
+    "epochs": 50,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.00001,
+    "max_grad_norm": 5.0,
+    "early_stopping_patience": 10,
+    "early_stopping_min_epochs": 40,
+    "early_stopping_min_delta_relative": 0.001,
+    "checkpoint_selection_rule": "validation_loss",
+    "mirror_augmentation_probability": 0.0,
+    "sequence_length": 32,
+    "sequences_per_batch": 16,
+    "micro_batch_sequences": 16,
+    "action_loss_weights": [
+      1.0,
+      1.0
+    ],
+    "action_loss_weighting": "inverse_variance",
+    "correlation_loss_weight": 0.0,
+    "variance_loss_weight": 0.0,
+    "training_min_prediction_std_ratios": [
+      0.0,
+      0.0
+    ]
+  },
+  "data": {
+    "collection_id": null,
+    "continuous_action_columns": [
+      "acceleration_norm",
+      "steering_norm"
+    ],
+    "continuous_action_scales": [
+      5.0,
+      0.7853981633974483
+    ],
+    "policy_observation_dim": null,
+    "shared_input_target_contract": null,
+    "shared_input_target_contract_decision_receipt": null,
+    "training_collection": null,
+    "require_explicit_data_contracts": true,
+    "max_expert_samples": 300000,
+    "max_validation_samples": 100000,
+    "row_budget_semantics": "trajectory_preserving_targets_may_overshoot",
+    "trajectory_identity_requirement": "scene_and_episode_name_plus_vehicle_id",
+    "data_seed": 20260731,
+    "split_seed": 20260731,
+    "train_fraction": 0.8,
+    "validation_fraction": 0.1,
+    "test_data_status": "sealed_not_opened"
+  },
+  "gates": {
+    "min_validation_skill": 0.1,
+    "max_validation_mae": 0.35,
+    "learning_action_index": 0,
+    "min_learning_action_std_ratio": 0.25,
+    "min_learning_action_correlation": 0.5,
+    "learning_action_indices": [
+      0,
+      1
+    ],
+    "min_learning_action_std_ratios": [
+      0.25,
+      0.1
+    ],
+    "min_learning_action_correlations": [
+      0.5,
+      0.2
+    ],
+    "minimum_event_coverage_through_intervention_onset": 0.9
+  },
+  "evaluation": {
+    "test_evaluation_mode": "deferred",
+    "validation_episodes": 12,
+    "episodes": 12,
+    "seed0_episode_count_role": "trainer_evaluator_canary_only_below_g0_minimum",
+    "split": "val",
+    "vehicle_mode": "single",
+    "enable_collision": true,
+    "terminate_on_collision": false,
+    "gail_aligned_matched_trajectories": true,
+    "horizons_seconds": [
+      1,
+      5,
+      10,
+      20
+    ],
+    "horizon_coverage_role": "reported_non_terminal",
+    "minimum_20s_horizon_coverage": 0.0,
+    "min_rollout_steps": 100,
+    "max_crash_fraction": 1.0,
+    "max_offroad_fraction": 1.0,
+    "engineering_execution_label": "finite_rollout_execution_passed",
+    "absolute_outcome_gate_role": "engineering_alert_non_publication_gate",
+    "matched_expert_floor_status": "artifact_complete_threshold_protocol_pending",
+    "matched_expert_floor_artifacts": {
+      "us": "results/runs/expert_floors/matched_single_ego_expert_floor_v3_20260730T184200Z/us_validation.json",
+      "japanese": "results/runs/expert_floors/matched_single_ego_expert_floor_v3_20260730T184200Z/japanese_validation.json"
+    },
+    "paired_outcome_protocol": {
+      "identity_fields": [
+        "episode_name",
+        "ego_vehicle_id",
+        "reset_seed"
+      ],
+      "minimum_paired_scenarios_per_domain": 24,
+      "scenario_bootstrap_replicates": 5000,
+      "one_sided_upper_quantile": 0.95,
+      "primary_estimands": [
+        "policy_minus_expert_collision_fraction",
+        "policy_minus_expert_offroad_fraction"
+      ],
+      "initial_collision_reported_separately": true,
+      "handover_order_reported_separately": true,
+      "domain_specific_acceptance_thresholds": null,
+      "pooled_domain_threshold_forbidden": true,
+      "threshold_status": "pending_prospective_feasibility_review_without_policy_outcomes"
+    }
+  },
+  "activation_requirements": {
+    "observability_v5_terminal_receipt": true,
+    "teacher_route_diagnostic_terminal_receipt": true,
+    "deployment_observable_candidate_receipt": true,
+    "audited_training_collection_receipt": true,
+    "input_or_regenerated_target_contract_selected": true,
+    "test_data_opened": false,
+    "draft_must_be_copied_to_new_locked_path": true,
+    "in_place_status_edit_forbidden": true
+  },
+  "failure_taxonomy": [
+    "engineering_invalid",
+    "scientific_ineligible",
+    "scientific_null",
+    "qualified"
+  ]
+}
