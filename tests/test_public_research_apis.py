@@ -2,7 +2,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-
 from highway_env import research_api
 from scripts_gail import policy_api
 
@@ -74,4 +73,5 @@ def test_research_api_reexports_repo_native_environment_contract():
     assert research_api.ENV_ID == "NGSim-US101-v0"
     assert research_api.ACCELERATION_RANGE == (-5.0, 5.0)
     assert research_api.MAX_STEER == np.pi / 4.0
-    assert research_api.PUBLIC_RESEARCH_API_VERSION == 1
+    assert research_api.PUBLIC_RESEARCH_API_VERSION == 2
+    assert policy_api.PUBLIC_POLICY_API_VERSION == 2

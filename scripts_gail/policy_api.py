@@ -8,6 +8,7 @@ architecture contracts.
 
 from __future__ import annotations
 
+import inspect
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,8 +45,11 @@ from scripts_gail.ps_gail.observations import (
     flatten_observation_value,
     policy_observations_from_flat,
 )
+from scripts_gail.ps_gail.recurrent_bc import mirror_policy_observations
 
-PUBLIC_POLICY_API_VERSION = 1
+PUBLIC_POLICY_API_VERSION = 2
+POLICY_API_FILE = str(Path(__file__).resolve())
+POLICY_MODELS_SOURCE_FILE = str(Path(inspect.getfile(make_actor_critic)).resolve())
 
 
 @dataclass(frozen=True)
@@ -233,8 +237,10 @@ __all__ = [
     "LIDAR_FEATURE_DIM",
     "NORMALIZED_ACTION_COLUMNS",
     "PHYSICAL_ACTION_COLUMNS",
+    "POLICY_API_FILE",
     "POLICY_ARCHITECTURE_FIELDS",
     "POLICY_EGO_COLUMNS",
+    "POLICY_MODELS_SOURCE_FILE",
     "POLICY_STATE_DIM",
     "PUBLIC_POLICY_API_VERSION",
     "PolicyBundle",
@@ -249,6 +255,7 @@ __all__ = [
     "infer_policy_obs_dim",
     "load_policy_bundle",
     "make_actor_critic",
+    "mirror_policy_observations",
     "policy_architecture_contract",
     "policy_observations_from_flat",
     "runtime_continuous_action_contract",
