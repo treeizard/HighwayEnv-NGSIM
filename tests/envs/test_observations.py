@@ -3,6 +3,9 @@ import numpy as np
 import pytest
 
 import highway_env
+from highway_env.envs.common.observations.lidar import LidarObservation
+from highway_env.road.road import Road, RoadNetwork
+from highway_env.vehicle.kinematics import Vehicle
 
 
 gym.register_envs(highway_env)
@@ -55,6 +58,43 @@ def test_multi_origin_lidar_road_edges_match_single_origin_reference():
 
     np.testing.assert_array_equal(actual, expected)
     env.close()
+
+
+def test_separated_lidar_preserves_positive_dynamic_distance_initialization():
+    class _Env:
+        pass
+
+    env = _Env()
+    env.road = Road(
+        RoadNetwork.straight_road_network(lanes=1, length=200.0)
+    )
+    ego = Vehicle(env.road, [40.0, 0.0], heading=0.0, speed=10.0)
+    lead = Vehicle(env.road, [50.0, 0.0], heading=0.0, speed=8.0)
+    env.road.vehicles.extend([ego, lead])
+    env.vehicle = ego
+    lidar = LidarObservation(
+        env,
+        cells=64,
+        maximum_range=64.0,
+        normalize=True,
+        ego_centric=True,
+        separate_road_edge_return=True,
+    )
+
+    observation = lidar.observe()
+
+    dynamic = observation[:, LidarObservation.DYNAMIC_PRESENCE] >= 0.5
+    assert np.any(dynamic)
+    assert set(np.flatnonzero(dynamic)).intersection({0, 63})
+    assert np.all(
+        observation[dynamic, LidarObservation.DYNAMIC_DISTANCE] > 0.0
+    )
+    assert np.all(
+        observation[dynamic, LidarObservation.DYNAMIC_DISTANCE] < 1.0
+    )
+    assert np.all(
+        observation[~dynamic, LidarObservation.DYNAMIC_DISTANCE] == 1.0
+    )
 
 
 if __name__ == "__main__":

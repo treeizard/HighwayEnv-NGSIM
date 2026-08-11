@@ -26,13 +26,26 @@ It follows the existing notebook / raw-data workflow:
 from __future__ import annotations
 
 import argparse
-import os
-from pathlib import Path
 import datetime as dt
 import gc
+import json
+import os
+import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from highway_env.data.curvature_remap import estimate_curvature_remap
+from highway_env.ngsim_utils.data.trajectory_gen import (
+    trajectory_has_min_continuous_occupancy,
+    trajectory_smoothing,
+)
+from highway_env.ngsim_utils.road.gen_road import (
+    JAPANESE_SOURCE_PREPROCESSING_CONTRACT,
+    JAPANESE_SOURCE_ROAD_CONTRACT,
+    create_japanese_road,
+)
+from highway_env.ngsim_utils.road.lane_mapping import target_lane_index_from_lane_id
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = Path(
@@ -40,17 +53,45 @@ DATA_ROOT = Path(
 ).expanduser().resolve()
 RAW_DATA_DIR = DATA_ROOT / "raw"
 
-from highway_env.data.curvature_remap import estimate_curvature_remap
-from highway_env.ngsim_utils.data.trajectory_gen import (
-    trajectory_has_min_continuous_occupancy,
-    trajectory_smoothing,
-)
-from highway_env.ngsim_utils.road.gen_road import create_japanese_road
-from highway_env.ngsim_utils.road.lane_mapping import target_lane_index_from_lane_id
-
 
 MORINOMIYA_START_JST = pd.Timestamp("2020-01-01 09:00:00", tz="Asia/Tokyo")
 JST_TIMEZONE = "Asia/Tokyo"
+SOURCE_TIME_SEPARATOR = "__t"
+SOURCE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+SOURCE_PRESERVING_PREPROCESSING_CONTRACT = JAPANESE_SOURCE_PREPROCESSING_CONTRACT
+
+
+def source_bound_episode_key(source_file: str, window_start: pd.Timestamp) -> str:
+    """Return an episode key that cannot alias a different source recording."""
+    source = str(source_file).strip()
+    if not SOURCE_NAME_PATTERN.fullmatch(source):
+        raise ValueError(
+            "Morinomiya source_file must be a nonempty filesystem-safe identifier; "
+            f"got {source_file!r}."
+        )
+    return f"{source}{SOURCE_TIME_SEPARATOR}{int(window_start.timestamp() * 1000)}"
+
+
+def episode_source_name(episode_key: str) -> str:
+    """Extract the source recording bound into a Japanese episode key."""
+    source, separator, timestamp = str(episode_key).rpartition(SOURCE_TIME_SEPARATOR)
+    if not separator or not source or not timestamp.isdigit():
+        raise ValueError(f"Episode key is not source-bound: {episode_key!r}")
+    return source
+
+
+def episode_time_ms(episode_key: str) -> int:
+    """Extract a millisecond timestamp from a source-bound or legacy key."""
+    key = str(episode_key)
+    if SOURCE_TIME_SEPARATOR in key:
+        _source, _separator, timestamp = key.rpartition(SOURCE_TIME_SEPARATOR)
+    elif key.startswith("t"):
+        timestamp = key[1:]
+    else:
+        timestamp = ""
+    if not timestamp.isdigit():
+        raise ValueError(f"Episode key does not encode a millisecond timestamp: {episode_key!r}")
+    return int(timestamp)
 
 
 def parse_args() -> argparse.Namespace:
@@ -177,6 +218,26 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Fail before saving if fewer than this many episode windows are built. "
             "Use this to avoid accidentally overwriting a full cache with a small subset."
+        ),
+    )
+    parser.add_argument(
+        "--preprocessing-contract",
+        choices=("legacy_warped_v1", SOURCE_PRESERVING_PREPROCESSING_CONTRACT),
+        default="legacy_warped_v1",
+        help=(
+            "Use the legacy curved-coordinate/recentering path only as a negative "
+            "control. The v3 contract preserves source trajectories under one rigid "
+            "shared SE(2) registration for all recordings and fits the road from train rows."
+        ),
+    )
+    parser.add_argument(
+        "--minimum_vehicle_center_separation_m",
+        type=float,
+        default=1.0,
+        help=(
+            "Quarantine both source trajectories if their recorded centers are "
+            "closer than this physically impossible distance at the same source "
+            "timestamp. Use a negative value to disable."
         ),
     )
     parser.add_argument(
@@ -311,11 +372,11 @@ def load_filtered_morinomiya(
         raise ValueError(
             f"{npy_path} does not contain a structured array with named columns."
         )
-
-    def field_to_numeric(name: str) -> np.ndarray:
-        if name not in field_names:
-            raise KeyError(name)
-        return pd.to_numeric(pd.Series(arr[name], copy=False), errors="coerce").to_numpy()
+    if "source_file" not in field_names:
+        raise ValueError(
+            "Filtered Morinomiya input has no source_file field. Source provenance "
+            "is required to prevent different recordings from sharing an episode."
+        )
 
     numeric_data: dict[str, np.ndarray] = {}
     for col in [
@@ -328,17 +389,22 @@ def load_filtered_morinomiya(
         "latitude",
         "vehicle_length",
         "detected_flag",
+        "kilopost",
         "x_m",
         "y_m",
     ]:
         if col in field_names:
-            numeric_data[col] = field_to_numeric(col)
+            numeric_data[col] = pd.to_numeric(
+                pd.Series(arr[col], copy=False),
+                errors="coerce",
+            ).to_numpy()
 
     required_mask = (
         np.isfinite(numeric_data["vehicle_id"])
         & np.isfinite(numeric_data["datetime"])
         & np.isfinite(numeric_data["traffic_lane"])
     )
+    source_files = np.asarray(arr["source_file"]).astype(str, copy=False)
 
     if "datetime_jst" in field_names:
         datetime_jst = parse_datetime_jst(arr["datetime_jst"])
@@ -377,16 +443,24 @@ def load_filtered_morinomiya(
     if not np.any(mask):
         raise ValueError("No rows remained after applying JST and x_m_max filtering.")
 
+    missing_source = mask & (np.char.strip(source_files) == "")
+    if np.any(missing_source):
+        raise ValueError(
+            f"{int(missing_source.sum())} retained Morinomiya rows have no source_file; "
+            "refusing to construct ambiguous episodes."
+        )
+
     # Materialize only the post-crop subset needed downstream.
     data = {
         "vehicle_id": numeric_data["vehicle_id"][mask].astype(np.int64, copy=False),
         "datetime": numeric_data["datetime"][mask].astype(np.int64, copy=False),
         "datetime_jst": datetime_jst[mask].reset_index(drop=True),
         "traffic_lane": numeric_data["traffic_lane"][mask].astype(np.int64, copy=False),
+        "source_file": source_files[mask],
         "x_m": x_m[mask],
         "y_m": y_m[mask],
     }
-    for col in ["vehicle_type", "velocity", "vehicle_length"]:
+    for col in ["vehicle_type", "velocity", "vehicle_length", "detected_flag", "kilopost"]:
         if col in numeric_data:
             data[col] = numeric_data[col][mask]
 
@@ -396,7 +470,149 @@ def load_filtered_morinomiya(
 
     gc.collect()
 
-    return df.sort_values(["vehicle_id", "datetime"]).reset_index(drop=True)
+    return df.sort_values(["source_file", "datetime", "vehicle_id"]).reset_index(drop=True)
+
+
+def quarantine_near_coincident_trajectories(
+    df: pd.DataFrame,
+    *,
+    minimum_center_separation_m: float,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Remove source trajectories participating in an impossible co-location.
+
+    The gate uses original local XY coordinates before curvature remapping,
+    recentering, smoothing, or episode slicing. Both track IDs are quarantined
+    for the full source recording so a fragmented/duplicated physical track
+    cannot leak across a later split boundary.
+    """
+    threshold = float(minimum_center_separation_m)
+    if threshold < 0.0:
+        return df.copy(), {
+            "enabled": False,
+            "minimum_center_separation_m": threshold,
+            "pair_count": 0,
+            "quarantined_identity_count": 0,
+            "removed_row_count": 0,
+            "sources": {},
+            "pairs": [],
+        }
+    if threshold <= 0.0:
+        raise ValueError("minimum_center_separation_m must be positive or negative to disable.")
+
+    required = {"source_file", "vehicle_id", "datetime", "x_m", "y_m"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"Near-coincident trajectory audit lacks columns: {missing}")
+
+    ordered = df.sort_values(["source_file", "datetime", "vehicle_id"]).reset_index(
+        drop=True
+    )
+    sources = ordered["source_file"].astype(str).to_numpy()
+    vehicle_ids = ordered["vehicle_id"].to_numpy(dtype=np.int64)
+    timestamps = ordered["datetime"].to_numpy(dtype=np.int64)
+    x_values = ordered["x_m"].to_numpy(dtype=float)
+    y_values = ordered["y_m"].to_numpy(dtype=float)
+
+    boundaries = np.flatnonzero(
+        (sources[1:] != sources[:-1]) | (timestamps[1:] != timestamps[:-1])
+    ) + 1
+    starts = np.concatenate((np.asarray([0]), boundaries))
+    ends = np.concatenate((boundaries, np.asarray([len(ordered)])))
+
+    pair_records: dict[tuple[str, int, int], dict[str, object]] = {}
+    quarantined_by_source: dict[str, set[int]] = {}
+    for start, end in zip(starts.tolist(), ends.tolist()):
+        x_order = np.argsort(x_values[start:end], kind="stable") + start
+        for position, left_index in enumerate(x_order):
+            right_position = position + 1
+            while (
+                right_position < len(x_order)
+                and x_values[x_order[right_position]] - x_values[left_index] < threshold
+            ):
+                right_index = int(x_order[right_position])
+                left_id = int(vehicle_ids[left_index])
+                right_id = int(vehicle_ids[right_index])
+                if left_id != right_id:
+                    distance = float(
+                        np.hypot(
+                            x_values[right_index] - x_values[left_index],
+                            y_values[right_index] - y_values[left_index],
+                        )
+                    )
+                    if distance < threshold:
+                        source = str(sources[left_index])
+                        first_id, second_id = sorted((left_id, right_id))
+                        key = (source, first_id, second_id)
+                        record = pair_records.setdefault(
+                            key,
+                            {
+                                "source_file": source,
+                                "vehicle_id_a": first_id,
+                                "vehicle_id_b": second_id,
+                                "event_count": 0,
+                                "minimum_center_distance_m": float("inf"),
+                                "first_timestamp": int(timestamps[left_index]),
+                                "last_timestamp": int(timestamps[left_index]),
+                            },
+                        )
+                        record["event_count"] = int(record["event_count"]) + 1
+                        record["minimum_center_distance_m"] = min(
+                            float(record["minimum_center_distance_m"]),
+                            distance,
+                        )
+                        record["first_timestamp"] = min(
+                            int(record["first_timestamp"]),
+                            int(timestamps[left_index]),
+                        )
+                        record["last_timestamp"] = max(
+                            int(record["last_timestamp"]),
+                            int(timestamps[left_index]),
+                        )
+                        quarantined_by_source.setdefault(source, set()).update(
+                            (first_id, second_id)
+                        )
+                right_position += 1
+
+    quarantined_keys = {
+        (source, int(vehicle_id))
+        for source, vehicle_ids_for_source in quarantined_by_source.items()
+        for vehicle_id in vehicle_ids_for_source
+    }
+    remove_mask = np.fromiter(
+        (
+            (str(source), int(vehicle_id)) in quarantined_keys
+            for source, vehicle_id in zip(sources, vehicle_ids)
+        ),
+        dtype=bool,
+        count=len(ordered),
+    )
+    retained = ordered.loc[~remove_mask].copy()
+    if retained.empty:
+        raise RuntimeError("Near-coincident trajectory quarantine removed every row.")
+    source_report = {}
+    for source in sorted(set(sources)):
+        source_mask = sources == source
+        source_quarantined = sorted(quarantined_by_source.get(source, set()))
+        source_report[source] = {
+            "input_identity_count": int(np.unique(vehicle_ids[source_mask]).size),
+            "quarantined_identity_count": len(source_quarantined),
+            "quarantined_vehicle_ids": source_quarantined,
+            "input_row_count": int(source_mask.sum()),
+            "removed_row_count": int(
+                (source_mask & np.isin(vehicle_ids, source_quarantined)).sum()
+            ),
+        }
+    report = {
+        "enabled": True,
+        "identity_key_format": "<source_file>,<vehicle_id>",
+        "minimum_center_separation_m": threshold,
+        "pair_count": len(pair_records),
+        "quarantined_identity_count": len(quarantined_keys),
+        "removed_row_count": int(len(ordered) - len(retained)),
+        "sources": source_report,
+        "pairs": [pair_records[key] for key in sorted(pair_records)],
+    }
+    return retained.reset_index(drop=True), report
 
 
 def add_vehicle_width(df: pd.DataFrame) -> pd.DataFrame:
@@ -423,10 +639,13 @@ def add_vehicle_width(df: pd.DataFrame) -> pd.DataFrame:
 
 def smooth_vehicle_trajectories(df: pd.DataFrame) -> pd.DataFrame:
     """Apply the existing Savitzky-Golay smoothing per vehicle."""
+    if "source_file" not in df.columns:
+        raise ValueError("source_file is required before smoothing Japanese trajectories.")
     smoothed_groups: list[pd.DataFrame] = []
 
-    for vehicle_id, group in df.groupby("vehicle_id", sort=True):
-        del vehicle_id
+    for (_source_file, _vehicle_id), group in df.groupby(
+        ["source_file", "vehicle_id"], sort=True
+    ):
         ordered = group.sort_values("datetime").copy()
         traj = ordered[["x_curved", "y_curved", "velocity", "traffic_lane"]].to_numpy(dtype=float)
         smoothed = np.asarray(trajectory_smoothing(traj), dtype=float)
@@ -440,6 +659,394 @@ def smooth_vehicle_trajectories(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("No vehicle trajectories were available for smoothing.")
 
     return pd.concat(smoothed_groups, ignore_index=True)
+
+
+def source_training_row_mask(
+    df: pd.DataFrame,
+    *,
+    window_sec: int,
+    val_ratio: float,
+    test_ratio: float,
+) -> np.ndarray:
+    """Return the predeclared chronological train section within each source."""
+    if not 0.0 <= float(val_ratio) < 1.0 or not 0.0 <= float(test_ratio) < 1.0:
+        raise ValueError("Validation/test ratios must be in [0, 1).")
+    if float(val_ratio) + float(test_ratio) >= 1.0:
+        raise ValueError("Validation and test ratios must sum to less than one.")
+    result = np.zeros(len(df), dtype=bool)
+    timestamps = parse_datetime_jst(df["datetime_jst"])
+    for source, indices in df.groupby("source_file", sort=True).groups.items():
+        row_indices = np.asarray(indices, dtype=np.int64)
+        source_times = timestamps.iloc[row_indices]
+        start = source_times.min().floor(f"{int(window_sec)}s")
+        windows = np.floor(
+            (source_times - start).dt.total_seconds().to_numpy(dtype=float)
+            / float(window_sec)
+        ).astype(np.int64)
+        unique_windows = np.unique(windows)
+        train_windows, _val_windows, _test_windows = split_episode_keys(
+            [f"t{int(value)}" for value in unique_windows],
+            val_ratio=float(val_ratio),
+            test_ratio=float(test_ratio),
+        )
+        selected = {int(value[1:]) for value in train_windows}
+        if not selected:
+            raise RuntimeError(f"Source {source!r} has no training windows for registration.")
+        result[row_indices] = np.isin(windows, np.asarray(sorted(selected), dtype=np.int64))
+    return result
+
+
+def rigid_register_shared_coordinates(
+    df: pd.DataFrame,
+    *,
+    fit_mask: np.ndarray,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Apply one train-fitted rigid SE(2) registration shared by every source.
+
+    Morinomiya longitude/latitude values are already WGS84 coordinates on the
+    same physical road.  Independent source translations would manufacture
+    multiple displaced copies of that road, so the transform is fitted once
+    and applied to all rows.  A shared rigid transform preserves every
+    intra-source and inter-source Euclidean distance.
+    """
+    if len(fit_mask) != len(df):
+        raise ValueError("Registration fit mask length does not match Japanese rows.")
+    out = df.copy()
+    fit_mask = np.asarray(fit_mask, dtype=bool)
+    fit_rows = out.loc[
+        fit_mask & out["traffic_lane"].astype(int).isin((1, 2)),
+        ["source_file", "x_m", "y_m"],
+    ].copy()
+    fit_counts = {
+        str(source): int(count)
+        for source, count in fit_rows.groupby("source_file", sort=True).size().items()
+    }
+    all_sources = sorted(out["source_file"].astype(str).unique().tolist())
+    missing = [source for source in all_sources if fit_counts.get(source, 0) < 100]
+    if missing:
+        raise RuntimeError(
+            "Shared Japanese registration lacks 100 mainline train rows for sources: "
+            f"{missing}; counts={fit_counts}."
+        )
+    fit_xy = fit_rows[["x_m", "y_m"]].to_numpy(dtype=float)
+    if not np.all(np.isfinite(fit_xy)):
+        raise ValueError("Japanese shared registration coordinates are non-finite.")
+    low_x, high_x = np.quantile(fit_xy[:, 0], [0.05, 0.95])
+    low = np.median(fit_xy[fit_xy[:, 0] <= low_x], axis=0)
+    high = np.median(fit_xy[fit_xy[:, 0] >= high_x], axis=0)
+    direction = high - low
+    direction_norm = float(np.linalg.norm(direction))
+    if not np.isfinite(direction_norm) or direction_norm < 100.0:
+        raise RuntimeError("Japanese shared registration has insufficient road span.")
+    angle = float(np.arctan2(direction[1], direction[0]))
+    cosine = float(np.cos(-angle))
+    sine = float(np.sin(-angle))
+    rotation = np.asarray([[cosine, -sine], [sine, cosine]], dtype=float)
+    all_xy = out[["x_m", "y_m"]].to_numpy(dtype=float)
+    rotated = all_xy @ rotation.T
+    fit_rotated = fit_xy @ rotation.T
+    x_origin = float(np.quantile(fit_rotated[:, 0], 0.005))
+    y_origin = float(np.median(fit_rotated[:, 1]))
+    registered = rotated - np.asarray([x_origin, y_origin], dtype=float)
+    out["x_registered"] = registered[:, 0]
+    out["y_registered"] = registered[:, 1]
+    if not np.all(np.isfinite(out[["x_registered", "y_registered"]].to_numpy(dtype=float))):
+        raise RuntimeError("Rigid Japanese registration left non-finite output coordinates.")
+    receipt: dict[str, object] = {
+        "fit_split": "train",
+        "fit_sources": all_sources,
+        "fit_row_count": int(len(fit_rows)),
+        "fit_rows_by_source": fit_counts,
+        "rotation_rad": float(-angle),
+        "translation_after_rotation_m": [-x_origin, -y_origin],
+        "transform_type": "rigid_se2",
+        "transform_scope": "one_shared_transform_all_sources",
+        "preserves_inter_source_geometry": True,
+        "lane_specific_transform": False,
+        "nonlinear_warp": False,
+    }
+    return out, receipt
+
+
+def audit_registered_kilopost(
+    df: pd.DataFrame,
+    *,
+    fit_mask: np.ndarray,
+) -> dict[str, object]:
+    """Audit registered x against the provider's road-distance coordinate.
+
+    Kilopost is retained as provenance only.  It is not written into the four-
+    column simulator trajectory and is never exposed to the policy.
+    """
+    required = {"source_file", "kilopost", "x_registered"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"Japanese kilopost audit lacks columns: {missing}")
+    fit_mask = np.asarray(fit_mask, dtype=bool)
+    if len(fit_mask) != len(df):
+        raise ValueError("Kilopost audit fit mask length mismatch.")
+    kilopost = pd.to_numeric(df["kilopost"], errors="coerce").to_numpy(dtype=float)
+    x_registered = pd.to_numeric(
+        df["x_registered"], errors="coerce"
+    ).to_numpy(dtype=float)
+    finite = np.isfinite(kilopost) & np.isfinite(x_registered)
+    fit = finite & fit_mask
+    if np.count_nonzero(fit) < 100:
+        raise RuntimeError("Japanese kilopost audit has insufficient train support.")
+    offset = float(np.median(kilopost[fit] - x_registered[fit]))
+
+    def summarize(mask: np.ndarray) -> dict[str, object]:
+        selected = finite & mask
+        residual = kilopost[selected] - x_registered[selected] - offset
+        return {
+            "row_count": int(np.count_nonzero(selected)),
+            "absolute_error_q50_m": float(np.quantile(np.abs(residual), 0.50)),
+            "absolute_error_q95_m": float(np.quantile(np.abs(residual), 0.95)),
+            "absolute_error_q99_m": float(np.quantile(np.abs(residual), 0.99)),
+            "pearson_correlation": float(
+                np.corrcoef(kilopost[selected], x_registered[selected])[0, 1]
+            ),
+        }
+
+    by_source = {}
+    sources = df["source_file"].astype(str).to_numpy()
+    for source in sorted(set(sources)):
+        by_source[source] = summarize(sources == source)
+    return {
+        "fit_split": "train",
+        "provider_field": "kilopost",
+        "provider_definition": "distance_from_starting_point_of_expressway_route_m",
+        "policy_visible": False,
+        "fitted_kilopost_minus_registered_x_offset_m": offset,
+        "train": summarize(fit_mask),
+        "all_retained_rows": summarize(np.ones(len(df), dtype=bool)),
+        "by_source_all_retained_rows": by_source,
+    }
+
+
+def source_preserving_trajectory_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Bind raw registered x/y/speed to the existing episode writer columns."""
+    out = df.copy()
+    speed = pd.to_numeric(out["velocity"], errors="coerce").to_numpy(dtype=float)
+    invalid_speed = ~np.isfinite(speed) | (speed < 0.0)
+    invalid_coordinate = ~np.all(
+        np.isfinite(out[["x_registered", "y_registered"]].to_numpy(dtype=float)),
+        axis=1,
+    )
+    rejected = invalid_speed | invalid_coordinate
+    report = {
+        "input_rows": int(len(out)),
+        "negative_speed_rows": int(np.count_nonzero(np.isfinite(speed) & (speed < 0.0))),
+        "nonfinite_speed_rows": int(np.count_nonzero(~np.isfinite(speed))),
+        "nonfinite_coordinate_rows": int(np.count_nonzero(invalid_coordinate)),
+        "rejected_rows": int(np.count_nonzero(rejected)),
+    }
+    out = out.loc[~rejected].copy()
+    out["x_smooth"] = out["x_registered"].astype(float)
+    out["y_smooth"] = out["y_registered"].astype(float)
+    out["v_smooth"] = pd.to_numeric(out["velocity"], errors="raise").astype(float)
+    report["output_rows"] = int(len(out))
+    return out, report
+
+
+def _binned_lane_centerline(
+    rows: pd.DataFrame,
+    *,
+    lane_id: int,
+    bin_size_m: float,
+    endpoint_padding_m: float = 0.0,
+) -> list[list[float]]:
+    lane = rows[rows["traffic_lane"].astype(int) == int(lane_id)][
+        ["x_registered", "y_registered"]
+    ].copy()
+    if len(lane) < 100:
+        raise RuntimeError(f"Lane {lane_id} has insufficient train rows for road fitting.")
+    x = lane["x_registered"].to_numpy(dtype=float)
+    # The upstream CSV ingestion already enforces finite physical support.
+    # Quantile trimming here silently shortened the road and made otherwise
+    # centered validation vehicles appear off-road near both endpoints.
+    lower = float(np.min(x))
+    upper = float(np.max(x))
+    bins = np.arange(lower, upper + float(bin_size_m), float(bin_size_m))
+    if len(bins) < 3:
+        raise RuntimeError(f"Lane {lane_id} has insufficient longitudinal road support.")
+    lane["_bin"] = pd.cut(
+        lane["x_registered"], bins=bins, labels=False, include_lowest=True
+    )
+    profile = (
+        lane.groupby("_bin", observed=False)[["x_registered", "y_registered"]]
+        .median()
+        .dropna()
+        .sort_values("x_registered")
+    )
+    profile = profile.loc[
+        ~profile["x_registered"].duplicated(keep="first")
+    ]
+    if len(profile) < 3:
+        raise RuntimeError(f"Lane {lane_id} road fit produced fewer than three points.")
+    values = profile.to_numpy(dtype=float)
+    if values[0, 0] > lower:
+        values = np.vstack(([lower, values[0, 1]], values))
+    if values[-1, 0] < upper:
+        values = np.vstack((values, [upper, values[-1, 1]]))
+    padding = float(endpoint_padding_m)
+    if padding < 0.0:
+        raise ValueError("Japanese road endpoint padding cannot be negative.")
+    if padding > 0.0:
+        start_slope = float(
+            (values[1, 1] - values[0, 1]) / (values[1, 0] - values[0, 0])
+        )
+        end_slope = float(
+            (values[-1, 1] - values[-2, 1])
+            / (values[-1, 0] - values[-2, 0])
+        )
+        padded_start_x = float(values[0, 0] - padding)
+        padded_end_x = float(values[-1, 0] + padding)
+        values = np.vstack(
+            (
+                [padded_start_x, values[0, 1] - padding * start_slope],
+                values,
+                [padded_end_x, values[-1, 1] + padding * end_slope],
+            )
+        )
+    return values.tolist()
+
+
+def _estimate_nominal_lane_width(
+    train: pd.DataFrame,
+    *,
+    bin_size_m: float,
+    quantile: float = 0.995,
+) -> tuple[float, dict[str, object]]:
+    """Estimate physical lane width from stable mainline lane separation.
+
+    Median vehicle positions can sit inward of the painted lane centers.  The
+    high, robust envelope of per-source binned lane-center separations recovers
+    the nominal width without using validation/test rows or merge trajectories.
+    """
+    if not 0.5 < float(quantile) < 1.0:
+        raise ValueError("Japanese lane-width quantile must lie in (0.5, 1).")
+    samples = []
+    counts: dict[str, int] = {}
+    for source, source_rows in train.groupby("source_file", sort=True):
+        mainline = source_rows[
+            source_rows["traffic_lane"].astype(int).isin((1, 2))
+        ].copy()
+        mainline["_width_bin"] = np.floor(
+            mainline["x_registered"].to_numpy(dtype=float) / float(bin_size_m)
+        ).astype(np.int64)
+        centers = mainline.groupby(
+            ["_width_bin", "traffic_lane"], observed=False
+        )["y_registered"].median().unstack()
+        if 1 not in centers or 2 not in centers:
+            raise RuntimeError(f"Source {source!r} lacks both mainline lanes.")
+        separation = (centers[1] - centers[2]).abs().dropna().to_numpy(dtype=float)
+        if len(separation) < 20:
+            raise RuntimeError(
+                f"Source {source!r} has insufficient lane-width bins: {len(separation)}."
+            )
+        samples.extend(separation.tolist())
+        counts[str(source)] = int(len(separation))
+    values = np.asarray(samples, dtype=float)
+    lane_width = float(np.quantile(values, float(quantile)))
+    if not 2.5 <= lane_width <= 5.0:
+        raise RuntimeError(f"Train-fitted Japanese lane width is implausible: {lane_width:g} m.")
+    receipt = {
+        "contract": "per_source_binned_mainline_center_separation_q995_v1",
+        "fit_split": "train",
+        "merge_rows_used": False,
+        "validation_or_test_rows_used": False,
+        "bin_size_m": float(bin_size_m),
+        "quantile": float(quantile),
+        "sample_count": int(len(values)),
+        "sample_counts_by_source": counts,
+        "sample_quantiles_m": {
+            str(value): float(np.quantile(values, value))
+            for value in (0.5, 0.9, 0.95, 0.99, 0.995)
+        },
+        "estimated_lane_width_m": lane_width,
+    }
+    return lane_width, receipt
+
+
+def fit_source_derived_japanese_road(
+    df: pd.DataFrame,
+    *,
+    fit_mask: np.ndarray,
+    bin_size_m: float = 10.0,
+) -> dict[str, object]:
+    """Fit a curved two-mainline-plus-merge road without changing any trajectory."""
+    train = df.loc[np.asarray(fit_mask, dtype=bool)].copy()
+    train_lane_row_counts = {
+        str(lane_id): int(
+            np.count_nonzero(train["traffic_lane"].astype(int).to_numpy() == lane_id)
+        )
+        for lane_id in (1, 2, 3)
+    }
+    insufficient = {
+        lane_id: count
+        for lane_id, count in train_lane_row_counts.items()
+        if count < 100
+    }
+    if insufficient:
+        raise RuntimeError(
+            "Train-only Japanese road fitting lacks lane support: "
+            f"counts={train_lane_row_counts}, required_per_lane=100."
+        )
+    if "vehicle_length" in train:
+        vehicle_lengths = pd.to_numeric(
+            train["vehicle_length"], errors="coerce"
+        ).to_numpy(dtype=float)
+        vehicle_lengths = vehicle_lengths[
+            np.isfinite(vehicle_lengths) & (vehicle_lengths > 0.0)
+        ]
+        endpoint_padding = 0.5 * float(np.quantile(vehicle_lengths, 0.999))
+    else:
+        endpoint_padding = 0.0
+    lane_centerlines = {
+        str(lane_id): _binned_lane_centerline(
+            train,
+            lane_id=lane_id,
+            bin_size_m=float(bin_size_m),
+            endpoint_padding_m=endpoint_padding,
+        )
+        for lane_id in (1, 2, 3)
+    }
+    main_1 = np.asarray(lane_centerlines["1"], dtype=float)
+    main_2 = np.asarray(lane_centerlines["2"], dtype=float)
+    merge = np.asarray(lane_centerlines["3"], dtype=float)
+    x_start = min(float(main_1[0, 0]), float(main_2[0, 0]))
+    x_end = max(float(main_1[-1, 0]), float(main_2[-1, 0]))
+    merge_start = float(np.quantile(merge[:, 0], 0.25))
+    merge_end = float(merge[-1, 0])
+    if not x_start < merge_start < merge_end < x_end:
+        raise RuntimeError("Train-fitted Japanese merge bounds are not ordered.")
+    lane_width, lane_width_receipt = _estimate_nominal_lane_width(
+        train,
+        bin_size_m=float(bin_size_m),
+    )
+    return {
+        "schema_version": 1,
+        "contract": JAPANESE_SOURCE_ROAD_CONTRACT,
+        "coordinate_contract": SOURCE_PRESERVING_PREPROCESSING_CONTRACT,
+        "fit_split": "train",
+        "test_rows_used": False,
+        "fit_sources": sorted(train["source_file"].astype(str).unique().tolist()),
+        "fit_row_count": int(len(train)),
+        "fit_lane_row_counts": train_lane_row_counts,
+        "lane_width_m": lane_width,
+        "lane_width_estimator": lane_width_receipt,
+        "centerline_endpoint_padding_m": endpoint_padding,
+        "centerline_endpoint_padding_contract": (
+            "half_train_vehicle_length_q999_for_full_recorded_footprint_v1"
+        ),
+        "x_start_m": x_start,
+        "x_end_m": x_end,
+        "merge_start_x_m": merge_start,
+        "merge_end_x_m": merge_end,
+        "lane_centerlines": lane_centerlines,
+        "trajectory_coordinates_modified_to_fit_road": False,
+    }
 
 
 def suppress_terminal_curvature(
@@ -730,6 +1337,7 @@ def build_episode_dicts(
     df = df_smooth.copy()
 
     required_cols = [
+        "source_file",
         "vehicle_id",
         "vehicle_length",
         "vehicle_width",
@@ -737,6 +1345,8 @@ def build_episode_dicts(
         "y_smooth",
         "v_smooth",
         "traffic_lane",
+        "kilopost",
+        "detected_flag",
         "datetime_jst",
     ]
     missing = [col for col in required_cols if col not in df.columns]
@@ -751,10 +1361,15 @@ def build_episode_dicts(
         "y_smooth",
         "v_smooth",
         "traffic_lane",
+        "kilopost",
+        "detected_flag",
     ]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    df["source_file"] = df["source_file"].astype(str).str.strip()
+    if (df["source_file"] == "").any():
+        raise ValueError("Japanese trajectory rows contain an empty source_file.")
     df["datetime_jst"] = parse_datetime_jst(df["datetime_jst"])
     df = df.dropna(subset=["datetime_jst"] + numeric_cols).copy()
 
@@ -763,82 +1378,98 @@ def build_episode_dicts(
 
     df["vehicle_id"] = df["vehicle_id"].astype(np.int64)
     df["traffic_lane"] = df["traffic_lane"].astype(np.int64)
-    df = df.sort_values(["datetime_jst", "vehicle_id"]).copy()
-
-    unique_times = pd.Series(df["datetime_jst"].drop_duplicates().sort_values())
-    time_deltas = unique_times.diff().dropna().dt.total_seconds()
-    if len(time_deltas) == 0:
-        raise ValueError("Not enough timestamps to estimate the sampling interval.")
-
-    nominal_dt = float(time_deltas.median())
-    if nominal_dt <= 0:
-        raise ValueError("Estimated a non-positive sampling interval.")
-
-    expected_frames = max(int(round(window_sec / nominal_dt)), 1)
-    min_presence_frames = int(np.ceil(expected_frames * presence_ratio_threshold))
-
-    print(f"Estimated nominal dt: {nominal_dt:.6f} s")
-    print(f"Expected frames per {window_sec}s window: {expected_frames}")
-    print(
-        f"Presence threshold ({presence_ratio_threshold:.0%}): "
-        f"{min_presence_frames} frames"
-    )
-
-    start_time = df["datetime_jst"].min().floor(f"{window_sec}s")
-    elapsed_sec = (df["datetime_jst"] - start_time).dt.total_seconds()
-    df["_window_idx"] = (elapsed_sec // window_sec).astype(int)
-    df["_window_start"] = start_time + pd.to_timedelta(df["_window_idx"] * window_sec, unit="s")
-
     veh_ids_by_episode: dict[str, list[np.int64]] = {}
     trajectories_by_episode: dict[str, dict[np.int64, dict[str, np.ndarray]]] = {}
 
-    for window_start, group in df.groupby("_window_start", sort=True):
-        key = f"t{int(window_start.timestamp() * 1000)}"
-        traj_dict: dict[np.int64, dict[str, np.ndarray]] = {}
-        valid_ids: list[np.int64] = []
+    for source_file, source_rows in df.groupby("source_file", sort=True):
+        source = str(source_file)
+        if not SOURCE_NAME_PATTERN.fullmatch(source):
+            raise ValueError(f"Unsafe or ambiguous source_file identifier: {source!r}")
+        source_rows = source_rows.sort_values(["datetime_jst", "vehicle_id"]).copy()
+        unique_times = pd.Series(
+            source_rows["datetime_jst"].drop_duplicates().sort_values()
+        )
+        time_deltas = unique_times.diff().dropna().dt.total_seconds()
+        if len(time_deltas) == 0:
+            raise ValueError(f"Not enough timestamps to estimate sampling for {source!r}.")
+        nominal_dt = float(time_deltas.median())
+        if nominal_dt <= 0:
+            raise ValueError(f"Estimated a non-positive sampling interval for {source!r}.")
+        expected_frames = max(int(round(window_sec / nominal_dt)), 1)
+        min_presence_frames = int(np.ceil(expected_frames * presence_ratio_threshold))
 
-        window_elapsed = (group["datetime_jst"] - window_start).dt.total_seconds()
-        group = group.copy()
-        group["_frame_idx"] = np.rint(
-            pd.to_numeric(window_elapsed, errors="coerce").to_numpy(dtype=float) / nominal_dt
-        ).astype(int)
-        group = group[
-            (group["_frame_idx"] >= 0)
-            & (group["_frame_idx"] < expected_frames)
-        ].copy()
+        print(
+            f"{source}: nominal_dt={nominal_dt:.6f}s, "
+            f"frames_per_window={expected_frames}, "
+            f"minimum_presence_frames={min_presence_frames}"
+        )
 
-        for veh_id, veh_group in group.groupby("vehicle_id", sort=True):
-            ordered = (
-                veh_group.sort_values("datetime_jst")
-                .drop_duplicates("_frame_idx", keep="last")
-                .copy()
-            )
-            if ordered.empty:
-                continue
+        start_time = source_rows["datetime_jst"].min().floor(f"{window_sec}s")
+        elapsed_sec = (source_rows["datetime_jst"] - start_time).dt.total_seconds()
+        source_rows["_window_idx"] = (elapsed_sec // window_sec).astype(int)
+        source_rows["_window_start"] = start_time + pd.to_timedelta(
+            source_rows["_window_idx"] * window_sec, unit="s"
+        )
 
-            traj = np.zeros((expected_frames, 4), dtype=float)
-            frame_idx = ordered["_frame_idx"].to_numpy(dtype=int)
-            values = ordered[
-                ["x_smooth", "y_smooth", "v_smooth", "traffic_lane"]
-            ].to_numpy(dtype=float)
-            values[:, 3] = ordered["traffic_lane"].to_numpy(dtype=np.int64)
-            traj[frame_idx] = values
+        for window_start, group in source_rows.groupby("_window_start", sort=True):
+            key = source_bound_episode_key(source, window_start)
+            if key in trajectories_by_episode:
+                raise RuntimeError(f"Duplicate source-bound episode key: {key}")
+            traj_dict: dict[np.int64, dict[str, np.ndarray]] = {}
+            valid_ids: list[np.int64] = []
 
-            traj_dict[np.int64(veh_id)] = {
-                "length": np.float64(ordered["vehicle_length"].iloc[0]),
-                "width": np.float64(ordered["vehicle_width"].iloc[0]),
-                "trajectory": traj,
-            }
+            window_elapsed = (group["datetime_jst"] - window_start).dt.total_seconds()
+            group = group.copy()
+            group["_frame_idx"] = np.rint(
+                pd.to_numeric(window_elapsed, errors="coerce").to_numpy(dtype=float)
+                / nominal_dt
+            ).astype(int)
+            group = group[
+                (group["_frame_idx"] >= 0)
+                & (group["_frame_idx"] < expected_frames)
+            ].copy()
 
-            if len(ordered) >= min_presence_frames and trajectory_has_min_continuous_occupancy(
-                traj,
-                min_presence_ratio=presence_ratio_threshold,
-            ):
-                valid_ids.append(np.int64(veh_id))
+            for veh_id, veh_group in group.groupby("vehicle_id", sort=True):
+                ordered = (
+                    veh_group.sort_values("datetime_jst")
+                    .drop_duplicates("_frame_idx", keep="last")
+                    .copy()
+                )
+                if ordered.empty:
+                    continue
 
-        if traj_dict:
-            veh_ids_by_episode[key] = valid_ids
-            trajectories_by_episode[key] = traj_dict
+                traj = np.zeros((expected_frames, 4), dtype=float)
+                provider_observation_mask = np.full(expected_frames, -1, dtype=np.int8)
+                frame_idx = ordered["_frame_idx"].to_numpy(dtype=int)
+                values = ordered[
+                    ["x_smooth", "y_smooth", "v_smooth", "traffic_lane"]
+                ].to_numpy(dtype=float)
+                values[:, 3] = ordered["traffic_lane"].to_numpy(dtype=np.int64)
+                traj[frame_idx] = values
+                detected = ordered["detected_flag"].to_numpy(dtype=np.int64)
+                if not np.isin(detected, (0, 1)).all():
+                    raise ValueError(
+                        f"Invalid Morinomiya detected_flag: {source}/{veh_id}"
+                    )
+                provider_observation_mask[frame_idx] = detected.astype(np.int8)
+
+                traj_dict[np.int64(veh_id)] = {
+                    "source_file": source,
+                    "length": np.float64(ordered["vehicle_length"].iloc[0]),
+                    "width": np.float64(ordered["vehicle_width"].iloc[0]),
+                    "trajectory": traj,
+                    "provider_observation_mask": provider_observation_mask,
+                }
+
+                if len(ordered) >= min_presence_frames and trajectory_has_min_continuous_occupancy(
+                    traj,
+                    min_presence_ratio=presence_ratio_threshold,
+                ):
+                    valid_ids.append(np.int64(veh_id))
+
+            if traj_dict:
+                veh_ids_by_episode[key] = valid_ids
+                trajectories_by_episode[key] = traj_dict
 
     return veh_ids_by_episode, trajectories_by_episode
 
@@ -856,7 +1487,7 @@ def split_episode_keys(
     if val_ratio + test_ratio >= 1.0:
         raise ValueError("--val_ratio + --test_ratio must be < 1.0.")
 
-    ordered = sorted(episode_keys)
+    ordered = sorted(episode_keys, key=lambda key: (episode_time_ms(key), str(key)))
     n_total = len(ordered)
     n_test = int(round(n_total * test_ratio))
     n_val = int(round(n_total * val_ratio))
@@ -867,6 +1498,40 @@ def split_episode_keys(
     val_keys = ordered[n_train : n_train + n_val]
     test_keys = ordered[n_train + n_val :]
     return train_keys, val_keys, test_keys
+
+
+def split_episode_keys_by_source(
+    episode_keys: list[str],
+    val_ratio: float,
+    test_ratio: float,
+) -> tuple[list[str], list[str], list[str]]:
+    """Chronologically split every source session, then aggregate the splits."""
+    by_source: dict[str, list[str]] = {}
+    for key in episode_keys:
+        by_source.setdefault(episode_source_name(key), []).append(str(key))
+    if not by_source:
+        raise ValueError("No source-bound Japanese episode keys were provided.")
+
+    combined = {"train": [], "val": [], "test": []}
+    for source, source_keys in sorted(by_source.items()):
+        train_keys, val_keys, test_keys = split_episode_keys(
+            source_keys,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+        )
+        source_splits = {"train": train_keys, "val": val_keys, "test": test_keys}
+        empty = [split for split, keys in source_splits.items() if not keys]
+        if empty:
+            raise RuntimeError(
+                f"Source {source!r} has insufficient episode support; empty splits: {empty}."
+            )
+        for split, keys in source_splits.items():
+            combined[split].extend(keys)
+
+    return tuple(
+        sorted(combined[split], key=lambda key: (episode_source_name(key), episode_time_ms(key)))
+        for split in ("train", "val", "test")
+    )
 
 
 def subset_dict(d: dict, keys: list[str]) -> dict:
@@ -921,58 +1586,106 @@ def main() -> None:
             f"allowed={sorted(allowed_lane_ids)}"
         )
 
-    df_curved, centerline_df = estimate_curvature_remap(
+    df, quarantine_report = quarantine_near_coincident_trajectories(
         df,
-        lanes=list(args.centerline_lanes),
-        bin_size_m=args.bin_size_m,
+        minimum_center_separation_m=args.minimum_vehicle_center_separation_m,
     )
-    df["x_curved"] = pd.to_numeric(df_curved["x_curved"], errors="coerce")
-    df["y_curved"] = pd.to_numeric(df_curved["y_curved"], errors="coerce")
-    df = df.dropna(subset=["x_curved", "y_curved"]).copy()
-    if args.disable_lane_center_alignment:
-        alignment_profile = pd.DataFrame(columns=["lane_id", "x_center", "y_bias"])
+    print(
+        "Near-coincident raw trajectory quarantine: "
+        f"pairs={quarantine_report['pair_count']}, "
+        f"identities={quarantine_report['quarantined_identity_count']}, "
+        f"rows={quarantine_report['removed_row_count']}"
+    )
+
+    road_geometry = None
+    registration_receipt: dict[str, object] = {}
+    kilopost_receipt: dict[str, object] | None = None
+    source_state_rejections = {
+        "input_rows": int(len(df)),
+        "negative_speed_rows": 0,
+        "nonfinite_speed_rows": 0,
+        "nonfinite_coordinate_rows": 0,
+        "rejected_rows": 0,
+        "output_rows": int(len(df)),
+    }
+    if args.preprocessing_contract == SOURCE_PRESERVING_PREPROCESSING_CONTRACT:
+        df = df.reset_index(drop=True)
+        fit_mask = source_training_row_mask(
+            df,
+            window_sec=args.window_sec,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+        )
+        df["_road_fit_train"] = fit_mask
+        df, registration_receipt = rigid_register_shared_coordinates(
+            df,
+            fit_mask=fit_mask,
+        )
+        kilopost_receipt = audit_registered_kilopost(df, fit_mask=fit_mask)
+        df_smooth, source_state_rejections = source_preserving_trajectory_rows(df)
+        road_geometry = fit_source_derived_japanese_road(
+            df_smooth,
+            fit_mask=df_smooth["_road_fit_train"].to_numpy(dtype=bool),
+            bin_size_m=args.bin_size_m,
+        )
         alignment_summary = {"aligned_rows": 0, "clipped_rows": 0, "profile_rows": 0}
+        smooth_clip_summary = {"checked_rows": 0, "clipped_rows": 0}
+        print(
+            "Applied source-preserving train-fitted shared rigid SE(2) registration; "
+            "trajectory recentering=0, smoothing=0, clipping=0."
+        )
     else:
+        df_curved, centerline_df = estimate_curvature_remap(
+            df,
+            lanes=list(args.centerline_lanes),
+            bin_size_m=args.bin_size_m,
+        )
+        df["x_curved"] = pd.to_numeric(df_curved["x_curved"], errors="coerce")
+        df["y_curved"] = pd.to_numeric(df_curved["y_curved"], errors="coerce")
+        df = df.dropna(subset=["x_curved", "y_curved"]).copy()
         max_lane_lateral_m = (
             None
             if args.max_lane_lateral_m is None or float(args.max_lane_lateral_m) < 0.0
             else float(args.max_lane_lateral_m)
         )
-        df, alignment_profile, alignment_summary = align_lanes_to_japanese_road(
-            df,
-            x_col="x_curved",
-            y_col="y_curved",
-            lane_col="traffic_lane",
-            bin_size_m=args.curved_flatten_bin_size_m,
-            sample_step=args.curved_flatten_sample_step,
-            max_abs_lateral_m=max_lane_lateral_m,
-        )
-
-    print(
-        "Centerline estimated with "
-        f"{len(centerline_df)} samples using lanes {list(args.centerline_lanes)}"
-    )
-    print(
-        "Applied lane-aware Japanese road recentering with "
-        f"{len(alignment_profile)} bias samples; "
-        f"aligned_rows={alignment_summary['aligned_rows']}, "
-        f"clipped_rows={alignment_summary['clipped_rows']}"
-    )
-
-    df_smooth = smooth_vehicle_trajectories(df)
-    if not args.disable_lane_center_alignment and max_lane_lateral_m is not None:
-        df_smooth, smooth_clip_summary = clip_japanese_lateral_to_road(
-            df_smooth,
-            x_col="x_smooth",
-            y_col="y_smooth",
-            lane_col="traffic_lane",
-            max_abs_lateral_m=max_lane_lateral_m,
+        if args.disable_lane_center_alignment:
+            alignment_profile = pd.DataFrame(columns=["lane_id", "x_center", "y_bias"])
+            alignment_summary = {"aligned_rows": 0, "clipped_rows": 0, "profile_rows": 0}
+        else:
+            df, alignment_profile, alignment_summary = align_lanes_to_japanese_road(
+                df,
+                x_col="x_curved",
+                y_col="y_curved",
+                lane_col="traffic_lane",
+                bin_size_m=args.curved_flatten_bin_size_m,
+                sample_step=args.curved_flatten_sample_step,
+                max_abs_lateral_m=max_lane_lateral_m,
+            )
+        print(
+            "Centerline estimated with "
+            f"{len(centerline_df)} samples using lanes {list(args.centerline_lanes)}"
         )
         print(
-            "Applied post-smoothing lane lateral guard: "
-            f"checked_rows={smooth_clip_summary['checked_rows']}, "
-            f"clipped_rows={smooth_clip_summary['clipped_rows']}"
+            "Applied lane-aware Japanese road recentering with "
+            f"{len(alignment_profile)} bias samples; "
+            f"aligned_rows={alignment_summary['aligned_rows']}, "
+            f"clipped_rows={alignment_summary['clipped_rows']}"
         )
+        df_smooth = smooth_vehicle_trajectories(df)
+        smooth_clip_summary = {"checked_rows": 0, "clipped_rows": 0}
+        if not args.disable_lane_center_alignment and max_lane_lateral_m is not None:
+            df_smooth, smooth_clip_summary = clip_japanese_lateral_to_road(
+                df_smooth,
+                x_col="x_smooth",
+                y_col="y_smooth",
+                lane_col="traffic_lane",
+                max_abs_lateral_m=max_lane_lateral_m,
+            )
+            print(
+                "Applied post-smoothing lane lateral guard: "
+                f"checked_rows={smooth_clip_summary['checked_rows']}, "
+                f"clipped_rows={smooth_clip_summary['clipped_rows']}"
+            )
     veh_ids_all, traj_all = build_episode_dicts(
         df_smooth=df_smooth,
         window_sec=args.window_sec,
@@ -1005,7 +1718,7 @@ def main() -> None:
             f"built episode range {episode_keys[0]} to {episode_keys[-1]}."
         )
 
-    train_keys, val_keys, test_keys = split_episode_keys(
+    train_keys, val_keys, test_keys = split_episode_keys_by_source(
         episode_keys=episode_keys,
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
@@ -1018,6 +1731,61 @@ def main() -> None:
         f"Built {len(episode_keys)} total episodes: "
         f"{len(train_keys)} train, {len(val_keys)} val, {len(test_keys)} test"
     )
+
+    split_keys = {"train": train_keys, "val": val_keys, "test": test_keys}
+    source_manifest: dict[str, dict[str, int]] = {}
+    for source in sorted({episode_source_name(key) for key in episode_keys}):
+        source_manifest[source] = {
+            split: sum(episode_source_name(key) == source for key in keys)
+            for split, keys in split_keys.items()
+        }
+    manifest = {
+        "schema_version": 2,
+        "contract": "source_bound_episode_key_and_trajectory_metadata_v1",
+        "preprocessing_contract": str(args.preprocessing_contract),
+        "policy_visible_future_rows": False
+        if args.preprocessing_contract == SOURCE_PRESERVING_PREPROCESSING_CONTRACT
+        else True,
+        "trajectory_recentered_rows": int(alignment_summary["aligned_rows"]),
+        "trajectory_clipped_rows": int(
+            alignment_summary["clipped_rows"] + smooth_clip_summary["clipped_rows"]
+        ),
+        "trajectory_centered_smoothing_applied": bool(
+            args.preprocessing_contract != SOURCE_PRESERVING_PREPROCESSING_CONTRACT
+        ),
+        "rigid_shared_registration": registration_receipt,
+        "kilopost_registration_audit": kilopost_receipt,
+        "provider_observation_metadata": {
+            "field": "detected_flag",
+            "meaning": {"1": "image_detected", "0": "source_interpolated", "-1": "absent"},
+            "stored_per_vehicle_key": "provider_observation_mask",
+            "policy_visible": False,
+            "rows_removed_because_interpolated": 0,
+        },
+        "source_state_rejections": source_state_rejections,
+        "road_geometry_contract": (
+            road_geometry.get("contract") if road_geometry is not None else None
+        ),
+        "input_npy": str(Path(args.input_npy).expanduser().resolve()),
+        "episode_key_format": "<source_file>__t<unix_time_ms>",
+        "source_episode_counts_by_split": source_manifest,
+        "total_episode_counts_by_split": {
+            split: len(keys) for split, keys in split_keys.items()
+        },
+    }
+    Path(out_dir, "SOURCE_SESSION_MANIFEST.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    Path(out_dir, "QUARANTINED_TRAJECTORIES.json").write_text(
+        json.dumps(quarantine_report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    if road_geometry is not None:
+        Path(out_dir, "ROAD_GEOMETRY.json").write_text(
+            json.dumps(road_geometry, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
     save_split(
         out_dir=out_dir,

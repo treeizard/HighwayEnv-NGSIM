@@ -1,5 +1,13 @@
 # GAIL Methodology and Implementation
 
+> **Status: historical component note; do not execute paths or pilot commands
+> from this document.** Training ownership moved to the parent repository under
+> `src/policy/`. Current work is governed by
+> `docs/plan/expert_replay_bc_recovery_20260808.md`: applied normalized
+> `[acceleration, steering]`, no yaw surrogate, no trained-BC peer initializer,
+> and the same declared recurrent-Transformer actor for BC, IQ-Learn, GAIL, and
+> AIRL. Method-specific discriminator, Q, value, and reward heads may differ.
+
 This note describes the methodology used for the project GAIL testing system. It is intended to complement the mathematical background in `Cognitive Driving Simulator and GAIL (May 2026)` by making the link from the GAIL objective to this repository's implementation explicit.
 
 ## Methodological Aim
@@ -8,8 +16,9 @@ The testing system trains an imitation policy for NGSIM-style highway driving wi
 
 The core implementation lives in:
 
-- `scripts_gail/train_simple_ps_gail.py`
-- `scripts_gail/ps_gail/`
+- `src/policy/methods/gail/train.py`
+- `src/policy/methods/gail/airl.py`
+- `src/policy/models/recurrent.py`
 - `highway_env/imitation/expert_dataset.py`
 - `highway_env/envs/ngsim_env.py`
 - `highway_env/ngsim_utils/expert/ngsim_expert_mixin.py`
@@ -120,7 +129,7 @@ The code path is:
 - `highway_env/ngsim_utils/expert/ngsim_expert_mixin.py::_resolve_expert_action()`
   resolves expert controls and exposes them through `info`.
 - `highway_env/ngsim_utils/core/constants.py` defines the shared
-  `[-10, 10]` m/s^2 acceleration range used by expert tracking,
+  `[-5, 5]` m/s^2 acceleration range used by expert tracking,
   normalization, and continuous environment actions.
 
 This design supports both `per_vehicle` datasets for transition-level imitation and `scene` datasets for multi-agent or scene-level discriminators.
@@ -169,12 +178,11 @@ Optional feature standardization is enabled by default for discriminator inputs.
 
 ## Models
 
-The policy is an actor-critic network. The default is an MLP policy, with optional transformer and recurrent-transformer variants:
+Historical trainers supported several actor families. The current four-method
+comparison permits only the declared depth-2/depth-3 recurrent Transformer:
 
-- `scripts_gail/ps_gail/models.py::SharedActorCritic`
-- `scripts_gail/ps_gail/models.py::TransformerActorCritic`
-- `scripts_gail/ps_gail/models.py::RecurrentTransformerActorCritic`
-- `scripts_gail/ps_gail/models.py::make_actor_critic()`
+- `src/policy/models/recurrent.py::RecurrentTransformerActorCritic`
+- `src/policy/models/recurrent.py::make_actor_critic()`
 
 The discriminator family is:
 
@@ -395,12 +403,13 @@ Regression tests also cover the GAIL-specific choices:
 | Adversarial reward from discriminator | Learned reward/cost replacing hand-designed expert reward | `scripts_gail/ps_gail/training/rewards.py::discriminator_reward()` |
 | PPO update | Policy-gradient optimizer for discriminator-derived rewards | `scripts_gail/ps_gail/training/ppo.py::update_policy()` |
 | Collision/offroad penalties | Safety constraints retained during adversarial imitation | `scripts_gail/ps_gail/training/rollouts.py::combine_primary_env_challenge_rewards()` |
-| Steering diagnostics | Monitoring-only action-distribution and diversity checks | `scripts_gail/ps_gail/steering_diagnostics.py` |
+| Steering diagnostics | Monitoring-only action-distribution and diversity checks | `src/policy/evaluation/steering_diagnostics.py` |
 | Matched validation/test metrics | External behavioral check against held-out trajectories | `scripts_gail/ps_gail/training/evaluation.py::evaluate_policy_matched_trajectories()` |
 
-## Locked US GAIL/AIRL Pilot
+## Historical US GAIL/AIRL Pilot (superseded; do not execute)
 
-The first deployment is intentionally limited to four models: GAIL and AIRL
+This retained pilot used trained BC initializers and therefore is not a current
+peer-method comparison. The first deployment was intentionally limited to four models: GAIL and AIRL
 with recurrent-transformer depths 2 and 3. Depth 2 uses qualified US BC seed 0;
 depth 3 uses qualified US BC seed 1. Method comparisons are matched within a
 depth, while comparisons across depths are exploratory because the BC seeds

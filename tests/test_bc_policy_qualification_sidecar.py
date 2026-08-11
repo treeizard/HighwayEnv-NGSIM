@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from scripts_gail import qualify_bc_policy_checkpoint as sidecar
-from scripts_gail.ps_gail.config import PSGAILConfig
+from policy.evaluation import qualify_bc as sidecar
+from policy.contracts.training_config import PSGAILConfig
 
 
 def test_development_mode_refuses_every_test_input_before_opening_data(
@@ -1349,7 +1349,7 @@ def test_receipt_is_fresh_hashed_and_never_overwritten(tmp_path):
 def test_standalone_expert_baseline_defaults_to_validation():
     source = (
         Path(sidecar.__file__).resolve().with_name(
-            "audit_expert_replay_collision_baseline.py"
+            "expert_replay.py"
         )
     ).read_text(encoding="utf-8")
 
@@ -1362,7 +1362,7 @@ def test_standalone_expert_baseline_defaults_to_validation():
 def test_matched_single_ego_expert_floor_is_validation_only_and_pairable():
     source = (
         Path(sidecar.__file__).resolve().with_name(
-            "audit_matched_single_ego_expert_floor.py"
+            "expert_floor.py"
         )
     ).read_text(encoding="utf-8")
 

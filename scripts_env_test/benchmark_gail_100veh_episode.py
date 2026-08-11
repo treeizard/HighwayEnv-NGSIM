@@ -17,11 +17,11 @@ try:
 except Exception:  # pragma: no cover
     tqdm = None
 
-from scripts_gail.ps_gail.config import PSGAILConfig
-from scripts_gail.ps_gail.envs import make_training_env
-from scripts_gail.ps_gail.models import make_actor_critic
-from scripts_gail.ps_gail.observations import flatten_agent_observations, policy_observations_from_flat
-from scripts_gail.ps_gail.trainer import (
+from policy.contracts.training_config import PSGAILConfig
+from policy.data.environments import make_training_env
+from policy.models.recurrent import make_actor_critic
+from policy.contracts.observations import flatten_agent_observations, policy_observations_from_flat
+from policy.methods.gail.trainer import (
     _actions_to_env_tuple,
     _masked_discrete_logits,
     _sample_policy_actions,

@@ -2,23 +2,11 @@
 
 from __future__ import annotations
 
-import os
 import time
-from collections import OrderedDict
-from collections import defaultdict
-from dataclasses import dataclass
-from itertools import product
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pandas as pd
 from gymnasium import spaces
-
-from highway_env import utils
-from highway_env.envs.common.finite_mdp import compute_ttc_grid
-from highway_env.road.lane import AbstractLane, SineLane, StraightLane
-from highway_env.utils import Vector
-from highway_env.vehicle.kinematics import Vehicle
 
 try:
     from scipy.spatial import cKDTree
@@ -30,6 +18,165 @@ if TYPE_CHECKING:
 
 from .base import ObservationType, _ObservationProfiler, _ObstacleSpatialIndex
 from .lidar import LidarObservation
+
+
+def _wrap_angle(angle: float) -> float:
+    return float((float(angle) + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+def _lane_state_from_camera(
+    camera_observation: np.ndarray,
+    *,
+    maximum_range: float,
+) -> tuple[float, float, float]:
+    """Estimate local lane state only from the current lane-camera returns.
+
+    The camera rows are normalized ego-frame boundary points.  Fitting one line
+    per visible side keeps this actor input causal and sensor-derived: no lane
+    object, lane index, route, or future geometry is consulted.
+    """
+    values = np.asarray(camera_observation, dtype=float)
+    if values.ndim != 2 or values.shape[1] != 3:
+        raise ValueError(f"Expected lane-camera rows [N,3], got {values.shape}.")
+    scale = float(maximum_range)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"maximum_range must be positive and finite, got {scale}.")
+    points = values[:, 1:3] * scale
+    valid = (
+        (values[:, 0] >= 0.5)
+        & np.all(np.isfinite(points), axis=1)
+        & (points[:, 0] >= 0.0)
+        # Use the near field so boundary side can be identified without a
+        # privileged lane label even when the road bends farther ahead.
+        & (points[:, 0] <= min(scale, 12.0))
+    )
+
+    def fit_side(intercept_sign: float) -> tuple[float, float] | None:
+        side_points = points[valid]
+        if len(side_points) < 3:
+            return None
+        best: tuple[tuple[int, float, float], np.ndarray] | None = None
+        for first in range(len(side_points) - 1):
+            for second in range(first + 1, len(side_points)):
+                dx = float(side_points[second, 0] - side_points[first, 0])
+                if abs(dx) < 0.75:
+                    continue
+                slope = float(
+                    (side_points[second, 1] - side_points[first, 1]) / dx
+                )
+                if abs(slope) > 1.0:
+                    continue
+                intercept = float(
+                    side_points[first, 1] - slope * side_points[first, 0]
+                )
+                if intercept * intercept_sign <= 0.0:
+                    continue
+                residuals = np.abs(
+                    side_points[:, 1]
+                    - (slope * side_points[:, 0] + intercept)
+                )
+                inliers = residuals <= 0.15
+                count = int(inliers.sum())
+                if count < 3:
+                    continue
+                score = (
+                    count,
+                    -abs(intercept),
+                    -float(np.median(residuals[inliers])),
+                )
+                if best is None or score > best[0]:
+                    best = score, inliers
+        if best is None:
+            return None
+        inlier_points = side_points[best[1]]
+        x = inlier_points[:, 0]
+        y = inlier_points[:, 1]
+        design = np.column_stack([x, np.ones_like(x)])
+        weights = 1.0 / (1.0 + x / 15.0)
+        coefficients, *_ = np.linalg.lstsq(
+            design * np.sqrt(weights[:, None]),
+            y * np.sqrt(weights),
+            rcond=None,
+        )
+        slope, intercept = (float(value) for value in coefficients)
+        if (
+            not np.isfinite(slope)
+            or not np.isfinite(intercept)
+            or intercept * intercept_sign <= 0.0
+        ):
+            return None
+        return float(np.clip(slope, -1.0, 1.0)), float(
+            np.clip(intercept, -scale, scale)
+        )
+
+    left = fit_side(1.0)
+    right = fit_side(-1.0)
+    available = [fit for fit in (left, right) if fit is not None]
+    if not available:
+        return 0.0, 0.0, 0.0
+    lane_slope = float(np.mean([fit[0] for fit in available]))
+    lane_heading_error = -float(np.arctan(lane_slope))
+    if left is None or right is None:
+        return 0.0, lane_heading_error, 0.0
+    lane_center = 0.5 * (left[1] + right[1])
+    lane_width = abs(left[1] - right[1])
+    if not 2.4 <= lane_width <= 5.5:
+        return 0.0, lane_heading_error, 0.0
+    return -float(lane_center), lane_heading_error, float(lane_width)
+
+
+def _route_free_ego_state(
+    env: AbstractEnv,
+    vehicle,
+    history: dict[int, tuple[int, np.ndarray, float, float, np.ndarray]],
+    camera_observation: np.ndarray,
+    *,
+    camera_maximum_range: float,
+) -> np.ndarray:
+    """Build causal IMU/odometry plus sensor-estimated local-lane features."""
+    key = id(vehicle)
+    step = int(getattr(env, "steps", 0))
+    position = np.asarray(getattr(vehicle, "position", np.zeros(2)), dtype=float)
+    speed = float(getattr(vehicle, "speed", 0.0))
+    heading = float(getattr(vehicle, "heading", 0.0))
+    previous = history.get(key)
+    if previous is not None and previous[0] == step:
+        return previous[4].copy()
+    frequency = max(1.0, float(getattr(env, "config", {}).get("policy_frequency", 10.0)))
+    dt = 1.0 / frequency
+    longitudinal_acceleration = 0.0
+    lateral_speed = 0.0
+    yaw_rate = 0.0
+    if previous is not None and step > previous[0]:
+        elapsed = max(dt, float(step - previous[0]) * dt)
+        longitudinal_acceleration = (speed - previous[2]) / elapsed
+        displacement = position - previous[1]
+        lateral_axis = np.asarray([-np.sin(heading), np.cos(heading)], dtype=float)
+        lateral_speed = float(displacement.dot(lateral_axis) / elapsed)
+        yaw_rate = _wrap_angle(heading - previous[3]) / elapsed
+
+    lane_offset, lane_heading_error, lane_width = _lane_state_from_camera(
+        camera_observation,
+        maximum_range=camera_maximum_range,
+    )
+    state = np.asarray(
+        [
+            float(max(getattr(vehicle, "LENGTH", 0.0), 0.0)),
+            float(max(getattr(vehicle, "WIDTH", 0.0), 0.0)),
+            speed,
+            float(np.clip(longitudinal_acceleration, -20.0, 20.0)),
+            float(np.clip(lateral_speed, -20.0, 20.0)),
+            float(np.clip(yaw_rate, -4.0, 4.0)),
+            float(lane_offset),
+            float(np.sin(lane_heading_error)),
+            float(np.cos(lane_heading_error)),
+            float(max(lane_width, 0.0)),
+        ],
+        dtype=np.float32,
+    )
+    history[key] = (step, position.copy(), speed, heading, state.copy())
+    return state
+
 
 class SharedMultiAgentLidarCameraObservations(ObservationType):
     """
@@ -46,23 +193,44 @@ class SharedMultiAgentLidarCameraObservations(ObservationType):
         lidar: dict | None = None,
         camera: dict | None = None,
         batch_road_edges: bool = False,
+        ego_state_version: str = "legacy_v1",
         **kwargs,
     ) -> None:
         super().__init__(env, **kwargs)
         self.lidar_observation = LidarObservation(env, **(lidar or {}))
         self.camera_observation = LaneCameraObservation(env, **(camera or {}))
         self.batch_road_edges = bool(batch_road_edges)
+        self.ego_state_version = str(ego_state_version)
+        self._ego_history: dict[
+            int, tuple[int, np.ndarray, float, float, np.ndarray]
+        ] = {}
 
-    @staticmethod
-    def _ego_state_space() -> spaces.Box:
+    def _ego_state_space(self) -> spaces.Box:
+        if self.ego_state_version == "route_free_v2":
+            return spaces.Box(
+                low=np.full(10, -np.inf, dtype=np.float32),
+                high=np.full(10, np.inf, dtype=np.float32),
+                dtype=np.float32,
+            )
         return spaces.Box(
             low=np.array([-np.inf, -np.pi, 0.0, 0.0], dtype=np.float32),
             high=np.array([np.inf, np.pi, np.inf, np.inf], dtype=np.float32),
             dtype=np.float32,
         )
 
-    @staticmethod
-    def _build_ego_state(vehicle) -> np.ndarray:
+    def _build_ego_state(
+        self, vehicle, camera_observation: np.ndarray | None = None
+    ) -> np.ndarray:
+        if self.ego_state_version == "route_free_v2":
+            if camera_observation is None:
+                raise ValueError("route_free_v2 requires a current lane-camera observation.")
+            return _route_free_ego_state(
+                self.env,
+                vehicle,
+                self._ego_history,
+                camera_observation,
+                camera_maximum_range=self.camera_observation.maximum_range,
+            )
         return np.array(
             [
                 float(getattr(vehicle, "speed", 0.0)),
@@ -93,12 +261,22 @@ class SharedMultiAgentLidarCameraObservations(ObservationType):
         _ObservationProfiler.record("shared_obstacle_index_build", time.perf_counter() - index_started)
         vehicles = list(self.env.controlled_vehicles)
         origins = np.asarray([vehicle.position for vehicle in vehicles], dtype=float)
+        headings = np.asarray(
+            [float(getattr(vehicle, "heading", 0.0)) for vehicle in vehicles],
+            dtype=float,
+        )
         if self.batch_road_edges:
             edge_started = time.perf_counter()
             edge_distances: list[np.ndarray | None] | np.ndarray = (
                 self.lidar_observation._distance_to_road_edges_many(
                     origins=origins,
-                    directions=self.lidar_observation._directions,
+                    directions=np.stack(
+                        [
+                            self.lidar_observation.directions_for_heading(heading)
+                            for heading in headings
+                        ],
+                        axis=0,
+                    ),
                     max_range=self.lidar_observation.maximum_range,
                     coarse_step=self.lidar_observation.coarse_step,
                     refine_iters=self.lidar_observation.refine_iters,
@@ -118,14 +296,15 @@ class SharedMultiAgentLidarCameraObservations(ObservationType):
         ):
             self.lidar_observation.observer_vehicle = vehicle
             self.camera_observation.observer_vehicle = vehicle
-            ego_state = self._build_ego_state(vehicle)
+            camera_observation = self.camera_observation.observe()
+            ego_state = self._build_ego_state(vehicle, camera_observation)
             observations.append(
                 (
                     self.lidar_observation.observe(
                         obstacle_entries=vehicle_obstacle_entries,
                         edge_dists=vehicle_edge_distances,
                     ),
-                    self.camera_observation.observe(),
+                    camera_observation,
                     ego_state,
                 )
             )
@@ -323,22 +502,43 @@ class LidarCameraObservations(ObservationType):
         env: AbstractEnv,
         lidar: dict | None = None,
         camera: dict | None = None,
+        ego_state_version: str = "legacy_v1",
         **kwargs,
     ) -> None:
         super().__init__(env, **kwargs)
         self.lidar_observation = LidarObservation(env, **(lidar or {}))
         self.camera_observation = LaneCameraObservation(env, **(camera or {}))
+        self.ego_state_version = str(ego_state_version)
+        self._ego_history: dict[
+            int, tuple[int, np.ndarray, float, float, np.ndarray]
+        ] = {}
 
-    @staticmethod
-    def _ego_state_space() -> spaces.Box:
+    def _ego_state_space(self) -> spaces.Box:
+        if self.ego_state_version == "route_free_v2":
+            return spaces.Box(
+                low=np.full(10, -np.inf, dtype=np.float32),
+                high=np.full(10, np.inf, dtype=np.float32),
+                dtype=np.float32,
+            )
         return spaces.Box(
             low=np.array([-np.inf, -np.pi, 0.0, 0.0], dtype=np.float32),
             high=np.array([np.inf, np.pi, np.inf, np.inf], dtype=np.float32),
             dtype=np.float32,
         )
 
-    @staticmethod
-    def _build_ego_state(vehicle) -> np.ndarray:
+    def _build_ego_state(
+        self, vehicle, camera_observation: np.ndarray | None = None
+    ) -> np.ndarray:
+        if self.ego_state_version == "route_free_v2":
+            if camera_observation is None:
+                raise ValueError("route_free_v2 requires a current lane-camera observation.")
+            return _route_free_ego_state(
+                self.env,
+                vehicle,
+                self._ego_history,
+                camera_observation,
+                camera_maximum_range=self.camera_observation.maximum_range,
+            )
         return np.array(
             [
                 float(getattr(vehicle, "speed", 0.0)),
@@ -361,10 +561,13 @@ class LidarCameraObservations(ObservationType):
     def observe(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         self.lidar_observation.observer_vehicle = self.observer_vehicle
         self.camera_observation.observer_vehicle = self.observer_vehicle
-        ego_state = self._build_ego_state(self.observer_vehicle)
+        camera_observation = self.camera_observation.observe()
+        ego_state = self._build_ego_state(
+            self.observer_vehicle, camera_observation
+        )
         return (
             self.lidar_observation.observe(),
-            self.camera_observation.observe(),
+            camera_observation,
             ego_state,
         )
 

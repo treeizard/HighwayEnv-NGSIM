@@ -1,9 +1,11 @@
 # HighwayEnv-NGSIM
 
-Independent simulator and imitation-learning fork used by the
-validation-first interpretability project. This repository owns `highway_env`,
-`scripts_gail`, dataset preparation, simulator diagnostics, tests, and Slurm
-launchers. It remains a separate Git repository when checked out below
+Independent simulator fork used by the validation-first interpretability
+project. This repository owns `highway_env`, dataset preparation, simulator
+diagnostics, and simulator tests. Policy training, study orchestration, and
+Slurm execution are owned by the parent project's `src/policy/`,
+`src/studies/`, and `src/execution/` packages. It remains a separate Git
+repository when checked out below
 `components/HighwayEnv-NGSIM` in the parent project.
 
 ## Environment
@@ -23,11 +25,12 @@ modules and do not require `PYTHONPATH` changes.
 ## Layout
 
 - `highway_env/`: simulator, replay environment, and NGSIM data utilities.
-- `scripts_gail/`: BC, GAIL, AIRL, and IQ-Learn training code.
 - `scripts_setup/`: dataset preparation commands.
-- `scripts_env_test/`: simulator and training diagnostics.
-- `hpc/slurm/`: Linux HPC launchers.
+- `scripts_env_test/`: simulator diagnostics.
 - `tests/`: fork-owned unit and integration tests.
+
+The component must not contain training algorithms, study matrices, deployment
+snapshots, or Slurm launchers.
 
 The validation-first recurrent IQ-Learn workflow, evidence, and promotion gates
 are documented in the study memory

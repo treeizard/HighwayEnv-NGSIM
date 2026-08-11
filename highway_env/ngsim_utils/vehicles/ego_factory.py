@@ -22,8 +22,11 @@ from __future__ import annotations
 
 import numpy as np
 
+from highway_env.ngsim_utils.road.lane_mapping import (
+    heading_from_trajectory_row,
+    target_lane_index_from_lane_id,
+)
 from highway_env.ngsim_utils.vehicles.ego import EgoVehicle
-from highway_env.ngsim_utils.road.lane_mapping import target_lane_index_from_lane_id
 
 
 def estimate_initial_heading(ego_traj: np.ndarray) -> float:
@@ -78,7 +81,13 @@ def build_ego_vehicle(
 ) -> EgoVehicle:
     x0, y0, ego_speed, lane0 = ego_traj[0]
     ego_xy = np.array([x0, y0], dtype=float)
-    heading_raw = estimate_initial_heading(ego_traj)
+    heading_raw = heading_from_trajectory_row(
+        road.network,
+        scene,
+        np.asarray(ego_traj[0], dtype=float),
+        fallback_heading=0.0,
+        prefer_motion=False,
+    )
     target_speeds = target_speeds_for_trajectory(
         ego_traj,
         control_mode=control_mode,
@@ -112,17 +121,13 @@ def build_ego_vehicle(
         ego.target_lane_index = mapped_lane_index
         ego.lane_index = mapped_lane_index
         ego.lane = road.network.get_lane(mapped_lane_index)
-        s0, r0 = ego.lane.local_coordinates(ego.position)
-        if not ego.lane.on_lane(ego.position, s0, r0):
-            lane_margin = max(0.1, 0.5 * ego_wid)
-            r0 = float(
-                np.clip(
-                    r0,
-                    -ego.lane.width_at(s0) / 2.0 + lane_margin,
-                    ego.lane.width_at(s0) / 2.0 - lane_margin,
-                )
-            )
-            ego.position = ego.lane.position(s0, r0)
-        ego.heading = float(ego.lane.heading_at(s0))
+        # Preserve the recorded pose.  Moving a source vehicle onto the lane
+        # would make its observation disagree with its action label; corpus
+        # qualification separately rejects poses that do not overlap their
+        # mapped lane.
+        # Keep reliable filtered motion heading at the controlled-policy
+        # boundary. ``heading_from_trajectory_row`` already uses this lane
+        # tangent as the low-speed/unreliable-motion fallback, matching the
+        # direct yaw-rate label contract used during expert collection.
 
     return ego

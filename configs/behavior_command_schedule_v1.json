@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "schedule_id": "feasible_uniform_behavior_commands_v1",
+  "keep_lane_horizon_steps": 20,
+  "lane_change_horizon_steps": 40,
+  "overtake_horizon_steps": 100,
+  "overtake_min_lead_gap_m": 5.0,
+  "overtake_max_lead_gap_m": 60.0
+}

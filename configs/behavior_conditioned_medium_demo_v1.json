@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "recipe_id": "behavior_conditioned_medium_demo_v1",
+  "status": "engineering_demo_not_confirmatory",
+  "claim_boundary": "behavior-command-conditioned imitation engineering demo",
+  "test_split_opened": false,
+    "inputs": {
+        "require_complete_train_validation_recollections": true,
+        "require_behavior_basis_schema": 2,
+        "canary_support_profile": "maneuver_family_with_direction_presence",
+        "minimum_raw_vehicle_groups_per_maneuver_family_domain_split": 24,
+        "require_both_lane_change_directions_present": true,
+        "confirmatory_minimum_raw_vehicle_groups_per_behavior_domain_split": 24,
+        "canary_does_not_unlock_direction_specific_claims": true
+    },
+  "matrix": {
+    "domains": ["us", "japanese"],
+    "depths": [2],
+    "seeds": [0],
+    "methods": ["bc", "iq_learn", "gail"],
+    "confirmatory_minimum_matched_seeds": 3,
+    "demo_can_satisfy_confirmatory_seed_gate": false
+  },
+  "shared": {
+    "max_train_rows_per_domain": 120000,
+    "max_validation_rows_per_domain": 60000,
+    "windows_per_behavior": 512,
+    "sequence_length": 32,
+    "memory_context_length": 32,
+    "normalizer": "equal_domain_train_only_322",
+    "actor_width": 256,
+    "actor_heads": 4,
+    "actor_dropout": 0.0,
+    "actor_norm_first": true,
+    "actor_memory_tokens": 1,
+    "actor_tokenization": "dense_temporal"
+  },
+  "bc": {
+    "epochs": 12,
+    "early_stopping_patience": 4,
+    "learning_rate": 0.0003,
+    "sequences_per_batch": 32,
+    "micro_batch_sequences": 8,
+    "bc_initialization": "shared_random_actor"
+  },
+  "iq_learn": {
+    "updates": 400,
+    "q_only_updates": 80,
+    "minimum_joint_updates": 200,
+    "eval_every": 40,
+    "collect_steps": 256,
+    "bc_coefficient": 0.0,
+    "initialization": "shared_random_actor"
+  },
+  "gail": {
+    "rounds": 30,
+    "rollout_steps": 512,
+    "rollout_workers": 4,
+    "bc_pretrain_epochs": 0,
+    "policy_bc_regularization": 0.0,
+    "initialization": "shared_random_actor",
+    "target_kl": 0.01
+  },
+  "execution": {
+    "stages": [
+      "sidecars_and_independent_audit",
+      "observability_normalizer_and_sampling",
+      "shared_random_actor",
+      "bc_seed0",
+      "independent_iq_and_gail_seed0",
+      "offline_common_qualification",
+      "paired_closed_loop_pending",
+      "feature_collection_locked_until_full_qualification"
+    ],
+    "source_snapshot_required": true,
+    "sbatch_test_only_required": true,
+    "fresh_output_root_required": true,
+    "environment_lock_required": true
+  }
+}

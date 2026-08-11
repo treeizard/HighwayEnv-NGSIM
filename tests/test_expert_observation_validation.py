@@ -7,15 +7,16 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import scripts_gail.audit_domain_matched_expert as audit_module
+import policy.data.audit_expert as audit_module
 from highway_env.envs.common.observations.lidar import LidarObservation
-from scripts_gail.ps_gail.contracts import (
+from highway_env.road.lane import PolyLaneFixedWidth
+from policy.contracts.imitation import (
     assert_compatible_observation_contracts,
     policy_observation_contract,
     runtime_continuous_action_contract,
     validate_declared_raw_observation_space,
 )
-from scripts_gail.ps_gail.data import load_expert_transition_data
+from policy.data.expert import load_expert_transition_data
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -105,6 +106,32 @@ def test_runtime_lidar_space_and_contract_reject_bound_drift():
         assert_compatible_observation_contracts(reference, drifted)
 
 
+def test_polyline_lane_vectorized_on_road_matches_scalar_highwayenv_semantics():
+    lane = PolyLaneFixedWidth(
+        [(0.0, 0.0), (40.0, 2.0), (80.0, -1.0), (120.0, 1.0)],
+        width=3.7,
+    )
+    lidar = object.__new__(LidarObservation)
+    lidar._lane_geometry_cache = {}
+    rng = np.random.default_rng(20260806)
+    random_points = np.column_stack(
+        (rng.uniform(-8.0, 128.0, 4000), rng.uniform(-8.0, 8.0, 4000))
+    )
+    boundary_points = np.asarray(
+        [
+            lane.position(longitudinal, lateral)
+            for longitudinal in (-5.0, 0.0, 20.0, 60.0, lane.length, lane.length + 4.9)
+            for lateral in (-1.85, 0.0, 1.85)
+        ]
+    )
+    points = np.vstack((random_points, boundary_points))
+
+    vectorized = lidar._lane_on_points_vectorized(lane, points)
+    scalar = np.asarray([lane.on_lane(point) for point in points], dtype=bool)
+
+    np.testing.assert_array_equal(vectorized, scalar)
+
+
 def write_action_conditioned_expert(
     path: Path,
     observations: np.ndarray,
@@ -180,6 +207,11 @@ def test_domain_audit_train_val_subset_never_resolves_test(
     monkeypatch,
 ):
     opened: list[Path] = []
+    opened_manifests: list[Path] = []
+
+    def fake_read_json(path: Path):
+        opened_manifests.append(path)
+        return {"policy_observation_contract": {"contract_id": "test"}}
 
     def fake_audit_split(root: Path, *, reference_observation):
         del reference_observation
@@ -198,6 +230,7 @@ def test_domain_audit_train_val_subset_never_resolves_test(
             ],
         }
 
+    monkeypatch.setattr(audit_module, "read_json", fake_read_json)
     monkeypatch.setattr(audit_module, "audit_split", fake_audit_split)
     result = audit_module.audit_collection(
         tmp_path / "collection",
@@ -205,35 +238,12 @@ def test_domain_audit_train_val_subset_never_resolves_test(
     )
 
     assert len(opened) == 4
+    assert len(opened_manifests) == 1
+    assert opened_manifests[0].parent.name == "train"
     assert all(path.name in {"train", "val"} for path in opened)
+    assert not any(path.parent.name == "test" for path in opened_manifests)
     assert not any(path.name == "test" for path in opened)
     assert result["audited_splits"] == ["train", "val"]
     assert result["not_opened_splits"] == ["test"]
     assert result["test_data_status"] == "not_opened"
     assert result["domain_split_count"] == 4
-
-
-def test_collection_wrapper_locks_all_sensor_producing_sources_and_validates():
-    collection_runner = (
-        ROOT
-        / "hpc/slurm/script_data_collection/"
-        "collect_domain_matched_expert_accel5_array.bash"
-    ).read_text(encoding="utf-8")
-    for lock in (
-        "COLLECTION_EXPECTED_REPLAY_SHA256",
-        "COLLECTION_EXPECTED_TRAJECTORY_GEN_SHA256",
-        "COLLECTION_EXPECTED_NGSIM_ENV_SHA256",
-        "COLLECTION_EXPECTED_LIDAR_SHA256",
-    ):
-        assert f"${{{lock}:?" in collection_runner
-    assert "validate_declared_raw_observation_space" in collection_runner
-    assert 'context=f"{path} observations"' in collection_runner
-    assert 'context=f"{path} next_observations"' in collection_runner
-
-    audit_runner = (
-        ROOT
-        / "hpc/slurm/script_data_collection/"
-        "audit_domain_matched_expert_accel5.bash"
-    ).read_text(encoding="utf-8")
-    assert 'AUDIT_SPLITS="${AUDIT_SPLITS:-train val}"' in audit_runner
-    assert '--splits "${AUDIT_SPLIT_ARGS[@]}"' in audit_runner

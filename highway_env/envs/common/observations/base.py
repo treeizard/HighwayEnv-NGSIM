@@ -51,6 +51,10 @@ class _LaneGeometry:
     amplitude: float = 0.0
     pulsation: float = 0.0
     phase: float = 0.0
+    curve_s: np.ndarray | None = None
+    curve_positions: np.ndarray | None = None
+    curve_normals: np.ndarray | None = None
+    curve_orthonormals: np.ndarray | None = None
 
 @dataclass(frozen=True)
 class _LaneBounds:

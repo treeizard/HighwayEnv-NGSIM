@@ -4,15 +4,15 @@ import numpy as np
 import pytest
 import torch
 
-from scripts_gail.ps_gail.config import PSGAILConfig
-from scripts_gail.ps_gail.contracts import (
+from policy.contracts.training_config import PSGAILConfig
+from policy.contracts.imitation import (
     assert_compatible_observation_contracts,
     policy_observation_contract,
     runtime_continuous_action_contract,
     validate_expert_action_contract,
 )
-from scripts_gail.ps_gail.models import make_actor_critic
-from scripts_gail.ps_gail.trainer import policy_distribution_values_memory
+from policy.models.recurrent import make_actor_critic
+from policy.methods.gail.trainer import policy_distribution_values_memory
 
 
 def test_runtime_action_and_policy_observation_contracts_are_explicit():

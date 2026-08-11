@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "status": "locked_pending_upstream_gates",
+  "claim_boundary": "behavior-command-conditioned imitation and training-domain-associated feature formation",
+  "forbidden_claims": [
+    "latent human intent",
+    "human-driver cloning",
+    "policy realism",
+    "culture effects"
+  ],
+  "factorial": {
+    "methods": ["bc", "iq_learn", "gail"],
+    "domains": ["us", "japanese"],
+    "depths": [2, 3],
+    "seeds": [0, 1, 2, 3, 4],
+    "behavior_ids": [0, 1, 2, 3],
+    "minimum_fully_matched_qualified_seeds": 3
+  },
+  "policy": {
+    "model": "recurrent_transformer",
+    "input_dim": 326,
+    "sensor_state_dim": 322,
+    "behavior_intent_dim": 4,
+    "hidden_size": 256,
+    "heads": 4,
+    "norm_first": true,
+    "dropout": 0.0,
+    "memory_tokens": 1,
+    "memory_context_length": 32,
+    "tokenization": "dense_temporal",
+    "policy_head_init_std": 0.01,
+    "action_order_normalized": ["acceleration", "steering"],
+    "action_scales": [5.0, 0.7853981633974483],
+    "shared_random_checkpoint_kind": "shared_random_actor",
+    "normalizer": "equal_domain_train_only_322",
+    "unstandardized_tail_dim": 4
+  },
+  "method_independence": {
+    "bc_unlocks_contract_only": true,
+    "iq_actor_bc_coefficient": 0.0,
+    "iq_bc_only_updates": 0,
+    "gail_bc_pretrain_epochs": 0,
+    "gail_policy_bc_regularization": 0.0,
+    "trained_bc_checkpoint_allowed_for_primary_iq": false,
+    "trained_bc_checkpoint_allowed_for_primary_gail": false,
+    "hybrid_rescue_names": ["BC+IQ-Learn", "BC+GAIL"]
+  },
+    "support_gate": {
+        "seed0_canary_profile": "maneuver_family_with_direction_presence",
+        "seed0_minimum_raw_vehicle_groups_per_maneuver_family_domain_split": 24,
+        "seed0_requires_both_lane_change_directions_present": true,
+        "confirmatory_minimum_raw_vehicle_groups_per_behavior_domain_split": 24,
+        "seed0_canary_cannot_unlock_direction_specific_feature_claims": true,
+        "synthetic_or_duplicated_groups_can_repair_support": false,
+        "test_sealed_during_selection": true
+    },
+  "observability_gate": {
+    "bootstrap_steering_correlation_lower_95_min": 0.5,
+    "current_input_to_full_oracle_mse_gap_recovery_min": 0.9,
+    "whole_segment_shuffle_gain_retention_max": 0.2,
+    "failure_locks_all_methods": true
+  },
+  "policy_gates": {
+    "validation_skill_min": 0.1,
+    "action_correlation_min": [0.5, 0.2],
+    "prediction_std_ratio_min": [0.25, 0.1],
+    "behavior_event_coverage_min": 0.9,
+    "full_prefix_recurrence_required": true,
+    "exact_action_execution_required": true,
+    "closed_loop_20_second_coverage_min": 0.95,
+    "excess_collision_upper_95_max": 0.1,
+    "excess_offroad_upper_95_max": 0.1
+  },
+  "execution_dag": [
+    "full_train_validation_collection",
+    "behavior_sidecar_build_and_independent_audit",
+    "behavior_observability_control",
+    "equal_domain_normalizer_and_shared_random_receipts",
+    "bc_seed0_then_five_seed_matrix",
+    "independent_iq_and_gail_seed0_canaries",
+    "remaining_iq_and_gail_five_seed_matrix",
+    "paired_expert_policy_evaluation",
+    "activation_and_response_bank_collection",
+    "dense_then_conditional_sparse_interpretability"
+  ],
+  "interpretability": {
+    "primary_features": "actor_residual_policy_tokens",
+    "critics_and_discriminator": "secondary_method_specific",
+    "intent_swap": "same_causal_history_four_way_only",
+    "dense_bottlenecks": ["U_R", "U_A"],
+    "sae_requires_qualified_dense_bottleneck": true,
+    "exact_suffix_interventions_required": true,
+    "raw_neuron_ids_compared_across_seeds": false
+  }
+}

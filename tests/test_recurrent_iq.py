@@ -1,28 +1,66 @@
 from __future__ import annotations
 
-import math
 import hashlib
+import math
+import sys
 import types
 
 import numpy as np
 import pytest
 import torch
-
-from scripts_gail.ps_gail.config import PSGAILConfig
-from scripts_gail.ps_gail.models import make_actor_critic
-from scripts_gail.ps_gail.recurrent_bc import build_sequence_windows, split_trajectory_ids
-from scripts_gail.ps_gail.recurrent_iq import (
+from policy.contracts.training_config import PSGAILConfig
+from policy.evaluation.checkpoints import (
+    canonical_tensor_state_sha256,
+    policy_architecture_contract,
+)
+from policy.models.recurrent import make_actor_critic
+from policy.methods.bc import build_sequence_windows, split_trajectory_ids
+from policy.methods.iq_learn import (
     RecurrentTwinQNetwork,
     update_recurrent_iq,
 )
-from scripts_gail.train_recurrent_iq_learn import (
+from policy.methods.iq_learn_train import (
     _tensorboard_scalars,
     load_initial_policy_checkpoint,
+    make_config,
+    parse_args,
     policy_architecture,
     rollout_capability,
     rollout_thresholds,
     sample_policy_replay_action,
 )
+
+
+def test_unconditioned_iq_mode_keeps_behavior_references_empty(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_recurrent_iq_learn.py",
+            "--expert-data",
+            str(tmp_path / "train"),
+            "--expert-validation-data",
+            str(tmp_path / "validation"),
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--initial-policy-checkpoint",
+            str(tmp_path / "bc.pt"),
+            "--transformer-layers",
+            "2",
+            "--conditioning-mode",
+            "none",
+            "--initialization-mode",
+            "bc",
+        ],
+    )
+
+    args = parse_args()
+    cfg = make_config(args)
+
+    assert not cfg.behavior_conditioning_enabled
+    assert cfg.behavior_label_sidecar == ""
+    assert cfg.behavior_command_schedule == ""
+    assert cfg.behavior_sampling_manifest == ""
 
 
 def synthetic_transitions(seed: int = 0):
@@ -154,12 +192,14 @@ def test_recurrent_iq_update_is_finite_and_changes_actor_and_q():
         bc_coef=1.0,
         actor_bc_only=False,
         max_grad_norm=1.0,
+        q_l2_coef=1.0e-3,
     )
 
     assert stats.samples > 0
     assert stats.expert_samples > 0
     assert stats.policy_samples > 0
     assert stats.q1_loss != stats.q2_loss
+    assert stats.q_l2_loss > 0.0
     assert all(math.isfinite(value) for value in stats.as_dict().values())
     assert stats.q_abs_max < 100.0
     assert any(not torch.equal(actor_before[name], value) for name, value in policy.state_dict().items())
@@ -329,7 +369,10 @@ def test_initial_policy_checkpoint_requires_exact_recurrent_architecture(tmp_pat
     )
 
     incompatible_cfg = PSGAILConfig(**{**vars(cfg), "transformer_memory_context_length": 3})
-    with pytest.raises(RuntimeError, match="architecture mismatch.*memory_context_length"):
+    with pytest.raises(
+        RuntimeError,
+        match="architecture contract mismatch.*memory_context_length",
+    ):
         load_initial_policy_checkpoint(
             loaded_policy,
             checkpoint,
@@ -337,3 +380,54 @@ def test_initial_policy_checkpoint_requires_exact_recurrent_architecture(tmp_pat
             action_dim=2,
             cfg=incompatible_cfg,
         )
+
+
+def test_initial_policy_checkpoint_accepts_shared_actor_dimension_metadata(tmp_path):
+    source_policy, _q_net, _target = make_models()
+    cfg = PSGAILConfig(
+        seed=0,
+        action_mode="continuous",
+        continuous_action_dim=2,
+        policy_model="recurrent_transformer",
+        hidden_size=8,
+        transformer_layers=1,
+        transformer_heads=2,
+        transformer_dropout=0.0,
+        transformer_memory_tokens=1,
+        transformer_memory_context_length=2,
+        transformer_use_causal_attention=True,
+    )
+    checkpoint = tmp_path / "shared.pt"
+    state = source_policy.state_dict()
+    architecture = policy_architecture_contract(cfg)
+    assert "obs_dim" not in architecture
+    torch.save(
+        {
+            "checkpoint_kind": "shared_random_actor",
+            "policy_state_dict": state,
+            "policy_architecture": architecture,
+            "policy_observation_dim": 4,
+            "actor_state_sha256": canonical_tensor_state_sha256(state),
+            "config": vars(cfg),
+        },
+        checkpoint,
+    )
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    checkpoint.with_name("shared.pt.sha256").write_text(
+        f"{digest}  shared.pt\n",
+        encoding="utf-8",
+    )
+    loaded_policy, _q_net, _target = make_models()
+
+    provenance = load_initial_policy_checkpoint(
+        loaded_policy,
+        checkpoint,
+        obs_dim=4,
+        action_dim=2,
+        cfg=cfg,
+        domain="us",
+        seed=0,
+        required_checkpoint_kind="shared_random_actor",
+    )
+
+    assert provenance["actor_state_sha256"] == canonical_tensor_state_sha256(state)

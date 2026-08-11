@@ -4,17 +4,16 @@ import types
 
 import numpy as np
 import pytest
+import policy.methods.bc as recurrent_bc_module
 import torch
-
-import scripts_gail.ps_gail.recurrent_bc as recurrent_bc_module
-from scripts_gail.ps_gail.checkpoints import (
+from policy.evaluation.checkpoints import (
     assert_policy_architecture_matches_checkpoint,
     policy_architecture_contract,
     shared_interpretable_transformer_architecture,
 )
-from scripts_gail.ps_gail.config import PSGAILConfig
-from scripts_gail.ps_gail.models import make_actor_critic
-from scripts_gail.ps_gail.recurrent_bc import (
+from policy.contracts.training_config import PSGAILConfig
+from policy.models.recurrent import make_actor_critic
+from policy.methods.bc import (
     _batched_sequence_loss,
     _center_sequence_steps,
     _mixture_mean_variance,
@@ -27,11 +26,11 @@ from scripts_gail.ps_gail.recurrent_bc import (
     train_recurrent_behavior_clone,
     trajectory_segments,
 )
-from scripts_gail.ps_gail.training.policy import (
+from policy.methods.gail.policy import (
     _make_policy_from_state_dict,
     fit_policy_observation_normalizer,
 )
-from scripts_gail.train_simple_ps_gail import _policy_action_tuple
+from policy.methods.gail.train import _policy_action_tuple
 
 
 def test_temporal_centering_removes_only_per_sequence_offsets():
@@ -1198,6 +1197,27 @@ def test_explicit_source_splits_are_preserved_without_internal_resplitting():
         np.square(prepared.actions[validation_indices] - train_mean)
     )
     assert prepared.validation_baseline_mse == pytest.approx(expected_baseline)
+
+
+def test_explicit_unconditioned_splits_ignore_all_invalid_behavior_sentinels():
+    source_splits = {
+        "train": synthetic_transitions(seed=21),
+        "validation": synthetic_transitions(seed=22),
+    }
+    for transitions in source_splits.values():
+        rows = len(transitions.trajectory_ids)
+        transitions.behavior_ids = np.full(rows, -1, dtype=np.int8)
+        transitions.next_behavior_ids = np.full(rows, -1, dtype=np.int8)
+        transitions.segment_ids = np.full(rows, -1, dtype=np.int64)
+
+    prepared = prepare_recurrent_bc_data_from_explicit_splits(
+        source_splits,
+        sequence_length=2,
+        context_length=2,
+    )
+
+    assert prepared.behavior_sampling_manifest is None
+    assert prepared.split_windows["train"]
 
 
 def test_explicit_train_validation_preparation_keeps_test_unopened():

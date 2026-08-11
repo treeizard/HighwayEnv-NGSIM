@@ -2,8 +2,8 @@ import numpy as np
 import pytest
 
 from highway_env.road.route_intent import route_intent_contract
-from scripts_gail.ps_gail.contracts import policy_observation_contract
-from scripts_gail.ps_gail.observations import policy_observations_from_flat
+from policy.contracts.imitation import policy_observation_contract
+from policy.contracts.observations import policy_observations_from_flat
 
 
 def test_route_intent_extends_policy_only_and_preserves_raw_observation():

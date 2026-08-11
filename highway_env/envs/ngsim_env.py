@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -50,11 +51,10 @@ from highway_env.ngsim_utils.data.ego_trajectory import (
 )
 from highway_env.ngsim_utils.road.lane_mapping import (
     heading_from_trajectory_row,
-    target_lane_index_from_lane_id,
+    resolve_target_lane_index_from_row,
 )
 from highway_env.ngsim_utils.vehicles.replay import (
     road_entity_conflicts_at_pose,
-    road_entity_pose_polygon,
     spawn_surrounding_vehicles,
 )
 from highway_env.ngsim_utils.road.gen_road import create_ngsim_101_road, create_japanese_road
@@ -88,7 +88,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         tuple[str, str, str, float],
         tuple[dict[str, np.ndarray], dict[str, dict[Any, Any]], list[str]],
     ] = {}
-    _NETWORK_CACHE: dict[str, Any] = {}
+    _NETWORK_CACHE: dict[tuple[str, str], Any] = {}
     _PROCESSED_TRAJECTORY_CACHE: dict[tuple[str, str, str, int], np.ndarray] = {}
     _EXPERT_REFERENCE_CACHE: dict[
         tuple[str, str, str, int, int, float],
@@ -148,6 +148,9 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 # Raw data selections
                 "episode_root": "data/highway_env/processed_20s",
                 "prebuilt_split": "train",
+                # When omitted, a run-owned ROAD_GEOMETRY.json beside the
+                # Japanese prebuilt arrays is discovered automatically.
+                "japanese_road_geometry": None,
                 # Quality of life/ debugging
                 "control_all_vehicles": False,
                 "max_surrounding": "all",
@@ -167,13 +170,22 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 "percentage_controlled_vehicles": 0.1,
                 "clip_controlled_vehicles_to_available": True,
                 "terminate_when_all_controlled_crashed": True,
-                "truncate_to_trajectory_length": False, # allow for replay
+                "truncate_to_trajectory_length": False,  # allow for replay
                 "scene_dataset_collection_mode": False,
+                # A causal collector may supply actions directly without
+                # constructing the privileged trajectory tracker. The flag is
+                # valid only for scene collection and affects activation
+                # bookkeeping, never the actor observation.
+                "scene_collection_external_controller": False,
                 "disable_controlled_vehicle_collisions": False,
                 "crash_controlled_vehicles_offroad": True,
                 "complete_controlled_vehicles_at_road_end": True,
                 "road_end_completion_lateral_margin": 0.25,
                 "disable_scene_collection_spawn_safety": False,
+                # Corrected corpus runs fail closed on negative speeds and use
+                # only previous->current motion for actor-visible heading.
+                # Kept opt-in so historical US checkpoints remain reproducible.
+                "source_preserving_trajectory_state": False,
                 "allow_idm": True,
                 "controlled_vehicle_min_occupancy": 0.8,
                 "scene_collection_min_occupancy_steps": None,
@@ -283,10 +295,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         self.steps = 0
         self._frames_per_action = max(
             1,
-            int(
-                self.config["simulation_frequency"]
-                // self.config["policy_frequency"]
-            ),
+            int(self.config["simulation_frequency"] // self.config["policy_frequency"]),
         )
 
         seed = self.config.get("seed", None)
@@ -303,15 +312,10 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 self._replay_xy_pol = list(expert_state["replay_xy"])
 
     def _prune_removed_vehicles(self) -> None:
-        if not any(
-            getattr(vehicle, "remove_from_road", False)
-            for vehicle in self.road.vehicles
-        ):
+        if not any(getattr(vehicle, "remove_from_road", False) for vehicle in self.road.vehicles):
             return
         self.road.vehicles = [
-            vehicle
-            for vehicle in self.road.vehicles
-            if not getattr(vehicle, "remove_from_road", False)
+            vehicle for vehicle in self.road.vehicles if not getattr(vehicle, "remove_from_road", False)
         ]
 
     def _simulate(self, action: Action | None = None) -> None:
@@ -319,11 +323,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         frames = self._frames_per_action
         dt = 1 / self.config["simulation_frequency"]
         for frame in range(frames):
-            if (
-                action is not None
-                and not self.config["manual_control"]
-                and self.steps % frames == 0
-            ):
+            if action is not None and not self.config["manual_control"] and self.steps % frames == 0:
                 self.action_type.act(action)
 
             self.road.act()
@@ -377,9 +377,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
 
             length = float(getattr(vehicle, "LENGTH", lane.VEHICLE_LENGTH))
             front_bumper_reached_end = longitudinal >= float(lane.length) - 0.5 * length
-            lateral_margin = float(
-                self.config.get("road_end_completion_lateral_margin", 0.25)
-            )
+            lateral_margin = float(self.config.get("road_end_completion_lateral_margin", 0.25))
             laterally_on_lane = abs(float(lateral)) <= width / 2.0 + lateral_margin
             if front_bumper_reached_end and laterally_on_lane:
                 return True
@@ -432,15 +430,11 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         self.ego_ids = select_ego_ids(
             valid_ids,
             explicit_ego_id,
-            percentage_controlled_vehicles=self.config[
-                "percentage_controlled_vehicles"
-            ],
+            percentage_controlled_vehicles=self.config["percentage_controlled_vehicles"],
             np_random=self.np_random,
             episode_name=self.episode_name,
             control_all_vehicles=bool(self.config.get("control_all_vehicles", False)),
-            clip_to_available=bool(
-                self.config.get("clip_controlled_vehicles_to_available", True)
-            ),
+            clip_to_available=bool(self.config.get("clip_controlled_vehicles_to_available", True)),
         )
         self.ego_id = self.ego_ids[0] if self.ego_ids else None
         self.trajectory_set = build_trajectory_set(
@@ -451,7 +445,6 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
 
         logger.info("Loaded episode=%s ego_ids=%s", self.episode_name, self.ego_ids)
 
-    
     # -------------------------------------------------------------------------
     # ROAD + VEHICLES + Test Mode
     # -------------------------------------------------------------------------
@@ -461,27 +454,37 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             raise ValueError(f"Unsupported scene={self.scene!r}")
         query_mode = str(self.config.get("road_query_mode", "legacy")).lower()
         if query_mode not in {"legacy", "spatial", "optimized"}:
-            raise ValueError(
-                "road_query_mode must be one of: legacy, spatial, optimized"
-            )
-        collision_mode = str(
-            self.config.get("collision_check_mode", "legacy")
-        ).lower()
+            raise ValueError("road_query_mode must be one of: legacy, spatial, optimized")
+        collision_mode = str(self.config.get("collision_check_mode", "legacy")).lower()
         if collision_mode not in {"legacy", "broadphase", "optimized"}:
-            raise ValueError(
-                "collision_check_mode must be one of: legacy, broadphase, optimized"
-            )
-        sensor_mode = str(
-            self.config.get("sensor_road_edge_mode", "per_vehicle")
-        ).lower()
+            raise ValueError("collision_check_mode must be one of: legacy, broadphase, optimized")
+        sensor_mode = str(self.config.get("sensor_road_edge_mode", "per_vehicle")).lower()
         if sensor_mode not in {"per_vehicle", "batched", "optimized"}:
-            raise ValueError(
-                "sensor_road_edge_mode must be one of: per_vehicle, batched, optimized"
+            raise ValueError("sensor_road_edge_mode must be one of: per_vehicle, batched, optimized")
+        geometry_path = None
+        if self.scene == "japanese":
+            configured = self.config.get("japanese_road_geometry")
+            candidate = (
+                Path(str(configured)).expanduser().resolve()
+                if configured
+                else Path(self._prebuilt_dir).resolve() / "ROAD_GEOMETRY.json"
             )
-        net = self._NETWORK_CACHE.get(self.scene)
+            if candidate.is_file():
+                geometry_path = candidate
+            elif configured:
+                raise FileNotFoundError(candidate)
+        cache_key = (
+            self.scene,
+            str(geometry_path) if geometry_path is not None else "legacy",
+        )
+        net = self._NETWORK_CACHE.get(cache_key)
         if net is None:
-            net = builder()
-            self._NETWORK_CACHE[self.scene] = net
+            net = (
+                create_japanese_road(geometry_path)
+                if self.scene == "japanese" and geometry_path is not None
+                else builder()
+            )
+            self._NETWORK_CACHE[cache_key] = net
         self.net = net
         self.road = Road(
             network=net,
@@ -490,26 +493,16 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             use_query_fast_path=query_mode != "legacy",
             query_cell_size=float(self.config.get("road_query_cell_size", 25.0)),
             use_collision_broadphase=collision_mode != "legacy",
-            collision_cell_size=float(
-                self.config.get("collision_broadphase_cell_size", 12.0)
-            ),
-            collision_broadphase_min_entities=int(
-                self.config.get("collision_broadphase_min_entities", 32)
-            ),
-            record_replay_diagnostics=bool(
-                self.config.get("record_replay_diagnostics", True)
-            ),
+            collision_cell_size=float(self.config.get("collision_broadphase_cell_size", 12.0)),
+            collision_broadphase_min_entities=int(self.config.get("collision_broadphase_min_entities", 32)),
+            record_replay_diagnostics=bool(self.config.get("record_replay_diagnostics", True)),
         )
         self.road.debug_idm_handover = bool(self.config.get("debug_idm_handover", False))
         debug_ids = self.config.get("debug_idm_handover_ids")
-        self.road.debug_idm_handover_ids = (
-            {int(vehicle_id) for vehicle_id in debug_ids}
-            if debug_ids
-            else None
-        )
+        self.road.debug_idm_handover_ids = {int(vehicle_id) for vehicle_id in debug_ids} if debug_ids else None
 
     def _create_vehicles(self):
-        # Build ego vehicles first. 
+        # Build ego vehicles first.
         self.controlled_vehicles = []
         self._ego_start_indices = {}
         self._expert_state_by_vehicle_id = {}
@@ -517,7 +510,6 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         ego_records = self.trajectory_set["ego"]
         shared_start_index = self._resolve_shared_ego_start_index(ego_records)
         max_traj_steps = []
-        scene_collection_spawn_records: list[dict[str, Any]] = []
 
         for ego_index, ego_id in enumerate(self.ego_ids):
             ego_rec = ego_records[ego_id]
@@ -543,27 +535,17 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             if self.scene_dataset_collection_mode:
                 self._configure_scene_collection_vehicle(
                     ego=ego,
+                    ego_rec=ego_rec,
                     ego_traj_full=ego_traj_full,
                 )
                 active_occupancy = self._scene_collection_spawn_active_occupancy(ego)
-                min_occupancy = float(
-                    self.config.get("controlled_vehicle_min_occupancy", 0.0)
-                )
+                min_occupancy = float(self.config.get("controlled_vehicle_min_occupancy", 0.0))
                 if active_occupancy < min_occupancy:
                     logger.warning(
                         "Skipping controlled vehicle %s because its scene-collection active occupancy %.3f is below the configured minimum %.3f.",
                         ego_id,
                         active_occupancy,
                         min_occupancy,
-                    )
-                    continue
-                if self._scene_collection_spawn_has_conflict(
-                    ego,
-                    scene_collection_spawn_records,
-                ):
-                    logger.warning(
-                        "Skipping controlled vehicle %s because its scene-collection spawn pose overlaps an existing controlled vehicle.",
-                        ego_id,
                     )
                     continue
             elif self._vehicle_has_spawn_conflict(ego):
@@ -576,9 +558,6 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             self.controlled_vehicles.append(ego)
             self._ego_start_indices[int(ego_id)] = int(ego_start_index)
             if self.scene_dataset_collection_mode:
-                scene_collection_spawn_records.append(
-                    self._scene_collection_spawn_record(ego)
-                )
                 max_traj_steps.append(int(len(ego_traj_full)))
             else:
                 max_traj_steps.append(int(ego_policy_steps))
@@ -599,19 +578,15 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         self._max_traj_policy_steps = min(max_traj_steps) if max_traj_steps else None
         if self.scene_dataset_collection_mode:
             self._sync_scene_collection_controlled_vehicles(step_index=0)
-        
+
         # Build obstacle vehicles
         self._spawn_surrounding_vehicles()
 
-    def _resolve_shared_ego_start_index(
-        self, ego_records: dict[int, dict[str, Any]]
-    ) -> int:
+    def _resolve_shared_ego_start_index(self, ego_records: dict[int, dict[str, Any]]) -> int:
         if self.expert_test_mode:
             return 0
 
-        start_idx = common_first_valid_index(
-            [ego_records[ego_id]["trajectory"] for ego_id in self.ego_ids]
-        )
+        start_idx = common_first_valid_index([ego_records[ego_id]["trajectory"] for ego_id in self.ego_ids])
         if start_idx is None:
             raise RuntimeError("At least one controlled trajectory contains no valid motion data.")
         return int(start_idx)
@@ -649,10 +624,13 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         self,
         *,
         ego: EgoVehicle,
+        ego_rec: dict[str, Any],
         ego_traj_full: np.ndarray,
     ) -> None:
         vehicle_id = int(getattr(ego, "vehicle_ID"))
-        if self.control_mode == "teleport":
+        if self.control_mode == "teleport" or bool(
+            self.config.get("scene_collection_external_controller", False)
+        ):
             start_idx, end_idx, span_len = longest_continuous_active_span_bounds(
                 ego_traj_full,
             )
@@ -670,9 +648,27 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         x0, y0, speed0, lane0 = first_row[:4]
 
         ego.scene_collection_full_traj = np.asarray(ego_traj_full, dtype=float)
+        provider_mask = ego_rec.get("provider_observation_mask")
+        if provider_mask is None:
+            ego.scene_collection_provider_observation_mask = None
+        else:
+            provider_mask = np.asarray(provider_mask, dtype=np.int8)
+            if provider_mask.shape != (len(ego_traj_full),):
+                raise ValueError(
+                    "provider_observation_mask must align one-to-one with the "
+                    f"trajectory for vehicle {vehicle_id}: "
+                    f"{provider_mask.shape} != {(len(ego_traj_full),)}."
+                )
+            if not np.all(np.isin(provider_mask, [-1, 0, 1])):
+                raise ValueError(
+                    "provider_observation_mask may contain only -1 (absent), "
+                    "0 (provider-interpolated), or 1 (image-detected)."
+                )
+            ego.scene_collection_provider_observation_mask = provider_mask.copy()
         ego.scene_collection_start_index = start_index
         ego.scene_collection_end_index = end_index
         ego.scene_collection_is_active = False
+        ego.scene_collection_current_provider_lane_reconciled = False
         ego.scene_collection_real_length = float(getattr(ego, "LENGTH", 0.0))
         ego.scene_collection_real_width = float(getattr(ego, "WIDTH", 0.0))
         ego.scene_collection_spawn_position = np.array([x0, y0], dtype=float)
@@ -686,7 +682,9 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         ego: EgoVehicle,
         row: np.ndarray,
         *,
+        previous_row: np.ndarray | None = None,
         next_row: np.ndarray | None = None,
+        provider_observation_flag: int | None = None,
     ) -> None:
         x, y, speed, lane_id = np.asarray(row, dtype=float)[:4]
         speed = trajectory_step_speed_mps(
@@ -695,39 +693,56 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             sample_frequency_hz=float(self.config["simulation_frequency"]),
         )
         ego.position = np.array([x, y], dtype=float)
-        ego.speed = float(max(speed, 0.0))
-        ego.target_speed = float(max(speed, 0.0))
+        ego.speed = float(speed)
+        ego.target_speed = float(speed)
         ego.visible = True
         ego.scene_collection_is_active = True
         ego.LENGTH = float(getattr(ego, "scene_collection_real_length", ego.LENGTH))
         ego.WIDTH = float(getattr(ego, "scene_collection_real_width", ego.WIDTH))
 
-        mapped_lane_index = target_lane_index_from_lane_id(
+        fallback_heading = float(getattr(ego, "heading", 0.0))
+        mapped_lane_index, provider_lane_reconciled = resolve_target_lane_index_from_row(
             self.road.network,
             self.scene,
-            float(x),
-            int(lane_id),
+            np.asarray(row, dtype=float),
+            vehicle_width_m=float(ego.WIDTH),
+            provider_observation_flag=provider_observation_flag,
         )
+        ego.scene_collection_current_provider_lane_reconciled = bool(provider_lane_reconciled)
         if mapped_lane_index is not None:
             ego.target_lane_index = mapped_lane_index
             ego.lane_index = mapped_lane_index
             ego.lane = self.road.network.get_lane(mapped_lane_index)
             s0, _r0 = ego.lane.local_coordinates(ego.position)
-            ego.heading = float(ego.lane.heading_at(s0))
+            fallback_heading = float(ego.lane.heading_at(s0))
+        ego.heading = self._heading_for_spawn_row(
+            np.asarray(row, dtype=float),
+            previous_row=(None if previous_row is None else np.asarray(previous_row, dtype=float)),
+            next_row=None if next_row is None else np.asarray(next_row, dtype=float),
+            fallback_heading=fallback_heading,
+            prefer_motion=self.control_mode == "teleport",
+            lane_index_override=mapped_lane_index,
+        )
 
     def _heading_for_spawn_row(
         self,
         row: np.ndarray,
         *,
+        previous_row: np.ndarray | None = None,
         next_row: np.ndarray | None = None,
         fallback_heading: float = 0.0,
+        prefer_motion: bool = False,
+        lane_index_override: tuple[str, str, int] | None = None,
     ) -> float:
         return heading_from_trajectory_row(
             self.road.network,
             self.scene,
             row,
+            previous_row=previous_row,
             next_row=next_row,
             fallback_heading=fallback_heading,
+            prefer_motion=prefer_motion,
+            lane_index_override=lane_index_override,
         )
 
     def _vehicle_has_spawn_conflict(self, vehicle: EgoVehicle) -> bool:
@@ -745,11 +760,13 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         ego: EgoVehicle,
         row: np.ndarray,
         *,
+        previous_row: np.ndarray | None = None,
         next_row: np.ndarray | None = None,
     ) -> bool:
         row_arr = np.asarray(row, dtype=float)
         heading = self._heading_for_spawn_row(
             row_arr,
+            previous_row=previous_row,
             next_row=next_row,
             fallback_heading=float(getattr(ego, "heading", 0.0)),
         )
@@ -761,30 +778,6 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             width=float(getattr(ego, "scene_collection_real_width", ego.WIDTH)),
             ignore_entity=ego,
         )
-
-    def _scene_collection_spawn_record(self, ego: EgoVehicle) -> dict[str, Any]:
-        traj = np.asarray(getattr(ego, "scene_collection_full_traj"))
-        start_index = int(getattr(ego, "scene_collection_start_index", 0))
-        row = np.asarray(traj[start_index], dtype=float)
-        next_row = (
-            np.asarray(traj[start_index + 1], dtype=float)
-            if start_index + 1 < len(traj)
-            else None
-        )
-        length = float(getattr(ego, "scene_collection_real_length", ego.LENGTH))
-        width = float(getattr(ego, "scene_collection_real_width", ego.WIDTH))
-        heading = self._heading_for_spawn_row(
-            row,
-            next_row=next_row,
-            fallback_heading=float(getattr(ego, "heading", 0.0)),
-        )
-        position = np.asarray(row[:2], dtype=float)
-        return {
-            "vehicle_id": int(getattr(ego, "vehicle_ID", -1)),
-            "position": position,
-            "diagonal": float(np.hypot(length, width)),
-            "polygon": road_entity_pose_polygon(position, heading, length, width),
-        }
 
     def _scene_collection_min_occupancy_horizon_steps(self, traj_len: int) -> int:
         configured_steps = self.config.get("scene_collection_min_occupancy_steps")
@@ -807,9 +800,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         end_index = int(getattr(ego, "scene_collection_end_index", len(traj) - 1))
         window_start = max(0, min(start_index, horizon_steps))
         window_end = max(window_start, min(end_index + 1, horizon_steps, len(traj)))
-        active_steps = sum(
-            1 for row in traj[window_start:window_end] if trajectory_row_is_active(row)
-        )
+        active_steps = sum(1 for row in traj[window_start:window_end] if trajectory_row_is_active(row))
         return float(active_steps) / float(horizon_steps)
 
     def _scene_collection_spawn_has_min_occupancy(self, ego: EgoVehicle) -> bool:
@@ -817,43 +808,6 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         if min_occupancy <= 0.0:
             return True
         return self._scene_collection_spawn_active_occupancy(ego) >= min_occupancy
-
-    def _scene_collection_spawn_has_conflict(
-        self,
-        ego: EgoVehicle,
-        accepted_spawn_records: list[dict[str, Any]],
-    ) -> bool:
-        if bool(self.config.get("disable_scene_collection_spawn_safety", False)):
-            return False
-
-        traj = np.asarray(getattr(ego, "scene_collection_full_traj"))
-        start_index = int(getattr(ego, "scene_collection_start_index", 0))
-        row = np.asarray(traj[start_index], dtype=float)
-        next_row = (
-            np.asarray(traj[start_index + 1], dtype=float)
-            if start_index + 1 < len(traj)
-            else None
-        )
-        if self._scene_collection_row_has_conflict(ego, row, next_row=next_row):
-            return True
-
-        candidate = self._scene_collection_spawn_record(ego)
-        zero_velocity = np.zeros(2, dtype=float)
-        for accepted in accepted_spawn_records:
-            if (
-                np.linalg.norm(candidate["position"] - accepted["position"])
-                > 0.5 * (candidate["diagonal"] + accepted["diagonal"])
-            ):
-                continue
-            intersecting, _will_intersect, _transition = utils.are_polygons_intersecting(
-                candidate["polygon"],
-                accepted["polygon"],
-                zero_velocity,
-                zero_velocity,
-            )
-            if intersecting:
-                return True
-        return False
 
     def _activate_scene_collection_vehicle(
         self,
@@ -866,34 +820,35 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             return
         traj = np.asarray(getattr(ego, "scene_collection_full_traj"))
         row = np.asarray(traj[step_index], dtype=float)
-        next_row = (
-            np.asarray(traj[step_index + 1], dtype=float)
-            if step_index + 1 < len(traj)
+        previous_row = (
+            np.asarray(traj[step_index - 1], dtype=float)
+            if step_index > 0 and trajectory_row_is_active(traj[step_index - 1])
             else None
         )
-        if (
-            not bool(self.config.get("disable_scene_collection_spawn_safety", False))
-            and self._scene_collection_row_has_conflict(ego, row, next_row=next_row)
+        next_row = np.asarray(traj[step_index + 1], dtype=float) if step_index + 1 < len(traj) else None
+        if not bool(
+            self.config.get("disable_scene_collection_spawn_safety", False)
+        ) and self._scene_collection_row_has_conflict(
+            ego,
+            row,
+            previous_row=previous_row,
+            next_row=next_row,
         ):
             self._deactivate_scene_collection_vehicle(ego)
             return
-        if not force_replay:
+        if not force_replay and not bool(
+            self.config.get("scene_collection_external_controller", False)
+        ):
             vehicle_id = int(getattr(ego, "vehicle_ID"))
             expert_state = self._expert_state_by_vehicle_id.get(vehicle_id)
             if not isinstance(expert_state, dict):
-                raise RuntimeError(
-                    "Scene-collection activation has no expert tracker for "
-                    f"vehicle {vehicle_id}."
-                )
+                raise RuntimeError(f"Scene-collection activation has no expert tracker for vehicle {vehicle_id}.")
             tracker = expert_state.get("tracker")
             if tracker is None or not callable(getattr(tracker, "reset", None)):
                 raise RuntimeError(
-                    "Scene-collection activation has an invalid expert tracker "
-                    f"for vehicle {vehicle_id}."
+                    f"Scene-collection activation has an invalid expert tracker for vehicle {vehicle_id}."
                 )
-            start_index = int(
-                getattr(ego, "scene_collection_start_index", 0)
-            )
+            start_index = int(getattr(ego, "scene_collection_start_index", 0))
             tracker_offset = int(step_index) - start_index
             if tracker_offset < 0:
                 raise RuntimeError(
@@ -902,10 +857,26 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 )
             tracker.reset(k0=tracker_offset)
             expert_state["activation_tracker_offset"] = tracker_offset
-        self._set_scene_collection_vehicle_from_row(ego, row, next_row=next_row)
+        self._set_scene_collection_vehicle_from_row(
+            ego,
+            row,
+            previous_row=previous_row,
+            next_row=next_row,
+            provider_observation_flag=(
+                None
+                if getattr(
+                    ego,
+                    "scene_collection_provider_observation_mask",
+                    None,
+                )
+                is None
+                else int(ego.scene_collection_provider_observation_mask[step_index])
+            ),
+        )
 
     def _deactivate_scene_collection_vehicle(self, ego: EgoVehicle) -> None:
         ego.scene_collection_is_active = False
+        ego.scene_collection_current_provider_lane_reconciled = False
         ego.visible = False
         ego.position = np.array(getattr(ego, "scene_collection_padding_position"), dtype=float)
         ego.speed = 0.0
@@ -950,25 +921,16 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         observation.  Teleport collection follows its separate in-step path.
         """
 
-        if (
-            not self.scene_dataset_collection_mode
-            or self.control_mode == "teleport"
-        ):
+        if not self.scene_dataset_collection_mode or self.control_mode == "teleport":
             return obs, {}
-        self._sync_scene_collection_controlled_vehicles(
-            step_index=int(self.steps)
-        )
+        self._sync_scene_collection_controlled_vehicles(step_index=int(self.steps))
         refreshed = self.observation_type.observe()
         return refreshed, self._info(refreshed, action)
 
-    def _processed_trajectory_cache_key(
-        self, episode_name: str, vehicle_id: int
-    ) -> tuple[str, str, str, int]:
+    def _processed_trajectory_cache_key(self, episode_name: str, vehicle_id: int) -> tuple[str, str, str, int]:
         return (self._prebuilt_dir, self.scene, episode_name, int(vehicle_id))
 
-    def _load_processed_ego_trajectory(
-        self, ego_id: int, ego_rec: dict[str, Any]
-    ) -> np.ndarray:
+    def _load_processed_ego_trajectory(self, ego_id: int, ego_rec: dict[str, Any]) -> np.ndarray:
         cache_key = self._processed_trajectory_cache_key(self.episode_name, ego_id)
         cached = self._PROCESSED_TRAJECTORY_CACHE.get(cache_key)
         if cached is None:
@@ -976,9 +938,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             self._PROCESSED_TRAJECTORY_CACHE[cache_key] = cached
         return cached
 
-    def _expert_reference_cache_key(
-        self, ego_id: int, ego_len: float
-    ) -> tuple[str, str, str, int, int, float]:
+    def _expert_reference_cache_key(self, ego_id: int, ego_len: float) -> tuple[str, str, str, int, int, float]:
         return (
             self._prebuilt_dir,
             self.scene,
@@ -988,9 +948,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             round(float(ego_len), 4),
         )
 
-    def _setup_expert_tracker(
-        self, ego_id: int, ego_traj_full: np.ndarray, ego_len: float
-    ) -> None:
+    def _setup_expert_tracker(self, ego_id: int, ego_traj_full: np.ndarray, ego_len: float) -> None:
         cache_key = self._expert_reference_cache_key(ego_id, ego_len)
         cached = self._EXPERT_REFERENCE_CACHE.get(cache_key)
         if cached is None:
@@ -1007,7 +965,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             max_steer=MAX_STEER,
             Ld0=5.0,
             Ld_k=0.6,
-            kp_v=0.8,
+            kp_v=float(self.config.get("expert_tracker_kp_v", 0.8)),
             steer_rate_limit=6.0,
             steer_lpf_tau=0.15,
             jerk_limit=10.0,
@@ -1048,14 +1006,9 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             scene=self.scene,
             allow_idm=bool(self.config.get("allow_idm", True)),
         )
-    
+
     def visualize(
-        self,
-        steps: int | None = None,
-        width: int = 1200,
-        height: int = 600,
-        scaling: float = 5.5,
-        mode: str = "all"
+        self, steps: int | None = None, width: int = 1200, height: int = 600, scaling: float = 5.5, mode: str = "all"
     ):
         """
         Visualize the environment.
@@ -1129,8 +1082,6 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
 
         else:
             raise ValueError(f"Unknown mode={mode!r}. Expected 'road' or 'all'.")
-            
-
 
     # -------------------------------------------------------------------------
     # INFO / REWARDS / TERMINATION
@@ -1198,8 +1149,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         metrics: list[dict[str, float | int | bool | str]] = []
         crash_flags = [bool(getattr(vehicle, "crashed", False)) for vehicle in self.controlled_vehicles]
         offroad_flags = [
-            (not bool(getattr(vehicle, "completed", False)))
-            and (not bool(getattr(vehicle, "on_road", True)))
+            (not bool(getattr(vehicle, "completed", False))) and (not bool(getattr(vehicle, "on_road", True)))
             for vehicle in self.controlled_vehicles
         ]
         for idx, vehicle in enumerate(self.controlled_vehicles):
@@ -1242,21 +1192,14 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         policy_vehicles = self._policy_controlled_vehicles()
         termination_vehicles = self._termination_vehicles()
         info["speed"] = [float(vehicle.speed) for vehicle in policy_vehicles]
-        info["all_controlled_vehicle_speeds"] = [
-            float(vehicle.speed) for vehicle in self.controlled_vehicles
-        ]
-        info["crashed"] = all(
-            vehicle.crashed for vehicle in termination_vehicles
-        ) if termination_vehicles else False
+        info["all_controlled_vehicle_speeds"] = [float(vehicle.speed) for vehicle in self.controlled_vehicles]
+        info["crashed"] = all(vehicle.crashed for vehicle in termination_vehicles) if termination_vehicles else False
         info["alive_controlled_vehicle_ids"] = [
             getattr(vehicle, "vehicle_ID", None)
             for vehicle in self.controlled_vehicles
             if not vehicle.crashed
             and not bool(getattr(vehicle, "completed", False))
-            and (
-                not self.scene_dataset_collection_mode
-                or bool(getattr(vehicle, "scene_collection_is_active", False))
-            )
+            and (not self.scene_dataset_collection_mode or bool(getattr(vehicle, "scene_collection_is_active", False)))
         ]
         info["support_vehicle_ids"] = [
             getattr(vehicle, "vehicle_ID", None)
@@ -1265,24 +1208,18 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         ]
         info["requested_controlled_vehicle_ids"] = list(self.ego_ids)
         info["controlled_vehicle_ids"] = [
-            int(getattr(vehicle, "vehicle_ID", -1))
-            for vehicle in self.controlled_vehicles
+            int(getattr(vehicle, "vehicle_ID", -1)) for vehicle in self.controlled_vehicles
         ]
-        info["controlled_vehicle_crashes"] = [
-            bool(vehicle.crashed) for vehicle in self.controlled_vehicles
-        ]
+        info["controlled_vehicle_crashes"] = [bool(vehicle.crashed) for vehicle in self.controlled_vehicles]
         info["controlled_vehicle_completed"] = [
-            bool(getattr(vehicle, "completed", False))
-            for vehicle in self.controlled_vehicles
+            bool(getattr(vehicle, "completed", False)) for vehicle in self.controlled_vehicles
         ]
         info["controlled_vehicle_on_road"] = [
-            bool(getattr(vehicle, "completed", False))
-            or bool(getattr(vehicle, "on_road", True))
+            bool(getattr(vehicle, "completed", False)) or bool(getattr(vehicle, "on_road", True))
             for vehicle in self.controlled_vehicles
         ]
         info["controlled_vehicle_offroad"] = [
-            (not bool(getattr(vehicle, "completed", False)))
-            and (not bool(getattr(vehicle, "on_road", True)))
+            (not bool(getattr(vehicle, "completed", False))) and (not bool(getattr(vehicle, "on_road", True)))
             for vehicle in self.controlled_vehicles
         ]
         info["controlled_vehicle_collision_partners"] = [
@@ -1311,21 +1248,15 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             }
             for vehicle in self.controlled_vehicles
         ]
-        controlled_identities = {
-            id(vehicle) for vehicle in self.controlled_vehicles
-        }
+        controlled_identities = {id(vehicle) for vehicle in self.controlled_vehicles}
         info["background_idm_handovers"] = [
             {
                 "vehicle_id": int(getattr(vehicle, "vehicle_ID", -1)),
                 "handover_step": int(vehicle.idm_handover_step),
-                "reason": str(
-                    getattr(vehicle, "idm_handover_reason", None)
-                    or "unspecified"
-                ),
+                "reason": str(getattr(vehicle, "idm_handover_reason", None) or "unspecified"),
             }
             for vehicle in list(getattr(self.road, "vehicles", ()) or ())
-            if id(vehicle) not in controlled_identities
-            and getattr(vehicle, "idm_handover_step", None) is not None
+            if id(vehicle) not in controlled_identities and getattr(vehicle, "idm_handover_step", None) is not None
         ]
         if bool(self.config.get("enable_interaction_metrics", False)):
             info["controlled_vehicle_interaction_metrics"] = self.controlled_vehicle_interaction_metrics()
@@ -1340,14 +1271,11 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         crashes = [float(vehicle.crashed) for vehicle in termination_vehicles]
         return {
             "collision_reward": max(crashes) if crashes else 0.0,
-            "all_controlled_crashed": float(
-                all(vehicle.crashed for vehicle in termination_vehicles)
-            ) if termination_vehicles else 0.0,
+            "all_controlled_crashed": float(all(vehicle.crashed for vehicle in termination_vehicles))
+            if termination_vehicles
+            else 0.0,
             "all_controlled_terminal": float(
-                all(
-                    self._vehicle_is_terminal(vehicle)
-                    for vehicle in termination_vehicles
-                )
+                all(self._vehicle_is_terminal(vehicle) for vehicle in termination_vehicles)
             )
             if termination_vehicles
             else 0.0,
@@ -1362,16 +1290,12 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             return False
 
         if self.config.get("terminate_when_all_controlled_crashed", True):
-            return all(
-                self._vehicle_is_terminal(vehicle) for vehicle in termination_vehicles
-            )
+            return all(self._vehicle_is_terminal(vehicle) for vehicle in termination_vehicles)
         return any(self._vehicle_is_terminal(vehicle) for vehicle in termination_vehicles)
 
     @staticmethod
     def _vehicle_is_terminal(vehicle: EgoVehicle) -> bool:
-        return bool(getattr(vehicle, "crashed", False)) or bool(
-            getattr(vehicle, "completed", False)
-        )
+        return bool(getattr(vehicle, "crashed", False)) or bool(getattr(vehicle, "completed", False))
 
     def _is_truncated(self) -> bool:
         max_steps_cfg = self.config.get("max_episode_steps", None)
@@ -1399,13 +1323,9 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
             if self.config.get("action", {}).get("type") == "MultiAgentAction":
                 resolved_actions = []
                 for vehicle in self.controlled_vehicles:
-                    a_i, a_cont_i, a_str_i, a_idx_i = self._resolve_expert_action(
-                        vehicle=vehicle
-                    )
+                    a_i, a_cont_i, a_str_i, a_idx_i = self._resolve_expert_action(vehicle=vehicle)
                     resolved_actions.append(a_i)
-                    expert_actions.append(
-                        a_cont_i.copy() if a_cont_i is not None else None
-                    )
+                    expert_actions.append(a_cont_i.copy() if a_cont_i is not None else None)
                     expert_action_strs.append(a_str_i)
                     expert_action_idxs.append(a_idx_i)
 
@@ -1415,12 +1335,8 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                     expert_action_str = expert_action_strs[0]
                     expert_action_idx = expert_action_idxs[0]
             else:
-                action, expert_action, expert_action_str, expert_action_idx = (
-                    self._resolve_expert_action()
-                )
-                expert_actions = [
-                    expert_action.copy() if expert_action is not None else None
-                ]
+                action, expert_action, expert_action_str, expert_action_idx = self._resolve_expert_action()
+                expert_actions = [expert_action.copy() if expert_action is not None else None]
                 expert_action_strs = [expert_action_str]
                 expert_action_idxs = [expert_action_idx]
 
@@ -1429,9 +1345,7 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
         # -----------------------------------------------------------
         if self.scene_dataset_collection_mode and self.control_mode == "teleport":
             if self.road is None or self.vehicle is None:
-                raise NotImplementedError(
-                    "The road and vehicle must be initialized in the environment implementation"
-                )
+                raise NotImplementedError("The road and vehicle must be initialized in the environment implementation")
 
             self.time += 1 / self.config["policy_frequency"]
             self._simulate(action)
@@ -1451,17 +1365,14 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
 
         info["applied_action"] = action
         info["expert_controlled_vehicle_ids"] = [
-            int(getattr(vehicle, "vehicle_ID", -1))
-            for vehicle in self.controlled_vehicles
+            int(getattr(vehicle, "vehicle_ID", -1)) for vehicle in self.controlled_vehicles
         ]
         if isinstance(action, tuple):
             info["applied_actions"] = tuple(action)
         if expert_action is not None:
             info["expert_action_continuous"] = expert_action.copy()
         if expert_actions:
-            info["expert_action_continuous_all"] = [
-                a.copy() if a is not None else None for a in expert_actions
-            ]
+            info["expert_action_continuous_all"] = [a.copy() if a is not None else None for a in expert_actions]
         if expert_action_str is not None:
             info["expert_action_discrete"] = expert_action_str
             info["expert_action_discrete_idx"] = expert_action_idx
@@ -1476,18 +1387,14 @@ class NGSimEnv(NGSimExpertMixin, AbstractEnv):
                 if expert_state is not None:
                     expert_state["replay_xy"].append(vehicle.position.copy())
             if self.vehicle is not None:
-                expert_state = self._expert_state_by_vehicle_id.get(
-                    int(self.vehicle.vehicle_ID)
-                )
+                expert_state = self._expert_state_by_vehicle_id.get(int(self.vehicle.vehicle_ID))
                 if expert_state is not None:
                     self._replay_xy_pol = list(expert_state["replay_xy"])
 
         if self.scene_dataset_collection_mode and self.control_mode != "teleport":
-            obs, refreshed_info = (
-                self._refresh_scene_collection_observation_after_sync(
-                    obs,
-                    action,
-                )
+            obs, refreshed_info = self._refresh_scene_collection_observation_after_sync(
+                obs,
+                action,
             )
             info.update(refreshed_info)
 

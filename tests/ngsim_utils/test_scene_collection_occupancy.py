@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from highway_env.envs.ngsim_env import NGSimEnv
-from scripts_gail import build_ps_traj_expert_discrete as collector
+from policy.data import collect_expert as collector
 
 
 def _active_traj(length: int, start: int = 0, end: int | None = None) -> np.ndarray:
@@ -118,11 +118,9 @@ def test_poststep_activation_refreshes_the_observation_before_return():
     env.observation_type = Observation()
     env._info = info
 
-    refreshed, refreshed_info = (
-        env._refresh_scene_collection_observation_after_sync(
-            np.asarray([-1.0]),
-            np.zeros(2, dtype=np.float32),
-        )
+    refreshed, refreshed_info = env._refresh_scene_collection_observation_after_sync(
+        np.asarray([-1.0]),
+        np.zeros(2, dtype=np.float32),
     )
 
     assert state["observed_after_sync"]
@@ -133,14 +131,114 @@ def test_poststep_activation_refreshes_the_observation_before_return():
     )
 
 
+def test_teleport_scene_replay_uses_only_past_recorded_motion_heading():
+    class Lane:
+        @staticmethod
+        def local_coordinates(_position):
+            return 0.0, 0.0
+
+        @staticmethod
+        def heading_at(_longitudinal):
+            return 0.0
+
+    class Network:
+        @staticmethod
+        def get_lane(_lane_index):
+            return Lane()
+
+    env = NGSimEnv.__new__(NGSimEnv)
+    env.scene = "japanese"
+    env.config = {
+        "simulation_frequency": 10,
+        "source_preserving_trajectory_state": True,
+    }
+    env.road = SimpleNamespace(network=Network())
+    ego = SimpleNamespace(
+        heading=0.0,
+        LENGTH=4.5,
+        WIDTH=1.8,
+        scene_collection_real_length=4.5,
+        scene_collection_real_width=1.8,
+    )
+    row = np.asarray([10.0, 2.0, 12.0, 1.0])
+    previous_row = np.asarray([9.0, 1.8, 12.0, 1.0])
+    next_row = np.asarray([11.0, 2.2, 12.0, 1.0])
+
+    env.control_mode = "teleport"
+    env._set_scene_collection_vehicle_from_row(
+        ego,
+        row,
+        previous_row=previous_row,
+        next_row=next_row,
+    )
+    assert ego.heading == pytest.approx(np.arctan2(0.2, 1.0))
+
+    # Metamorphic causal check: changing every future coordinate cannot alter
+    # the actor-visible pose at the current row.
+    future_perturbed = np.asarray([-400.0, 900.0, 12.0, 1.0])
+    env._set_scene_collection_vehicle_from_row(
+        ego,
+        row,
+        previous_row=previous_row,
+        next_row=future_perturbed,
+    )
+    assert ego.heading == pytest.approx(np.arctan2(0.2, 1.0))
+
+    env.control_mode = "continuous"
+    env._set_scene_collection_vehicle_from_row(
+        ego,
+        row,
+        previous_row=previous_row,
+        next_row=next_row,
+    )
+    assert ego.heading == pytest.approx(0.0)
+
+
+def test_source_preserving_scene_replay_rejects_negative_speed_without_source_mutation():
+    env = NGSimEnv.__new__(NGSimEnv)
+    env.scene = "japanese"
+    env.control_mode = "teleport"
+    env.config = {
+        "simulation_frequency": 10,
+        "source_preserving_trajectory_state": True,
+    }
+
+    class Lane:
+        @staticmethod
+        def local_coordinates(_position):
+            return 0.0, 0.0
+
+        @staticmethod
+        def heading_at(_longitudinal):
+            return 0.0
+
+    class Network:
+        @staticmethod
+        def get_lane(_lane_index):
+            return Lane()
+
+    env.road = SimpleNamespace(network=Network())
+    ego = SimpleNamespace(
+        heading=0.0,
+        LENGTH=4.5,
+        WIDTH=1.8,
+        scene_collection_real_length=4.5,
+        scene_collection_real_width=1.8,
+    )
+
+    row = np.asarray([10.0, 2.0, -0.1, 1.0])
+    source_copy = row.copy()
+    with pytest.raises(ValueError, match="negative recorded speed"):
+        env._set_scene_collection_vehicle_from_row(ego, row)
+    np.testing.assert_array_equal(row, source_copy)
+
+
 def test_delayed_scene_activation_resets_tracker_to_source_relative_offset():
     env = NGSimEnv.__new__(NGSimEnv)
     env.config = {"disable_scene_collection_spawn_safety": True}
     env.control_mode = "continuous"
     reset_offsets: list[int] = []
-    tracker = SimpleNamespace(
-        reset=lambda *, k0=0: reset_offsets.append(int(k0))
-    )
+    tracker = SimpleNamespace(reset=lambda *, k0=0: reset_offsets.append(int(k0)))
     env._expert_state_by_vehicle_id = {7: {"tracker": tracker}}
     ego = SimpleNamespace(
         vehicle_ID=7,
@@ -149,17 +247,108 @@ def test_delayed_scene_activation_resets_tracker_to_source_relative_offset():
         scene_collection_full_traj=_active_traj(12, start=3),
     )
 
-    def activate_from_row(_ego, _row, *, next_row=None):
+    def activate_from_row(
+        _ego,
+        _row,
+        *,
+        previous_row=None,
+        next_row=None,
+        provider_observation_flag=None,
+    ):
+        assert previous_row is not None
         assert next_row is not None
+        assert provider_observation_flag is None
         _ego.scene_collection_is_active = True
 
     env._set_scene_collection_vehicle_from_row = activate_from_row
 
     env._activate_scene_collection_vehicle(ego, step_index=5)
     assert reset_offsets == [2]
-    assert env._expert_state_by_vehicle_id[7][
-        "activation_tracker_offset"
-    ] == 2
+    assert env._expert_state_by_vehicle_id[7]["activation_tracker_offset"] == 2
 
     env._activate_scene_collection_vehicle(ego, step_index=6)
     assert reset_offsets == [2]
+
+
+def test_external_scene_controller_configures_active_span_without_privileged_tracker():
+    env = NGSimEnv.__new__(NGSimEnv)
+    env.config = {"scene_collection_external_controller": True}
+    env.control_mode = "continuous"
+    env._expert_state_by_vehicle_id = {}
+    env._deactivate_scene_collection_vehicle = lambda _ego: setattr(
+        _ego, "scene_collection_is_active", False
+    )
+    ego = SimpleNamespace(vehicle_ID=7, LENGTH=4.5, WIDTH=1.8)
+    traj = _active_traj(12, start=3, end=10)
+
+    env._configure_scene_collection_vehicle(
+        ego=ego,
+        ego_rec={},
+        ego_traj_full=traj,
+    )
+
+    assert ego.scene_collection_start_index == 3
+    assert ego.scene_collection_end_index == 9
+    np.testing.assert_array_equal(ego.scene_collection_spawn_position, [4.0, 1.0])
+    assert ego.scene_collection_spawn_speed == pytest.approx(1.0)
+
+
+def test_external_scene_controller_activation_does_not_require_privileged_tracker():
+    env = NGSimEnv.__new__(NGSimEnv)
+    env.config = {
+        "disable_scene_collection_spawn_safety": True,
+        "scene_collection_external_controller": True,
+    }
+    env.control_mode = "continuous"
+    env._expert_state_by_vehicle_id = {}
+    ego = SimpleNamespace(
+        vehicle_ID=7,
+        scene_collection_is_active=False,
+        scene_collection_start_index=3,
+        scene_collection_provider_observation_mask=None,
+        scene_collection_full_traj=_active_traj(12, start=3),
+    )
+    activations: list[int] = []
+
+    def activate_from_row(
+        _ego,
+        _row,
+        *,
+        previous_row=None,
+        next_row=None,
+        provider_observation_flag=None,
+    ):
+        assert previous_row is not None
+        assert next_row is not None
+        assert provider_observation_flag is None
+        activations.append(1)
+        _ego.scene_collection_is_active = True
+
+    env._set_scene_collection_vehicle_from_row = activate_from_row
+
+    env._activate_scene_collection_vehicle(ego, step_index=5)
+
+    assert activations == [1]
+    assert ego.scene_collection_is_active
+
+
+def test_scene_collection_conflicts_are_checked_at_actual_activation_time():
+    env = NGSimEnv.__new__(NGSimEnv)
+    env.config = {"disable_scene_collection_spawn_safety": False}
+    env.control_mode = "continuous"
+    tracker_resets: list[int] = []
+    env._expert_state_by_vehicle_id = {7: {"tracker": SimpleNamespace(reset=lambda *, k0=0: tracker_resets.append(k0))}}
+    ego = SimpleNamespace(
+        vehicle_ID=7,
+        scene_collection_is_active=False,
+        scene_collection_start_index=3,
+        scene_collection_full_traj=_active_traj(12, start=3),
+    )
+    deactivated: list[int] = []
+    env._scene_collection_row_has_conflict = lambda _ego, _row, *, previous_row=None, next_row=None: True
+    env._deactivate_scene_collection_vehicle = lambda _ego: deactivated.append(int(_ego.vehicle_ID))
+
+    env._activate_scene_collection_vehicle(ego, step_index=5)
+
+    assert deactivated == [7]
+    assert tracker_resets == []

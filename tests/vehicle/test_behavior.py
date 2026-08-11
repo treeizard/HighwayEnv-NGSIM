@@ -1,12 +1,17 @@
+import numpy as np
 import pytest
-
-from highway_env.ngsim_utils.road.gen_road import create_ngsim_101_road
-from highway_env.ngsim_utils.road.lane_mapping import target_lane_index_from_lane_id
+from highway_env.ngsim_utils.road.gen_road import (
+    create_japanese_road,
+    create_ngsim_101_road,
+)
+from highway_env.ngsim_utils.road.lane_mapping import (
+    resolve_target_lane_index_from_row,
+    target_lane_index_from_lane_id,
+)
 from highway_env.road.road import Road, RoadNetwork
 from highway_env.vehicle.behavior import IDMVehicle
 from highway_env.vehicle.controller import ControlledVehicle
 from highway_env.vehicle.objects import Obstacle
-
 
 FPS = 15
 
@@ -129,15 +134,53 @@ def test_ngsim_lane_mapping_uses_canonical_positive_lane_ids():
 
     assert target_lane_index_from_lane_id(net, "us-101", 200.0, 6) == ("s2", "s3", 5)
     assert target_lane_index_from_lane_id(net, "us-101", 200.0, 7) == (
+        "s2",
+        "s3",
+        5,
+    )
+    assert target_lane_index_from_lane_id(net, "us-101", 160.0, 7) == (
         "merge_in",
         "s2",
         0,
     )
-    assert target_lane_index_from_lane_id(net, "us-101", 500.0, 8) == (
+    assert target_lane_index_from_lane_id(net, "us-101", 450.0, 8) == (
         "s3",
         "merge_out",
         0,
     )
+    assert target_lane_index_from_lane_id(net, "us-101", 420.0, 8) == (
+        "s2",
+        "s3",
+        5,
+    )
+    assert target_lane_index_from_lane_id(net, "us-101", 500.0, 8) is None
+
+
+def test_japanese_interpolated_stale_lane_id_uses_only_current_pose():
+    net = create_japanese_road()
+    expected = ("b", "c", 1)
+    position = net.get_lane(expected).position(20.0, 0.0)
+    row = np.asarray([position[0], position[1], 20.0, 3.0], dtype=float)
+
+    detected, detected_changed = resolve_target_lane_index_from_row(
+        net,
+        "japanese",
+        row,
+        vehicle_width_m=1.7,
+        provider_observation_flag=1,
+    )
+    interpolated, interpolated_changed = resolve_target_lane_index_from_row(
+        net,
+        "japanese",
+        row,
+        vehicle_width_m=1.7,
+        provider_observation_flag=0,
+    )
+
+    assert detected == ("b", "c", 2)
+    assert detected_changed is False
+    assert interpolated == expected
+    assert interpolated_changed is True
 
 
 def test_low_speed_steering_control_does_not_saturate_to_max_lock():

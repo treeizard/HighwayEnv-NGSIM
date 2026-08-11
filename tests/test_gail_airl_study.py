@@ -1,26 +1,25 @@
 from __future__ import annotations
 
 import json
-import sys
 
 import pytest
 import torch
-from scripts_gail import build_gail_airl_study
-from scripts_gail.ps_gail.config import PSGAILConfig
-from scripts_gail.ps_gail.experiment import (
+
+from execution.monitoring import WandbMonitor
+from policy.contracts.training_config import PSGAILConfig
+from policy.evaluation.health import (
+    TrainingHealthMonitor,
+    health_warning_metrics,
+    partition_health_reasons,
+)
+from studies.policy_experiment import (
     config_hash,
     policy_relative_l2_delta,
     resolve_algorithm_variant,
     write_evaluation_summary,
     write_run_manifest,
 )
-from scripts_gail.ps_gail.health import (
-    TrainingHealthMonitor,
-    health_warning_metrics,
-    partition_health_reasons,
-)
-from scripts_gail.ps_gail.monitoring import WandbMonitor
-from scripts_gail.ps_gail.study import (
+from studies.policy_matrix import (
     assess_evaluation_summary,
     build_screening_trials,
     safety_thresholds,
@@ -102,6 +101,7 @@ def test_screening_study_has_preregistered_balanced_24_trials_per_method(tmp_pat
         episode_root="episodes",
         bc_checkpoint="bc.pt",
         bc_policy_config={"transformer_layers": 3, "hidden_size": 192},
+        allow_historical_bc_warm_start=True,
     )
     assert len(trials) == 48
     for method in ("gail", "airl"):
@@ -131,6 +131,15 @@ def test_screening_study_has_preregistered_balanced_24_trials_per_method(tmp_pat
     assert len((tmp_path / "commands.txt").read_text().splitlines()) == 48
     assert json.loads((tmp_path / "trials.json").read_text())["trial_count"] == 48
     assert paths["manifest"].endswith("trials.json")
+
+
+def test_historical_bc_warm_start_matrix_is_blocked_by_default():
+    with pytest.raises(RuntimeError, match="historical-only"):
+        build_screening_trials(
+            expert_data="expert",
+            episode_root="episodes",
+            bc_checkpoint="bc.pt",
+        )
 
 
 def test_safety_gate_uses_expert_relative_floors_and_rejects_nonfinite():
@@ -298,56 +307,3 @@ def test_policy_delta_and_durable_compact_metric_reporting(tmp_path):
     assert rows[0]["step"] == 1
     assert rows[0]["validation/score"] == pytest.approx(-3.0)
     assert rows[0]["nonfinite"] is None
-
-
-def test_study_cli_requires_and_propagates_validated_bc_architecture(tmp_path, monkeypatch):
-    bc_dir = tmp_path / "bc"
-    bc_dir.mkdir()
-    checkpoint = bc_dir / "best.pt"
-    torch.save(
-        {
-            "checkpoint_kind": "behaviour_cloning_warm_start",
-            "config": {
-                "policy_model": "recurrent_transformer",
-                "hidden_size": 192,
-                "transformer_layers": 3,
-                "transformer_heads": 4,
-            },
-            "policy_state_dict": {},
-        },
-        checkpoint,
-    )
-    (bc_dir / "summary.json").write_text(
-        json.dumps(
-            {
-                "checkpoint_purpose": "warm_start",
-                "checkpoint_saved": True,
-                "warm_start_passed": True,
-                "configured_epochs": 2,
-                "relative_validation_improvement": 0.1,
-            }
-        )
-    )
-    output = tmp_path / "study"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "build_gail_airl_study",
-            "--bc-checkpoint",
-            str(checkpoint),
-            "--expert-data",
-            str(tmp_path / "expert"),
-            "--episode-root",
-            str(tmp_path / "episodes"),
-            "--output-dir",
-            str(output),
-        ],
-    )
-
-    build_gail_airl_study.main()
-
-    payload = json.loads((output / "trials.json").read_text())
-    assert payload["trial_count"] == 48
-    assert all(row["arguments"]["hidden_size"] == 192 for row in payload["trials"])
-    assert all(row["arguments"]["transformer_layers"] == 3 for row in payload["trials"])

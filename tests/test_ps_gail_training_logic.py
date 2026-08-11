@@ -1,16 +1,15 @@
 import ast
-from dataclasses import fields, replace
 import json
 import re
 import sys
 import types
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 from torch.distributions import Categorical
-
 
 try:
     import gymnasium  # noqa: F401
@@ -77,8 +76,10 @@ except ModuleNotFoundError:
     sys.modules["gymnasium.utils"] = utils
     sys.modules["gymnasium.wrappers"] = wrappers
 
-from scripts_gail.ps_gail.config import PSGAILConfig
-from scripts_gail.ps_gail.data import (
+import policy.evaluation.closed_loop as eval_mod
+import policy.evaluation.steering_diagnostics as steering_diag_mod
+from policy.contracts.training_config import PSGAILConfig
+from policy.data.expert import (
     ACTION_CONTINUOUS_ENV_COLUMNS,
     ACTION_CONTINUOUS_ENV_KEY,
     ACTION_STEERING_ACCELERATION_COLUMNS,
@@ -90,16 +91,7 @@ from scripts_gail.ps_gail.data import (
     standardize_features,
     transform_sequence_features,
 )
-from scripts_gail.ps_gail.training import evaluation as eval_mod
-from scripts_gail.ps_gail.training import rollouts as rollout_module
-from scripts_gail.ps_gail.validation import (
-    best_checkpoint_payload,
-    closed_loop_policy_quality,
-)
-from scripts_gail.ps_gail.validation import scored_validation_metrics
-from scripts_gail.ps_gail.validation import validation_cost_and_score
-import scripts_gail.ps_gail.steering_diagnostics as steering_diag_mod
-from scripts_gail.ps_gail.steering_diagnostics import (
+from policy.evaluation.steering_diagnostics import (
     STEERING_HISTOGRAM_BINS,
     policy_safe_steering_vendi_metrics,
     safe_policy_steering_actions,
@@ -108,54 +100,63 @@ from scripts_gail.ps_gail.steering_diagnostics import (
     steering_vendi_metrics,
     steering_windows,
 )
-from scripts_gail.ps_gail.vendi import safe_sequence_window_mask, vendi_score
-from scripts_gail.ps_gail.models import (
-    SequenceTrajectoryDiscriminator,
-    TrajectoryDiscriminator,
-    make_actor_critic,
+from policy.evaluation.validation import (
+    best_checkpoint_payload,
+    closed_loop_policy_quality,
+    scored_validation_metrics,
+    validation_cost_and_score,
 )
-from scripts_gail.ps_gail.trainer import (
+from policy.evaluation.vendi import safe_sequence_window_mask, vendi_score
+from policy.methods.gail import rollouts as rollout_module
+from policy.methods.gail.airl import (
+    AIRLReward,
+    _airl_wgan_gradient_penalty,
+    _build_recurrent_trajectory_index,
+    _recurrent_policy_log_probs_for_indices,
+    append_airl_replay,
+    concat_airl_replay,
+    load_airl_resume_checkpoint,
+    refresh_airl_rewards,
+    update_reward_model,
+)
+from policy.methods.gail.airl import config_for_round as airl_config_for_round
+from policy.methods.gail.airl import parse_args as airl_parse_args
+from policy.methods.gail.policy import _actions_to_env_tuple
+from policy.methods.gail.ppo import (
+    PPO_KL_MAX_BACKTRACKS,
+    _clipped_value_loss,
+    _optimizer_step_with_kl_backtracking,
+    _validated_expert_actions,
+)
+from policy.methods.gail.train import behavior_clone_pretrain
+from policy.methods.gail.train import config_for_round as ps_gail_config_for_round
+from policy.methods.gail.train import parse_args as ps_gail_parse_args
+from policy.methods.gail.trainer import (
     RolloutBatch,
     central_critic_observation_dim,
     central_critic_observations,
     combine_primary_env_challenge_rewards,
     configure_policy_action_std,
     discriminator_reward,
-    policy_distribution_and_values,
-    policy_distribution_values_memory,
     player_challenge_bonus,
     player_challenge_payoff,
     player_challenge_pressure_from_metric,
+    policy_distribution_and_values,
+    policy_distribution_values_memory,
     refresh_rollout_rewards,
-    sequence_rewards_to_transition_rewards,
     select_hard_discriminator_examples,
+    sequence_rewards_to_transition_rewards,
     shape_rollout_rewards,
     subsample_rollout_for_training,
     update_discriminator,
     update_policy,
 )
-from scripts_gail.ps_gail.training.ppo import (
-    PPO_KL_MAX_BACKTRACKS,
-    _clipped_value_loss,
-    _optimizer_step_with_kl_backtracking,
-    _validated_expert_actions,
+from policy.methods.iq_legacy import convergence_reached, convergence_score
+from policy.models.recurrent import (
+    SequenceTrajectoryDiscriminator,
+    TrajectoryDiscriminator,
+    make_actor_critic,
 )
-from scripts_gail.ps_gail.training.policy import _actions_to_env_tuple
-from scripts_gail.train_simple_ps_gail import behavior_clone_pretrain
-from scripts_gail.train_simple_ps_gail import config_for_round as ps_gail_config_for_round
-from scripts_gail.train_simple_ps_gail import parse_args as ps_gail_parse_args
-from scripts_gail.train_simple_airl import AIRLReward
-from scripts_gail.train_simple_airl import _airl_wgan_gradient_penalty
-from scripts_gail.train_simple_airl import _build_recurrent_trajectory_index
-from scripts_gail.train_simple_airl import _recurrent_policy_log_probs_for_indices
-from scripts_gail.train_simple_airl import append_airl_replay
-from scripts_gail.train_simple_airl import concat_airl_replay
-from scripts_gail.train_simple_airl import config_for_round as airl_config_for_round
-from scripts_gail.train_simple_airl import load_airl_resume_checkpoint
-from scripts_gail.train_simple_airl import parse_args as airl_parse_args
-from scripts_gail.train_simple_airl import refresh_airl_rewards
-from scripts_gail.train_simple_airl import update_reward_model
-from scripts_gail.train_simple_iq_learn import convergence_reached, convergence_score
 
 
 def test_action_std_configuration_is_opt_in_action_specific_and_bounded():
@@ -1205,7 +1206,11 @@ def test_all_matched_eval_builders_separate_offroad_from_collision(monkeypatch):
         return object()
 
     monkeypatch.setattr(eval_mod.gym, "make", make)
-    cfg = PSGAILConfig(action_mode="continuous", continuous_action_dim=2)
+    cfg = PSGAILConfig(
+        action_mode="continuous",
+        continuous_action_dim=2,
+        evaluation_controlled_vehicle_min_occupancy=1.0,
+    )
 
     eval_mod._make_matched_eval_env(
         cfg,
@@ -1232,6 +1237,10 @@ def test_all_matched_eval_builders_separate_offroad_from_collision(monkeypatch):
     )
     assert all(
         config["crash_controlled_vehicles_offroad"] is False
+        for config in captured
+    )
+    assert all(
+        config["controlled_vehicle_min_occupancy"] == 1.0
         for config in captured
     )
     assert all(
@@ -1861,7 +1870,7 @@ def test_safe_policy_steering_actions_use_zero_penalty_windows():
 
 
 def test_steering_safe_diagnostics_respect_vendi_safe_only_gate():
-    source = (Path(__file__).resolve().parents[1] / "scripts_gail/train_simple_ps_gail.py").read_text(
+    source = (Path(__file__).resolve().parents[3] / "src/policy/methods/gail/train.py").read_text(
         encoding="utf-8"
     )
     tree = ast.parse(source)
@@ -2670,7 +2679,7 @@ def test_recurrent_airl_log_probs_skip_centralized_critic(monkeypatch):
 
 
 def test_recurrent_airl_log_probs_scan_segments_once(monkeypatch):
-    import scripts_gail.train_simple_airl as airl
+    import policy.methods.gail.airl as airl
 
     torch.manual_seed(7)
     np.random.seed(7)
@@ -3380,6 +3389,37 @@ def test_training_count_validation_selects_scheduled_vehicle_count_and_clips(mon
     assert sorted(len(vehicle_ids) for _idx, _episode, vehicle_ids in clipped_specs) == [2, 3]
 
 
+def test_evaluation_filters_episodes_without_complete_occupancy_support(monkeypatch):
+    captured: dict[str, float] = {}
+    valid_ids_by_episode = {
+        "ep_empty": np.asarray([], dtype=np.int64),
+        "ep_a": np.asarray([1, 2], dtype=np.int64),
+        "ep_b": np.asarray([3], dtype=np.int64),
+    }
+
+    def fake_load_prebuilt_data(*_args, **kwargs):
+        captured["min_occupancy"] = float(kwargs["min_occupancy"])
+        return "", valid_ids_by_episode, {}, ["ep_empty", "ep_a", "ep_b"]
+
+    monkeypatch.setattr(eval_mod, "load_prebuilt_data", fake_load_prebuilt_data)
+    cfg = PSGAILConfig(
+        percentage_controlled_vehicles=1,
+        evaluation_controlled_vehicle_min_occupancy=1.0,
+    )
+
+    assert set(eval_mod._evaluation_episode_names(cfg, split="val", episodes=3)) == {
+        "ep_a",
+        "ep_b",
+    }
+    specs = eval_mod._evaluation_training_count_episode_specs(
+        cfg,
+        split="val",
+        episodes=3,
+    )
+    assert {episode for _index, episode, _ids in specs} == {"ep_a", "ep_b"}
+    assert captured["min_occupancy"] == 1.0
+
+
 def test_gail_and_airl_parse_same_validation_strategy_defaults(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["train_simple_ps_gail.py"])
     gail_cfg = ps_gail_parse_args()
@@ -3414,68 +3454,6 @@ def test_airl_parse_exposes_separate_log_prob_batch_size(monkeypatch):
     assert airl_log_prob_batch_size == 128
 
 
-def _parser_flag_set(*, airl: bool = False) -> set[str]:
-    flags = {
-        "--" + field.name.replace("_", "-")
-        for field in fields(PSGAILConfig)
-    }
-    for field in fields(PSGAILConfig):
-        if isinstance(getattr(PSGAILConfig(), field.name), bool):
-            flags.add("--no-" + field.name.replace("_", "-"))
-    if airl:
-        flags.update({"--reward-batch-size", "--airl-log-prob-batch-size"})
-    return flags
-
-
-def _python_flags_from_slurm_script(script: Path, train_target_pattern: str) -> set[str]:
-    text = script.read_text(encoding="utf-8")
-    match = re.search(
-        rf'python\s+(?:-m\s+)?"?{train_target_pattern}"?\s+\\(?P<body>.*?)(?:\n\s*(?:if|echo|$))',
-        text,
-        flags=re.DOTALL,
-    )
-    assert match is not None, f"Could not find training invocation in {script}"
-    literal_flags = set(re.findall(r"(?<![\w-])--[a-z0-9][a-z0-9-]*", match.group("body")))
-    arg_variable_flags = set(
-        re.findall(r'\b[A-Z0-9_]*ARG="(--(?:no-)?[a-z0-9][a-z0-9-]*)"', text)
-    )
-    return literal_flags | arg_variable_flags
-
-
-def test_primary_slurm_scripts_only_pass_known_training_flags():
-    root = Path(__file__).resolve().parents[1]
-    cases = [
-        (
-            root / "hpc/slurm/script_pretrain/train_gail_continuous_gpu_32c_stage1_50veh.bash",
-            r"scripts_gail\.train_simple_ps_gail",
-            _parser_flag_set(),
-        ),
-        (
-            root / "hpc/slurm/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
-            r"scripts_gail\.train_simple_ps_gail",
-            _parser_flag_set(),
-        ),
-        (
-            root / "hpc/slurm/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash",
-            r"\$\{AIRL_TRAIN_MODULE\}",
-            _parser_flag_set(airl=True),
-        ),
-        (
-            root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
-            r"\$\{AIRL_TRAIN_MODULE\}",
-            _parser_flag_set(airl=True),
-        ),
-    ]
-
-    for script, train_target_pattern, known_flags in cases:
-        unknown_flags = sorted(
-            flag
-            for flag in _python_flags_from_slurm_script(script, train_target_pattern)
-            if flag not in known_flags
-        )
-        assert unknown_flags == [], f"{script.name} passes unknown flags: {unknown_flags}"
-
-
 def test_gail_methodology_doc_uses_stable_code_anchors():
     root = Path(__file__).resolve().parents[1]
     text = (root / "docs/gail_methodology_and_implementation.md").read_text(encoding="utf-8")
@@ -3487,7 +3465,7 @@ def test_gail_methodology_doc_uses_stable_code_anchors():
         "select_hard_discriminator_examples()",
         "shape_adversarial_rewards()",
         "evaluate_policy_matched_trajectories()",
-        "scripts_gail/ps_gail/steering_diagnostics.py",
+        "src/policy/evaluation/steering_diagnostics.py",
     ]:
         assert anchor in text
 
@@ -3498,131 +3476,12 @@ def test_expert_dataset_doc_describes_ngsim_continuous_action_contract():
 
     for phrase in [
         "[acceleration_norm, steering_norm]",
-        "`acceleration_norm=-1` maps to `-10 m/s^2`",
-        "`acceleration_norm=1` maps to `10 m/s^2`",
+        "`acceleration_norm=-1` maps to `-5 m/s^2`",
+        "`acceleration_norm=1` maps to `5 m/s^2`",
         "`[-pi/4, pi/4]` radians",
         "normalized continuous actions outside `[-1, 1]`",
     ]:
         assert phrase in text
-
-
-def test_paper_slurm_scripts_keep_scene_and_expert_budget_explicit():
-    root = Path(__file__).resolve().parents[1]
-    scripts = [
-        root / "hpc/slurm/script_pretrain/train_gail_continuous_gpu_32c_stage1_50veh.bash",
-        root / "hpc/slurm/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
-        root / "hpc/slurm/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash",
-        root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
-    ]
-
-    for script in scripts:
-        text = script.read_text(encoding="utf-8")
-        assert 'SCENE="${SCENE:-us-101}"' in text
-        assert 'EPISODE_ROOT="${EPISODE_ROOT:-${VFI_HIGHWAY_DATA_ROOT}/processed_20s}"' in text
-        assert 'PREBUILT_SPLIT="${PREBUILT_SPLIT:-train}"' in text
-        assert 'MAX_EXPERT_SAMPLES="${MAX_EXPERT_SAMPLES:-0}"' in text
-        assert '--scene "${SCENE}"' in text
-        assert '--episode-root "${EPISODE_ROOT}"' in text
-        assert '--prebuilt-split "${PREBUILT_SPLIT}"' in text
-        assert "--scene us-101" not in text
-        assert '--max-expert-samples "${MAX_EXPERT_SAMPLES}"' in text
-
-
-def test_paper_airl_slurm_scripts_pin_canonical_discriminator_reward_mode():
-    root = Path(__file__).resolve().parents[1]
-    scripts = [
-        root / "hpc/slurm/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash",
-        root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
-    ]
-
-    for script in scripts:
-        text = script.read_text(encoding="utf-8")
-        assert 'ALGORITHM_VARIANT="${ALGORITHM_VARIANT:-airl_bce}"' in text
-        assert 'AIRL_POLICY_REWARD_MODE="${AIRL_POLICY_REWARD_MODE:-discriminator}"' in text
-        assert '--airl-policy-reward-mode "${AIRL_POLICY_REWARD_MODE}"' in text
-    assert "ALLOW_AIRL_RESUME_WITHOUT_REWARD" in scripts[1].read_text(encoding="utf-8")
-
-
-def test_paper_airl_slurm_scripts_default_to_gradual_vehicle_schedules():
-    root = Path(__file__).resolve().parents[1]
-    airl_stage1 = (
-        root / "hpc/slurm/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash"
-    ).read_text(encoding="utf-8")
-    airl_stage2 = (
-        root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash"
-    ).read_text(encoding="utf-8")
-
-    assert 'CONTROLLED_VEHICLE_SCHEDULE_PROFILE="${CONTROLLED_VEHICLE_SCHEDULE_PROFILE:-gradual}"' in airl_stage1
-    assert 'CONTROLLED_VEHICLE_SCHEDULE_PROFILE="${CONTROLLED_VEHICLE_SCHEDULE_PROFILE:-gradual}"' in airl_stage2
-    assert 'INITIAL_CONTROLLED_VEHICLES="${INITIAL_CONTROLLED_VEHICLES:-50}"' in airl_stage2
-    assert (
-        'CONTROLLED_VEHICLE_SCHEDULE_GRADUAL="${CONTROLLED_VEHICLE_SCHEDULE_GRADUAL:-'
-        '0:40:50:70;40:80:70:90;80:100:90:100;100:200:100:100}"'
-    ) in airl_stage2
-    assert 'CONTROLLED_VEHICLE_SCHEDULE_SUDDEN="${CONTROLLED_VEHICLE_SCHEDULE_SUDDEN:-0:200:100:100}"' in airl_stage2
-
-
-def test_paper_finetune_slurm_scripts_auto_resolve_ckpt_folder():
-    root = Path(__file__).resolve().parents[1]
-    gail = (
-        root / "hpc/slurm/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash"
-    ).read_text(encoding="utf-8")
-    airl = (
-        root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash"
-    ).read_text(encoding="utf-8")
-
-    assert 'CKPT_ROOT="${CKPT_ROOT:-${VFI_CHECKPOINT_ROOT}}"' in gail
-    assert 'CKPT_ROOT="${CKPT_ROOT:-${VFI_CHECKPOINT_ROOT}}"' in airl
-    assert 'CKPT_DATASET="${CKPT_DATASET:-}"' in gail
-    assert 'CKPT_DATASET="${CKPT_DATASET:-}"' in airl
-    assert '"${CKPT_ROOT}/${CKPT_DATASET}/gail/final_pretrain.pt"' in gail
-    assert '"${CKPT_ROOT}/${CKPT_DATASET}/airl/final_pretrain.pt"' in airl
-    assert '"${CKPT_ROOT}/${CKPT_DATASET}/gail/best.pt"' not in gail
-    assert '"${CKPT_ROOT}/${CKPT_DATASET}/gail/final.pt"' not in gail
-    assert '"${CKPT_ROOT}/${CKPT_DATASET}/airl/best.pt"' not in airl
-    assert '"${CKPT_ROOT}/${CKPT_DATASET}/airl/final.pt"' not in airl
-    assert '$(basename "${RESUME_CHECKPOINT}")" != "final_pretrain.pt"' in gail
-    assert '$(basename "${RESUME_CHECKPOINT}")" != "final_pretrain.pt"' in airl
-    assert '$(basename "${RESUME_CHECKPOINT}")" != "best.pt"' not in gail
-    assert '$(basename "${RESUME_CHECKPOINT}")" != "best.pt"' not in airl
-    assert '$(basename "${RESUME_CHECKPOINT}")" != "final.pt"' not in gail
-    assert '$(basename "${RESUME_CHECKPOINT}")" != "final.pt"' not in airl
-
-
-def test_paper_slurm_scripts_use_low_nonzero_entropy():
-    root = Path(__file__).resolve().parents[1]
-    airl_stage1 = (
-        root / "hpc/slurm/script_pretrain/train_airl_continuous_gpu_32c_stage1_50veh.bash"
-    ).read_text(encoding="utf-8")
-    airl_stage2 = (
-        root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash"
-    ).read_text(encoding="utf-8")
-    gail_stage1 = (
-        root / "hpc/slurm/script_pretrain/train_gail_continuous_gpu_32c_stage1_50veh.bash"
-    ).read_text(encoding="utf-8")
-    gail_stage2 = (
-        root / "hpc/slurm/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash"
-    ).read_text(encoding="utf-8")
-
-    assert 'WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.001}"' in airl_stage1
-    assert 'ENTROPY_COEF="${ENTROPY_COEF:-0.003}"' in airl_stage1
-    assert 'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"' in airl_stage1
-    assert 'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"' in airl_stage2
-    assert 'WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.0015}"' in gail_stage1
-    assert 'ENTROPY_COEF="${ENTROPY_COEF:-0.002}"' in gail_stage1
-    assert 'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-}"' in gail_stage1
-    assert 'WARMUP_ENTROPY_COEF="${WARMUP_ENTROPY_COEF:-0.001}"' in gail_stage2
-    assert 'ENTROPY_COEF="${ENTROPY_COEF:-0.001}"' in gail_stage2
-    assert (
-        'ENTROPY_COEF_SCHEDULE="${ENTROPY_COEF_SCHEDULE:-'
-        '0:50:0.001:0.0005;50:100:0.0005:0.0001;100:200:0.0001:0.0001}"'
-    ) in gail_stage2
-    for text in (airl_stage1, airl_stage2, gail_stage1, gail_stage2):
-        assert "0:100:0.04:0.015" not in text
-        assert "0:600:0.0005:0.001" not in text
-        assert "0:200:0.0005:0.001" not in text
-        assert "0:600:0.0008:0.0015" not in text
-        assert "0:200:0.0008:0.0015" not in text
 
 
 def test_finetune_schedule_reaches_full_load_by_round_100_and_holds():
@@ -3658,60 +3517,6 @@ def test_finetune_schedule_reaches_full_load_by_round_100_and_holds():
     assert round_200.rollout_target_agent_steps == 40000
     assert round_200.gamma == pytest.approx(0.99)
     assert round_200.entropy_coef == pytest.approx(0.0001)
-
-
-def test_finetune_slurm_scripts_use_200_round_stage2_schedules():
-    root = Path(__file__).resolve().parents[1]
-    scripts = [
-        root / "hpc/slurm/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
-        root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
-    ]
-    expected_vehicle_schedule = (
-        "0:40:50:70;40:80:70:90;80:100:90:100;100:200:100:100"
-    )
-    expected_rollout_schedule = (
-        "0:40:10000:18000;40:80:18000:30000;"
-        "80:100:30000:40000;100:200:40000:40000"
-    )
-    expected_gamma_schedule = 'GAMMA_SCHEDULE="${GAMMA_SCHEDULE:-1:${TOTAL_ROUNDS}:0.99:0.99}"'
-
-    for script in scripts:
-        text = script.read_text(encoding="utf-8")
-        assert expected_vehicle_schedule in text
-        assert expected_rollout_schedule in text
-        assert expected_gamma_schedule in text
-        assert "0:500:10000:10000" not in text
-        assert "600:800:0.99:0.99" not in text
-
-
-def test_finetune_slurm_scripts_keep_stage2_safety_penalties_consistent():
-    root = Path(__file__).resolve().parents[1]
-    scripts = [
-        root / "hpc/slurm/script_finetune/train_gail_continuous_gpu_32c_stage2_100veh.bash",
-        root / "hpc/slurm/script_finetune/train_airl_continuous_gpu_32c_stage2_100veh.bash",
-    ]
-
-    for script in scripts:
-        text = script.read_text(encoding="utf-8")
-        assert 'COLLISION_PENALTY="${COLLISION_PENALTY:-2.0}"' in text
-        assert 'OFFROAD_PENALTY="${OFFROAD_PENALTY:-2.0}"' in text
-        assert 'COLLISION_PENALTY="${COLLISION_PENALTY:-4.0}"' not in text
-        assert 'OFFROAD_PENALTY="${OFFROAD_PENALTY:-4.0}"' not in text
-
-
-def test_full_training_submitters_export_stage2_safety_penalties():
-    root = Path(__file__).resolve().parents[1]
-    scripts = [
-        root / "hpc/slurm/script_full_training/submit_gail_pretrain_finetune_5day.bash",
-        root / "hpc/slurm/script_full_training/submit_airl_pretrain_finetune_5day.bash",
-    ]
-
-    for script in scripts:
-        text = script.read_text(encoding="utf-8")
-        assert 'FINETUNE_COLLISION_PENALTY="${FINETUNE_COLLISION_PENALTY:-2.0}"' in text
-        assert 'FINETUNE_OFFROAD_PENALTY="${FINETUNE_OFFROAD_PENALTY:-2.0}"' in text
-        assert "COLLISION_PENALTY=${FINETUNE_COLLISION_PENALTY}" in text
-        assert "OFFROAD_PENALTY=${FINETUNE_OFFROAD_PENALTY}" in text
 
 
 def test_weighted_validation_score_prefers_lower_rmse_and_safety_rates():
@@ -3886,16 +3691,39 @@ def test_parallel_matched_action_receipts_use_global_counts_and_maximum():
         horizons=[],
     )
 
-    assert metrics[f"{prefix}/normalized_action_echo_exact_rate"] == (
-        pytest.approx(0.9)
-    )
-    assert metrics[f"{prefix}/post_step_action_state_exact_rate"] == (
-        pytest.approx(0.7)
-    )
+    assert metrics[f"{prefix}/normalized_action_echo_exact_rate"] == pytest.approx(0.9)
+    assert metrics[f"{prefix}/post_step_action_state_exact_rate"] == pytest.approx(0.7)
     assert metrics[f"{prefix}/crash_physics_action_override_count"] == 1.0
     assert metrics[f"{prefix}/speed_bound_action_override_count"] == 1.0
     assert metrics[f"{prefix}/unexpected_action_override_count"] == 1.0
     assert metrics[f"{prefix}/maximum_post_step_action_abs_difference"] == 4.0
+
+
+def test_parallel_matched_identity_receipts_preserve_substitution_counts():
+    prefix = "validation"
+    metrics = eval_mod._combine_matched_eval_metric_dicts(
+        [
+            {
+                f"{prefix}/episodes": 1.0,
+                f"{prefix}/vehicle_episodes": 2.0,
+                f"{prefix}/evaluated_steps": 0.0,
+                f"__raw/{prefix}/episode_lengths": (0,),
+                f"__raw/{prefix}/controlled_vehicle_counts": (2,),
+                f"__raw/{prefix}/requested_controlled_vehicle_counts": (2,),
+                f"__raw/{prefix}/missing_controlled_vehicle_counts": (1,),
+                f"__raw/{prefix}/unexpected_controlled_vehicle_counts": (1,),
+            }
+        ],
+        prefix=prefix,
+        horizons=[],
+    )
+
+    assert metrics[f"{prefix}/realized_controlled_vehicles_total"] == 2
+    assert metrics[f"{prefix}/missing_controlled_vehicles"] == 1
+    assert metrics[f"{prefix}/unexpected_controlled_vehicles"] == 1
+    assert metrics[
+        f"{prefix}/controlled_vehicle_realization_fraction"
+    ] == pytest.approx(0.5)
 
 
 def test_matched_validation_reports_crash_agent_fraction_separately_from_incidence():
@@ -3934,6 +3762,97 @@ def test_matched_validation_reports_crash_agent_fraction_separately_from_inciden
     assert metrics[
         "validation/mean_background_idm_handovers_per_episode"
     ] == pytest.approx(2.0)
+
+
+def test_matched_validation_reports_requested_vehicle_realization():
+    squared = {
+        20: {"x": [], "y": [], "position": [], "speed": [], "lane_offset": []}
+    }
+    final_squared = {
+        "x": [],
+        "y": [],
+        "position": [],
+        "speed": [],
+        "lane_offset": [],
+    }
+    metrics = eval_mod._matched_eval_metrics(
+        prefix="validation",
+        attempted_episodes=2,
+        evaluated_episodes=2,
+        skipped_missing_expert=0,
+        skipped_bad_reference=0,
+        skipped_empty_rollout=0,
+        total_steps=400,
+        collision_steps=0,
+        offroad_steps=0,
+        hard_brake_steps=0,
+        episode_lengths=[200, 200],
+        squared=squared,
+        final_squared=final_squared,
+        horizons=[20],
+        controlled_vehicle_counts=[99, 100],
+        requested_controlled_vehicle_counts=[100, 100],
+        missing_controlled_vehicle_counts=[1, 0],
+        unexpected_controlled_vehicle_counts=[0, 0],
+    )
+
+    assert metrics["validation/requested_controlled_vehicles_total"] == 200
+    assert metrics["validation/realized_controlled_vehicles_total"] == 199
+    assert metrics["validation/missing_controlled_vehicles"] == 1
+    assert metrics["validation/unexpected_controlled_vehicles"] == 0
+    assert metrics[
+        "validation/controlled_vehicle_realization_fraction"
+    ] == pytest.approx(0.995)
+    assert metrics["validation/controlled_vehicle_missing_fraction"] == pytest.approx(
+        0.005
+    )
+
+
+def test_matched_validation_identity_gate_detects_equal_count_substitution():
+    squared = {
+        20: {"x": [], "y": [], "position": [], "speed": [], "lane_offset": []}
+    }
+    final_squared = {
+        "x": [],
+        "y": [],
+        "position": [],
+        "speed": [],
+        "lane_offset": [],
+    }
+    metrics = eval_mod._matched_eval_metrics(
+        prefix="validation",
+        attempted_episodes=1,
+        evaluated_episodes=1,
+        skipped_missing_expert=0,
+        skipped_bad_reference=0,
+        skipped_empty_rollout=0,
+        total_steps=200,
+        collision_steps=0,
+        offroad_steps=0,
+        hard_brake_steps=0,
+        episode_lengths=[200],
+        squared=squared,
+        final_squared=final_squared,
+        horizons=[20],
+        controlled_vehicle_counts=[2],
+        requested_controlled_vehicle_counts=[2],
+        missing_controlled_vehicle_counts=[1],
+        unexpected_controlled_vehicle_counts=[1],
+    )
+
+    assert metrics["validation/realized_controlled_vehicles_total"] == 2
+    assert metrics["validation/missing_controlled_vehicles"] == 1
+    assert metrics["validation/unexpected_controlled_vehicles"] == 1
+    assert metrics[
+        "validation/controlled_vehicle_realization_fraction"
+    ] == pytest.approx(0.5)
+
+
+def test_matched_validation_identity_gate_rejects_duplicate_ids():
+    with pytest.raises(RuntimeError, match="requested duplicate"):
+        eval_mod._controlled_vehicle_identity_differences([1, 1], [1])
+    with pytest.raises(RuntimeError, match="realized duplicate"):
+        eval_mod._controlled_vehicle_identity_differences([1], [1, 1])
 
 
 def test_matched_validation_separates_rollout_from_reference_horizon_coverage():
@@ -4048,6 +3967,44 @@ def test_validation_score_uses_explicit_duration_crash_metric_by_default():
     assert scored["validation/score_component_vehicle_crash_rate"] == pytest.approx(1.0)
 
 
+def test_validation_score_fails_closed_on_controlled_vehicle_realization():
+    cfg = PSGAILConfig(
+        evaluation_min_controlled_vehicle_realization_fraction=0.99,
+    )
+    cfg.validation_score_position_weight = 0.0
+    cfg.validation_score_speed_weight = 0.0
+    cfg.validation_score_lane_offset_weight = 0.0
+    cfg.validation_score_crash_weight = 0.0
+    cfg.validation_score_offroad_weight = 0.0
+    cfg.validation_score_hard_brake_weight = 0.0
+    metrics = {
+        "validation/rmse_position_20s": 0.0,
+        "validation/rmse_speed_20s": 0.0,
+        "validation/rmse_lane_offset_20s": 0.0,
+        "validation/collision_duration_rate": 0.0,
+        "validation/vehicle_crash_rate": 0.0,
+        "validation/vehicle_offroad_rate": 0.0,
+        "validation/hard_brake_rate": 0.0,
+        "validation/controlled_vehicle_realization_fraction": 0.98,
+        "validation/unexpected_controlled_vehicles": 0.0,
+    }
+
+    failed_cost, failed_score, _ = validation_cost_and_score(metrics, cfg)
+    assert failed_cost == float("inf")
+    assert failed_score == float("-inf")
+
+    metrics["validation/controlled_vehicle_realization_fraction"] = 0.995
+    cost, score, components = validation_cost_and_score(metrics, cfg)
+    assert cost == pytest.approx(0.0)
+    assert score == pytest.approx(0.0)
+    assert components["controlled_vehicle_realization"] == pytest.approx(0.995)
+
+    metrics["validation/unexpected_controlled_vehicles"] = 1.0
+    failed_cost, failed_score, _ = validation_cost_and_score(metrics, cfg)
+    assert failed_cost == float("inf")
+    assert failed_score == float("-inf")
+
+
 def test_strict_validation_requires_exact_horizon_coverage_and_vehicle_crash_rate():
     cfg = PSGAILConfig(
         validation_require_exact_horizon=True,
@@ -4149,16 +4106,3 @@ def test_best_checkpoint_payload_carries_validation_metadata_and_model_state_key
     assert payload["validation_metrics"] == metrics
     assert "policy_state_dict" in payload
     assert "discriminator_state_dict" in payload
-
-
-def test_stage2_scripts_require_final_pretrain_resume_by_default():
-    root = Path(__file__).resolve().parents[1]
-    gail_script = root / "hpc" / "slurm" / "script_finetune" / "train_gail_continuous_gpu_32c_stage2_100veh.bash"
-    airl_script = root / "hpc" / "slurm" / "script_finetune" / "train_airl_continuous_gpu_32c_stage2_100veh.bash"
-    for script in (gail_script, airl_script):
-        text = script.read_text(encoding="utf-8")
-        assert 'ALLOW_NON_BEST_RESUME="${ALLOW_NON_BEST_RESUME:-false}"' in text
-        assert '$(basename "${RESUME_CHECKPOINT}")" != "final_pretrain.pt"' in text
-        assert '$(basename "${RESUME_CHECKPOINT}")" != "best.pt"' not in text
-        assert '$(basename "${RESUME_CHECKPOINT}")" != "final.pt"' not in text
-        assert "Set ALLOW_NON_BEST_RESUME=true to override" in text

@@ -4,16 +4,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-
 from highway_env.imitation.expert_dataset import ENV_ID, build_env_config, register_ngsim_env
-from scripts_gail.ps_gail.config import PSGAILConfig
-from scripts_gail.ps_gail.envs import observation_config
+
+from policy.contracts.training_config import PSGAILConfig
+from policy.data.environments import observation_config
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,6 +25,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--max-surrounding", default="all")
+    parser.add_argument(
+        "--controlled-vehicles",
+        type=float,
+        default=100.0,
+        help="Requested controlled-vehicle count; zero selects all vehicles.",
+    )
+    parser.add_argument(
+        "--observation-contract",
+        choices=("legacy_322", "route_free_v2_64", "route_free_v2_128"),
+        default="legacy_322",
+    )
     parser.add_argument("--output", default="")
     parser.add_argument("--obs-profile", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compare-determinism", action=argparse.BooleanOptionalAction, default=False)
@@ -38,14 +48,24 @@ def parse_args() -> argparse.Namespace:
 def make_env(args: argparse.Namespace):
     import gymnasium as gym
 
+    route_free = str(args.observation_contract).startswith("route_free_v2")
+    cells = 64 if str(args.observation_contract).endswith("_64") else 128
+    control_all = float(args.controlled_vehicles) <= 0.0
     cfg = PSGAILConfig(
         action_mode="continuous",
         scene=str(args.scene),
         episode_root=str(args.episode_root),
         prebuilt_split=str(args.split),
         max_surrounding=str(args.max_surrounding),
-        control_all_vehicles=True,
-        percentage_controlled_vehicles=1.0,
+        control_all_vehicles=control_all,
+        percentage_controlled_vehicles=(
+            1.0 if control_all else float(args.controlled_vehicles)
+        ),
+        cells=cells,
+        policy_model=("causal_scene_transformer" if route_free else "recurrent_transformer"),
+        transformer_observation_tokenization=(
+            f"scene_raw_v2_{cells}" if route_free else "dense_temporal"
+        ),
         max_episode_steps=int(args.steps),
     )
     register_ngsim_env()
@@ -54,8 +74,8 @@ def make_env(args: argparse.Namespace):
         action_mode="continuous",
         episode_root=cfg.episode_root,
         prebuilt_split=cfg.prebuilt_split,
-        percentage_controlled_vehicles=1.0,
-        control_all_vehicles=True,
+        percentage_controlled_vehicles=cfg.percentage_controlled_vehicles,
+        control_all_vehicles=cfg.control_all_vehicles,
         max_surrounding=cfg.max_surrounding,
         observation_config=observation_config(cfg),
         simulation_frequency=cfg.simulation_frequency,
@@ -70,6 +90,11 @@ def make_env(args: argparse.Namespace):
     env_cfg["terminate_when_all_controlled_crashed"] = bool(cfg.terminate_when_all_controlled_crashed)
     env_cfg["allow_idm"] = bool(cfg.allow_idm)
     env_cfg["crash_controlled_vehicles_offroad"] = True
+    env_cfg["road_query_mode"] = "spatial"
+    env_cfg["collision_check_mode"] = "broadphase"
+    env_cfg["record_replay_diagnostics"] = False
+    env_cfg["sensor_road_edge_mode"] = "batched"
+    env_cfg["reuse_pre_reset_spaces"] = True
     return gym.make(ENV_ID, config=env_cfg)
 
 
@@ -295,6 +320,7 @@ def main() -> None:
         "controlled_vehicles": len(controlled),
         "road_vehicles": len(getattr(road, "vehicles", []) or []),
         "observation_type": type(getattr(env.unwrapped, "observation_type", None)).__name__,
+        "observation_contract": str(args.observation_contract),
         "make_seconds": make_seconds,
         "reset_seconds": reset_seconds,
         "steps_completed": len(step_seconds),
@@ -304,6 +330,16 @@ def main() -> None:
         "step_mean_seconds": float(np.mean(step_seconds)) if step_seconds else 0.0,
         "step_p50_seconds": float(np.percentile(step_seconds, 50)) if step_seconds else 0.0,
         "step_p95_seconds": float(np.percentile(step_seconds, 95)) if step_seconds else 0.0,
+        "environment_steps_per_second": (
+            float(len(step_seconds)) / float(np.sum(step_seconds))
+            if step_seconds and float(np.sum(step_seconds)) > 0.0
+            else 0.0
+        ),
+        "agent_rows_per_second": (
+            float(len(step_seconds) * len(controlled)) / float(np.sum(step_seconds))
+            if step_seconds and float(np.sum(step_seconds)) > 0.0
+            else 0.0
+        ),
         "final_info": final_info,
     }
     env.close()

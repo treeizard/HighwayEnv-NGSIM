@@ -17,7 +17,6 @@
 #   howpublished = {\url{https://github.com/eleurent/highway-env}},
 # }
 
-
 import numpy as np
 from scipy import signal
 import matplotlib.pyplot as plt
@@ -52,43 +51,38 @@ def trajectory_smoothing(trajectory):
         if window_length <= polyorder:
             # Not enough points to fit a cubic; skip smoothing
             return arr
-        arr[idx] = signal.savgol_filter(
-            arr[idx], window_length=window_length, polyorder=polyorder
-        )
+        arr[idx] = signal.savgol_filter(arr[idx], window_length=window_length, polyorder=polyorder)
         return arr
 
     x = _smooth_1d(x)
     y = _smooth_1d(y)
     speed = _smooth_1d(speed)
 
-    return [
-        [float(xx), float(yy), float(s), int(l)]
-        for xx, yy, s, l in zip(x, y, speed, lane)
-    ]
+    return [[float(xx), float(yy), float(s), int(l)] for xx, yy, s, l in zip(x, y, speed, lane)]
 
 
 def build_trajectory(scene, period, vehicle_ID):
     ng = ngsim_data(scene)
-    ng.load('data/highway_env/processed/'+scene)
+    ng.load("data/highway_env/processed/" + scene)
     records = ng.vr_dict
     vehicles = ng.veh_dict
     snapshots = ng.snap_dict
     surroundings = []
-    record_trajectory = {'ego':{'length':0, 'width':0, 'trajectory':[]}}
-    
+    record_trajectory = {"ego": {"length": 0, "width": 0, "trajectory": []}}
+
     for veh_ID, v in vehicles.items():
         v.build_trajectory()
 
     ego_trajectories = vehicles[vehicle_ID].trajectory
     selected_trajectory = ego_trajectories[period]
 
-    D = 200 if scene == 'us-101' else 20
+    D = 200 if scene == "us-101" else 20
 
     ego = []
     nearby_IDs = []
     for position in selected_trajectory:
-        record_trajectory['ego']['length'] = position.len
-        record_trajectory['ego']['width'] = position.wid
+        record_trajectory["ego"]["length"] = position.len
+        record_trajectory["ego"]["width"] = position.wid
         ego.append([position.x, position.y, position.spd, position.lane_ID])
         records = snapshots[position.unixtime].vr_list
         other = []
@@ -96,15 +90,15 @@ def build_trajectory(scene, period, vehicle_ID):
             if record.veh_ID != vehicle_ID:
                 other.append([record.veh_ID, record.len, record.wid, record.x, record.y, record.spd, record.lane_ID])
                 d = abs(position.y - record.y)
-                if d <= D:            
+                if d <= D:
                     nearby_IDs.append(record.veh_ID)
         surroundings.append(other)
-        
-    record_trajectory['ego']['trajectory'] = ego
+
+    record_trajectory["ego"]["trajectory"] = ego
 
     for v_ID in set(nearby_IDs):
-        record_trajectory[v_ID] = {'length':0, 'width':0, 'trajectory':[]}
-    
+        record_trajectory[v_ID] = {"length": 0, "width": 0, "trajectory": []}
+
     # fill in data
     for timestep_record in surroundings:
         scene_IDs = []
@@ -118,18 +112,18 @@ def build_trajectory(scene, period, vehicle_ID):
             v_laneID = vehicle_record[6]
             if v_ID in set(nearby_IDs):
                 scene_IDs.append(v_ID)
-                record_trajectory[v_ID]['length'] = v_length
-                record_trajectory[v_ID]['width'] = v_width
-                record_trajectory[v_ID]['trajectory'].append([v_x, v_y, v_s, v_laneID])
+                record_trajectory[v_ID]["length"] = v_length
+                record_trajectory[v_ID]["width"] = v_width
+                record_trajectory[v_ID]["trajectory"].append([v_x, v_y, v_s, v_laneID])
         for v_ID in set(nearby_IDs):
             if v_ID not in scene_IDs:
-                record_trajectory[v_ID]['trajectory'].append([0, 0, 0, 0])
-    
+                record_trajectory[v_ID]["trajectory"].append([0, 0, 0, 0])
+
     # trajectory smoothing
     for key in record_trajectory.keys():
-        orginal_trajectory = record_trajectory[key]['trajectory']
+        orginal_trajectory = record_trajectory[key]["trajectory"]
         smoothed_trajectory = trajectory_smoothing(orginal_trajectory)
-        record_trajectory[key]['trajectory'] = smoothed_trajectory
+        record_trajectory[key]["trajectory"] = smoothed_trajectory
 
     return record_trajectory
 
@@ -142,46 +136,45 @@ def build_trajectory_from_chunk(scene, vehicle_ID, episode_dir):
         "data/highway_env/processed_20s/us-101/t1118846663000"
     """
     ng = ngsim_data(scene)
-    ng.load(episode_dir)          # <-- loads only that small episode
-    records    = ng.vr_dict
-    vehicles   = ng.veh_dict
-    snapshots  = ng.snap_dict
+    ng.load(episode_dir)  # <-- loads only that small episode
+    records = ng.vr_dict
+    vehicles = ng.veh_dict
+    snapshots = ng.snap_dict
     surroundings = []
-    record_trajectory = {'ego': {'length': 0, 'width': 0, 'trajectory': []}}
+    record_trajectory = {"ego": {"length": 0, "width": 0, "trajectory": []}}
 
     # Only build ego trajectory, NOT all vehicles
     ego_vehicle = vehicles[vehicle_ID]
     ego_vehicle.build_trajectory()
     ego_trajectories = ego_vehicle.trajectory
-    #print('trajectory:',ego_trajectories)
+    # print('trajectory:',ego_trajectories)
     # With a fixed-length chunk you'll almost always have a single period = 0
     selected_trajectory = ego_trajectories[0]
 
-    D = 200 if scene == 'us-101' else 20
+    D = 200 if scene == "us-101" else 20
 
     ego = []
     nearby_IDs = []
     for position in selected_trajectory:
-        record_trajectory['ego']['length'] = position.len
-        record_trajectory['ego']['width']  = position.wid
+        record_trajectory["ego"]["length"] = position.len
+        record_trajectory["ego"]["width"] = position.wid
         ego.append([position.x, position.y, position.spd, position.lane_ID])
 
         records = snapshots[position.unixtime].vr_list
         other = []
         for record in records:
             if record.veh_ID != vehicle_ID:
-                other.append([record.veh_ID, record.len, record.wid,
-                              record.x, record.y, record.spd, record.lane_ID])
+                other.append([record.veh_ID, record.len, record.wid, record.x, record.y, record.spd, record.lane_ID])
                 d = abs(position.y - record.y)
                 if d <= D:
                     nearby_IDs.append(record.veh_ID)
         surroundings.append(other)
 
-    record_trajectory['ego']['trajectory'] = ego
+    record_trajectory["ego"]["trajectory"] = ego
 
     # allocate neighbor containers
     for v_ID in set(nearby_IDs):
-        record_trajectory[v_ID] = {'length': 0, 'width': 0, 'trajectory': []}
+        record_trajectory[v_ID] = {"length": 0, "width": 0, "trajectory": []}
 
     # fill neighbors per time step
     for timestep_record in surroundings:
@@ -190,25 +183,22 @@ def build_trajectory_from_chunk(scene, vehicle_ID, episode_dir):
             v_ID, v_length, v_width, v_x, v_y, v_s, v_laneID = vehicle_record
             if v_ID in record_trajectory:
                 scene_IDs.append(v_ID)
-                record_trajectory[v_ID]['length'] = v_length
-                record_trajectory[v_ID]['width']  = v_width
-                record_trajectory[v_ID]['trajectory'].append(
-                    [v_x, v_y, v_s, v_laneID]
-                )
+                record_trajectory[v_ID]["length"] = v_length
+                record_trajectory[v_ID]["width"] = v_width
+                record_trajectory[v_ID]["trajectory"].append([v_x, v_y, v_s, v_laneID])
         for v_ID in record_trajectory.keys():
-            if v_ID == 'ego':
+            if v_ID == "ego":
                 continue
             if v_ID not in scene_IDs:
-                record_trajectory[v_ID]['trajectory'].append([0, 0, 0, 0])
+                record_trajectory[v_ID]["trajectory"].append([0, 0, 0, 0])
 
     # smoothing
     for key in record_trajectory.keys():
-        orginal_trajectory = record_trajectory[key]['trajectory']
+        orginal_trajectory = record_trajectory[key]["trajectory"]
         smoothed_trajectory = trajectory_smoothing(orginal_trajectory)
-        record_trajectory[key]['trajectory'] = smoothed_trajectory
+        record_trajectory[key]["trajectory"] = smoothed_trajectory
 
     return record_trajectory
-
 
 
 def build_all_trajectories_for_scene(
@@ -263,8 +253,7 @@ def build_all_trajectories_for_scene(
 
     # Find all 10-second episode folders (same rule as _ensure_episode_list)
     episode_names = sorted(
-        d for d in os.listdir(scene_root)
-        if d.startswith("t") and os.path.isdir(os.path.join(scene_root, d))
+        d for d in os.listdir(scene_root) if d.startswith("t") and os.path.isdir(os.path.join(scene_root, d))
     )
     if not episode_names:
         raise RuntimeError(f"No 10-second episodes found in {scene_root}")
@@ -305,16 +294,12 @@ def build_all_trajectories_for_scene(
                         "trajectory": [],
                     }
                     if step_idx > 0:
-                        record_trajectory[v_ID]["trajectory"].extend(
-                            [[0.0, 0.0, 0.0, 0] for _ in range(step_idx)]
-                        )
+                        record_trajectory[v_ID]["trajectory"].extend([[0.0, 0.0, 0.0, 0] for _ in range(step_idx)])
 
                 rec = record_trajectory[v_ID]
                 rec["length"] = vr.len
                 rec["width"] = vr.wid
-                rec["trajectory"].append(
-                    [vr.x, vr.y, vr.spd, vr.lane_ID]
-                )
+                rec["trajectory"].append([vr.x, vr.y, vr.spd, vr.lane_ID])
 
             # 2) For vehicles we've already seen but that are not
             #    present in this snapshot: append a zero row to keep
@@ -334,19 +319,18 @@ def build_all_trajectories_for_scene(
     return all_episodes
 
 
-
 def process_raw_trajectory(trajectory, scene):
     if scene == "us-101":
         trajectory = np.array(trajectory)
         for i in range(trajectory.shape[0]):
-            '''
+            """
             if np.all(trajectory[i] == 0):
                 trajectory[i][0] = 0
                 trajectory[i][1] = 0
                 trajectory[i][2] = 0
             
             else:
-            '''
+            """
             x = trajectory[i][0] - 6
             y = trajectory[i][1]
             speed = trajectory[i][2]
@@ -356,14 +340,14 @@ def process_raw_trajectory(trajectory, scene):
     elif scene == "japanese":
         trajectory = np.array(trajectory)
         for i in range(trajectory.shape[0]):
-            '''
+            """
             if np.all(trajectory[i] == 0):
                 trajectory[i][0] = 0
                 trajectory[i][1] = 0
                 trajectory[i][2] = 0
             
             else:
-            '''
+            """
             x = trajectory[i][0]
             y = trajectory[i][1]
             speed = trajectory[i][2]
@@ -373,11 +357,12 @@ def process_raw_trajectory(trajectory, scene):
             # Japanese trajectory coordinates are already in meters, while speed is stored in km/h.
             # Convert only the speed channel so the processed trajectory is consistently in SI units.
             trajectory[i][2] = speed / 3.6
-            #print(x, y, speed)
+            # print(x, y, speed)
     else:
         raise UserWarning("The Scene is not Recognised Please Try Again")
 
     return trajectory
+
 
 def trajectory_row_is_active(row):
     """
@@ -388,16 +373,9 @@ def trajectory_row_is_active(row):
     """
     x, y, spd, lane = np.asarray(row, dtype=float)[:4]
     invalid_sentinel = (
-        np.isclose(x, 0.0)
-        and np.isclose(y, -1.82871076)
-        and np.isclose(spd, 0.0)
-        and np.isclose(lane, 0.0)
+        np.isclose(x, 0.0) and np.isclose(y, -1.82871076) and np.isclose(spd, 0.0) and np.isclose(lane, 0.0)
     )
-    inactive_padding = (
-        np.isclose(x, 0.0)
-        and np.isclose(spd, 0.0)
-        and np.isclose(lane, 0.0)
-    )
+    inactive_padding = np.isclose(x, 0.0) and np.isclose(spd, 0.0) and np.isclose(lane, 0.0)
     return not (invalid_sentinel or inactive_padding)
 
 
@@ -406,33 +384,38 @@ def trajectory_step_speed_mps(
     next_row,
     *,
     sample_frequency_hz: float,
+    reject_negative: bool = False,
 ):
-    """Return a finite replay speed without differentiating into padding.
+    """Return the processed trajectory's recorded SI speed.
 
-    Processed trajectories use zero/sentinel rows outside a vehicle's active
-    interval.  Spatially differencing the last active row against the first
-    padding row creates a one-frame speed of thousands of metres per second,
-    which then contaminates lidar relative-speed observations.  Use the
-    recorded current-row speed at active-interval boundaries and spatial
-    differencing only between two active rows.
+    The direct acceleration label is derived from consecutive recorded speed
+    values.  Replay observations and closed-loop initialization must use that
+    same state variable; deriving observation speed from position deltas makes
+    the observed transition disagree with its supervised acceleration target,
+    especially after the Japanese geometry remap and smoothing stages.
+
+    ``next_row`` remains in the public helper signature for compatibility and
+    for callers that also inspect trajectory continuity.  It is deliberately
+    not used to redefine the policy-visible speed.  Negative and non-finite
+    source values are fatal: production replay must use a separately versioned,
+    raw-crosschecked compensated episode root instead of silently changing data
+    at runtime.
     """
 
     row_arr = np.asarray(row, dtype=float)
     recorded_speed = float(row_arr[2])
     if not np.isfinite(recorded_speed):
         raise ValueError("Trajectory row contains a non-finite recorded speed.")
-    recorded_speed = max(recorded_speed, 0.0)
+    if recorded_speed < 0.0:
+        raise ValueError(
+            "Trajectory row contains a negative recorded speed; replay requires "
+            "a raw-crosschecked compensated episode root."
+        )
     frequency = float(sample_frequency_hz)
     if not np.isfinite(frequency) or frequency <= 0.0:
         raise ValueError("sample_frequency_hz must be finite and positive.")
-    if next_row is None or not trajectory_row_is_active(next_row):
-        return recorded_speed
-    next_arr = np.asarray(next_row, dtype=float)
-    displacement = float(np.linalg.norm(next_arr[:2] - row_arr[:2]))
-    speed_from_delta = displacement * frequency
-    if not np.isfinite(speed_from_delta):
-        raise ValueError("Trajectory row delta produces a non-finite speed.")
-    return speed_from_delta if speed_from_delta > 1e-3 else recorded_speed
+    del next_row, reject_negative
+    return recorded_speed
 
 
 def trajectory_rows_are_continuous(
@@ -624,8 +607,9 @@ def common_first_valid_index(trajectories):
         return None
     return max(start_indices)
 
+
 if __name__ == "__main__":
-    scene  = "us-101"
+    scene = "us-101"
     period = 0
 
     # Build once
@@ -640,15 +624,15 @@ if __name__ == "__main__":
 
     plt.figure(figsize=(10, 4))
     for vid in sel:
-        traj_ft = trajectory_set[vid]["trajectory"]        # [x_ft, y_ft, spd, lane]
-        traj_m  = process_raw_trajectory(traj_ft)          # [s_m, r_m, spd_mps, lane]
+        traj_ft = trajectory_set[vid]["trajectory"]  # [x_ft, y_ft, spd, lane]
+        traj_m = process_raw_trajectory(traj_ft)  # [s_m, r_m, spd_mps, lane]
         arr = np.asarray(traj_m)
-        s = arr[:, 0]   # longitudinal (meters)
-        r = arr[:, 1]   # lateral (meters)
+        s = arr[:, 0]  # longitudinal (meters)
+        r = arr[:, 1]  # lateral (meters)
         plt.plot(s, r, linewidth=1, alpha=0.45)
 
     # Axes/labels
-    plt.gca().set_aspect('auto', 'datalim')
+    plt.gca().set_aspect("auto", "datalim")
     plt.xlabel("Longitudinal position [m]", fontsize=14)
     plt.ylabel("Lateral position [m]", fontsize=14)
 

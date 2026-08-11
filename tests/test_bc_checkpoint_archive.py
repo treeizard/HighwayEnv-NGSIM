@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts_gail.archive_bc_checkpoints import archive_bc_checkpoints
+from policy.evaluation.checkpoint_archive import archive_bc_checkpoints
 
 
 def digest(path: Path) -> str:

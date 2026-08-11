@@ -17,8 +17,16 @@
 #   howpublished = {\url{https://github.com/eleurent/highway-env}},
 # }
 import numpy as np
-from highway_env.ngsim_utils.core.constants import FEET_PER_METER, US101_SECTION_ENDS_M
+
+from highway_env.ngsim_utils.core.constants import (
+    FEET_PER_METER,
+    KINEMATIC_HEADING_MIN_DISPLACEMENT_M,
+    KINEMATIC_HEADING_MIN_SPEED_MPS,
+    US101_MERGE_OUT_END_M,
+    US101_SECTION_ENDS_M,
+)
 from highway_env.ngsim_utils.data.trajectory_gen import trajectory_row_is_active
+
 
 # -------------------------------------------------------------------------
 # ROAD / LANE HELPERS
@@ -52,6 +60,7 @@ def edge_from_x(net, x: float) -> tuple[str, str]:
     """
     x_m = float(x)
     candidates = []
+    containing = []
 
     for src, dsts in net.graph.items():
         for dst, lanes in dsts.items():
@@ -59,17 +68,31 @@ def edge_from_x(net, x: float) -> tuple[str, str]:
                 continue
 
             lane0 = lanes[0]
-            start_x = float(min(lane0.start[0], lane0.end[0]))
-            end_x = float(max(lane0.start[0], lane0.end[0]))
+            if hasattr(lane0, "start") and hasattr(lane0, "end"):
+                endpoint_x = [float(lane0.start[0]), float(lane0.end[0])]
+            else:
+                # Curved HighwayEnv lanes (for example PolyLaneFixedWidth) do
+                # not expose StraightLane's start/end attributes.  Query the
+                # common AbstractLane geometry interface instead.
+                endpoint_x = [
+                    float(lane0.position(0.0, 0.0)[0]),
+                    float(lane0.position(float(lane0.length), 0.0)[0]),
+                ]
+            start_x = float(min(endpoint_x))
+            end_x = float(max(endpoint_x))
 
             # Prefer edges with multiple lanes, which represent the main carriageway.
             score = len(lanes)
             if start_x <= x_m <= end_x:
-                return (src, dst)
+                containing.append((-score, start_x, src, dst))
+                continue
 
             dist = min(abs(x_m - start_x), abs(x_m - end_x))
             candidates.append((dist, -score, start_x, src, dst))
 
+    if containing:
+        _, _, src, dst = min(containing)
+        return (src, dst)
     if not candidates:
         raise KeyError("Road network graph does not contain any lane edges.")
 
@@ -110,10 +133,22 @@ def target_lane_index_from_lane_id(
             edge = ("s2", "s3")
             return (edge[0], edge[1], _last_lane_id(net, edge))
         if lane_id == 7:
-            edge = ("merge_in", "s2")
+            # Lane 7 is the merge approach only before the first section
+            # boundary.  The recorded identifier can persist briefly after
+            # the ramp has joined the six-lane mainline; bind those rows to
+            # the spatially valid outer mainline lane.
+            edge = ("merge_in", "s2") if x < US101_SECTION_ENDS_M[1] else us101_edge_from_x(x)
             return (edge[0], edge[1], _last_lane_id(net, edge))
         if lane_id == 8:
-            edge = ("s3", "merge_out")
+            # Likewise, lane 8 can appear just before the modeled exit ramp.
+            # It is the outer mainline lane until the ramp starts, and is not
+            # representable after the modeled ramp ends.
+            if x < US101_SECTION_ENDS_M[2]:
+                edge = us101_edge_from_x(x)
+            elif x <= US101_MERGE_OUT_END_M:
+                edge = ("s3", "merge_out")
+            else:
+                return None
             return (edge[0], edge[1], _last_lane_id(net, edge))
         return None
 
@@ -131,8 +166,8 @@ def target_lane_index_from_lane_id(
         #   lane_id 2 -> right mainline lane
         #   lane_id 1 -> left mainline lane
         #   lane_id 3 -> left merge lane
-        x_merge_start = 150.0
-        x_merge_end = 315.0
+        x_merge_start = float(getattr(net, "japanese_merge_start_x_m", 150.0))
+        x_merge_end = float(getattr(net, "japanese_merge_end_x_m", 315.0))
         if lane_id == 2:
             if x < x_merge_start:
                 return ("a", "b", 0)
@@ -157,31 +192,129 @@ def target_lane_index_from_lane_id(
     return None
 
 
+def resolve_target_lane_index_from_row(
+    net,
+    scene: str,
+    row: np.ndarray,
+    *,
+    vehicle_width_m: float = 0.0,
+    provider_observation_flag: int | None = None,
+    measurement_tolerance_m: float = 0.2,
+) -> tuple[tuple[str, str, int] | None, bool]:
+    """Resolve a current-row lane without changing source trajectory state.
+
+    Morinomiya provider-interpolated rows can retain a stale categorical lane
+    identifier even when the current recorded pose has already moved to an
+    adjacent lane.  For those rows only, replace a declared lane that does not
+    overlap the current vehicle footprint with the closest overlapping lane.
+    This uses no future row.  Image-detected rows and every non-Japanese scene
+    retain the dataset lane-id mapping unchanged.
+    """
+    values = np.asarray(row, dtype=float)
+    declared = target_lane_index_from_lane_id(
+        net,
+        scene,
+        float(values[0]),
+        int(values[3]),
+    )
+    if (
+        str(scene) != "japanese"
+        or provider_observation_flag != 0
+        or declared is None
+    ):
+        return declared, False
+
+    position = values[:2]
+    overlap_margin = max(0.0, 0.5 * float(vehicle_width_m)) + max(
+        0.0,
+        float(measurement_tolerance_m),
+    )
+
+    declared_lane = net.get_lane(declared)
+    declared_s, declared_r = declared_lane.local_coordinates(position)
+    if declared_lane.on_lane(
+        position,
+        declared_s,
+        declared_r,
+        margin=overlap_margin,
+    ):
+        return declared, False
+
+    overlapping: list[tuple[float, tuple[str, str, int]]] = []
+    seen: set[tuple[str, str, int]] = set()
+    for candidate_lane_id in (1, 2, 3):
+        candidate = target_lane_index_from_lane_id(
+            net,
+            scene,
+            float(values[0]),
+            candidate_lane_id,
+        )
+        if candidate is None or candidate in seen:
+            continue
+        seen.add(candidate)
+        lane = net.get_lane(candidate)
+        longitudinal, lateral = lane.local_coordinates(position)
+        if lane.on_lane(
+            position,
+            longitudinal,
+            lateral,
+            margin=overlap_margin,
+        ):
+            overlapping.append((abs(float(lateral)), candidate))
+
+    if not overlapping:
+        return declared, False
+    resolved = min(overlapping, key=lambda item: (item[0], item[1]))[1]
+    return resolved, resolved != declared
+
+
 def heading_from_trajectory_row(
     net,
     scene: str,
     row: np.ndarray,
     *,
+    previous_row: np.ndarray | None = None,
     next_row: np.ndarray | None = None,
     fallback_heading: float = 0.0,
+    prefer_motion: bool = False,
+    lane_index_override: tuple[str, str, int] | None = None,
 ) -> float:
-    """Infer heading from a trajectory row using lane geometry, then motion delta."""
+    """Infer a causal heading from lane geometry or past recorded motion.
+
+    Actor-visible state at time ``t`` must not read ``t+1``.  Reliable motion
+    heading therefore uses ``previous_row -> row``.  ``next_row`` remains only
+    for source compatibility with older callers and is deliberately ignored.
+    ``prefer_motion`` is reserved for teleport replay; other callers retain
+    the established lane-first behavior.
+    """
     row_arr = np.asarray(row, dtype=float)
     x, y, _speed, lane_id = row_arr[:4]
-    mapped_lane_index = target_lane_index_from_lane_id(
-        net,
-        scene,
-        float(x),
-        int(lane_id),
-    )
+    motion_heading = None
+    if previous_row is not None and trajectory_row_is_active(previous_row):
+        previous_arr = np.asarray(previous_row, dtype=float)
+        dx = float(x - previous_arr[0])
+        dy = float(y - previous_arr[1])
+        reliable_motion = (
+            float(row_arr[2]) >= KINEMATIC_HEADING_MIN_SPEED_MPS
+            and np.hypot(dx, dy) >= KINEMATIC_HEADING_MIN_DISPLACEMENT_M
+        )
+        if reliable_motion:
+            motion_heading = float(np.arctan2(dy, dx))
+    del next_row
+    if bool(prefer_motion) and motion_heading is not None:
+        return motion_heading
+    mapped_lane_index = lane_index_override
+    if mapped_lane_index is None:
+        mapped_lane_index = target_lane_index_from_lane_id(
+            net,
+            scene,
+            float(x),
+            int(lane_id),
+        )
     if mapped_lane_index is not None:
         lane = net.get_lane(mapped_lane_index)
         local_s, _local_r = lane.local_coordinates(np.array([x, y], dtype=float))
         return float(lane.heading_at(local_s))
-    if next_row is not None and trajectory_row_is_active(next_row):
-        next_arr = np.asarray(next_row, dtype=float)
-        dx = float(next_arr[0] - x)
-        dy = float(next_arr[1] - y)
-        if np.hypot(dx, dy) > 1e-3:
-            return float(np.arctan2(dy, dx))
+    if motion_heading is not None:
+        return motion_heading
     return float(fallback_heading)

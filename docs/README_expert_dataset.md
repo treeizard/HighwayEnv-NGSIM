@@ -1,6 +1,10 @@
 # Expert Dataset Pipeline
 
-This module turns processed NGSIM trajectory replays into saved imitation-learning datasets.
+Status: component reference. For current four-method work, the parent
+repository's `docs/plan/expert_replay_bc_recovery_20260808.md` is authoritative.
+
+This module turns processed NGSIM trajectory replays into saved expert
+**transition** datasets, not action-only tables.
 Instead of reading low-level CSV action tables directly, it replays the real trajectories through
 `NGSimEnv` and records the observations and expert actions that the simulator actually uses.
 
@@ -14,10 +18,10 @@ That gives us:
 
 - `highway_env/imitation/expert_dataset.py`
   Canonical implementation for dataset collection, validation, metadata loading, and PyTorch datasets.
-- `scripts_ngsim/build_expert_dataset.py`
-  CLI wrapper for building a dataset from processed replay episodes.
-- `scripts_ngsim/inspect_expert_dataset.py`
-  CLI tool for checking dataset stats and printing a replay command for one saved episode.
+- `src/policy/data/collect_expert.py` in the parent repository
+  Current contract-aware collection CLI.
+- `src/policy/data/audit_expert.py` in the parent repository
+  Independent collection and split audit.
 
 ## Data Source
 
@@ -31,6 +35,21 @@ It relies on two existing properties of the environment:
 - `NGSimEnv.step()` exposes the internally applied expert action in `info`
 
 This makes the saved dataset match the simulator's actual observation and action conventions.
+
+The dependency graph is branched:
+
+```text
+raw trajectories -> cleaned/windowed processed_20s replay episodes
+                 -> expert replay -> expert transition datasets
+
+processed_20s replay episodes -> online rollouts and closed-loop evaluation
+```
+
+BC consumes supervised observation/action pairs. IQ-Learn consumes expert
+transitions plus online simulator interactions. GAIL consumes expert occupancy
+features plus generator rollouts. AIRL consumes full expert transitions plus
+generator rollouts. Sharing a transition corpus does not authorize sharing a
+trained BC model across these methods.
 
 ## Dataset Modes
 
@@ -90,78 +109,54 @@ Action storage:
 
 ## Observation and Action Conventions
 
-Default observation:
+The component's legacy bare default observation is lidar `(128, 2)`. The
+current four-method actor does not use that 256D flattening directly. Its v1
+policy projection is 322D:
 
-- `LidarObservation`
-- shape `(128, 2)` before batching
-- commonly flattened to `256` features for MLP-style imitation baselines
+- vehicle lidar: `128 x 2 = 256`;
+- lane camera: `21 x 3 = 63`; and
+- ego fields: `[length_m, speed_mps, heading_rad] = 3`.
 
-Supported action modes:
+The component retains historical discrete support. Current four-method
+comparisons use only:
 
-- `discrete`: `DiscreteSteerMetaAction`, scalar action in `{0, 1, 2, 3, 4}`
 - `continuous`: `ContinuousAction`, normalized `float32 [2]` stored as
   `[acceleration_norm, steering_norm]`
 
 For NGSIM continuous control, the normalized action interval is always
-`[-1, 1]`. `acceleration_norm=-1` maps to `-10 m/s^2`,
-`acceleration_norm=1` maps to `10 m/s^2`, and `steering_norm` maps to
+`[-1, 1]`. `acceleration_norm=-1` maps to `-5 m/s^2`,
+`acceleration_norm=1` maps to `5 m/s^2`, and `steering_norm` maps to
 `[-pi/4, pi/4]` radians. Expert files produced for action-conditioned
 GAIL/AIRL should also contain `actions_continuous_env` with these normalized
 columns and, when available, `actions_steering_acceleration` with physical
 `[steering_rad, acceleration_mps2]` columns. Loaders reject non-finite
 continuous expert arrays and normalized continuous actions outside `[-1, 1]`.
+The exact metadata stored with each dataset remains authoritative; a scale or
+column mismatch must fail rather than be converted. The current recovery
+forbids yaw-rate surrogate labels and steering/yaw adapters.
 
 ## Build a Dataset
 
-Example single-vehicle discrete dataset:
+Current production collection is launched through a source-locked `StudySpec`.
+For a bounded local receipt test only, use the current module and explicit
+expert-replay controls:
 
 ```bash
-python scripts_ngsim/build_expert_dataset.py \
-  --scene us-101 \
-  --action-mode discrete \
-  --episodes 32 \
-  --out expert_data/ngsim_expert_dataset_discrete.npz
-```
-
-Example single-vehicle continuous dataset:
-
-```bash
-python scripts_ngsim/build_expert_dataset.py \
-  --scene us-101 \
-  --action-mode continuous \
-  --episodes 32 \
-  --out expert_data/ngsim_expert_dataset_continuous.npz
-```
-
-Example full-scene discrete dataset:
-
-```bash
-python scripts_ngsim/build_expert_dataset.py \
-  --scene us-101 \
-  --prebuilt-split train \
-  --dataset-mode scene \
-  --control-all-vehicles \
-  --action-mode discrete \
-  --episodes 32 \
-  --out expert_data/ngsim_expert_scene_dataset_discrete.npz
-```
-
-Example targeted debug run on one known episode:
-
-```bash
-python scripts_ngsim/build_expert_dataset.py \
+python -m policy.data.collect_expert \
   --scene us-101 \
   --prebuilt-split train \
   --episode-name t1118849739700 \
-  --dataset-mode scene \
   --control-all-vehicles \
-  --action-mode discrete \
-  --episodes 1 \
-  --max-horizon 20 \
-  --out /tmp/ngsim_scene_debug.npz
+  --expert-control-mode continuous \
+  --trajectory-state-source simulated \
+  --no-allow-idm \
+  --max-episodes 1 \
+  --max-steps-per-episode 20 \
+  --out /tmp/ngsim_expert_replay_receipt
 ```
 
-Useful CLI options:
+This command is engineering-only and does not replace the active recovery's
+dual-domain local gates. Useful CLI options include:
 
 - `--episode-root`
   Override the processed trajectory root.
@@ -169,31 +164,18 @@ Useful CLI options:
   Choose which prebuilt split to sample from.
 - `--episode-name`
   Restrict collection to one replay episode.
-- `--max-horizon`
+- `--max-steps-per-episode`
   Cap the number of collected steps per scenario.
-- `--controlled-vehicles`
-  Replay a fixed number of expert-controlled vehicles together.
 - `--control-all-vehicles`
   Control every valid vehicle in the selected traffic segment.
-- `--dataset-mode scene`
-  Save one scene-level sequence instead of separate per-vehicle rollouts.
 - `--max-surrounding`
   Limit how many replay vehicles are spawned as context.
 
 ## Inspect a Saved Dataset
 
-```bash
-python scripts_ngsim/inspect_expert_dataset.py expert_data/ngsim_expert_dataset_discrete.npz
-```
-
-The inspector prints:
-
-- number of saved dataset episodes
-- total transitions
-- trajectory length statistics
-- observation and action shapes
-- a few sample transitions
-- a ready-to-run replay command for the first recorded episode
+Use `python -m policy.data.audit_expert --help` for the independent collection
+audit, or load a single file through the dataset classes below. Do not rely on
+the removed `scripts_ngsim/inspect_expert_dataset.py` prototype.
 
 ## Load from Python
 

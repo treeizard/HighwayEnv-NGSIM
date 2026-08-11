@@ -52,6 +52,13 @@ MIN_ACCEL = ACCELERATION_RANGE[0]
 MAX_ACCEL = ACCELERATION_RANGE[1]
 MAX_STEER = np.pi / 4
 
+# A one-frame motion direction is not a meaningful vehicle heading when a
+# filtered trajectory is effectively stationary. NGSIM position smoothing can
+# leave centimetre-scale wiggles while recorded speed is zero, which otherwise
+# creates headings near +/-pi and large artificial yaw rates.
+KINEMATIC_HEADING_MIN_SPEED_MPS = 0.2
+KINEMATIC_HEADING_MIN_DISPLACEMENT_M = 0.02
+
 
 def normalize_acceleration(acceleration: float) -> float:
     """Map physical acceleration to the normalized env action interval."""

@@ -4,21 +4,18 @@ from __future__ import annotations
 
 import os
 import time
-from collections import OrderedDict
-from collections import defaultdict
-from dataclasses import dataclass
-from itertools import product
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pandas as pd
 from gymnasium import spaces
 
 from highway_env import utils
-from highway_env.envs.common.finite_mdp import compute_ttc_grid
-from highway_env.road.lane import AbstractLane, SineLane, StraightLane
-from highway_env.utils import Vector
-from highway_env.vehicle.kinematics import Vehicle
+from highway_env.road.lane import (
+    AbstractLane,
+    PolyLaneFixedWidth,
+    SineLane,
+    StraightLane,
+)
 
 try:
     from scipy.spatial import cKDTree
@@ -26,7 +23,7 @@ except Exception:  # pragma: no cover - scipy is optional at runtime
     cKDTree = None
 
 if TYPE_CHECKING:
-    from highway_env.envs.common.abstract import AbstractEnv
+    pass
 
 from .base import (
     ObservationType,
@@ -36,6 +33,7 @@ from .base import (
     _ObstacleEntry,
     _ObstacleSpatialIndex,
 )
+
 
 class LidarObservation(ObservationType):
     """
@@ -54,6 +52,10 @@ class LidarObservation(ObservationType):
 
     DISTANCE = 0
     SPEED = 1
+    DYNAMIC_PRESENCE = 0
+    DYNAMIC_DISTANCE = 1
+    DYNAMIC_SPEED = 2
+    ROAD_EDGE_DISTANCE = 3
 
     def __init__(
         self,
@@ -62,6 +64,8 @@ class LidarObservation(ObservationType):
         maximum_range: float = 60.0,
         normalize: bool = True,
         edge_as_return: bool = True,
+        ego_centric: bool = False,
+        separate_road_edge_return: bool = False,
         coarse_step: float | None = None,
         refine_iters: int = 8,
         use_topology_fast_path: bool = True,
@@ -72,6 +76,8 @@ class LidarObservation(ObservationType):
         self.maximum_range = float(maximum_range)
         self.normalize = bool(normalize)
         self.use_topology_fast_path = bool(use_topology_fast_path)
+        self.ego_centric = bool(ego_centric)
+        self.separate_road_edge_return = bool(separate_road_edge_return)
 
         # If True: empty beams return road-edge distance; else they return maximum_range.
         self.edge_as_return = bool(edge_as_return)
@@ -81,7 +87,8 @@ class LidarObservation(ObservationType):
         self.refine_iters = int(refine_iters)
 
         self.angle = 2 * np.pi / self.cells
-        self.grid = np.ones((self.cells, 2), dtype=np.float32) * self.maximum_range
+        feature_dim = 4 if self.separate_road_edge_return else 2
+        self.grid = np.ones((self.cells, feature_dim), dtype=np.float32) * self.maximum_range
         self.origin = None
         self._directions = np.stack(
             [self.index_to_direction(i) for i in range(self.cells)],
@@ -104,6 +111,19 @@ class LidarObservation(ObservationType):
 
     def space(self) -> spaces.Space:
         high = 1.0 if self.normalize else self.maximum_range
+        if bool(getattr(self, "separate_road_edge_return", False)):
+            return spaces.Box(
+                shape=(self.cells, 4),
+                low=np.tile(
+                    np.array([0.0, 0.0, -high, 0.0], dtype=np.float32),
+                    (self.cells, 1),
+                ),
+                high=np.tile(
+                    np.array([1.0, high, high, high], dtype=np.float32),
+                    (self.cells, 1),
+                ),
+                dtype=np.float32,
+            )
         low = np.tile(
             np.array([0.0, -high], dtype=np.float32),
             (self.cells, 1),
@@ -130,6 +150,7 @@ class LidarObservation(ObservationType):
         traced = self.trace(
             self.observer_vehicle.position,
             self.observer_vehicle.velocity,
+            heading=float(getattr(self.observer_vehicle, "heading", 0.0)),
             obstacle_entries=obstacle_entries,
             obstacle_index=obstacle_index,
             edge_dists=edge_dists,
@@ -137,7 +158,10 @@ class LidarObservation(ObservationType):
         started = time.perf_counter()
         obs = traced.copy()
         if self.normalize:
-            obs /= self.maximum_range
+            if self.separate_road_edge_return:
+                obs[:, 1:] /= self.maximum_range
+            else:
+                obs /= self.maximum_range
         _ObservationProfiler.record("lidar_normalize_copy", time.perf_counter() - started)
         return obs
 
@@ -196,11 +220,13 @@ class LidarObservation(ObservationType):
         self,
         origin: np.ndarray,
         origin_velocity: np.ndarray,
+        heading: float = 0.0,
         obstacle_entries: list[_ObstacleEntry] | None = None,
         obstacle_index: _ObstacleSpatialIndex | None = None,
         edge_dists: np.ndarray | None = None,
     ) -> np.ndarray:
         self.origin = np.array(origin, dtype=float).copy()
+        directions = self.directions_for_heading(heading)
 
         # Ensure velocity is finite
         if origin_velocity is None or not np.all(np.isfinite(origin_velocity)):
@@ -226,7 +252,7 @@ class LidarObservation(ObservationType):
         if edge_dists is None:
             edge_dists = self._distance_to_road_edges_batch(
                 origin=self.origin,
-                directions=self._directions,
+                directions=directions,
                 max_range=self.maximum_range,
                 coarse_step=self.coarse_step,
                 refine_iters=self.refine_iters,
@@ -241,11 +267,22 @@ class LidarObservation(ObservationType):
 
         # Initialize grid distances
         self.grid.fill(0.0)
-        if self.edge_as_return:
+        if self.separate_road_edge_return:
+            self.grid[:, self.DYNAMIC_PRESENCE] = 0.0
+            self.grid[:, self.DYNAMIC_DISTANCE] = self.maximum_range
+            self.grid[:, self.DYNAMIC_SPEED] = 0.0
+            self.grid[:, self.ROAD_EDGE_DISTANCE] = edge_dists
+        elif self.edge_as_return:
             self.grid[:, self.DISTANCE] = edge_dists
         else:
             self.grid[:, self.DISTANCE] = self.maximum_range
-        self.grid[:, self.SPEED] = 0.0
+        # ``SPEED`` is the legacy two-field column 1. In the separated
+        # four-field contract, column 1 is ``DYNAMIC_DISTANCE`` and was just
+        # initialized to ``maximum_range`` above. Resetting it here rejected
+        # every positive-distance obstacle hit and left only zero-distance
+        # overlaps visible.
+        if not self.separate_road_edge_return:
+            self.grid[:, self.SPEED] = 0.0
 
         # Iterate over road vehicles + static objects
         started = time.perf_counter()
@@ -269,14 +306,19 @@ class LidarObservation(ObservationType):
             center_distance = float(center_distances[int(obstacle_entry_index)])
 
             # Approximate center ray bin
-            center_angle = self.position_to_angle(entry.position, self.origin)
+            center_angle = self.position_to_angle(
+                entry.position, self.origin, heading=heading
+            )
             center_index = self.angle_to_index(center_angle)
 
             # Quick cull: if obstacle center beyond the road edge for its bin plus its half width, likely irrelevant
             if center_distance > float(edge_dists[center_index]) + 0.5 * entry.width:
                 # Still might intersect another bin, but this removes many far obstacles cheaply
                 pass  # keep conservative; do not continue
-            angles = [self.position_to_angle(corner, self.origin) for corner in entry.corners]
+            angles = [
+                self.position_to_angle(corner, self.origin, heading=heading)
+                for corner in entry.corners
+            ]
             angles = [a for a in angles if np.isfinite(a)]
             if len(angles) == 0:
                 continue
@@ -302,7 +344,7 @@ class LidarObservation(ObservationType):
                     if max_t <= 0.0:
                         continue
 
-                    direction = self._directions[int(index)]
+                    direction = directions[int(index)]
 
                     dist = self._distance_to_rect_precomputed(
                         origin=self.origin,
@@ -316,12 +358,22 @@ class LidarObservation(ObservationType):
 
                     dist = float(np.clip(dist, 0.0, max_t))
 
-                    if dist <= float(self.grid[int(index), self.DISTANCE]):
+                    distance_column = (
+                        self.DYNAMIC_DISTANCE
+                        if self.separate_road_edge_return
+                        else self.DISTANCE
+                    )
+                    if dist <= float(self.grid[int(index), distance_column]):
                         rel_vel = float((entry.velocity - origin_velocity).dot(direction))
-                        self.grid[int(index), :] = [dist, rel_vel]
+                        if self.separate_road_edge_return:
+                            self.grid[int(index), self.DYNAMIC_PRESENCE] = 1.0
+                            self.grid[int(index), self.DYNAMIC_DISTANCE] = dist
+                            self.grid[int(index), self.DYNAMIC_SPEED] = rel_vel
+                        else:
+                            self.grid[int(index), :] = [dist, rel_vel]
 
         # If we are NOT returning edge as return, still ensure beams do not exceed edge
-        if not self.edge_as_return:
+        if not self.edge_as_return and not self.separate_road_edge_return:
             self.grid[:, self.DISTANCE] = np.minimum(self.grid[:, self.DISTANCE], edge_dists)
 
         _ObservationProfiler.record("lidar_obstacles", time.perf_counter() - started)
@@ -407,6 +459,25 @@ class LidarObservation(ObservationType):
         return bounds
 
     def _trusted_lane_bounds(self, lane: AbstractLane) -> _LaneBounds:
+        if type(lane) is PolyLaneFixedWidth:
+            try:
+                geometry = self._lane_geometry(lane)
+                positions = np.asarray(geometry.curve_positions, dtype=float)
+                margin = (
+                    0.5 * float(geometry.width)
+                    + float(geometry.vehicle_length)
+                    + max(1.0e-9, 1.0e-9 * max(1.0, self.maximum_range, geometry.length))
+                )
+                return _LaneBounds(
+                    lane=lane,
+                    min_x=float(np.min(positions[:, 0]) - margin),
+                    max_x=float(np.max(positions[:, 0]) + margin),
+                    min_y=float(np.min(positions[:, 1]) - margin),
+                    max_y=float(np.max(positions[:, 1]) + margin),
+                    always_required=False,
+                )
+            except Exception:
+                return _LaneBounds(lane=lane, always_required=True)
         if not isinstance(lane, StraightLane) or isinstance(lane, SineLane):
             return _LaneBounds(lane=lane, always_required=True)
         try:
@@ -584,6 +655,8 @@ class LidarObservation(ObservationType):
             longitudinal = delta @ geometry.direction
             lateral = delta @ geometry.direction_lateral
             width = geometry.width
+        elif geometry.kind == "polyline_fixed":
+            return self._polyline_fixed_on_points(geometry, points)
         else:
             return None
 
@@ -594,6 +667,51 @@ class LidarObservation(ObservationType):
         ) & (
             longitudinal < geometry.length + geometry.vehicle_length
         )
+
+    @staticmethod
+    def _polyline_fixed_on_points(
+        geometry: _LaneGeometry,
+        points: np.ndarray,
+        *,
+        chunk_size: int = 2048,
+    ) -> np.ndarray:
+        """Vectorized exact equivalent of LinearSpline2D.cartesian_to_frenet.
+
+        This follows the source method's reverse-pose selection, including its
+        special terminal-pose rule.  Chunking bounds temporary memory for
+        multi-vehicle road-edge queries on long curved roads.
+        """
+        points = np.asarray(points, dtype=float).reshape(-1, 2)
+        positions = np.asarray(geometry.curve_positions, dtype=float)
+        normals = np.asarray(geometry.curve_normals, dtype=float)
+        orthonormals = np.asarray(geometry.curve_orthonormals, dtype=float)
+        s_samples = np.asarray(geometry.curve_s, dtype=float)
+        result = np.zeros(len(points), dtype=bool)
+        pose_indices = np.arange(len(s_samples), dtype=np.int64)
+        for start in range(0, len(points), max(1, int(chunk_size))):
+            stop = min(len(points), start + max(1, int(chunk_size)))
+            delta = points[start:stop, None, :] - positions[None, :, :]
+            projection = np.einsum("npi,pi->np", delta, normals, optimize=True)
+            distance = np.linalg.norm(delta, axis=2)
+            eligible = (projection >= 0.0) & (projection < distance)
+            eligible[:, -1] = False
+            selected = np.max(
+                np.where(eligible, pose_indices[None, :], -1), axis=1
+            )
+            selected = np.where(projection[:, -1] >= 0.0, len(s_samples) - 1, selected)
+            selected = np.where(selected >= 0, selected, 0).astype(np.int64)
+            row_indices = np.arange(stop - start, dtype=np.int64)
+            selected_delta = delta[row_indices, selected]
+            longitudinal = s_samples[selected] + projection[row_indices, selected]
+            lateral = np.einsum(
+                "ni,ni->n", selected_delta, orthonormals[selected], optimize=True
+            )
+            result[start:stop] = (
+                (np.abs(lateral) <= 0.5 * float(geometry.width))
+                & (-float(geometry.vehicle_length) <= longitudinal)
+                & (longitudinal < float(geometry.length) + float(geometry.vehicle_length))
+            )
+        return result
 
     def _lane_geometry(self, lane: AbstractLane) -> _LaneGeometry | None:
         key = id(lane)
@@ -624,6 +742,23 @@ class LidarObservation(ObservationType):
                 width=float(lane.width),
                 length=float(lane.length),
                 vehicle_length=float(lane.VEHICLE_LENGTH),
+            )
+        elif type(lane) is PolyLaneFixedWidth:
+            poses = tuple(lane.curve.poses)
+            geometry = _LaneGeometry(
+                lane=lane,
+                kind="polyline_fixed",
+                width=float(lane.width),
+                length=float(lane.length),
+                vehicle_length=float(lane.VEHICLE_LENGTH),
+                curve_s=np.asarray(lane.curve.s_samples, dtype=float),
+                curve_positions=np.asarray(
+                    [pose.position for pose in poses], dtype=float
+                ),
+                curve_normals=np.asarray([pose.normal for pose in poses], dtype=float),
+                curve_orthonormals=np.asarray(
+                    [pose.orthonormal for pose in poses], dtype=float
+                ),
             )
         else:
             geometry = None
@@ -817,14 +952,26 @@ class LidarObservation(ObservationType):
         shared across controlled vehicles.
         """
         origins = np.asarray(origins, dtype=float).reshape(-1, 2)
-        directions = np.asarray(directions, dtype=float).reshape(-1, 2)
+        directions = np.asarray(directions, dtype=float)
+        if directions.ndim == 2:
+            directions = np.broadcast_to(
+                directions.reshape(1, -1, 2),
+                (origins.shape[0], directions.shape[0], 2),
+            )
+        elif directions.ndim == 3 and directions.shape[0] == origins.shape[0]:
+            directions = directions.reshape(origins.shape[0], -1, 2)
+        else:
+            raise ValueError(
+                "directions must have shape [C,2] or [N,C,2] aligned with origins; "
+                f"got {directions.shape}."
+            )
         max_range = float(max_range)
         coarse_step = float(coarse_step)
         refine_iters = int(refine_iters)
-        if origins.shape[0] == 0 or directions.shape[0] == 0:
-            return np.zeros((origins.shape[0], directions.shape[0]), dtype=np.float32)
+        if origins.shape[0] == 0 or directions.shape[1] == 0:
+            return np.zeros((origins.shape[0], directions.shape[1]), dtype=np.float32)
 
-        norms = np.linalg.norm(directions, axis=1, keepdims=True) + 1.0e-12
+        norms = np.linalg.norm(directions, axis=2, keepdims=True) + 1.0e-12
         directions = directions / norms
         if coarse_step <= 0.0:
             coarse_step = max_range
@@ -835,24 +982,25 @@ class LidarObservation(ObservationType):
             steps[-1] = min(float(steps[-1]), max_range)
 
         origin_on_road = self._on_road_many(origins)
-        distances = np.zeros((origins.shape[0], directions.shape[0]), dtype=float)
+        distances = np.zeros((origins.shape[0], directions.shape[1]), dtype=float)
         active_origins = np.flatnonzero(origin_on_road)
         if active_origins.size == 0:
             return distances.astype(np.float32)
 
         active_points = (
             origins[active_origins, None, None, :]
-            + steps[None, :, None, None] * directions[None, None, :, :]
+            + steps[None, :, None, None]
+            * directions[active_origins, None, :, :]
         )
         on_road = self._on_road_many(active_points.reshape(-1, 2)).reshape(
             active_origins.size,
             steps.shape[0],
-            directions.shape[0],
+            directions.shape[1],
         )
         first_off = np.argmax(~on_road, axis=1)
         has_off = np.any(~on_road, axis=1)
         active_distances = np.full(
-            (active_origins.size, directions.shape[0]), max_range, dtype=float
+            (active_origins.size, directions.shape[1]), max_range, dtype=float
         )
         crossing_active, crossing_directions = np.nonzero(has_off)
         if crossing_active.size:
@@ -864,7 +1012,9 @@ class LidarObservation(ObservationType):
                 0.0,
             ).astype(float, copy=True)
             crossing_origins = origins[active_origins[crossing_active]]
-            crossing_dirs = directions[crossing_directions]
+            crossing_dirs = directions[
+                active_origins[crossing_active], crossing_directions
+            ]
             for _ in range(refine_iters):
                 mid = 0.5 * (lo + hi)
                 mid_points = crossing_origins + mid.reshape(-1, 1) * crossing_dirs
@@ -918,14 +1068,21 @@ class LidarObservation(ObservationType):
 
     # ----------------- Helper functions -----------------
 
-    def position_to_angle(self, position: np.ndarray, origin: np.ndarray) -> float:
+    def position_to_angle(
+        self,
+        position: np.ndarray,
+        origin: np.ndarray,
+        *,
+        heading: float = 0.0,
+    ) -> float:
         dx = float(position[0] - origin[0])
         dy = float(position[1] - origin[1])
 
         if not np.isfinite(dx) or not np.isfinite(dy):
             return 0.0
 
-        ang = float(np.arctan2(dy, dx) + self.angle / 2.0)
+        reference_heading = float(heading) if self.ego_centric else 0.0
+        ang = float(np.arctan2(dy, dx) - reference_heading + self.angle / 2.0)
         if not np.isfinite(ang):
             return 0.0
         return ang
@@ -945,6 +1102,15 @@ class LidarObservation(ObservationType):
         """
         theta = (int(index) + 0.5) * self.angle
         return np.array([np.cos(theta), np.sin(theta)], dtype=float)
+
+    def directions_for_heading(self, heading: float) -> np.ndarray:
+        """Return world-space rays for the configured sensor reference frame."""
+        if not self.ego_centric:
+            return self._directions
+        theta = float(heading)
+        cosine, sine = np.cos(theta), np.sin(theta)
+        rotation = np.asarray([[cosine, -sine], [sine, cosine]], dtype=float)
+        return self._directions @ rotation.T
 
 __all__ = [
     'LidarObservation',

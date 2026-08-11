@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts_gail.run_bc_domain_depth_matrix import (
+from policy.contracts.study_recipe import (
     read_locked_recipe,
     validate_active_causal_motif_expert_paths,
 )

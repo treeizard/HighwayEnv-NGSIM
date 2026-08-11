@@ -210,10 +210,20 @@ def are_polygons_intersecting(
     intersecting = will_intersect = True
     min_distance = np.inf
     translation, translation_axis = None, None
+    valid_axes = 0
     for polygon in [a, b]:
         for p1, p2 in zip(polygon, polygon[1:]):
             normal = np.array([-p2[1] + p1[1], p2[0] - p1[0]])
-            normal /= np.linalg.norm(normal)
+            normal_norm = float(np.linalg.norm(normal))
+            # Zero-width/zero-length entities can produce duplicate adjacent
+            # polygon vertices. They contribute no separating axis; the valid
+            # axes from the remaining edges still define the point/line versus
+            # rectangle test. Normalizing the zero edge previously injected
+            # NaNs and left ``translation_axis`` unset.
+            if not np.isfinite(normal_norm) or normal_norm <= 1.0e-12:
+                continue
+            normal /= normal_norm
+            valid_axes += 1
             min_a, max_a = project_polygon(a, normal)
             min_b, max_b = project_polygon(b, normal)
 
@@ -236,8 +246,13 @@ def are_polygons_intersecting(
                 d = a[:-1].mean(axis=0) - b[:-1].mean(axis=0)  # center difference
                 translation_axis = normal if d.dot(normal) > 0 else -normal
 
-    if will_intersect:
+    if valid_axes == 0:
+        # Two zero-area point polygons have no physical collision surface.
+        return False, False, None
+    if will_intersect and translation_axis is not None:
         translation = min_distance * translation_axis
+    elif will_intersect:
+        will_intersect = False
     return intersecting, will_intersect, translation
 
 
