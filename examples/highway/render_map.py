@@ -1,12 +1,11 @@
 import argparse
-import os
-import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import gymnasium as gym
 import numpy as np
 from gymnasium.envs.registration import register
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 
 register(id="NGSim-US101-v0", entry_point="highway_env.envs.ngsim_env:NGSimEnv")
@@ -50,12 +49,34 @@ def _fit_view_to_road(base_env, width, height, margin_ratio=0.92):
     return center, scaling
 
 
-def save_static_map_with_api(env, out_path="us101_static.png"):
+def _font(size):
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def save_static_map_with_api(
+    env,
+    out_path="us101_static.png",
+    *,
+    road_network=None,
+    title=None,
+    subtitle=None,
+):
     """Render the full road topology, fit it in frame, and save to PNG."""
+    from highway_env.road.road import Road
+
     base_env = env.unwrapped
     if base_env.render_mode is None:
         base_env.render_mode = "rgb_array"
-    base_env._create_road()
+    if road_network is None:
+        base_env._create_road()
+    else:
+        base_env.road = Road(
+            network=road_network,
+            np_random=getattr(base_env, "np_random", None),
+        )
     base_env.road.vehicles = []
     base_env.vehicle = None
 
@@ -74,10 +95,31 @@ def save_static_map_with_api(env, out_path="us101_static.png"):
     finally:
         base_env.observation_type = original_observation_type
 
-    Image.fromarray(frame).save(out_path)
+    if not np.any(frame):
+        raise RuntimeError(
+            "Native HighwayEnv viewer returned an all-black frame. "
+            "This fork disables drawing when SDL_VIDEODRIVER=dummy; unset that "
+            "variable for an offscreen topology export."
+        )
+    rendered = Image.fromarray(frame)
+    if title or subtitle:
+        caption_height = 92
+        captioned = Image.new(
+            "RGB", (rendered.width, rendered.height + caption_height), "white"
+        )
+        captioned.paste(rendered, (0, caption_height))
+        draw = ImageDraw.Draw(captioned)
+        if title:
+            draw.text((24, 12), str(title), fill=(18, 18, 18), font=_font(28))
+        if subtitle:
+            draw.text((24, 52), str(subtitle), fill=(75, 75, 75), font=_font(18))
+        rendered = captioned
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    rendered.save(out_path)
     print(f"Saved static map to {out_path}")
     print(f"camera_center={center.tolist()}")
     print(f"camera_scaling={scaling:.4f}")
+    print("equal_xy_scaling=true")
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -88,6 +130,22 @@ def parse_args():
         choices=("us-101", "japanese"),
         default="us-101",
         help="Road topology to render.",
+    )
+    source_group = parser.add_mutually_exclusive_group()
+    source_group.add_argument(
+        "--road-geometry-v3",
+        type=Path,
+        default=None,
+        help="Render a manifest RoadGeometryV3 through the native HighwayEnv viewer.",
+    )
+    source_group.add_argument(
+        "--japanese-source-geometry",
+        type=Path,
+        default=None,
+        help=(
+            "Render a historical source-derived Japanese geometry through the "
+            "legacy native road constructor."
+        ),
     )
     parser.add_argument(
         "--out",
@@ -106,6 +164,10 @@ def parse_args():
         default=None,
         help="Output image height in pixels.",
     )
+    parser.add_argument("--title", default=None, help="Optional caption above the map.")
+    parser.add_argument(
+        "--subtitle", default=None, help="Optional disclosure caption above the map."
+    )
     return parser.parse_args()
 
 
@@ -116,6 +178,25 @@ def main():
         "japanese": (2200, 300),
     }
     default_width, default_height = default_sizes[args.scene]
+    road_network = None
+    source_label = f"legacy scene={args.scene}"
+    if args.road_geometry_v3 is not None:
+        from highway_env.ngsim_utils.road.manifest_road import (
+            RoadGeometryV3,
+            build_road_network,
+        )
+
+        geometry = RoadGeometryV3.from_source(args.road_geometry_v3)
+        road_network = build_road_network(geometry)
+        source_label = (
+            f"RoadGeometryV3 environment_id={geometry.environment_id or 'unspecified'}"
+        )
+    elif args.japanese_source_geometry is not None:
+        from highway_env.ngsim_utils.road.gen_road import create_japanese_road
+
+        road_network = create_japanese_road(args.japanese_source_geometry)
+        source_label = "historical source-derived Japanese geometry"
+
     width = args.width if args.width is not None else default_width
     height = args.height if args.height is not None else default_height
     out_path = args.out or f"{args.scene.replace('-', '_')}_static_full_topology.png"
@@ -138,7 +219,13 @@ def main():
     # Pass config at construction time so scene-dependent internals are initialized correctly.
     env = gym.make("NGSim-US101-v0", config=cfg, render_mode="rgb_array")
 
-    save_static_map_with_api(env, out_path)
+    save_static_map_with_api(
+        env,
+        out_path,
+        road_network=road_network,
+        title=args.title,
+        subtitle=args.subtitle or source_label,
+    )
 
     # (Optional) run a short rollout or just close
     env.close()

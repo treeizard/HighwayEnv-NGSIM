@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import numpy as np
-
 from highway_env.envs.ngsim_env import NGSimEnv
 from highway_env.ngsim_utils.vehicles.replay import NGSIMVehicle
+from highway_env.road.lane import PolyLaneFixedWidth
 from highway_env.road.road import Road, RoadNetwork
 from highway_env.vehicle.kinematics import Vehicle
 from highway_env.vehicle.objects import Obstacle
@@ -62,6 +62,34 @@ def test_spatial_queries_match_legacy_results_and_tie_order() -> None:
         _token(legacy_front),
         _token(legacy_rear),
     )
+
+
+def test_polyline_batched_coordinates_and_neighbours_match_scalar_path() -> None:
+    lane = PolyLaneFixedWidth(
+        [(0.0, 0.0), (100.0, 1.0), (200.0, -1.0), (400.0, 0.0)]
+    )
+    rng = np.random.default_rng(20260827)
+    positions = np.column_stack(
+        (rng.uniform(-5.0, 405.0, size=100), rng.uniform(-6.0, 6.0, size=100))
+    )
+    scalar = np.asarray([lane.local_coordinates(position) for position in positions])
+    batched = lane.local_coordinates_many(positions)
+    np.testing.assert_allclose(batched, scalar, rtol=0.0, atol=1.0e-12)
+
+    network = RoadNetwork()
+    network.add_lane("a", "b", lane)
+    road = Road(network, use_query_fast_path=True)
+    ego = Vehicle(road, lane.position(200.0, 0.0), speed=0.0)
+    road.vehicles.append(ego)
+    for longitudinal in np.linspace(5.0, 395.0, num=70):
+        road.vehicles.append(
+            Vehicle(road, lane.position(float(longitudinal), 0.0), speed=0.0)
+        )
+    road.use_query_fast_path = False
+    legacy = road.neighbour_vehicles(ego)
+    road.use_query_fast_path = True
+    optimized = road.neighbour_vehicles(ego)
+    assert optimized == legacy
 
 
 def _collision_road(*, use_broadphase: bool) -> Road:

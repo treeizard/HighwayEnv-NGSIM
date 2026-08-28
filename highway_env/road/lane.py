@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from abc import ABCMeta, abstractmethod
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from numbers import Real
 
 import numpy as np
 
@@ -19,6 +22,7 @@ class AbstractLane:
     VEHICLE_LENGTH: float = 5
     length: float = 0
     line_types: list[LineType]
+    marking_profile: tuple[LaneMarkingInterval, ...] | None = None
 
     @abstractmethod
     def position(self, longitudinal: float, lateral: float) -> np.ndarray:
@@ -156,6 +160,116 @@ class LineType:
     STRIPED = 1
     CONTINUOUS = 2
     CONTINUOUS_LINE = 3
+
+
+@dataclass(frozen=True)
+class LaneMarkingInterval:
+    """Line styles applied over one contiguous longitudinal lane interval."""
+
+    start_s_m: float
+    end_s_m: float
+    line_types: tuple[int, int]
+
+    def to_config(self) -> dict:
+        return {
+            "start_s_m": self.start_s_m,
+            "end_s_m": self.end_s_m,
+            "line_types": list(self.line_types),
+        }
+
+
+_VALID_LINE_TYPES = frozenset(
+    {
+        LineType.NONE,
+        LineType.STRIPED,
+        LineType.CONTINUOUS,
+        LineType.CONTINUOUS_LINE,
+    }
+)
+
+
+def normalize_marking_profile(
+    marking_profile: Sequence[LaneMarkingInterval | Mapping[str, object]] | None,
+    *,
+    lane_length: float,
+    label: str = "lane marking_profile",
+) -> tuple[LaneMarkingInterval, ...] | None:
+    """Validate and normalize an optional full longitudinal marking partition."""
+
+    if marking_profile is None:
+        return None
+    if (
+        isinstance(marking_profile, (str, bytes, Mapping))
+        or not isinstance(marking_profile, Sequence)
+        or not marking_profile
+    ):
+        raise ValueError(f"{label} must be a non-empty ordered list of intervals.")
+    length = float(lane_length)
+    if not np.isfinite(length) or length <= 0.0:
+        raise ValueError(f"{label} requires a finite positive lane length.")
+
+    normalized: list[LaneMarkingInterval] = []
+    expected_start = 0.0
+    for index, raw_interval in enumerate(marking_profile):
+        interval_label = f"{label} interval {index}"
+        if isinstance(raw_interval, LaneMarkingInterval):
+            raw_start = raw_interval.start_s_m
+            raw_end = raw_interval.end_s_m
+            raw_line_types = raw_interval.line_types
+        elif isinstance(raw_interval, Mapping):
+            raw_start = raw_interval.get("start_s_m")
+            raw_end = raw_interval.get("end_s_m")
+            raw_line_types = raw_interval.get("line_types")
+        else:
+            raise ValueError(f"{interval_label} must be an object.")
+
+        for field_name, value in (
+            ("start_s_m", raw_start),
+            ("end_s_m", raw_end),
+        ):
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise ValueError(f"{interval_label} {field_name} must be numeric.")
+            if not np.isfinite(float(value)):
+                raise ValueError(f"{interval_label} {field_name} must be finite.")
+        start = float(raw_start)
+        end = float(raw_end)
+        if start != expected_start:
+            raise ValueError(
+                f"{interval_label} must start at {expected_start:g} m to form an exact contiguous partition."
+            )
+        if end <= start:
+            raise ValueError(f"{interval_label} must have positive length.")
+        if end > length:
+            raise ValueError(f"{interval_label} extends beyond lane length {length:g} m.")
+
+        if (
+            isinstance(raw_line_types, (str, bytes))
+            or not isinstance(raw_line_types, Sequence)
+            or len(raw_line_types) != 2
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value not in _VALID_LINE_TYPES
+                for value in raw_line_types
+            )
+        ):
+            raise ValueError(
+                f"{interval_label} line_types must contain two valid LineType integers."
+            )
+        normalized.append(
+            LaneMarkingInterval(
+                start_s_m=start,
+                end_s_m=end,
+                line_types=(int(raw_line_types[0]), int(raw_line_types[1])),
+            )
+        )
+        expected_start = end
+
+    if expected_start != length:
+        raise ValueError(
+            f"{label} must end at lane length {length:g} m to form a full partition."
+        )
+    return tuple(normalized)
 
 
 class StraightLane(AbstractLane):
@@ -399,6 +513,7 @@ class PolyLaneFixedWidth(AbstractLane):
         forbidden: bool = False,
         speed_limit: float = 20,
         priority: int = 0,
+        marking_profile: Sequence[LaneMarkingInterval | Mapping[str, object]] | None = None,
     ) -> None:
         self.curve = LinearSpline2D(lane_points)
         self.length = self.curve.length
@@ -407,6 +522,10 @@ class PolyLaneFixedWidth(AbstractLane):
         self.forbidden = forbidden
         self.speed_limit = speed_limit
         self.priority = priority
+        self.marking_profile = normalize_marking_profile(
+            marking_profile,
+            lane_length=self.length,
+        )
 
     def position(self, longitudinal: float, lateral: float) -> np.ndarray:
         x, y = self.curve(longitudinal)
@@ -416,6 +535,11 @@ class PolyLaneFixedWidth(AbstractLane):
     def local_coordinates(self, position: np.ndarray) -> tuple[float, float]:
         lon, lat = self.curve.cartesian_to_frenet(position)
         return lon, lat
+
+    def local_coordinates_many(self, positions: np.ndarray) -> np.ndarray:
+        """Return the scalar-equivalent Frenet coordinates for many positions."""
+
+        return self.curve.cartesian_to_frenet_many(positions)
 
     def heading_at(self, longitudinal: float) -> float:
         dx, dy = self.curve.get_dx_dy(longitudinal)
@@ -429,7 +553,7 @@ class PolyLaneFixedWidth(AbstractLane):
         return cls(**config)
 
     def to_config(self) -> dict:
-        return {
+        config = {
             "class_name": self.__class__.__name__,
             "config": {
                 "lane_points": _to_serializable(
@@ -442,6 +566,11 @@ class PolyLaneFixedWidth(AbstractLane):
                 "priority": self.priority,
             },
         }
+        if self.marking_profile is not None:
+            config["config"]["marking_profile"] = [
+                interval.to_config() for interval in self.marking_profile
+            ]
+        return config
 
 
 class PolyLane(PolyLaneFixedWidth):
@@ -458,6 +587,7 @@ class PolyLane(PolyLaneFixedWidth):
         forbidden: bool = False,
         speed_limit: float = 20,
         priority: int = 0,
+        marking_profile: Sequence[LaneMarkingInterval | Mapping[str, object]] | None = None,
     ):
         super().__init__(
             lane_points=lane_points,
@@ -465,6 +595,7 @@ class PolyLane(PolyLaneFixedWidth):
             forbidden=forbidden,
             speed_limit=speed_limit,
             priority=priority,
+            marking_profile=marking_profile,
         )
         self.right_boundary = LinearSpline2D(right_boundary_points)
         self.left_boundary = LinearSpline2D(left_boundary_points)

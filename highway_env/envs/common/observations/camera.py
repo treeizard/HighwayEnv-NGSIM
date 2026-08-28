@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -22,6 +23,12 @@ from .lidar import LidarObservation
 
 def _wrap_angle(angle: float) -> float:
     return float((float(angle) + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+@lru_cache(maxsize=32)
+def _upper_triangle_pair_indices(count: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return stable lexicographic point-pair indices for the small lane fit."""
+    return np.triu_indices(int(count), k=1)
 
 
 def _lane_state_from_camera(
@@ -51,44 +58,77 @@ def _lane_state_from_camera(
         & (points[:, 0] <= min(scale, 12.0))
     )
 
-    def fit_side(intercept_sign: float) -> tuple[float, float] | None:
-        side_points = points[valid]
-        if len(side_points) < 3:
-            return None
-        best: tuple[tuple[int, float, float], np.ndarray] | None = None
-        for first in range(len(side_points) - 1):
-            for second in range(first + 1, len(side_points)):
-                dx = float(side_points[second, 0] - side_points[first, 0])
-                if abs(dx) < 0.75:
-                    continue
-                slope = float(
-                    (side_points[second, 1] - side_points[first, 1]) / dx
+    side_points = points[valid]
+    candidate_slopes = np.zeros((0,), dtype=float)
+    candidate_intercepts = np.zeros((0,), dtype=float)
+    candidate_residuals = np.zeros((0, len(side_points)), dtype=float)
+    candidate_inliers = np.zeros((0, len(side_points)), dtype=bool)
+    candidate_counts = np.zeros((0,), dtype=np.int64)
+    if len(side_points) >= 3:
+        first, second = _upper_triangle_pair_indices(len(side_points))
+        dx = side_points[second, 0] - side_points[first, 0]
+        usable = np.abs(dx) >= 0.75
+        first = first[usable]
+        second = second[usable]
+        dx = dx[usable]
+        if dx.size:
+            slopes = (side_points[second, 1] - side_points[first, 1]) / dx
+            usable = np.abs(slopes) <= 1.0
+            first = first[usable]
+            slopes = slopes[usable]
+            if slopes.size:
+                intercepts = (
+                    side_points[first, 1] - slopes * side_points[first, 0]
                 )
-                if abs(slope) > 1.0:
-                    continue
-                intercept = float(
-                    side_points[first, 1] - slope * side_points[first, 0]
-                )
-                if intercept * intercept_sign <= 0.0:
-                    continue
                 residuals = np.abs(
-                    side_points[:, 1]
-                    - (slope * side_points[:, 0] + intercept)
+                    side_points[None, :, 1]
+                    - (
+                        slopes[:, None] * side_points[None, :, 0]
+                        + intercepts[:, None]
+                    )
                 )
                 inliers = residuals <= 0.15
-                count = int(inliers.sum())
-                if count < 3:
-                    continue
-                score = (
-                    count,
-                    -abs(intercept),
-                    -float(np.median(residuals[inliers])),
-                )
-                if best is None or score > best[0]:
-                    best = score, inliers
-        if best is None:
+                candidate_slopes = slopes
+                candidate_intercepts = intercepts
+                candidate_residuals = residuals
+                candidate_inliers = inliers
+                candidate_counts = np.sum(inliers, axis=1, dtype=np.int64)
+
+    def fit_side(intercept_sign: float) -> tuple[float, float] | None:
+        if candidate_slopes.size == 0:
             return None
-        inlier_points = side_points[best[1]]
+        eligible = np.flatnonzero(
+            (candidate_intercepts * intercept_sign > 0.0)
+            & (candidate_counts >= 3)
+        )
+        if eligible.size == 0:
+            return None
+        maximum_count = int(np.max(candidate_counts[eligible]))
+        eligible = eligible[candidate_counts[eligible] == maximum_count]
+        minimum_abs_intercept = float(
+            np.min(np.abs(candidate_intercepts[eligible]))
+        )
+        eligible = eligible[
+            np.abs(candidate_intercepts[eligible]) == minimum_abs_intercept
+        ]
+        if eligible.size > 1:
+            eligible_residuals = np.where(
+                candidate_inliers[eligible],
+                candidate_residuals[eligible],
+                np.inf,
+            )
+            ordered_residuals = np.sort(eligible_residuals, axis=1)
+            middle = maximum_count // 2
+            if maximum_count % 2:
+                median_residuals = ordered_residuals[:, middle]
+            else:
+                median_residuals = np.mean(
+                    ordered_residuals[:, middle - 1 : middle + 1], axis=1
+                )
+            best_index = int(eligible[int(np.argmin(median_residuals))])
+        else:
+            best_index = int(eligible[0])
+        inlier_points = side_points[candidate_inliers[best_index]]
         x = inlier_points[:, 0]
         y = inlier_points[:, 1]
         design = np.column_stack([x, np.ones_like(x)])
@@ -297,7 +337,11 @@ class SharedMultiAgentLidarCameraObservations(ObservationType):
             self.lidar_observation.observer_vehicle = vehicle
             self.camera_observation.observer_vehicle = vehicle
             camera_observation = self.camera_observation.observe()
+            ego_started = time.perf_counter()
             ego_state = self._build_ego_state(vehicle, camera_observation)
+            _ObservationProfiler.record(
+                "shared_route_free_ego_state", time.perf_counter() - ego_started
+            )
             observations.append(
                 (
                     self.lidar_observation.observe(

@@ -17,12 +17,18 @@
 #   howpublished = {\url{https://github.com/eleurent/highway-env}},
 # }
 
+import os
+from typing import Any, Dict
+
+import matplotlib.pyplot as plt
 import numpy as np
 from scipy import signal
-import matplotlib.pyplot as plt
-from highway_env.data.ngsim import *
-from typing import Any, Dict
-from highway_env.ngsim_utils.core.constants import FEET_PER_METER
+
+from highway_env.data.ngsim import ngsim_data
+from highway_env.ngsim_utils.core.constants import (
+    FEET_PER_METER,
+    MORINOMIYA_MANIFEST_ENVIRONMENT_IDS,
+)
 
 
 def trajectory_smoothing(trajectory):
@@ -58,7 +64,10 @@ def trajectory_smoothing(trajectory):
     y = _smooth_1d(y)
     speed = _smooth_1d(speed)
 
-    return [[float(xx), float(yy), float(s), int(l)] for xx, yy, s, l in zip(x, y, speed, lane)]
+    return [
+        [float(xx), float(yy), float(s), int(lane_id)]
+        for xx, yy, s, lane_id in zip(x, y, speed, lane)
+    ]
 
 
 def build_trajectory(scene, period, vehicle_ID):
@@ -337,7 +346,7 @@ def process_raw_trajectory(trajectory, scene):
             trajectory[i][0] = y / FEET_PER_METER
             trajectory[i][1] = x / FEET_PER_METER
             trajectory[i][2] = speed / FEET_PER_METER
-    elif scene == "japanese":
+    elif scene == "japanese" or scene in MORINOMIYA_MANIFEST_ENVIRONMENT_IDS:
         trajectory = np.array(trajectory)
         for i in range(trajectory.shape[0]):
             """

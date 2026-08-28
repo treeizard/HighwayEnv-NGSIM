@@ -20,23 +20,24 @@
 
 from __future__ import annotations
 
-import math
 import numpy as np
 
 from highway_env import utils
-from highway_env.vehicle.behavior import IDMVehicle
 from highway_env.ngsim_utils.core.constants import FEET_PER_METER
-from highway_env.ngsim_utils.vehicles.ego import EgoVehicle
-from highway_env.ngsim_utils.road.lane_mapping import (
-    heading_from_trajectory_row,
-    target_lane_index_from_lane_id,
-)
 from highway_env.ngsim_utils.data.trajectory_gen import (
     first_valid_index as first_active_index,
+)
+from highway_env.ngsim_utils.data.trajectory_gen import (
     process_raw_trajectory,
     trajectory_row_is_active,
     trajectory_step_speed_mps,
 )
+from highway_env.ngsim_utils.road.lane_mapping import (
+    heading_from_trajectory_row,
+    target_lane_index_from_position_and_lane_id,
+)
+from highway_env.ngsim_utils.vehicles.ego import EgoVehicle
+from highway_env.vehicle.behavior import IDMVehicle
 
 
 def _road_entity_blocks_spawn(entity) -> bool:
@@ -167,6 +168,9 @@ class NGSIMVehicle(IDMVehicle):
         scene: str | None = None,
         color=None,
         allow_idm: bool = True,
+        ngsim_heading_rad=None,
+        ngsim_heading_valid_mask=None,
+        ngsim_heading_derivation=None,
     ):
         super().__init__(
             road,
@@ -185,6 +189,45 @@ class NGSIMVehicle(IDMVehicle):
         self.ngsim_traj = (
             np.asarray(ngsim_traj, dtype=float) if ngsim_traj is not None else None
         )
+        heading_inputs = (
+            ngsim_heading_rad,
+            ngsim_heading_valid_mask,
+            ngsim_heading_derivation,
+        )
+        if any(value is not None for value in heading_inputs) and not all(
+            value is not None for value in heading_inputs
+        ):
+            raise ValueError(
+                "NGSIMVehicle persisted heading requires heading_rad, "
+                "heading_valid_mask, and heading_derivation together."
+            )
+        self.ngsim_heading_rad = None
+        self.ngsim_heading_valid_mask = None
+        self.ngsim_heading_derivation = None
+        if all(value is not None for value in heading_inputs):
+            if self.ngsim_traj is None:
+                raise ValueError("Persisted heading arrays require an ngsim_traj.")
+            expected = (len(self.ngsim_traj),)
+            headings = np.asarray(ngsim_heading_rad, dtype=np.float64)
+            valid = np.asarray(ngsim_heading_valid_mask, dtype=bool)
+            derivations = np.asarray(ngsim_heading_derivation, dtype=np.int8)
+            if headings.shape != expected or valid.shape != expected or derivations.shape != expected:
+                raise ValueError(
+                    "NGSIMVehicle persisted heading arrays must align with ngsim_traj: "
+                    f"heading={headings.shape}, valid={valid.shape}, "
+                    f"derivation={derivations.shape}, expected={expected}."
+                )
+            if not np.all(np.isfinite(headings)) or np.any(headings < -np.pi) or np.any(
+                headings > np.pi
+            ):
+                raise ValueError("NGSIMVehicle persisted headings must be finite in [-pi, pi].")
+            if np.any(~np.isin(derivations[valid], [1, 2, 3])):
+                raise ValueError(
+                    "Valid NGSIMVehicle persisted headings require derivation in {1,2,3}."
+                )
+            self.ngsim_heading_rad = headings
+            self.ngsim_heading_valid_mask = valid
+            self.ngsim_heading_derivation = derivations
         self.vehicle_ID = vehicle_ID
         if scene is not None:
             self.SCENE = str(scene)
@@ -198,6 +241,7 @@ class NGSIMVehicle(IDMVehicle):
         self._debug_handover_logged = False
         self.idm_handover_step: int | None = None
         self.idm_handover_reason: str | None = None
+        self.current_heading_derivation: int | None = None
 
         # ---- Initialise from trajectory instead of dummy (0,0) ----
         if self.ngsim_traj is not None and len(self.ngsim_traj) > 0:
@@ -210,6 +254,9 @@ class NGSIMVehicle(IDMVehicle):
             self.target_speed = self.speed
 
             self.appear = trajectory_row_is_active(self.ngsim_traj[self.sim_steps])
+            persisted_heading = self._persisted_heading_at(self.sim_steps)
+            if persisted_heading is not None:
+                self.heading, self.current_heading_derivation = persisted_heading
         else:
             # Fallback if no traj at all
             self.appear = bool(self.position[0] != 0.0)
@@ -239,6 +286,18 @@ class NGSIMVehicle(IDMVehicle):
         self._update_diagonal()
 
         self.color = color if color is not None else self.DEFAULT_COLOR
+        if (
+            callable(getattr(self.road, "vehicle_lifecycle_event_recorder", None))
+            and self.ngsim_traj is not None
+            and not self.appear
+        ):
+            first_source_active = first_active_index(self.ngsim_traj)
+            if first_source_active is not None and first_source_active > 0:
+                self._record_lifecycle_event(
+                    "source_before_active",
+                    source_index=0,
+                    details={"first_active_source_index": int(first_source_active)},
+                )
     # ---------------- Factory ----------------
     @classmethod
     def create(
@@ -254,6 +313,9 @@ class NGSIMVehicle(IDMVehicle):
         speed: float = 15.0,
         color=None,  
         allow_idm: bool = True,
+        ngsim_heading_rad=None,
+        ngsim_heading_valid_mask=None,
+        ngsim_heading_derivation=None,
     ):
         return cls(
             road,
@@ -267,6 +329,9 @@ class NGSIMVehicle(IDMVehicle):
             scene=scene,
             color=color,
             allow_idm=allow_idm,
+            ngsim_heading_rad=ngsim_heading_rad,
+            ngsim_heading_valid_mask=ngsim_heading_valid_mask,
+            ngsim_heading_derivation=ngsim_heading_derivation,
         )
 
     # ---------------- Behaviour ----------------
@@ -290,19 +355,88 @@ class NGSIMVehicle(IDMVehicle):
         """Return the road-level diagnostics policy, preserving legacy defaults."""
         return bool(getattr(self.road, "record_replay_diagnostics", True))
 
+    def _preserves_interior_source_gap(self) -> bool:
+        if not bool(
+            getattr(self.road, "disable_background_replay_spawn_safety", False)
+        ):
+            return False
+        last_active_index = getattr(self, "_last_active_source_index", None)
+        if last_active_index is None:
+            last_active_index = next(
+                (
+                    index
+                    for index in range(len(self.ngsim_traj) - 1, -1, -1)
+                    if trajectory_row_is_active(self.ngsim_traj[index])
+                ),
+                -1,
+            )
+            self._last_active_source_index = int(last_active_index)
+        return int(self.sim_steps) < int(last_active_index)
+
+    def _record_lifecycle_event(
+        self,
+        event_type: str,
+        *,
+        source_index: int | None = None,
+        details: dict | None = None,
+    ) -> bool:
+        recorder = getattr(self.road, "vehicle_lifecycle_event_recorder", None)
+        if callable(recorder):
+            recorder(
+                event_type,
+                vehicle=self,
+                actor_role="background",
+                source_index=source_index,
+                details=details,
+            )
+            return True
+        return False
+
     def _record_position(self) -> None:
         if self._records_replay_diagnostics():
             self.traj = np.vstack([self.traj, self.position.copy()])
 
-    def _mark_for_removal(self) -> None:
+    def _mark_for_removal(
+        self,
+        lifecycle_event: str | None = None,
+        *,
+        source_index: int | None = None,
+        details: dict | None = None,
+    ) -> None:
         """Hide the vehicle and flag it for pruning from the road."""
+        if lifecycle_event is not None and self._record_lifecycle_event(
+            lifecycle_event,
+            source_index=source_index,
+            details=details,
+        ):
+            self.lifecycle_removal_reason = lifecycle_event
         self.remove_from_road = True
         self.speed = 0.0
         self.target_speed = 0.0
         self.position = self.HIDDEN_POSITION.copy()
         self._set_visibility_from_appearance(False)
 
-    def _row_heading(self, row: np.ndarray, next_row: np.ndarray | None = None) -> float:
+    def _persisted_heading_at(self, index: int) -> tuple[float, int] | None:
+        if self.ngsim_heading_rad is None or not bool(
+            self.ngsim_heading_valid_mask[index]
+        ):
+            return None
+        return (
+            float(self.ngsim_heading_rad[index]),
+            int(self.ngsim_heading_derivation[index]),
+        )
+
+    def _row_heading(
+        self,
+        row: np.ndarray,
+        next_row: np.ndarray | None = None,
+        *,
+        row_index: int | None = None,
+    ) -> float:
+        index = self.sim_steps if row_index is None else int(row_index)
+        persisted_heading = self._persisted_heading_at(index)
+        if persisted_heading is not None:
+            return persisted_heading[0]
         return heading_from_trajectory_row(
             self.road.network,
             self.SCENE,
@@ -311,12 +445,26 @@ class NGSIMVehicle(IDMVehicle):
             fallback_heading=float(self.heading),
         )
 
-    def _spawn_row_is_clear(self, row: np.ndarray, next_row: np.ndarray | None = None) -> bool:
+    def _spawn_row_is_clear(
+        self,
+        row: np.ndarray,
+        next_row: np.ndarray | None = None,
+        *,
+        row_index: int | None = None,
+    ) -> bool:
+        # Source-faithful collectors explicitly accept source overlap instead
+        # of suppressing the actor at either its initial or delayed activation.
+        if bool(
+            getattr(self.road, "disable_background_replay_spawn_safety", False)
+        ):
+            return True
         row_arr = np.asarray(row, dtype=float)
         return not road_entity_conflicts_at_pose(
             self.road,
             row_arr[:2],
-            heading=self._row_heading(row_arr, next_row=next_row),
+            heading=self._row_heading(
+                row_arr, next_row=next_row, row_index=row_index
+            ),
             length=float(self.real_length),
             width=float(self.real_width),
             ignore_entity=self,
@@ -333,10 +481,10 @@ class NGSIMVehicle(IDMVehicle):
         return bool(lane.on_lane(self.position, local_s, local_r, margin=0.05))
 
     def _set_lane_from_recorded_lane_id(self, lane_id: int) -> bool:
-        lane_index = target_lane_index_from_lane_id(
+        lane_index = target_lane_index_from_position_and_lane_id(
             self.road.network,
             self.SCENE,
-            float(self.position[0]),
+            self.position,
             int(lane_id),
         )
         if lane_index is None or not self._lane_index_contains_current_pose(lane_index):
@@ -362,6 +510,12 @@ class NGSIMVehicle(IDMVehicle):
         local_s, _ = lane.local_coordinates(self.position)
         removal_margin = 0.5 * max(float(self.real_length), 0.0)
         return bool(local_s >= lane.length - removal_margin)
+
+    def _requires_terminal_lane_removal(self) -> bool:
+        """Keep logged rows authoritative in explicit source-fidelity replay."""
+        return not bool(
+            getattr(self.road, "source_faithful_background_replay", False)
+        ) and self._reached_terminal_lane_end()
 
     def act(self, action: dict | str = None):
         """
@@ -394,6 +548,88 @@ class NGSIMVehicle(IDMVehicle):
 
     # ---------------- collision prevention ----------------
 
+    def _set_from_source_row(self, source_index: int) -> None:
+        """Set the replay state exactly from one processed source row."""
+        if self.ngsim_traj is None:
+            raise RuntimeError("Source-row synchronization requires an NGSIM trajectory.")
+        if source_index < 0 or source_index >= len(self.ngsim_traj):
+            raise IndexError(
+                f"Source-row index {source_index} is outside trajectory length "
+                f"{len(self.ngsim_traj)}."
+            )
+
+        self.sim_steps = int(source_index)
+        current_row = self.ngsim_traj[self.sim_steps]
+        if not trajectory_row_is_active(current_row):
+            self.position = self.HIDDEN_POSITION.copy()
+            self.speed = 0.0
+            self.target_speed = 0.0
+            self._set_visibility_from_appearance(False)
+            return
+
+        # Current sample: [x, y, v, lane_id]
+        cur_x, cur_y, _cur_v, cur_lane = current_row[:4]
+        next_row = (
+            self.ngsim_traj[self.sim_steps + 1]
+            if self.sim_steps + 1 < len(self.ngsim_traj)
+            else None
+        )
+
+        # Position from data
+        self.position = np.array([cur_x, cur_y], dtype=float)
+
+        # Update appear/visible + footprint for this frame
+        self._set_visibility_from_appearance(True)
+
+        # Never differentiate the last active pose into an inactive padding
+        # row: that creates a one-frame kilometre-scale displacement and
+        # corrupts relative-speed lidar.
+        self.speed = trajectory_step_speed_mps(
+            current_row,
+            next_row,
+            sample_frequency_hz=1.0 / self.DATA_DT,
+        )
+        self.target_speed = self.speed
+
+        # Prefer the recorded lane id during replay; fall back to closest geometry.
+        mapped_lane_index = target_lane_index_from_position_and_lane_id(
+            self.road.network,
+            self.SCENE,
+            self.position,
+            int(cur_lane),
+        )
+        self.lane_index = (
+            mapped_lane_index
+            if mapped_lane_index is not None
+            else self.road.network.get_closest_lane_index(self.position)
+        )
+        self.lane = self.road.network.get_lane(self.lane_index)
+
+        persisted_heading = self._persisted_heading_at(self.sim_steps)
+        if persisted_heading is not None:
+            self.heading, self.current_heading_derivation = persisted_heading
+        else:
+            local_s, _local_r = self.lane.local_coordinates(self.position)
+            self.heading = self.lane.heading_at(local_s)
+            self.current_heading_derivation = None
+
+    def synchronize_source_replay(self, source_index: int) -> None:
+        """Align a source-faithful background actor to the observation frame.
+
+        ``Road.step`` consumes the current replay row and increments
+        ``sim_steps``.  Scene collection observes the newly reached environment
+        frame, so it must apply that row before producing the observation.  This
+        path is deliberately unavailable to normal replay/IDM simulation.
+        """
+        if not bool(
+            getattr(self.road, "source_faithful_background_replay", False)
+        ):
+            raise RuntimeError(
+                "Source-row synchronization requires "
+                "road.source_faithful_background_replay."
+            )
+        self._set_from_source_row(int(source_index))
+
     def _update_from_trajectory(self):
         """
         Apply one replay step from ngsim_traj[sim_steps] -> [sim_steps+1].
@@ -408,41 +644,7 @@ class NGSIMVehicle(IDMVehicle):
             self.overtaken = True
             return
 
-        # Current and next samples: [x, y, v, lane_id]
-        cur_x, cur_y, cur_v, cur_lane = self.ngsim_traj[self.sim_steps][:4]
-        nxt_x, nxt_y, nxt_v, _        = self.ngsim_traj[self.sim_steps + 1][:4]
-
-        # Position from data
-        self.position = np.array([cur_x, cur_y], dtype=float)
-
-        # Update appear/visible + footprint for this frame
-        self._set_visibility_from_appearance(
-            trajectory_row_is_active(self.ngsim_traj[self.sim_steps])
-        )
-
-        # Never differentiate the last active pose into an inactive padding
-        # row: that creates a one-frame kilometre-scale displacement and
-        # corrupts relative-speed lidar.
-        self.speed = trajectory_step_speed_mps(
-            self.ngsim_traj[self.sim_steps],
-            self.ngsim_traj[self.sim_steps + 1],
-            sample_frequency_hz=1.0 / self.DATA_DT,
-        )
-        self.target_speed = self.speed
-
-        # Prefer the recorded lane id during replay; fall back to closest geometry.
-        mapped_lane_index = target_lane_index_from_lane_id(
-            self.road.network, self.SCENE, self.position[0], cur_lane
-        )
-        self.lane_index = (
-            mapped_lane_index
-            if mapped_lane_index is not None
-            else self.road.network.get_closest_lane_index(self.position)
-        )
-        self.lane = self.road.network.get_lane(self.lane_index)
-
-        local_s, _local_r = self.lane.local_coordinates(self.position)
-        self.heading = self.lane.heading_at(local_s)
+        self._set_from_source_row(self.sim_steps)
 
     def _front_vehicle_requires_takeover(self, front_vehicle) -> bool:
         """
@@ -574,16 +776,23 @@ class NGSIMVehicle(IDMVehicle):
         if self.ngsim_traj is None or len(self.ngsim_traj) == 0:
             self.overtaken = True
             super().step(dt)
-            if self._reached_terminal_lane_end():
-                self._mark_for_removal()
+            if self._requires_terminal_lane_removal():
+                self._mark_for_removal(
+                    "terminal_lane_removal",
+                    source_index=self.sim_steps,
+                )
             return
 
         current_row = self.ngsim_traj[self.sim_steps]
         if not trajectory_row_is_active(current_row):
             # Before a replay vehicle appears in the scene, keep advancing its
             # internal replay clock without running interaction or takeover logic.
-            if self._has_appeared_once:
-                self._mark_for_removal()
+            preserve_interior_source_gap = self._preserves_interior_source_gap()
+            if self._has_appeared_once and not preserve_interior_source_gap:
+                self._mark_for_removal(
+                    "source_after_end",
+                    source_index=self.sim_steps,
+                )
                 self._record_position()
                 return
             self.position = self.HIDDEN_POSITION.copy()
@@ -591,7 +800,11 @@ class NGSIMVehicle(IDMVehicle):
             self.target_speed = 0.0
             self._set_visibility_from_appearance(False)
             if self.sim_steps + 1 >= len(self.ngsim_traj):
-                self._mark_for_removal()
+                self._mark_for_removal(
+                    "trajectory_exhaustion",
+                    source_index=self.sim_steps,
+                    details={"source_was_never_active": True},
+                )
             else:
                 self.sim_steps += 1
             self._record_position()
@@ -620,10 +833,17 @@ class NGSIMVehicle(IDMVehicle):
 
         if not self.allow_idm:
             if replay_exhausted:
-                self._mark_for_removal()
+                self._mark_for_removal(
+                    "trajectory_exhaustion",
+                    source_index=self.sim_steps,
+                )
                 self._record_position()
                 return
             if not self.appear and not self._spawn_row_is_clear(current_row, next_row=next_row):
+                self._record_lifecycle_event(
+                    "background_delayed_spawn_conflict",
+                    source_index=self.sim_steps,
+                )
                 self.position = self.HIDDEN_POSITION.copy()
                 self.speed = 0.0
                 self.target_speed = 0.0
@@ -632,8 +852,11 @@ class NGSIMVehicle(IDMVehicle):
                 self._record_position()
                 return
             self._update_from_trajectory()
-            if self._reached_terminal_lane_end():
-                self._mark_for_removal()
+            if self._requires_terminal_lane_removal():
+                self._mark_for_removal(
+                    "terminal_lane_removal",
+                    source_index=self.sim_steps,
+                )
                 self._record_position()
                 return
             self.sim_steps += 1
@@ -645,6 +868,10 @@ class NGSIMVehicle(IDMVehicle):
         #  - If a relevant front vehicle is ahead: only replay when gap >= desired_gap.
         if can_replay and (not relevant_front or not handover_needed):
             if not self.appear and not self._spawn_row_is_clear(current_row, next_row=next_row):
+                self._record_lifecycle_event(
+                    "background_delayed_spawn_conflict",
+                    source_index=self.sim_steps,
+                )
                 self.position = self.HIDDEN_POSITION.copy()
                 self.speed = 0.0
                 self.target_speed = 0.0
@@ -654,23 +881,36 @@ class NGSIMVehicle(IDMVehicle):
                 return
             # Keep replaying the NGSIM trajectory
             self._update_from_trajectory()
-            if self._reached_terminal_lane_end():
-                self._mark_for_removal()
+            if self._requires_terminal_lane_removal():
+                self._mark_for_removal(
+                    "terminal_lane_removal",
+                    source_index=self.sim_steps,
+                )
                 self._record_position()
                 return
             self.sim_steps += 1
         else:
             if not self.overtaken and replay_exhausted:
-                self._mark_for_removal()
+                self._mark_for_removal(
+                    "trajectory_exhaustion",
+                    source_index=self.sim_steps,
+                )
                 self._record_position()
                 return
 
             handover_reason = "replay_exhausted" if replay_exhausted else handover_reason
 
             # Handover to IDM/MOBIL
+            was_overtaken = bool(self.overtaken)
             self.overtaken = True
             self.idm_handover_step = int(self.sim_steps)
             self.idm_handover_reason = handover_reason
+            if not was_overtaken:
+                self._record_lifecycle_event(
+                    "idm_handover",
+                    source_index=self.sim_steps,
+                    details={"reason": str(handover_reason)},
+                )
             self.color = (100, 200, 255)
 
             # Use lane_id + x to pick a target lane index (your existing mapping)
@@ -678,9 +918,11 @@ class NGSIMVehicle(IDMVehicle):
                 self.ngsim_traj[min(self.sim_steps, len(self.ngsim_traj) - 1)][3]
             )
             self._set_lane_from_recorded_lane_id(lane_id)
-            x = self.position[0]
-            target_lane_index = target_lane_index_from_lane_id(
-                self.road.network, self.SCENE, x, lane_id
+            target_lane_index = target_lane_index_from_position_and_lane_id(
+                self.road.network,
+                self.SCENE,
+                self.position,
+                lane_id,
             )
 
             if target_lane_index is not None and self._handover_target_lane_is_safe(
@@ -724,8 +966,11 @@ class NGSIMVehicle(IDMVehicle):
 
             # Now evolve with IDM/MOBIL dynamics
             super().step(dt)
-            if self._reached_terminal_lane_end():
-                self._mark_for_removal()
+            if self._requires_terminal_lane_removal():
+                self._mark_for_removal(
+                    "terminal_lane_removal",
+                    source_index=self.sim_steps,
+                )
 
         # Record replayed / simulated position
         self._record_position()
@@ -938,6 +1183,10 @@ def spawn_surrounding_vehicles(
             else None
         )
         if not v._spawn_row_is_clear(spawn_row, next_row=next_row):
+            v._record_lifecycle_event(
+                "background_initial_spawn_conflict",
+                source_index=first_idx,
+            )
             continue
         road.vehicles.append(v)
         spawned += 1

@@ -673,7 +673,7 @@ class LidarObservation(ObservationType):
         geometry: _LaneGeometry,
         points: np.ndarray,
         *,
-        chunk_size: int = 2048,
+        chunk_size: int = 32768,
     ) -> np.ndarray:
         """Vectorized exact equivalent of LinearSpline2D.cartesian_to_frenet.
 
@@ -687,22 +687,210 @@ class LidarObservation(ObservationType):
         orthonormals = np.asarray(geometry.curve_orthonormals, dtype=float)
         s_samples = np.asarray(geometry.curve_s, dtype=float)
         result = np.zeros(len(points), dtype=bool)
-        pose_indices = np.arange(len(s_samples), dtype=np.int64)
+        pose_count = len(s_samples)
+        pose_indices = np.arange(pose_count, dtype=np.int64)
+
+        def dense_reference(chunk: np.ndarray) -> np.ndarray:
+            """Preserve the literal source-order scan as the fail-closed oracle."""
+            dense_result = np.zeros(len(chunk), dtype=bool)
+            # A failed certificate must not turn the old [N,P] scan into an
+            # unbounded allocation merely because the ordered fast path uses
+            # a larger outer chunk.
+            for dense_start in range(0, len(chunk), 2048):
+                dense_stop = min(len(chunk), dense_start + 2048)
+                dense_chunk = chunk[dense_start:dense_stop]
+                delta_x = dense_chunk[:, None, 0] - positions[None, :, 0]
+                delta_y = dense_chunk[:, None, 1] - positions[None, :, 1]
+                projection = (
+                    delta_x * normals[None, :, 0]
+                    + delta_y * normals[None, :, 1]
+                )
+                distance = np.sqrt(delta_x * delta_x + delta_y * delta_y)
+                eligible = (projection >= 0.0) & (projection < distance)
+                eligible[:, -1] = False
+                selected = np.max(
+                    np.where(eligible, pose_indices[None, :], -1), axis=1
+                )
+                selected = np.where(
+                    projection[:, -1] >= 0.0, pose_count - 1, selected
+                )
+                selected = np.where(selected >= 0, selected, 0).astype(np.int64)
+                row_indices = np.arange(len(dense_chunk), dtype=np.int64)
+                selected_delta = dense_chunk - positions[selected]
+                longitudinal = (
+                    s_samples[selected] + projection[row_indices, selected]
+                )
+                lateral = np.einsum(
+                    "ni,ni->n",
+                    selected_delta,
+                    orthonormals[selected],
+                    optimize=True,
+                )
+                dense_result[dense_start:dense_stop] = (
+                    (np.abs(lateral) <= 0.5 * float(geometry.width))
+                    & (-float(geometry.vehicle_length) <= longitudinal)
+                    & (
+                        longitudinal
+                        < float(geometry.length) + float(geometry.vehicle_length)
+                    )
+                )
+            return dense_result
+
         for start in range(0, len(points), max(1, int(chunk_size))):
             stop = min(len(points), start + max(1, int(chunk_size)))
-            delta = points[start:stop, None, :] - positions[None, :, :]
-            projection = np.einsum("npi,pi->np", delta, normals, optimize=True)
-            distance = np.linalg.norm(delta, axis=2)
-            eligible = (projection >= 0.0) & (projection < distance)
-            eligible[:, -1] = False
-            selected = np.max(
-                np.where(eligible, pose_indices[None, :], -1), axis=1
+            chunk = points[start:stop]
+            if pose_count < 2:
+                result[start:stop] = dense_reference(chunk)
+                continue
+
+            # LinearSpline2D searches poses in reverse and returns the greatest
+            # pose whose forward projection is non-negative (subject to its
+            # strict non-collinearity check).  On a curved lane, consecutive
+            # projection functions are affine in the query point.  Certify
+            # their ordering over this chunk's complete axis-aligned bounding
+            # box, split at every uncertified transition, and binary-search
+            # only within certified monotone runs.  This removes the [N,P]
+            # temporaries on long Japanese road polylines without assuming a
+            # globally straight or x-monotone geometry.
+            min_x = float(np.min(chunk[:, 0]))
+            max_x = float(np.max(chunk[:, 0]))
+            min_y = float(np.min(chunk[:, 1]))
+            max_y = float(np.max(chunk[:, 1]))
+            corners = np.asarray(
+                [
+                    [min_x, min_y],
+                    [min_x, max_y],
+                    [max_x, min_y],
+                    [max_x, max_y],
+                ],
+                dtype=float,
             )
-            selected = np.where(projection[:, -1] >= 0.0, len(s_samples) - 1, selected)
-            selected = np.where(selected >= 0, selected, 0).astype(np.int64)
-            row_indices = np.arange(stop - start, dtype=np.int64)
-            selected_delta = delta[row_indices, selected]
-            longitudinal = s_samples[selected] + projection[row_indices, selected]
+            candidate_stop = pose_count - 2
+            if candidate_stop > 0:
+                transition_normals = (
+                    normals[:candidate_stop] - normals[1 : candidate_stop + 1]
+                )
+                transition_offsets = (
+                    np.einsum(
+                        "ij,ij->i",
+                        positions[1 : candidate_stop + 1],
+                        normals[1 : candidate_stop + 1],
+                        optimize=True,
+                    )
+                    - np.einsum(
+                        "ij,ij->i",
+                        positions[:candidate_stop],
+                        normals[:candidate_stop],
+                        optimize=True,
+                    )
+                )
+                ordering_margin = (
+                    corners @ transition_normals.T + transition_offsets[None, :]
+                )
+                scale = max(
+                    1.0,
+                    float(np.max(np.abs(corners))),
+                    float(np.max(np.abs(positions))),
+                )
+                tolerance = 64.0 * np.finfo(float).eps * scale
+                safe_transition = np.min(ordering_margin, axis=0) > tolerance
+                cuts = np.flatnonzero(~safe_transition)
+                segment_starts = np.concatenate(
+                    [np.asarray([0], dtype=np.int64), cuts + 1]
+                )
+                segment_ends = np.concatenate(
+                    [cuts, np.asarray([candidate_stop], dtype=np.int64)]
+                )
+            else:
+                segment_starts = np.asarray([0], dtype=np.int64)
+                segment_ends = np.asarray([candidate_stop], dtype=np.int64)
+
+            selected = np.full(len(chunk), -1, dtype=np.int64)
+            terminal_delta = chunk - positions[-1]
+            terminal_projection = (
+                terminal_delta[:, 0] * normals[-1, 0]
+                + terminal_delta[:, 1] * normals[-1, 1]
+            )
+            terminal = terminal_projection >= 0.0
+            selected[terminal] = pose_count - 1
+            unresolved = ~terminal
+            use_dense_reference = False
+
+            for segment_start, segment_end in zip(
+                segment_starts[::-1], segment_ends[::-1], strict=True
+            ):
+                unresolved_rows = np.flatnonzero(unresolved)
+                if unresolved_rows.size == 0:
+                    break
+                segment_start = int(segment_start)
+                segment_end = int(segment_end)
+                start_delta = chunk[unresolved_rows] - positions[segment_start]
+                start_projection = (
+                    start_delta[:, 0] * normals[segment_start, 0]
+                    + start_delta[:, 1] * normals[segment_start, 1]
+                )
+                possible_rows = unresolved_rows[start_projection >= 0.0]
+                if possible_rows.size == 0:
+                    continue
+
+                end_delta = chunk[possible_rows] - positions[segment_end]
+                end_projection = (
+                    end_delta[:, 0] * normals[segment_end, 0]
+                    + end_delta[:, 1] * normals[segment_end, 1]
+                )
+                lower = np.full(
+                    possible_rows.size, segment_start, dtype=np.int64
+                )
+                upper = np.full(
+                    possible_rows.size, segment_end + 1, dtype=np.int64
+                )
+                lower[end_projection >= 0.0] = segment_end
+                while bool(np.any(upper - lower > 1)):
+                    search_rows = np.flatnonzero(upper - lower > 1)
+                    middle = (lower[search_rows] + upper[search_rows]) // 2
+                    middle_delta = (
+                        chunk[possible_rows[search_rows]] - positions[middle]
+                    )
+                    middle_projection = (
+                        middle_delta[:, 0] * normals[middle, 0]
+                        + middle_delta[:, 1] * normals[middle, 1]
+                    )
+                    nonnegative = middle_projection >= 0.0
+                    lower[search_rows[nonnegative]] = middle[nonnegative]
+                    upper[search_rows[~nonnegative]] = middle[~nonnegative]
+
+                candidate_delta = chunk[possible_rows] - positions[lower]
+                candidate_projection = (
+                    candidate_delta[:, 0] * normals[lower, 0]
+                    + candidate_delta[:, 1] * normals[lower, 1]
+                )
+                candidate_distance = np.sqrt(
+                    candidate_delta[:, 0] * candidate_delta[:, 0]
+                    + candidate_delta[:, 1] * candidate_delta[:, 1]
+                )
+                strict_eligible = (
+                    (candidate_projection >= 0.0)
+                    & (candidate_projection < candidate_distance)
+                )
+                # Exact collinearity is rare but changes the source search: an
+                # earlier pose may win.  Fall back for the whole bounded chunk
+                # instead of weakening that strict source condition.
+                if not bool(np.all(strict_eligible)):
+                    use_dense_reference = True
+                    break
+                selected[possible_rows] = lower
+                unresolved[possible_rows] = False
+
+            if use_dense_reference:
+                result[start:stop] = dense_reference(chunk)
+                continue
+            selected[selected < 0] = 0
+            selected_delta = chunk - positions[selected]
+            selected_projection = (
+                selected_delta[:, 0] * normals[selected, 0]
+                + selected_delta[:, 1] * normals[selected, 1]
+            )
+            longitudinal = s_samples[selected] + selected_projection
             lateral = np.einsum(
                 "ni,ni->n", selected_delta, orthonormals[selected], optimize=True
             )

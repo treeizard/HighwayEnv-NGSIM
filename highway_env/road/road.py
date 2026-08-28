@@ -67,8 +67,8 @@ class RoadNetwork:
         indexes, distances = [], []
         for _from, to_dict in self.graph.items():
             for _to, lanes in to_dict.items():
-                for _id, l in enumerate(lanes):
-                    distances.append(l.distance_with_heading(position, heading))
+                for _id, lane in enumerate(lanes):
+                    distances.append(lane.distance_with_heading(position, heading))
                     indexes.append((_from, _to, _id))
         return indexes[int(np.argmin(distances))]
 
@@ -94,6 +94,26 @@ class RoadNetwork:
         """
         _from, _to, _id = current_index
         next_to = next_id = None
+        manifest_successors = getattr(
+            self, "manifest_lane_successor_indexes", None
+        )
+        if isinstance(manifest_successors, dict) and current_index in manifest_successors:
+            candidates = manifest_successors[current_index]
+            if candidates:
+                if position is None:
+                    return min(candidates)
+                position_arr = np.asarray(position, dtype=float)
+                return min(
+                    candidates,
+                    key=lambda index: (
+                        self.get_lane(index).distance(position_arr),
+                        index,
+                    ),
+                )
+            # A declared empty successor list is an explicit terminal lane.
+            # Do not infer a handoff from incidental graph-node adjacency or a
+            # caller-provided route; manifest topology is authoritative.
+            return current_index
         # Pick next road according to planned route
         if route:
             if (
@@ -154,7 +174,8 @@ class RoadNetwork:
         else:
             lanes = range(len(self.graph[_to][next_to]))
             next_id = min(
-                lanes, key=lambda l: self.get_lane((_to, next_to, l)).distance(position)
+                lanes,
+                key=lambda lane_id: self.get_lane((_to, next_to, lane_id)).distance(position),
             )
         return next_id, self.get_lane((_to, next_to, next_id)).distance(position)
 
@@ -1013,14 +1034,35 @@ class Road:
         if not candidates:
             return self._neighbour_vehicles_legacy(vehicle, lane_index=lane_index)
 
-        for v in candidates:
-            if (
-                v is vehicle
-                or isinstance(v, Landmark)
-                or not self._is_neighbour_candidate(v)
-            ):
-                continue
-            s_v, lat_v = lane.local_coordinates(v.position)
+        eligible_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate is not vehicle
+            and not isinstance(candidate, Landmark)
+            and self._is_neighbour_candidate(candidate)
+        ]
+        local_coordinates_many = getattr(lane, "local_coordinates_many", None)
+        if callable(local_coordinates_many) and eligible_candidates:
+            coordinates = np.asarray(
+                local_coordinates_many(
+                    np.asarray(
+                        [candidate.position for candidate in eligible_candidates],
+                        dtype=float,
+                    )
+                ),
+                dtype=float,
+            )
+            if coordinates.shape != (len(eligible_candidates), 2):
+                raise RuntimeError("Batched lane coordinates have the wrong shape.")
+        else:
+            coordinates = np.asarray(
+                [lane.local_coordinates(candidate.position) for candidate in eligible_candidates],
+                dtype=float,
+            ).reshape(-1, 2)
+
+        for v, (s_v, lat_v) in zip(
+            eligible_candidates, coordinates, strict=True
+        ):
             if not lane.on_lane(v.position, s_v, lat_v, margin=0.05):
                 continue
             if s <= s_v and (s_front is None or s_v <= s_front):

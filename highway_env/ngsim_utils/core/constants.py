@@ -124,7 +124,23 @@ SCENE_IDM_PARAMETER_KEY = {
     "i-80": "US",
     "lankershim": "US",
     "japanese": "JAPAN",
+    "morinomiya_0_800": "JAPAN",
+    "morinomiya_800_1600": "JAPAN",
+    "morinomiya_1600_2400": "JAPAN",
+    "morinomiya_2400_end": "JAPAN",
 }
+
+MORINOMIYA_MANIFEST_ENVIRONMENT_IDS = frozenset(
+    {
+        "morinomiya_0_800",
+        "morinomiya_800_1600",
+        "morinomiya_1600_2400",
+        "morinomiya_2400_end",
+    }
+)
+MANIFEST_RUNTIME_ENVIRONMENT_IDS = frozenset(
+    {*MORINOMIYA_MANIFEST_ENVIRONMENT_IDS, "i-80", "us-101"}
+)
 
 # US-101 geometry in dataset-native feet
 US101_MAINLINE_LENGTH_FT = 2150.0

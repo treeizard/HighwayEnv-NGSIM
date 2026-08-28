@@ -81,6 +81,19 @@ def test_japanese_controlled_vehicle_completes_at_terminal_road_end():
     assert env._is_terminated() is True
 
 
+def test_fixed_horizon_collision_panel_suppresses_terminal_signal_only():
+    env = _make_ngsim_env_with_road("us-101")
+    vehicle = _add_vehicle_at_front_bumper_end(env, ("s3", "s4", 0))
+    vehicle.crashed = True
+    env.config["suppress_controlled_vehicle_termination_until_truncation"] = True
+
+    assert env._is_terminated() is False
+    assert vehicle.crashed is True
+
+    env.config["suppress_controlled_vehicle_termination_until_truncation"] = False
+    assert env._is_terminated() is True
+
+
 def test_lateral_departure_near_road_end_still_crashes_as_offroad():
     env = _make_ngsim_env_with_road("japanese")
     lane_index = ("c", "d", 0)

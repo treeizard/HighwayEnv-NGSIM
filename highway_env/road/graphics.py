@@ -7,12 +7,11 @@ from typing import TYPE_CHECKING, Tuple, Union
 import numpy as np
 import pygame
 
-from highway_env.road.lane import AbstractLane, LineType
+from highway_env.road.lane import AbstractLane, LineType, StraightLane
 from highway_env.road.road import Road
 from highway_env.utils import Vector
 from highway_env.vehicle.graphics import VehicleGraphics
 from highway_env.vehicle.objects import Landmark, Obstacle
-
 
 if TYPE_CHECKING:
     from highway_env.vehicle.objects import RoadObject
@@ -125,6 +124,9 @@ class LaneGraphics:
     STRIPE_WIDTH: float = 0.3
     """ Width of a stripe [m]"""
 
+    CONTINUOUS_LINE_SAMPLE_SPACING: float = 1.0
+    """Maximum longitudinal spacing between samples of a curved solid line [m]."""
+
     @classmethod
     def display(cls, lane: AbstractLane, surface: WorldSurface) -> None:
         """
@@ -142,13 +144,70 @@ class LaneGraphics:
         s0 = (
             int(s_origin) // cls.STRIPE_SPACING - stripes_count // 2
         ) * cls.STRIPE_SPACING
+        marking_profile = getattr(lane, "marking_profile", None)
         for side in range(2):
-            if lane.line_types[side] == LineType.STRIPED:
-                cls.striped_line(lane, surface, stripes_count, s0, side)
-            elif lane.line_types[side] == LineType.CONTINUOUS:
-                cls.continuous_curve(lane, surface, stripes_count, s0, side)
-            elif lane.line_types[side] == LineType.CONTINUOUS_LINE:
-                cls.continuous_line(lane, surface, stripes_count, s0, side)
+            if marking_profile is None:
+                cls._display_line_type(
+                    lane,
+                    surface,
+                    stripes_count,
+                    s0,
+                    side,
+                    lane.line_types[side],
+                )
+                continue
+            for interval in marking_profile:
+                cls._display_line_type(
+                    lane,
+                    surface,
+                    stripes_count,
+                    s0,
+                    side,
+                    interval.line_types[side],
+                    longitudinal_bounds=(interval.start_s_m, interval.end_s_m),
+                )
+
+    @classmethod
+    def _display_line_type(
+        cls,
+        lane: AbstractLane,
+        surface: WorldSurface,
+        stripes_count: int,
+        longitudinal: float,
+        side: int,
+        line_type: int,
+        *,
+        longitudinal_bounds: tuple[float, float] | None = None,
+    ) -> None:
+        """Render one side and style, optionally clipped to a lane interval."""
+
+        if line_type == LineType.STRIPED:
+            cls.striped_line(
+                lane,
+                surface,
+                stripes_count,
+                longitudinal,
+                side,
+                longitudinal_bounds=longitudinal_bounds,
+            )
+        elif line_type == LineType.CONTINUOUS:
+            cls.continuous_curve(
+                lane,
+                surface,
+                stripes_count,
+                longitudinal,
+                side,
+                longitudinal_bounds=longitudinal_bounds,
+            )
+        elif line_type == LineType.CONTINUOUS_LINE:
+            cls.continuous_line(
+                lane,
+                surface,
+                stripes_count,
+                longitudinal,
+                side,
+                longitudinal_bounds=longitudinal_bounds,
+            )
 
     @classmethod
     def striped_line(
@@ -158,6 +217,8 @@ class LaneGraphics:
         stripes_count: int,
         longitudinal: float,
         side: int,
+        *,
+        longitudinal_bounds: tuple[float, float] | None = None,
     ) -> None:
         """
         Draw a striped line on one side of a lane, on a surface.
@@ -175,7 +236,15 @@ class LaneGraphics:
             + cls.STRIPE_LENGTH
         )
         lats = [(side - 0.5) * lane.width_at(s) for s in starts]
-        cls.draw_stripes(lane, surface, starts, ends, lats)
+        cls.draw_stripes(
+            lane,
+            surface,
+            starts,
+            ends,
+            lats,
+            longitudinal_bounds=longitudinal_bounds,
+            side=side if longitudinal_bounds is not None else None,
+        )
 
     @classmethod
     def continuous_curve(
@@ -185,6 +254,8 @@ class LaneGraphics:
         stripes_count: int,
         longitudinal: float,
         side: int,
+        *,
+        longitudinal_bounds: tuple[float, float] | None = None,
     ) -> None:
         """
         Draw a striped line on one side of a lane, on a surface.
@@ -202,7 +273,15 @@ class LaneGraphics:
             + cls.STRIPE_SPACING
         )
         lats = [(side - 0.5) * lane.width_at(s) for s in starts]
-        cls.draw_stripes(lane, surface, starts, ends, lats)
+        cls.draw_stripes(
+            lane,
+            surface,
+            starts,
+            ends,
+            lats,
+            longitudinal_bounds=longitudinal_bounds,
+            side=side if longitudinal_bounds is not None else None,
+        )
 
     @classmethod
     def continuous_line(
@@ -212,6 +291,8 @@ class LaneGraphics:
         stripes_count: int,
         longitudinal: float,
         side: int,
+        *,
+        longitudinal_bounds: tuple[float, float] | None = None,
     ) -> None:
         """
         Draw a continuous line on one side of a lane, on a surface.
@@ -222,10 +303,51 @@ class LaneGraphics:
         :param longitudinal: the longitudinal position of the start of the line [m]
         :param side: which side of the road to draw [0:left, 1:right]
         """
-        starts = [longitudinal + 0 * cls.STRIPE_SPACING]
-        ends = [longitudinal + stripes_count * cls.STRIPE_SPACING + cls.STRIPE_LENGTH]
-        lats = [(side - 0.5) * lane.width_at(s) for s in starts]
-        cls.draw_stripes(lane, surface, starts, ends, lats)
+        start = float(np.clip(longitudinal, 0.0, lane.length))
+        end = float(
+            np.clip(
+                longitudinal
+                + stripes_count * cls.STRIPE_SPACING
+                + cls.STRIPE_LENGTH,
+                0.0,
+                lane.length,
+            )
+        )
+        if longitudinal_bounds is not None:
+            start = max(start, longitudinal_bounds[0])
+            end = min(end, longitudinal_bounds[1])
+        if end - start <= 0.5 * cls.STRIPE_LENGTH:
+            return
+
+        # A single chord is exact for StraightLane and preserves its established
+        # rendering path. Curved lanes need intermediate samples: otherwise a
+        # hard outer edge cuts across the road instead of following its boundary.
+        if type(lane).position is StraightLane.position:
+            lateral = (side - 0.5) * lane.width_at(start)
+            cls.draw_stripes(lane, surface, [start], [end], [lateral])
+            return
+
+        segment_count = max(
+            1,
+            int(np.ceil((end - start) / cls.CONTINUOUS_LINE_SAMPLE_SPACING)),
+        )
+        longitudinal_samples = np.linspace(start, end, segment_count + 1)
+        points = [
+            surface.vec2pix(
+                lane.position(
+                    sample,
+                    (side - 0.5) * lane.width_at(sample),
+                )
+            )
+            for sample in longitudinal_samples
+        ]
+        pygame.draw.lines(
+            surface,
+            surface.WHITE,
+            False,
+            points,
+            max(surface.pix(cls.STRIPE_WIDTH), 1),
+        )
 
     @classmethod
     def draw_stripes(
@@ -235,6 +357,9 @@ class LaneGraphics:
         starts: list[float],
         ends: list[float],
         lats: list[float],
+        *,
+        longitudinal_bounds: tuple[float, float] | None = None,
+        side: int | None = None,
     ) -> None:
         """
         Draw a set of stripes along a lane.
@@ -245,8 +370,14 @@ class LaneGraphics:
         :param ends: a list of ending longitudinal positions for each stripe [m]
         :param lats: a list of lateral positions for each stripe [m]
         """
-        starts = np.clip(starts, 0, lane.length)
-        ends = np.clip(ends, 0, lane.length)
+        lower_bound, upper_bound = 0.0, lane.length
+        if longitudinal_bounds is not None:
+            lower_bound = max(lower_bound, longitudinal_bounds[0])
+            upper_bound = min(upper_bound, longitudinal_bounds[1])
+        starts = np.clip(starts, lower_bound, upper_bound)
+        ends = np.clip(ends, lower_bound, upper_bound)
+        if side is not None:
+            lats = [(side - 0.5) * lane.width_at(start) for start in starts]
         for k, _ in enumerate(starts):
             if abs(starts[k] - ends[k]) > 0.5 * cls.STRIPE_LENGTH:
                 pygame.draw.line(
@@ -305,8 +436,8 @@ class RoadGraphics:
         surface.fill(surface.GREY)
         for _from in road.network.graph.keys():
             for _to in road.network.graph[_from].keys():
-                for l in road.network.graph[_from][_to]:
-                    LaneGraphics.display(l, surface)
+                for lane in road.network.graph[_from][_to]:
+                    LaneGraphics.display(lane, surface)
 
     @staticmethod
     def display_traffic(

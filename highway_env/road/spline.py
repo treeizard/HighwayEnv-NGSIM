@@ -40,6 +40,11 @@ class LinearSpline2D:
         (self.s_samples, self.poses) = self.sample_curve(
             self.x_curve, self.y_curve, self.length, self.PARAM_CURVE_SAMPLE_DISTANCE
         )
+        self.pose_positions = np.asarray([pose.position for pose in self.poses])
+        self.pose_normals = np.asarray([pose.normal for pose in self.poses])
+        self.pose_orthonormals = np.asarray(
+            [pose.orthonormal for pose in self.poses]
+        )
 
     def __call__(self, lon: float) -> tuple[float, float]:
         return self.x_curve(lon), self.y_curve(lon)
@@ -75,6 +80,40 @@ class LinearSpline2D:
         lon = pose.project_onto_normal(position)
         lat = pose.project_onto_orthonormal(position)
         return lon, lat
+
+    def cartesian_to_frenet_many(self, positions: np.ndarray) -> np.ndarray:
+        """Vectorize the exact scalar segment-selection rule over many points."""
+
+        points = np.asarray(positions, dtype=float)
+        if points.ndim != 2 or points.shape[1] != 2 or not np.isfinite(points).all():
+            raise ValueError("Cartesian positions must be finite [N,2] values.")
+        if len(points) == 0:
+            return np.empty((0, 2), dtype=float)
+        delta = points[:, None, :] - self.pose_positions[None, :, :]
+        projection = np.einsum(
+            "npi,pi->np", delta, self.pose_normals, optimize=True
+        )
+        distance = np.linalg.norm(delta, axis=2)
+        pose_indices = np.arange(len(self.poses), dtype=np.int64)
+        eligible = (projection >= 0.0) & (projection < distance)
+        eligible[:, -1] = False
+        selected = np.max(
+            np.where(eligible, pose_indices[None, :], -1), axis=1
+        )
+        selected = np.where(
+            projection[:, -1] >= 0.0, len(self.poses) - 1, selected
+        )
+        selected = np.where(selected >= 0, selected, 0).astype(np.int64)
+        rows = np.arange(len(points), dtype=np.int64)
+        selected_delta = delta[rows, selected]
+        longitudinal = self.s_samples[selected] + projection[rows, selected]
+        lateral = np.einsum(
+            "ni,ni->n",
+            selected_delta,
+            self.pose_orthonormals[selected],
+            optimize=True,
+        )
+        return np.column_stack((longitudinal, lateral))
 
     def frenet_to_cartesian(self, lon: float, lat: float) -> tuple[float, float]:
         """

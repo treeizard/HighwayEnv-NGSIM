@@ -24,7 +24,7 @@ import numpy as np
 
 from highway_env.ngsim_utils.road.lane_mapping import (
     heading_from_trajectory_row,
-    target_lane_index_from_lane_id,
+    target_lane_index_from_position_and_lane_id,
 )
 from highway_env.ngsim_utils.vehicles.ego import EgoVehicle
 
@@ -116,7 +116,12 @@ def build_ego_vehicle(
     )
     ego.set_ego_dimension(width=ego_wid, length=ego_len)
 
-    mapped_lane_index = target_lane_index_from_lane_id(road.network, scene, x0, int(lane0))
+    mapped_lane_index = target_lane_index_from_position_and_lane_id(
+        road.network,
+        scene,
+        ego_xy,
+        int(lane0),
+    )
     if mapped_lane_index is not None:
         ego.target_lane_index = mapped_lane_index
         ego.lane_index = mapped_lane_index

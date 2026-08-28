@@ -24,6 +24,7 @@ from highway_env.ngsim_utils.core.constants import (
     KINEMATIC_HEADING_MIN_SPEED_MPS,
     US101_MERGE_OUT_END_M,
     US101_SECTION_ENDS_M,
+    MORINOMIYA_MANIFEST_ENVIRONMENT_IDS,
 )
 from highway_env.ngsim_utils.data.trajectory_gen import trajectory_row_is_active
 
@@ -161,7 +162,7 @@ def target_lane_index_from_lane_id(
             return (edge[0], edge[1], _last_lane_id(net, edge))
         return None
 
-    if scene == "japanese":
+    if scene == "japanese" or scene in MORINOMIYA_MANIFEST_ENVIRONMENT_IDS:
         # Dataset convention:
         #   lane_id 2 -> right mainline lane
         #   lane_id 1 -> left mainline lane
@@ -192,6 +193,82 @@ def target_lane_index_from_lane_id(
     return None
 
 
+def target_lane_index_from_position_and_lane_id(
+    net,
+    scene: str,
+    position: np.ndarray,
+    lane_id: int,
+    *,
+    measurement_tolerance_m: float = 0.2,
+) -> tuple[str, str, int] | None:
+    """Map one current pose through manifest raw-lane metadata when available.
+
+    A raw lane may occur on several manifest edges.  Candidate selection uses
+    only the current ``[x, y]`` pose: an on-lane candidate wins, otherwise the
+    geometrically nearest candidate wins. At a shared endpoint, the lane with
+    more remaining length wins before stable lane-index ordering, selecting the
+    downstream edge without consulting a previous or future row. Networks
+    without manifest metadata retain the historical scene-specific mapping and
+    its original longitudinal-axis convention.
+    """
+    position_arr = np.asarray(position, dtype=float)
+    if position_arr.shape != (2,) or not np.all(np.isfinite(position_arr)):
+        raise ValueError("Lane mapping position must contain two finite coordinates.")
+    tolerance = float(measurement_tolerance_m)
+    if not np.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("Lane mapping tolerance must be finite and non-negative.")
+
+    raw_lane_indexes = getattr(net, "manifest_raw_lane_indexes", None)
+    if not isinstance(raw_lane_indexes, dict):
+        return target_lane_index_from_lane_id(
+            net,
+            scene,
+            float(position_arr[0]),
+            int(lane_id),
+        )
+
+    raw_lane_id = int(lane_id)
+    lookup_keys: list[str | int] = [raw_lane_id, str(raw_lane_id)]
+    candidates: list[tuple[str, str, int]] = []
+    for lookup_key in lookup_keys:
+        for raw_index in raw_lane_indexes.get(lookup_key, ()):
+            lane_index = tuple(raw_index)
+            if lane_index not in candidates:
+                candidates.append(lane_index)
+    if not candidates:
+        return None
+
+    scored: list[tuple[int, float, float, float, tuple[str, str, int]]] = []
+    for lane_index in candidates:
+        lane = net.get_lane(lane_index)
+        longitudinal, lateral = lane.local_coordinates(position_arr)
+        on_lane = lane.on_lane(
+            position_arr,
+            longitudinal,
+            lateral,
+            margin=tolerance,
+        )
+        longitudinal_error = max(
+            -float(longitudinal),
+            float(longitudinal) - float(lane.length),
+            0.0,
+        )
+        lateral_error = max(
+            abs(float(lateral)) - 0.5 * float(lane.width_at(longitudinal)),
+            0.0,
+        )
+        scored.append(
+            (
+                0 if on_lane else 1,
+                float(np.hypot(longitudinal_error, lateral_error)),
+                abs(float(lateral)),
+                -max(float(lane.length) - float(longitudinal), 0.0),
+                lane_index,
+            )
+        )
+    return min(scored)[-1]
+
+
 def resolve_target_lane_index_from_row(
     net,
     scene: str,
@@ -211,14 +288,16 @@ def resolve_target_lane_index_from_row(
     retain the dataset lane-id mapping unchanged.
     """
     values = np.asarray(row, dtype=float)
-    declared = target_lane_index_from_lane_id(
+    declared = target_lane_index_from_position_and_lane_id(
         net,
         scene,
-        float(values[0]),
+        values[:2],
         int(values[3]),
+        measurement_tolerance_m=measurement_tolerance_m,
     )
     if (
         str(scene) != "japanese"
+        and str(scene) not in MORINOMIYA_MANIFEST_ENVIRONMENT_IDS
         or provider_observation_flag != 0
         or declared is None
     ):
@@ -243,11 +322,12 @@ def resolve_target_lane_index_from_row(
     overlapping: list[tuple[float, tuple[str, str, int]]] = []
     seen: set[tuple[str, str, int]] = set()
     for candidate_lane_id in (1, 2, 3):
-        candidate = target_lane_index_from_lane_id(
+        candidate = target_lane_index_from_position_and_lane_id(
             net,
             scene,
-            float(values[0]),
+            position,
             candidate_lane_id,
+            measurement_tolerance_m=measurement_tolerance_m,
         )
         if candidate is None or candidate in seen:
             continue
@@ -305,10 +385,10 @@ def heading_from_trajectory_row(
         return motion_heading
     mapped_lane_index = lane_index_override
     if mapped_lane_index is None:
-        mapped_lane_index = target_lane_index_from_lane_id(
+        mapped_lane_index = target_lane_index_from_position_and_lane_id(
             net,
             scene,
-            float(x),
+            np.array([x, y], dtype=float),
             int(lane_id),
         )
     if mapped_lane_index is not None:

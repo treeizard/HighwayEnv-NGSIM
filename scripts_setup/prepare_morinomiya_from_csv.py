@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +34,7 @@ TRAJECTORY_COLUMNS = [
     "detected_flag",
 ]
 JST_TIMEZONE = "Asia/Tokyo"
+SOURCE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 DEFAULT_BASE_DATE = "2020-01-01"
 
 
@@ -50,11 +53,27 @@ def parse_args() -> argparse.Namespace:
         "--availability-csv",
         default="artifacts/morinomiya_processing/morinomiya_availability_by_source.csv",
     )
+    parser.add_argument(
+        "--parquet-root",
+        default=None,
+        help=(
+            "Optional fresh directory for source-partitioned canonical Parquet. "
+            "The directory is atomically published and is never overwritten."
+        ),
+    )
     parser.add_argument("--start-clock", default="09:00:00")
     parser.add_argument("--end-clock", default="13:00:00")
     parser.add_argument("--base-date", default=DEFAULT_BASE_DATE)
     parser.add_argument("--x-m-min", type=float, default=0.0)
     parser.add_argument("--x-m-max", type=float, default=800.0)
+    parser.add_argument(
+        "--full-road",
+        action="store_true",
+        help=(
+            "Disable the legacy 0-800 m crop and retain the complete recorded "
+            "longitudinal extent. Existing invocations remain cropped by default."
+        ),
+    )
     parser.add_argument("--basis-lat", type=float, default=34.681580)
     parser.add_argument("--basis-lon", type=float, default=135.527945)
     parser.add_argument("--id-source-stride", type=int, default=10_000_000)
@@ -330,13 +349,21 @@ def to_record_array(df: pd.DataFrame) -> np.ndarray:
 
 def main() -> None:
     args = parse_args()
+    if args.full_road:
+        args.x_m_min = None
+        args.x_m_max = None
     raw_root = Path(args.raw_root)
     output_npy = Path(args.output_npy)
     summary_json = Path(args.summary_json)
     availability_csv = Path(args.availability_csv)
+    parquet_root = (
+        None if args.parquet_root is None else Path(args.parquet_root).expanduser().resolve()
+    )
 
     if output_npy.exists() and not args.overwrite and not args.availability_only:
         raise FileExistsError(f"{output_npy} already exists; pass --overwrite to replace it.")
+    if parquet_root is not None and parquet_root.exists():
+        raise FileExistsError(f"Canonical Parquet root already exists: {parquet_root}")
 
     start_clock = parse_clock_time(args.start_clock)
     end_clock = parse_clock_time(args.end_clock)
@@ -371,6 +398,20 @@ def main() -> None:
     conflicts_before = conflict_summary(combined)
     cleaned = clean_rows(combined)
     conflicts_after = conflict_summary(cleaned)
+    lane_counts = {
+        str(int(lane_id)): int(count)
+        for lane_id, count in cleaned["traffic_lane"].value_counts().sort_index().items()
+    } if not cleaned.empty else {}
+    if cleaned.empty:
+        spatial_band_counts = {}
+    else:
+        x_values = pd.to_numeric(cleaned["x_m"], errors="coerce").to_numpy(dtype=float)
+        spatial_band_counts = {
+            "0_800": int(((x_values >= 0.0) & (x_values <= 800.0)).sum()),
+            "800_1600": int(((x_values > 800.0) & (x_values <= 1600.0)).sum()),
+            "1600_2400": int(((x_values > 1600.0) & (x_values <= 2400.0)).sum()),
+            "2400_end": int((x_values > 2400.0).sum()),
+        }
 
     availability_csv.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(source_summaries).to_csv(availability_csv, index=False)
@@ -383,16 +424,60 @@ def main() -> None:
         "base_date": args.base_date,
         "x_m_min": args.x_m_min,
         "x_m_max": args.x_m_max,
+        "full_road": bool(args.full_road),
         "source_count": len(source_summaries),
         "rows_before_duplicate_drop": int(len(combined)),
         "rows_after_duplicate_drop": int(len(cleaned)),
         "time_min": str(cleaned["datetime_jst"].min()) if not cleaned.empty else None,
         "time_max": str(cleaned["datetime_jst"].max()) if not cleaned.empty else None,
         "global_vehicle_count": int(cleaned["vehicle_id"].nunique()) if not cleaned.empty else 0,
+        "lane_row_counts": lane_counts,
+        "spatial_band_row_counts": spatial_band_counts,
         "conflicts_before_duplicate_drop": conflicts_before,
         "conflicts_after_duplicate_drop": conflicts_after,
         "sources": source_summaries,
     }
+
+    if parquet_root is not None and not args.availability_only:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        partial_root = parquet_root.with_name(parquet_root.name + ".partial")
+        if partial_root.exists():
+            raise FileExistsError(f"Partial canonical Parquet root already exists: {partial_root}")
+        partial_root.mkdir(parents=True)
+        parquet_inventory: list[dict[str, object]] = []
+        for source_file, source_rows in cleaned.groupby("source_file", sort=True):
+            source = str(source_file)
+            if not SOURCE_PATTERN.fullmatch(source):
+                raise ValueError(f"Unsafe source_file for Parquet partition: {source!r}")
+            partition = partial_root / f"source_file={source}"
+            partition.mkdir()
+            output_path = partition / "canonical_rows.parquet"
+            table = pa.Table.from_pandas(source_rows.reset_index(drop=True), preserve_index=False)
+            pq.write_table(table, output_path, compression="zstd", row_group_size=250_000)
+            digest = hashlib.sha256()
+            with output_path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            parquet_inventory.append(
+                {
+                    "source_file": source,
+                    "relative_path": str(output_path.relative_to(partial_root)),
+                    "row_count": int(len(source_rows)),
+                    "size": int(output_path.stat().st_size),
+                    "sha256": digest.hexdigest(),
+                }
+            )
+        partial_root.rename(parquet_root)
+        summary["canonical_parquet"] = {
+            "contract_id": "morinomiya_canonical_parquet_v1",
+            "root": str(parquet_root),
+            "partitioning": ["source_file"],
+            "compression": "zstd",
+            "row_count": int(sum(int(item["row_count"]) for item in parquet_inventory)),
+            "files": parquet_inventory,
+        }
 
     summary_json.parent.mkdir(parents=True, exist_ok=True)
     summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")

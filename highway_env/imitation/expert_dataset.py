@@ -111,6 +111,9 @@ def build_env_config(
     scene_dataset_collection_mode: bool = False,
     allow_idm: bool = True,
     clip_controlled_vehicles_to_available: bool = True,
+    site_manifest: str | None = None,
+    episode_store: str | None = None,
+    road_geometry: str | None = None,
 ) -> dict[str, Any]:
     """
     Build a repo-native NGSim config for expert replay collection.
@@ -146,7 +149,23 @@ def build_env_config(
         observation = obs_cfg
         action = action_config
 
-    return {
+    manifest_values = {
+        "site_manifest": site_manifest,
+        "episode_store": episode_store,
+        "road_geometry": road_geometry,
+    }
+    declared_manifest_values = {
+        key: str(value)
+        for key, value in manifest_values.items()
+        if value is not None and str(value).strip()
+    }
+    if declared_manifest_values and len(declared_manifest_values) != 3:
+        raise ValueError(
+            "Manifest-driven runtime requires site_manifest, episode_store, "
+            "and road_geometry together."
+        )
+
+    config = {
         "scene": str(scene),
         "observation": observation,
         "action": action,
@@ -172,6 +191,8 @@ def build_env_config(
         "terminate_when_all_controlled_crashed": not bool(scene_dataset_collection_mode),
         "allow_idm": bool(allow_idm),
     }
+    config.update(declared_manifest_values)
+    return config
 
 
 def _flatten_action_for_storage(action: np.ndarray | int | float) -> np.ndarray:
